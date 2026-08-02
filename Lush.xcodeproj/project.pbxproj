@@ -13,17 +13,17 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		F001D308301E8AA900E154BD /* richtext.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = richtext.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F001D308301E8AA900E154BD /* Lush.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Lush.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		F001D314301E8AAA00E154BD /* Exceptions for "richtext" folder in "richtext" target */ = {
+		F001D314301E8AAA00E154BD /* Exceptions for "richtext" folder in "Lush" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = F001D307301E8AA900E154BD /* richtext */;
+			target = F001D307301E8AA900E154BD /* Lush */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -31,7 +31,7 @@
 		F001D30A301E8AA900E154BD /* richtext */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				F001D314301E8AAA00E154BD /* Exceptions for "richtext" folder in "richtext" target */,
+				F001D314301E8AAA00E154BD /* Exceptions for "richtext" folder in "Lush" target */,
 			);
 			path = richtext;
 			sourceTree = "<group>";
@@ -63,7 +63,7 @@
 		F001D309301E8AA900E154BD /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				F001D308301E8AA900E154BD /* richtext.app */,
+				F001D308301E8AA900E154BD /* Lush.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -71,9 +71,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		F001D307301E8AA900E154BD /* richtext */ = {
+		F001D307301E8AA900E154BD /* Lush */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = F001D315301E8AAA00E154BD /* Build configuration list for PBXNativeTarget "richtext" */;
+			buildConfigurationList = F001D315301E8AAA00E154BD /* Build configuration list for PBXNativeTarget "Lush" */;
 			buildPhases = (
 				F001D304301E8AA900E154BD /* Sources */,
 				F001D305301E8AA900E154BD /* Frameworks */,
@@ -86,13 +86,13 @@
 			fileSystemSynchronizedGroups = (
 				F001D30A301E8AA900E154BD /* richtext */,
 			);
-			name = richtext;
+			name = Lush;
 			packageProductDependencies = (
 				F0872FA6301F718C003F9B3B /* PatchworkServerKit */,
 				F0872FA9301F756A003F9B3B /* PatchworkServerKit */,
 			);
 			productName = richtext;
-			productReference = F001D308301E8AA900E154BD /* richtext.app */;
+			productReference = F001D308301E8AA900E154BD /* Lush.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -127,7 +127,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				F001D307301E8AA900E154BD /* richtext */,
+				F001D307301E8AA900E154BD /* Lush */,
 			);
 		};
 /* End PBXProject section */
@@ -428,7 +428,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		F001D315301E8AAA00E154BD /* Build configuration list for PBXNativeTarget "richtext" */ = {
+		F001D315301E8AAA00E154BD /* Build configuration list for PBXNativeTarget "Lush" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				F001D316301E8AAA00E154BD /* Debug */,

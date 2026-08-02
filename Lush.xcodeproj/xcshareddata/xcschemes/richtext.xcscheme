@@ -15,8 +15,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "F001D307301E8AA900E154BD"
-               BuildableName = "richtext.app"
-               BlueprintName = "richtext"
+               BuildableName = "Lush.app"
+               BlueprintName = "Lush"
                ReferencedContainer = "container:Lush.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -45,8 +45,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "F001D307301E8AA900E154BD"
-            BuildableName = "richtext.app"
-            BlueprintName = "richtext"
+            BuildableName = "Lush.app"
+            BlueprintName = "Lush"
             ReferencedContainer = "container:Lush.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -62,8 +62,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "F001D307301E8AA900E154BD"
-            BuildableName = "richtext.app"
-            BlueprintName = "richtext"
+            BuildableName = "Lush.app"
+            BlueprintName = "Lush"
             ReferencedContainer = "container:Lush.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
