@@ -349,9 +349,34 @@ enum EditorSettings {
 
     static let designs: [(key: String, label: String)] = [
         ("system", "System"),
-        ("serif", "Serif"),
+        ("serif", "New York"),
         ("rounded", "Rounded"),
         ("mono", "Monospaced"),
+        ("georgia", "Georgia"),
+        ("palatino", "Palatino"),
+        ("baskerville", "Baskerville"),
+        ("times", "Times New Roman"),
+        ("didot", "Didot"),
+        ("helvetica", "Helvetica Neue"),
+        ("avenir", "Avenir Next"),
+        ("optima", "Optima"),
+        ("typewriter", "Typewriter"),
+        ("courier", "Courier New"),
+        ("menlo", "Menlo"),
+    ]
+
+    private static let namedFonts: [String: String] = [
+        "georgia": "Georgia",
+        "palatino": "Palatino",
+        "baskerville": "Baskerville",
+        "times": "Times New Roman",
+        "didot": "Didot",
+        "helvetica": "Helvetica Neue",
+        "avenir": "Avenir Next",
+        "optima": "Optima",
+        "typewriter": "American Typewriter",
+        "courier": "Courier New",
+        "menlo": "Menlo",
     ]
 
     static var defaultBodySize: Double {
@@ -383,21 +408,28 @@ enum EditorSettings {
 
     static func font(ofSize size: CGFloat, weight: PFont.Weight = .regular) -> PFont {
         let base = PFont.systemFont(ofSize: size, weight: weight)
-        let systemDesign: PFontDescriptor.SystemDesign
         switch design {
-        case "serif": systemDesign = .serif
-        case "rounded": systemDesign = .rounded
-        case "mono": systemDesign = .monospaced
-        default: return base
+        case "serif":
+            guard let descriptor = base.fontDescriptor.withDesign(.serif) else { return base }
+            #if os(macOS)
+            return PFont(descriptor: descriptor, size: size) ?? base
+            #else
+            return PFont(descriptor: descriptor, size: size)
+            #endif
+        case "rounded":
+            guard let descriptor = base.fontDescriptor.withDesign(.rounded) else { return base }
+            #if os(macOS)
+            return PFont(descriptor: descriptor, size: size) ?? base
+            #else
+            return PFont(descriptor: descriptor, size: size)
+            #endif
+        case "mono":
+            return .monospacedSystemFont(ofSize: size, weight: weight)
+        default:
+            guard let fontName = namedFonts[design],
+                  let named = PFont(name: fontName, size: size) else { return base }
+            return weight.rawValue > 0 ? named.addingTraits(bold: true) : named
         }
-        guard let descriptor = base.fontDescriptor.withDesign(systemDesign) else {
-            return base
-        }
-        #if os(macOS)
-        return PFont(descriptor: descriptor, size: size) ?? base
-        #else
-        return PFont(descriptor: descriptor, size: size)
-        #endif
     }
 }
 

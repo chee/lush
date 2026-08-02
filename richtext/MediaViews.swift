@@ -90,7 +90,9 @@ struct AudioInlineView: View {
                     Text(name)
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
-                    WaveformView(levels: levels, progress: progress)
+                    WaveformView(levels: levels, progress: progress) { frac in
+                            seekTo(frac)
+                        }
                         .frame(height: 26)
                 }
                 Button {
@@ -150,32 +152,57 @@ struct AudioInlineView: View {
             playing = true
         }
     }
+
+    private func seekTo(_ fraction: Double) {
+        if player == nil {
+            player = try? AVAudioPlayer(contentsOf: fileURL)
+            player?.prepareToPlay()
+        }
+        guard let player else { return }
+        player.currentTime = fraction * player.duration
+        progress = fraction
+        if !playing {
+            player.play()
+            playing = true
+        }
+    }
 }
 
 struct WaveformView: View {
     let levels: [Float]
     let progress: Double
+    var onSeek: ((Double) -> Void)? = nil
 
     var body: some View {
-        Canvas { context, size in
-            let bars = levels.isEmpty ? [Float](repeating: 0.3, count: 40) : levels
-            let barWidth = size.width / CGFloat(bars.count)
-            let playedX = size.width * CGFloat(progress)
-            for (index, level) in bars.enumerated() {
-                let height = max(2, CGFloat(level) * size.height)
-                let x = CGFloat(index) * barWidth
-                let rect = CGRect(
-                    x: x + barWidth * 0.15,
-                    y: (size.height - height) / 2,
-                    width: barWidth * 0.7,
-                    height: height
-                )
-                let played = x < playedX
-                context.fill(
-                    Path(roundedRect: rect, cornerRadius: barWidth * 0.35),
-                    with: .color(played ? Color.accentColor : Color.secondary.opacity(0.45))
-                )
+        GeometryReader { geo in
+            Canvas { context, size in
+                let bars = levels.isEmpty ? [Float](repeating: 0.3, count: 40) : levels
+                let barWidth = size.width / CGFloat(bars.count)
+                let playedX = size.width * CGFloat(progress)
+                for (index, level) in bars.enumerated() {
+                    let height = max(2, CGFloat(level) * size.height)
+                    let x = CGFloat(index) * barWidth
+                    let rect = CGRect(
+                        x: x + barWidth * 0.15,
+                        y: (size.height - height) / 2,
+                        width: barWidth * 0.7,
+                        height: height
+                    )
+                    let played = x < playedX
+                    context.fill(
+                        Path(roundedRect: rect, cornerRadius: barWidth * 0.35),
+                        with: .color(played ? Color.accentColor : Color.secondary.opacity(0.45))
+                    )
+                }
             }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard let onSeek else { return }
+                        let frac = max(0, min(1, Double(value.location.x / geo.size.width)))
+                        onSeek(frac)
+                    }
+            )
         }
     }
 
@@ -209,6 +236,74 @@ struct WaveformView: View {
     }
 }
 
+struct TrimWaveformView: View {
+    let levels: [Float]
+    let duration: TimeInterval
+    @Binding var trimStart: TimeInterval
+    @Binding var trimEnd: TimeInterval
+    var playhead: Double = 0
+
+    @State private var movingEnd: Bool? = nil
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let sf = CGFloat(duration > 0 ? trimStart / duration : 0)
+            let ef = CGFloat(duration > 0 ? trimEnd / duration : 1)
+            let ph = CGFloat(playhead)
+
+            Canvas { ctx, size in
+                let bars = levels.isEmpty ? [Float](repeating: 0.3, count: 48) : levels
+                let barWidth = size.width / CGFloat(bars.count)
+                for (i, level) in bars.enumerated() {
+                    let barFrac = (CGFloat(i) + 0.5) / CGFloat(bars.count)
+                    let inTrim = barFrac >= sf && barFrac <= ef
+                    let barH = max(2, CGFloat(level) * size.height)
+                    let x = CGFloat(i) * barWidth
+                    let rect = CGRect(
+                        x: x + barWidth * 0.15,
+                        y: (size.height - barH) / 2,
+                        width: barWidth * 0.7,
+                        height: barH
+                    )
+                    ctx.fill(
+                        Path(roundedRect: rect, cornerRadius: barWidth * 0.35),
+                        with: .color(inTrim ? Color.accentColor : Color.secondary.opacity(0.2))
+                    )
+                }
+                let playX = ph * size.width
+                ctx.fill(
+                    Path(CGRect(x: playX - 1, y: 0, width: 2, height: size.height)),
+                    with: .color(.white.opacity(0.75))
+                )
+                for frac in [sf, ef] {
+                    let x = frac * size.width
+                    ctx.fill(
+                        Path(CGRect(x: max(0, x - 1.5), y: 0, width: 3, height: size.height)),
+                        with: .color(Color.accentColor)
+                    )
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let x = max(0, min(w, value.location.x))
+                        let frac = Double(x / w)
+                        if movingEnd == nil {
+                            movingEnd = abs(frac - Double(ef)) < abs(frac - Double(sf))
+                        }
+                        if movingEnd == true {
+                            trimEnd = max(trimStart + 0.2, min(duration, frac * duration))
+                        } else {
+                            trimStart = max(0, min(trimEnd - 0.2, frac * duration))
+                        }
+                    }
+                    .onEnded { _ in movingEnd = nil }
+            )
+        }
+    }
+}
+
 struct EditorSheetView: View {
     let sheet: EditorSheet
     let controller: EditorController
@@ -219,7 +314,10 @@ struct EditorSheetView: View {
             AudioPlayerSheet(
                 fileURL: fileURL,
                 name: name,
-                fetchVision: { await controller.assetVision(assetUrl) }
+                fetchVision: { await controller.assetVision(assetUrl) },
+                saveTranscript: { transcript in
+                    controller.saveTranscript(assetUrl: assetUrl, transcript: transcript)
+                }
             ) { data in
                 let base = (name as NSString).deletingPathExtension
                 controller.replaceTrimmedAudio(
@@ -324,6 +422,7 @@ struct AudioPlayerSheet: View {
     let fileURL: URL
     let name: String
     let fetchVision: () async -> AssetVision?
+    let saveTranscript: ((String) -> Void)?
     let onTrimmed: (Data) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVAudioPlayer?
@@ -335,23 +434,47 @@ struct AudioPlayerSheet: View {
     @State private var trimEnd: TimeInterval = 0.01
     @State private var exporting = false
     @State private var exportFailed = false
-    @State private var transcript: String?
+    @State private var levels: [Float] = []
+    @State private var editableTranscript = ""
 
     var body: some View {
         VStack(spacing: 16) {
             Text(name)
                 .font(.headline)
                 .lineLimit(1)
-            HStack {
-                Text(timeString(position))
-                Slider(value: $position, in: 0...duration) { editing in
-                    if !editing {
-                        player?.currentTime = position
-                    }
+
+            if trimming {
+                TrimWaveformView(
+                    levels: levels,
+                    duration: duration,
+                    trimStart: $trimStart,
+                    trimEnd: $trimEnd,
+                    playhead: duration > 0 ? position / duration : 0
+                )
+                .frame(height: 60)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                HStack {
+                    Text(timeString(trimStart))
+                    Spacer()
+                    Text(timeString(trimEnd))
                 }
-                Text(timeString(duration))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            } else {
+                WaveformView(levels: levels, progress: duration > 0 ? position / duration : 0) { frac in
+                    position = frac * duration
+                    player?.currentTime = position
+                }
+                .frame(height: 44)
+                HStack {
+                    Text(timeString(position))
+                    Spacer()
+                    Text(timeString(duration))
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
             }
-            .font(.caption.monospacedDigit())
+
             Button {
                 togglePlayback()
             } label: {
@@ -361,30 +484,19 @@ struct AudioPlayerSheet: View {
             .buttonStyle(.plain)
 
             if trimming {
-                VStack(spacing: 8) {
-                    HStack {
-                        Text("Start \(timeString(trimStart))")
-                        Slider(value: $trimStart, in: 0...trimEnd)
-                    }
-                    HStack {
-                        Text("End \(timeString(trimEnd))")
-                        Slider(value: $trimEnd, in: trimStart...duration)
-                    }
-                    if exportFailed {
-                        Text("Couldn't trim this recording.")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-                    HStack {
-                        Button("Cancel") { trimming = false }
-                        Button("Save Trimmed Copy") {
-                            Task { await exportTrim() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(exporting || trimEnd - trimStart < 0.2)
-                    }
+                if exportFailed {
+                    Text("Couldn't trim this recording.")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
-                .font(.caption.monospacedDigit())
+                HStack(spacing: 12) {
+                    Button("Cancel") { trimming = false }
+                    Button("Save Trimmed Copy") {
+                        Task { await exportTrim() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(exporting || trimEnd - trimStart < 0.2)
+                }
             } else {
                 Button("Trim…") {
                     trimStart = 0
@@ -393,27 +505,33 @@ struct AudioPlayerSheet: View {
                 }
             }
 
-            if let transcript {
+            if !editableTranscript.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Transcript")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Button("Copy") { Clipboard.copy(transcript) }
+                        Button("Copy") { Clipboard.copy(editableTranscript) }
                             .font(.caption)
                     }
-                    ScrollView {
-                        Text(transcript)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(maxHeight: 140)
+                    TextEditor(text: $editableTranscript)
+                        .font(.caption)
+                        .frame(minHeight: 80, maxHeight: 160)
+                        .scrollContentBackground(.hidden)
+                        .padding(6)
+                        .background(Color.secondary.opacity(0.07))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
             }
 
-            Button("Done") { dismiss() }
-                .keyboardShortcut(.defaultAction)
+            Button("Done") {
+                if !editableTranscript.isEmpty {
+                    saveTranscript?(editableTranscript)
+                }
+                dismiss()
+            }
+            .keyboardShortcut(.defaultAction)
         }
         .padding(24)
         #if os(macOS)
@@ -425,9 +543,13 @@ struct AudioPlayerSheet: View {
             player = loaded
             duration = max(loaded?.duration ?? 0.01, 0.01)
             trimEnd = duration
+            let url = fileURL
+            Task {
+                levels = await Task.detached { WaveformView.levels(for: url) }.value
+            }
             Task {
                 if let ocr = await fetchVision()?.ocr, !ocr.isEmpty {
-                    transcript = ocr
+                    editableTranscript = ocr
                 }
             }
             while !Task.isCancelled {

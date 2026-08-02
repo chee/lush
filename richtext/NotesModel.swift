@@ -112,7 +112,7 @@ final class NotesModel {
                 .filter { $0.kind == "folder" }
                 .map { folderNode(url: $0.url, name: $0.name, parent: url) }
             children += entries
-                .filter { $0.kind == "lush" || $0.kind == "rich" }
+                .filter { $0.kind != "folder" }
                 .map {
                     FolderNode(url: $0.url, name: $0.name, kind: $0.kind, parentUrl: url, children: nil)
                 }
@@ -237,6 +237,17 @@ final class NotesModel {
             selectedNoteUrl = url
         } catch {
             status = "Couldn't create note: \(error.localizedDescription)"
+        }
+    }
+
+    func createScript() {
+        guard let core, let folderUrl else { return }
+        do {
+            let url = try core.createScriptIn(folderUrl: folderUrl, name: "")
+            refreshNotes()
+            selectedNoteUrl = url
+        } catch {
+            status = "Couldn't create script: \(error.localizedDescription)"
         }
     }
 
@@ -514,6 +525,61 @@ final class NotesModel {
         }.value
         refreshNotes()
     }
+
+    // Incoming content (share / open-with) ------------------------------------
+
+    var pendingIncoming: IncomingContent?
+
+    func importAsNewNote(_ content: IncomingContent) {
+        guard let core else { return }
+        do {
+            let title: String
+            let spansJson: String
+            switch content.payload {
+            case .text(let text):
+                title = String(text.prefix(60)).components(separatedBy: .newlines).first ?? ""
+                let spans = [SpanNode.text(text, [:])]
+                spansJson = SpanNode.encodeList(spans)
+            case .file(let url):
+                title = url.deletingPathExtension().lastPathComponent
+                spansJson = "[]"
+            }
+            let noteUrl = try core.createNote(title: title)
+            if !spansJson.isEmpty && spansJson != "[]" {
+                try? core.updateNoteSpans(url: noteUrl, spansJson: spansJson)
+            }
+            if case .file(let url) = content.payload,
+               let data = try? Data(contentsOf: url) {
+                let ext = url.pathExtension.lowercased()
+                let mime = mimeType(for: ext)
+                _ = try? core.createAsset(
+                    name: url.lastPathComponent,
+                    extension: ext.isEmpty ? "bin" : ext,
+                    mimeType: mime,
+                    data: data
+                )
+            }
+            refreshNotes()
+            selectedNoteUrl = noteUrl
+        } catch {
+            status = "Couldn't import: \(error.localizedDescription)"
+        }
+    }
+
+    private func mimeType(for ext: String) -> String {
+        switch ext {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "pdf": return "application/pdf"
+        case "mp4": return "video/mp4"
+        case "mov": return "video/quicktime"
+        case "mp3": return "audio/mpeg"
+        case "m4a": return "audio/mp4"
+        case "txt": return "text/plain"
+        default: return "application/octet-stream"
+        }
+    }
 }
 
 private final class DelegateBridge: CoreDelegate {
@@ -548,4 +614,14 @@ struct FolderNode: Identifiable, Hashable {
     var children: [FolderNode]?
 
     var id: String { url }
+    var isNote: Bool { kind == "lush" || kind == "rich" }
+}
+
+struct IncomingContent: Identifiable {
+    let id = UUID()
+    enum Payload {
+        case text(String)
+        case file(URL)
+    }
+    let payload: Payload
 }

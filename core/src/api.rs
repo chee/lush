@@ -7,6 +7,14 @@ use crate::{
     shapes,
 };
 
+fn synthesize_kind(kind: &str, lush: Option<&str>) -> String {
+    if kind == "file" && lush == Some("script") {
+        "lush:script".into()
+    } else {
+        kind.into()
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum CoreError {
     #[error("{msg}")]
@@ -151,11 +159,13 @@ impl Core {
             .map(|entries| {
                 entries
                     .into_iter()
-                    .filter(|e| e.kind == "rich" || e.kind == "folder")
-                    .map(|e| NoteInfo {
-                        url: e.url,
-                        name: e.name,
-                        kind: e.kind,
+                    .filter_map(|e| {
+                        let kind = synthesize_kind(&e.kind, e.lush.as_deref());
+                        if kind == "rich" || kind == "folder" || kind == "lush:script" {
+                            Some(NoteInfo { url: e.url, name: e.name, kind })
+                        } else {
+                            None
+                        }
                     })
                     .collect()
             })
@@ -172,11 +182,9 @@ impl Core {
             .map(|entries| {
                 entries
                     .into_iter()
-                    .filter(|e| e.kind == "rich" || e.kind == "folder")
-                    .map(|e| NoteInfo {
-                        url: e.url,
-                        name: e.name,
-                        kind: e.kind,
+                    .map(|e| {
+                        let kind = synthesize_kind(&e.kind, e.lush.as_deref());
+                        NoteInfo { url: e.url, name: e.name, kind }
                     })
                     .collect()
             })
@@ -285,6 +293,7 @@ impl Core {
                         name: title.clone(),
                         kind: "folder".into(),
                         url: sub.to_url(),
+                        lush: None,
                     },
                 )
             })
@@ -314,6 +323,7 @@ impl Core {
                         name: title.clone(),
                         kind: "rich".into(),
                         url: note.to_url(),
+                        lush: None,
                     },
                 )
             })
@@ -401,9 +411,7 @@ impl Core {
                     .await;
                 if let Ok(entries) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
                     for entry in entries {
-                        if entry.kind == "folder" || entry.kind == "rich" {
-                            queue.push(entry.url);
-                        }
+                        queue.push(entry.url);
                     }
                 }
                 if let Ok(embeds) = repo.read_doc(id, |doc| Ok(shapes::embed_urls(doc))).await {
@@ -650,6 +658,28 @@ impl Core {
         })
     }
 
+    pub fn create_script_in(&self, folder_url: String, name: String) -> Result<String, CoreError> {
+        let repo = self.repo.clone();
+        let url = self.runtime.block_on(async move {
+            let script = repo.create_doc(|doc| shapes::init_script(doc, &name)).await?;
+            let folder = DocId::from_url(&folder_url)?;
+            repo.change_doc(folder, |doc| {
+                shapes::add_folder_entry(
+                    doc,
+                    &shapes::DocLink {
+                        name: name.clone(),
+                        kind: "file".into(),
+                        url: script.to_url(),
+                        lush: Some("script".into()),
+                    },
+                )
+            })
+            .await?;
+            Ok::<_, anyhow::Error>(script.to_url())
+        })?;
+        Ok(url)
+    }
+
     /// Unix seconds of the newest change in the doc (0 when unknown).
     pub fn note_modified(&self, url: String) -> i64 {
         let Ok(id) = DocId::from_url(&url) else {
@@ -683,6 +713,7 @@ impl Core {
                             name: title.clone(),
                             kind: "rich".into(),
                             url: note.to_url(),
+                            lush: None,
                         },
                     )
                 })
@@ -713,6 +744,7 @@ impl Core {
                             name: title.clone(),
                             kind: "folder".into(),
                             url: sub.to_url(),
+                            lush: None,
                         },
                     )
                 })

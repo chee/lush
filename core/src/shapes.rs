@@ -115,6 +115,7 @@ pub struct DocLink {
     #[serde(rename = "type")]
     pub kind: String,
     pub url: String,
+    pub lush: Option<String>,
 }
 
 fn scalar_to_json(s: &ScalarValue) -> Json {
@@ -302,6 +303,28 @@ fn paragraph_block() -> hydrate::Map {
     hydrate::Map::from(m)
 }
 
+pub fn init_script(doc: &mut Automerge, name: &str) -> anyhow::Result<()> {
+    let filename = if name.is_empty() {
+        "script.js".to_string()
+    } else if name.ends_with(".js") {
+        name.to_string()
+    } else {
+        format!("{name}.js")
+    };
+    init_file_doc(doc, &filename, "js", "text/javascript", Vec::new())?;
+    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
+        let lush = t.put_object(ROOT, "@lush", ObjType::Map)?;
+        put_text(t, &lush, "type", "script")?;
+        Ok(())
+    }))?;
+    Ok(())
+}
+
+pub fn lush_type(doc: &Automerge) -> Option<String> {
+    let (_, lush) = doc.get(ROOT, "@lush").ok()??;
+    string_at(doc, &lush, "type")
+}
+
 pub fn init_rich_note(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
     tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
         let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
@@ -344,6 +367,7 @@ pub fn folder_entries(doc: &Automerge) -> anyhow::Result<Vec<DocLink>> {
             name: string_at(doc, &entry, "name").unwrap_or_default(),
             kind: string_at(doc, &entry, "type").unwrap_or_default(),
             url: string_at(doc, &entry, "url").unwrap_or_default(),
+            lush: string_at(doc, &entry, "lush"),
         });
     }
     Ok(out)
@@ -359,6 +383,9 @@ pub fn add_folder_entry(doc: &mut Automerge, link: &DocLink) -> anyhow::Result<(
         put_text(t, &entry, "name", &link.name)?;
         put_text(t, &entry, "type", &link.kind)?;
         put_text(t, &entry, "url", &link.url)?;
+        if let Some(lush) = &link.lush {
+            put_text(t, &entry, "lush", lush)?;
+        }
         Ok(())
     }))?;
     Ok(())
@@ -403,6 +430,11 @@ fn read_str(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<String
     }
 }
 
+fn doc_patchwork_type(doc: &Automerge) -> Option<String> {
+    let (_, pw) = doc.get(ROOT, "@patchwork").ok()??;
+    string_at(doc, &pw, "type")
+}
+
 pub fn doc_title(doc: &Automerge) -> String {
     if let Some(t) = read_str(doc, &ROOT, "title") {
         return t;
@@ -412,14 +444,20 @@ pub fn doc_title(doc: &Automerge) -> String {
             return t;
         }
     }
-    String::new()
+    // file docs store their display name in `name`
+    read_str(doc, &ROOT, "name").unwrap_or_default()
 }
 
 pub fn set_note_title(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
+    let is_file = doc_patchwork_type(doc).as_deref() == Some("file");
     tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        set_text(t, &ROOT, "title", title)?;
-        if let Some((_, pw)) = t.get(ROOT, "@patchwork")? {
-            set_text(t, &pw, "title", title)?;
+        if is_file {
+            set_text(t, &ROOT, "name", title)?;
+        } else {
+            set_text(t, &ROOT, "title", title)?;
+            if let Some((_, pw)) = t.get(ROOT, "@patchwork")? {
+                set_text(t, &pw, "title", title)?;
+            }
         }
         Ok(())
     }))?;

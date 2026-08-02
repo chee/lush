@@ -130,6 +130,7 @@ enum PatchworkWeb {
       html, body { margin: 0; height: 100%; }
       body > repo-provider, body > repo-provider > patchwork-view {
         display: block; height: 100%; overflow: auto;
+        background: var(--editor-fill); color: var(--editor-line);
       }
       #status { font: 12px system-ui, sans-serif; color: #888; padding: 12px; }
       .picker { display: flex; flex-direction: column; gap: 6px; padding: 14px;
@@ -818,6 +819,7 @@ struct PatchworkBoxView: View {
     let docUrl: String
     let toolId: String?
     var onSelectTool: ((String?) -> Void)?
+    var onRemove: (() -> Void)?
     @State private var tools: [ToolChoice] = []
     @State private var currentTool: String?
 
@@ -850,21 +852,27 @@ struct PatchworkBoxView: View {
                 .strokeBorder(.separator)
         )
         .overlay(alignment: .topTrailing) {
-            if let onSelectTool, !tools.isEmpty {
+            if onSelectTool != nil || onRemove != nil {
                 Menu {
-                    ForEach(tools) { tool in
-                        Button {
-                            onSelectTool(tool.id)
-                        } label: {
-                            if tool.id == currentTool {
-                                Label(tool.name, systemImage: "checkmark")
-                            } else {
-                                Text(tool.name)
+                    if let onSelectTool, !tools.isEmpty {
+                        ForEach(tools) { tool in
+                            Button {
+                                onSelectTool(tool.id)
+                            } label: {
+                                if tool.id == currentTool {
+                                    Label(tool.name, systemImage: "checkmark")
+                                } else {
+                                    Text(tool.name)
+                                }
                             }
                         }
+                        Divider()
+                        Button("Default") { onSelectTool(nil) }
+                        Divider()
                     }
-                    Divider()
-                    Button("Default") { onSelectTool(nil) }
+                    if let onRemove {
+                        Button("Remove", role: .destructive) { onRemove() }
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle.fill")
                         .foregroundStyle(.secondary)
@@ -873,7 +881,8 @@ struct PatchworkBoxView: View {
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
-                .padding(4)
+                .padding(.top, -10)
+                .padding(.trailing, -10)
             }
         }
     }

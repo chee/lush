@@ -6,6 +6,8 @@ import PhotosUI
 enum NavRoute: Hashable {
     case folder(String)
     case note(String)
+    case patchwork(String)
+    case script(String)
     case recents
 }
 
@@ -45,9 +47,22 @@ struct ContentView: View {
             let url = selectedItemUrls.first
             Task { await model.selectItem(url) }
         }
-        .onOpenURL { router.handle($0) }
+        .onOpenURL { url in
+            if url.scheme == "richtext" {
+                router.handle(url)
+            } else if url.isFileURL {
+                model.pendingIncoming = IncomingContent(payload: .file(url))
+            }
+        }
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
+        .sheet(item: Binding(
+            get: { model.pendingIncoming },
+            set: { model.pendingIncoming = $0 }
+        )) { content in
+            IncomingContentSheet(content: content)
+                .environment(model)
+        }
         #else
         NavigationStack(path: $path) {
             FolderScreen(folderUrl: nil) { path.append($0) }
@@ -58,14 +73,32 @@ struct ContentView: View {
                     case .note(let url):
                         NoteDetail(noteUrl: url)
                             .onAppear { model.selectedNoteUrl = url }
+                    case .patchwork(let url):
+                        PatchworkDetail(docUrl: url)
+                    case .script(let url):
+                        ScriptEditorView(url: url)
+                            .environment(model)
                     case .recents:
                         RecentsScreen()
                     }
                 }
         }
-        .onOpenURL { router.handle($0) }
+        .onOpenURL { url in
+            if url.scheme == "richtext" {
+                router.handle(url)
+            } else if url.isFileURL {
+                model.pendingIncoming = IncomingContent(payload: .file(url))
+            }
+        }
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
+        .sheet(item: Binding(
+            get: { model.pendingIncoming },
+            set: { model.pendingIncoming = $0 }
+        )) { content in
+            IncomingContentSheet(content: content)
+                .environment(model)
+        }
         #endif
     }
 
@@ -269,8 +302,10 @@ struct ContentView: View {
         HStack(spacing: 6) {
             Image(systemName: node.kind == "folder"
                 ? (node.parentUrl == nil ? "tray.full" : "folder")
-                : "doc.text")
+                : node.kind == "lush:script" ? "scroll"
+                : node.isNote ? "doc.text" : "shippingbox")
                 .foregroundStyle(node.kind == "folder" ? Color.accentColor : .secondary)
+                .allowsHitTesting(false)
             if renamingUrl == node.url {
                 TextField("Name", text: $renameText)
                     .textFieldStyle(.plain)
@@ -283,22 +318,17 @@ struct ContentView: View {
             } else {
                 Text(node.displayName)
                     .lineLimit(1)
-                    .simultaneousGesture(
-                        TapGesture().onEnded {
-                            if !NSEvent.modifierFlags.contains(.command),
-                               !NSEvent.modifierFlags.contains(.shift) {
-                                selectedItemUrls = [node.url]
-                            }
-                        }
-                    )
-                    .simultaneousGesture(
-                        TapGesture(count: 2).onEnded { beginRename(node) }
-                    )
+                    .allowsHitTesting(false)
             }
         }
+        .contentShape(Rectangle())
         .tag(node.url)
         .draggable(node.url)
         .modifier(FolderDropTarget(node: node, model: model))
+        .onTapGesture(count: 2) {
+            guard selectedItemUrls.count == 1, selectedItemUrls.contains(node.url) else { return }
+            beginRename(node)
+        }
         .contextMenu {
             let targets = selectedItemUrls.contains(node.url)
                 ? Array(selectedItemUrls)
@@ -345,8 +375,17 @@ struct ContentView: View {
     private var detail: some View {
         Group {
             if let url = model.selectedNoteUrl {
-                NoteDetail(noteUrl: url)
-                    .id(url)
+                if model.node(for: url)?.kind == "lush:script" {
+                    ScriptEditorView(url: url)
+                        .environment(model)
+                        .id(url)
+                } else if model.node(for: url)?.isNote != false {
+                    NoteDetail(noteUrl: url)
+                        .id(url)
+                } else {
+                    PatchworkDetail(docUrl: url)
+                        .id(url)
+                }
             } else if !model.status.isEmpty {
                 ContentUnavailableView {
                     Label("Note", systemImage: "doc.richtext")
@@ -364,10 +403,21 @@ struct ContentView: View {
         .navigationTitle("")
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                Button {
-                    model.createNote()
+                Menu {
+                    Button {
+                        model.createNote()
+                    } label: {
+                        Label("New Note", systemImage: "square.and.pencil")
+                    }
+                    Button {
+                        model.createScript()
+                    } label: {
+                        Label("New Script", systemImage: "scroll")
+                    }
                 } label: {
                     Label("New Note", systemImage: "square.and.pencil")
+                } primaryAction: {
+                    model.createNote()
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -455,11 +505,17 @@ struct FolderScreen: View {
                 OutlineGroup(nodes, children: \.children) { node in
                     NavigationLink(value: node.kind == "folder"
                         ? NavRoute.folder(node.url)
-                        : NavRoute.note(node.url)
+                        : node.kind == "lush:script"
+                            ? NavRoute.script(node.url)
+                            : node.isNote
+                                ? NavRoute.note(node.url)
+                                : NavRoute.patchwork(node.url)
                     ) {
                         Label(
                             node.displayName,
-                            systemImage: node.kind == "folder" ? "folder" : "doc.text"
+                            systemImage: node.kind == "folder" ? "folder"
+                                : node.kind == "lush:script" ? "scroll"
+                                : node.isNote ? "doc.text" : "shippingbox"
                         )
                         .lineLimit(1)
                     }
@@ -517,13 +573,24 @@ struct FolderScreen: View {
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarSpacer(.flexible, placement: .bottomBar)
             ToolbarItem(placement: .bottomBar) {
-                Button {
-                    model.createNote()
-                    if let url = model.selectedNoteUrl {
-                        push(.note(url))
+                Menu {
+                    Button {
+                        model.createNote()
+                        if let url = model.selectedNoteUrl { push(.note(url)) }
+                    } label: {
+                        Label("New Note", systemImage: "square.and.pencil")
+                    }
+                    Button {
+                        model.createScript()
+                        if let url = model.selectedNoteUrl { push(.script(url)) }
+                    } label: {
+                        Label("New Script", systemImage: "scroll")
                     }
                 } label: {
                     Label("New Note", systemImage: "square.and.pencil")
+                } primaryAction: {
+                    model.createNote()
+                    if let url = model.selectedNoteUrl { push(.note(url)) }
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -683,11 +750,17 @@ struct MoveSheet: View {
 struct NoteDetail: View {
     let noteUrl: String
     @Environment(NotesModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
     @State private var editor = EditorController()
     @State private var recorder = AudioRecorder()
+    @State private var renameText = ""
+    @State private var showingRename = false
+    @State private var moveTarget: MoveTarget?
     #if os(iOS)
     @State private var photoItem: PhotosPickerItem?
     #endif
+
+    private var currentNode: FolderNode? { model.node(for: noteUrl) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -703,6 +776,11 @@ struct NoteDetail: View {
             RichTextEditor(noteUrl: noteUrl, model: model, controller: editor)
         }
         .focusedSceneValue(\.editorController, editor)
+        .dropDestination(for: String.self) { urls, _ in
+            guard let url = urls.first(where: { $0.hasPrefix("automerge:") }) else { return false }
+            editor.insertPatchworkEmbed(url: url, tool: nil)
+            return true
+        }
         .toolbar {
             ToolbarItem {
                 Menu {
@@ -711,6 +789,15 @@ struct NoteDetail: View {
                     } label: {
                         Label("Choose Photo…", systemImage: "photo.on.rectangle")
                     }
+                    #if os(iOS)
+                    if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                        Button {
+                            editor.cameraPickerVisible = true
+                        } label: {
+                            Label("Take Photo", systemImage: "camera")
+                        }
+                    }
+                    #endif
                     Button {
                         editor.recorderVisible.toggle()
                     } label: {
@@ -781,12 +868,63 @@ struct NoteDetail: View {
                 .pickerStyle(.menu)
             }
             #endif
+            ToolbarItem {
+                Menu {
+                    if let node = currentNode {
+                        if node.kind == "lush" || node.kind == "rich" {
+                            Button(model.isPinned(noteUrl) ? "Unpin" : "Pin") {
+                                model.togglePin(noteUrl)
+                            }
+                            Button(model.quickNoteUrl == noteUrl ? "Unset Quick Note" : "Set as Quick Note") {
+                                model.setQuickNote(model.quickNoteUrl == noteUrl ? nil : noteUrl)
+                            }
+                            Divider()
+                        }
+                        if node.parentUrl != nil {
+                            Button("Move…") { moveTarget = MoveTarget(urls: [noteUrl]) }
+                        }
+                        Button("Rename") {
+                            renameText = node.name
+                            showingRename = true
+                        }
+                        Button("Copy Note URL") { Clipboard.copy(noteUrl) }
+                        if node.parentUrl != nil {
+                            Divider()
+                            Button("Delete", role: .destructive) {
+                                model.removeEntry(parentUrl: node.parentUrl, url: noteUrl)
+                                #if os(macOS)
+                                model.selectedNoteUrl = nil
+                                #else
+                                dismiss()
+                                #endif
+                            }
+                        }
+                    }
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle")
+                }
+                .disabled(currentNode == nil)
+            }
         }
         .sheet(item: Binding(
             get: { editor.sheet },
             set: { editor.sheet = $0 }
         )) { sheet in
             EditorSheetView(sheet: sheet, controller: editor)
+        }
+        .alert("Rename", isPresented: $showingRename) {
+            TextField("Name", text: $renameText)
+            Button("Save") {
+                guard let node = currentNode else { return }
+                let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty, name != node.name {
+                    model.renameEntry(parentUrl: node.parentUrl, url: noteUrl, to: name)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .sheet(item: $moveTarget) { target in
+            MoveSheet(urls: target.urls).environment(model)
         }
         #if os(iOS)
         .photosPicker(
@@ -826,6 +964,16 @@ struct NoteDetail: View {
                 editor.insertData(data, name: url.lastPathComponent)
             }
         }
+        .sheet(isPresented: Binding(
+            get: { editor.cameraPickerVisible },
+            set: { editor.cameraPickerVisible = $0 }
+        )) {
+            CameraPicker { image in
+                guard let data = image.jpegData(compressionQuality: 0.85) else { return }
+                let stamp = Int(Date().timeIntervalSince1970)
+                editor.insertData(data, name: "photo-\(stamp).jpg")
+            }
+        }
         #endif
     }
 
@@ -855,3 +1003,136 @@ private struct FolderDropTarget: ViewModifier {
         }
     }
 }
+
+struct PatchworkDetail: View {
+    let docUrl: String
+    @Environment(NotesModel.self) private var model
+
+    var body: some View {
+        Group {
+            if PatchworkWeb.available {
+                PatchworkWebView(docUrl: docUrl, toolId: nil)
+            } else {
+                ContentUnavailableView(
+                    "Patchwork Unavailable",
+                    systemImage: "shippingbox",
+                    description: Text("Add PatchworkWeb.bundle to render this document.")
+                )
+            }
+        }
+        .navigationTitle(model.node(for: docUrl)?.displayName ?? "")
+    }
+}
+
+struct IncomingContentSheet: View {
+    let content: IncomingContent
+    @Environment(NotesModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
+
+    private var displayTitle: String {
+        switch content.payload {
+        case .text(let t): return String(t.prefix(50)).components(separatedBy: .newlines).first ?? "Import"
+        case .file(let url): return url.lastPathComponent
+        }
+    }
+
+    private var allNotes: [FolderNode] {
+        var out: [FolderNode] = []
+        func walk(_ nodes: [FolderNode]) {
+            for node in nodes {
+                if node.isNote { out.append(node) }
+                if let ch = node.children { walk(ch) }
+            }
+        }
+        walk(model.folderTree)
+        return out
+    }
+
+    private var filtered: [FolderNode] {
+        search.isEmpty ? allNotes
+            : allNotes.filter { $0.displayName.localizedCaseInsensitiveContains(search) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Button {
+                        model.importAsNewNote(content)
+                        dismiss()
+                    } label: {
+                        Label("New Note", systemImage: "square.and.pencil")
+                            .foregroundStyle(.primary)
+                    }
+                }
+                if !allNotes.isEmpty {
+                    Section("Open in existing note") {
+                        ForEach(filtered) { note in
+                            Button {
+                                if case .text(let text) = content.payload {
+                                    Clipboard.copy(text)
+                                }
+                                model.selectedNoteUrl = note.url
+                                dismiss()
+                            } label: {
+                                Text(note.displayName.isEmpty ? "Untitled" : note.displayName)
+                                    .foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                }
+            }
+            .searchable(text: $search, prompt: "Search notes")
+            .navigationTitle(displayTitle.isEmpty ? "Import" : displayTitle)
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 360, minHeight: 400)
+        #endif
+    }
+}
+
+#if os(iOS)
+struct CameraPicker: UIViewControllerRepresentable {
+    let onCapture: (UIImage) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let parent: CameraPicker
+        init(_ parent: CameraPicker) { self.parent = parent }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage {
+                parent.onCapture(image)
+            }
+            parent.dismiss()
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            parent.dismiss()
+        }
+    }
+}
+#endif

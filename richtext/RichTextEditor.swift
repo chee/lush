@@ -55,6 +55,7 @@ final class EditorController {
     #if os(iOS)
     var photoPickerVisible = false
     var filePickerVisible = false
+    var cameraPickerVisible = false
     #endif
     @ObservationIgnored weak var core: EditorCore?
 
@@ -125,6 +126,15 @@ final class EditorController {
     func assetVision(_ url: String) async -> AssetVision? {
         guard let core else { return nil }
         return await core.model.assetVision(url)
+    }
+
+    func saveTranscript(assetUrl: String, transcript: String) {
+        core?.cache.transcripts[assetUrl] = transcript
+        Task { [weak self] in
+            guard let self else { return }
+            let vision = await self.assetVision(assetUrl)
+            await self.core?.model.updateAssetVision(assetUrl, description: vision?.description ?? "", ocr: transcript)
+        }
     }
 }
 
@@ -483,7 +493,7 @@ final class EditorCore {
     func blockAtSelection() -> BlockValue {
         guard let view, let storage = view.pStorage else { return .paragraph }
         let selection = view.pSelectedRange
-        if storage.length == 0 {
+        if storage.length == 0 || selection.location >= storage.length {
             return typingBlock()
         }
         let index = min(selection.location, storage.length - 1)
@@ -681,6 +691,14 @@ final class EditorCore {
             with: RichText.embedAttachment(for: newBlock, cache: cache)
         )
         scheduleSave()
+    }
+
+    func removeEmbed(_ box: BlockBox) {
+        guard let storage = view?.pStorage else { return }
+        guard let range = range(whereBlockBox: box, in: storage) else { return }
+        storage.replaceCharacters(in: range, with: NSAttributedString())
+        scheduleSave()
+        inline.setNeedsReconcile()
     }
 
     func updateEmbedTool(_ box: BlockBox, tool: String?) {

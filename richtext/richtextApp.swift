@@ -15,7 +15,11 @@ struct FolderCommands: Commands {
     let model: NotesModel
 
     var body: some Commands {
-        CommandGroup(after: .newItem) {
+        CommandGroup(replacing: .newItem) {
+            Button("New Note") { model.createNote() }
+                .keyboardShortcut("n", modifiers: .command)
+            Button("New Script") { model.createScript() }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
             Divider()
             Button("Copy Folder URL") { model.copyFolderUrl() }
                 .keyboardShortcut("c", modifiers: [.command, .shift])

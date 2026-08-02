@@ -218,6 +218,9 @@ final class InlineViewManager {
                 toolId: block.attrs["tool"]?.stringValue,
                 onSelectTool: { [weak core] tool in
                     core?.updateEmbedTool(box, tool: tool)
+                },
+                onRemove: { [weak core] in
+                    core?.removeEmbed(box)
                 }
             ))
             return Host(
