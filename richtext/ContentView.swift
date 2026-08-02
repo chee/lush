@@ -183,6 +183,9 @@ struct ContentView: View {
                 Text(displayName(node))
                     .lineLimit(1)
                     .simultaneousGesture(
+                        TapGesture().onEnded { selectedItemUrl = node.url }
+                    )
+                    .simultaneousGesture(
                         TapGesture(count: 2).onEnded { beginRename(node) }
                     )
             }
@@ -292,6 +295,11 @@ struct ContentView: View {
                                 editor.insertHtmlBlock()
                             } label: {
                                 Label("HTML Block", systemImage: "chevron.left.forwardslash.chevron.right")
+                            }
+                            Button {
+                                editor.insertPatchworkDoc()
+                            } label: {
+                                Label("Patchwork Doc…", systemImage: "shippingbox")
                             }
                         } label: {
                             Label("Attach", systemImage: "paperclip")

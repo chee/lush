@@ -42,6 +42,12 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AssetVision {
+    pub description: String,
+    pub ocr: String,
+}
+
 #[uniffi::export(callback_interface)]
 pub trait CoreDelegate: Send + Sync {
     fn on_doc_changed(&self, url: String);
@@ -546,6 +552,15 @@ impl Core {
                 })
             }))
             .ok()
+    }
+
+    pub fn asset_vision(&self, url: String) -> Option<AssetVision> {
+        let id = DocId::from_url(&url).ok()?;
+        self.runtime
+            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::asset_vision(doc))))
+            .ok()
+            .flatten()
+            .map(|(description, ocr)| AssetVision { description, ocr })
     }
 
     pub fn asset_bytes(&self, url: String) -> Result<Vec<u8>, CoreError> {

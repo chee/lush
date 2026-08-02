@@ -4,12 +4,14 @@ import AppKit
 typealias PFont = NSFont
 typealias PColor = NSColor
 typealias PImage = NSImage
+typealias PView = NSView
 #else
 import UIKit
 
 typealias PFont = UIFont
 typealias PColor = UIColor
 typealias PImage = UIImage
+typealias PView = UIView
 #endif
 
 enum Clipboard {
@@ -24,6 +26,17 @@ enum Clipboard {
 }
 
 extension PColor {
+    convenience init(rgb: Int, alpha: CGFloat = 1) {
+        let r = CGFloat((rgb >> 16) & 0xFF) / 255
+        let g = CGFloat((rgb >> 8) & 0xFF) / 255
+        let b = CGFloat(rgb & 0xFF) / 255
+        #if os(macOS)
+        self.init(srgbRed: r, green: g, blue: b, alpha: alpha)
+        #else
+        self.init(red: r, green: g, blue: b, alpha: alpha)
+        #endif
+    }
+
     static var pLabel: PColor {
         #if os(macOS)
         .labelColor

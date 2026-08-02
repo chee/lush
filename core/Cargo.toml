@@ -19,6 +19,9 @@ subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9
 subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["std"] }
 subduction_websocket = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["tokio_client"] }
 future_form = "0.3.0"
+# pure-Rust blake3 so its C kernels can't collide with the copy inside
+# PatchworkServerFFI when both static libs link into the app
+blake3 = { version = "1.8", features = ["pure"] }
 tokio = { version = "1.46", features = ["full"] }
 tungstenite = "0.27"
 async-lock = "3.4"

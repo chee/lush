@@ -332,6 +332,13 @@ final class NotesModel {
         }.value
     }
 
+    func assetVision(_ url: String) async -> AssetVision? {
+        guard let core else { return nil }
+        return await Task.detached {
+            core.assetVision(url: url)
+        }.value
+    }
+
     func updateTitleIfNeeded(_ url: String, title: String) async {
         guard let core else { return }
         let name = title.isEmpty ? "Untitled" : title

@@ -14,23 +14,20 @@ struct HtmlBlockHandle: Identifiable {
     let html: String
 }
 
-struct TableHandle: Identifiable {
-    let id = UUID()
-    let box: TableBox
-}
-
 enum EditorSheet: Identifiable {
     case audio(assetUrl: String, fileURL: URL, name: String)
     case video(fileURL: URL, name: String)
     case html(HtmlBlockHandle)
-    case table(TableHandle)
+    case info(assetUrl: String, name: String, image: PImage?)
+    case patchworkCreate
 
     var id: String {
         switch self {
         case .audio(let url, _, _): "audio-\(url)"
         case .video(let url, _): "video-\(url.path)"
         case .html(let handle): "html-\(handle.id)"
-        case .table(let handle): "table-\(handle.id)"
+        case .info(let url, _, _): "info-\(url)"
+        case .patchworkCreate: "patchwork-create"
         }
     }
 }
@@ -60,6 +57,11 @@ final class EditorController {
     func applyHighlight(_ name: String?) { core?.setHighlight(name) }
     func insertTable() { core?.insertTable() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
+    func insertPatchworkDoc() { sheet = .patchworkCreate }
+
+    func insertPatchworkEmbed(url: String, tool: String?) {
+        core?.insertPatchworkEmbed(url: url, tool: tool)
+    }
 
     func attachImageFromPanel() {
         #if os(macOS)
@@ -94,10 +96,6 @@ final class EditorController {
         core?.updateHtmlBlock(handle.box, html: html)
     }
 
-    func saveTable(_ handle: TableHandle, grid: TableGrid) {
-        core?.updateTable(handle.box, grid: grid)
-    }
-
     func replaceTrimmedAudio(assetUrl: String, data: Data, name: String) {
         core?.replaceAsset(
             oldUrl: assetUrl,
@@ -107,6 +105,11 @@ final class EditorController {
             mime: "audio/mp4"
         )
     }
+
+    func assetVision(_ url: String) async -> AssetVision? {
+        guard let core else { return nil }
+        return await core.model.assetVision(url)
+    }
 }
 
 @MainActor
@@ -114,6 +117,10 @@ protocol EditorTextViewLike: AnyObject {
     var pStorage: NSTextStorage? { get }
     var pSelectedRange: NSRange { get set }
     var pTypingAttributes: [NSAttributedString.Key: Any] { get set }
+    var pLayoutManager: NSLayoutManager? { get }
+    var pTextContainer: NSTextContainer? { get }
+    var pTextOrigin: CGPoint { get }
+    var pSelf: PView { get }
     func pInsertText(_ text: String)
     func pReplace(_ range: NSRange, with attributed: NSAttributedString)
 }
@@ -139,21 +146,41 @@ final class ListMarkerLayoutManager: NSLayoutManager {
             let isNumber = block.type == "ordered-list-item"
             guard isBullet || isNumber else { continue }
 
-            let marker = isBullet ? "•" : "\(ordinal(of: paragraph.location, in: storage, str: str))."
             let glyphIndex = glyphIndexForCharacter(at: paragraph.location)
             let lineRect = lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            let baseline = origin.y + lineRect.minY + self.location(forGlyphAt: glyphIndex).y
             let indent = (storage.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil)
                 as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: PFont.systemFont(ofSize: RichText.bodySize),
-                .foregroundColor: PColor.pSecondaryLabel,
-            ]
-            let size = marker.size(withAttributes: attrs)
-            let point = CGPoint(
-                x: origin.x + indent - size.width - 8,
-                y: origin.y + lineRect.minY + (lineRect.height - size.height) / 2
-            )
-            marker.draw(at: point, withAttributes: attrs)
+            let itemFont = storage.attribute(.font, at: paragraph.location, effectiveRange: nil)
+                as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
+            if isBullet {
+                let diameter: CGFloat = 6.5
+                let rect = CGRect(
+                    x: origin.x + indent - diameter - 5,
+                    y: baseline - itemFont.xHeight / 2 - diameter / 2,
+                    width: diameter,
+                    height: diameter
+                )
+                PColor.pSecondaryLabel.setFill()
+                #if os(macOS)
+                NSBezierPath(ovalIn: rect).fill()
+                #else
+                UIBezierPath(ovalIn: rect).fill()
+                #endif
+            } else {
+                let marker = "\(ordinal(of: paragraph.location, in: storage, str: str))."
+                let font = PFont.monospacedDigitSystemFont(ofSize: RichText.bodySize, weight: .regular)
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .foregroundColor: PColor.pSecondaryLabel,
+                ]
+                let size = marker.size(withAttributes: attrs)
+                let point = CGPoint(
+                    x: origin.x + indent - size.width - 5,
+                    y: baseline - font.ascender
+                )
+                marker.draw(at: point, withAttributes: attrs)
+            }
         }
     }
 
@@ -190,11 +217,14 @@ final class EditorCore {
     private var lastKnownJSON = ""
     private let cache = AssetCache()
 
+    let inline = InlineViewManager()
+
     init(noteUrl: String, model: NotesModel, controller: EditorController) {
         self.noteUrl = noteUrl
         self.model = model
         self.controller = controller
         controller.core = self
+        inline.core = self
         model.noteChanged = { [weak self] url in
             self?.remoteChanged(url)
         }
@@ -227,9 +257,16 @@ final class EditorCore {
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
-                  cache.images[url] == nil, cache.names[url] == nil
+                  cache.images[url] == nil, cache.names[url] == nil,
+                  !cache.patchworkDocs.contains(url)
             else { continue }
-            guard let data = await model.assetBytes(url) else { continue }
+            guard let data = await model.assetBytes(url) else {
+                // present locally but not a file asset → a patchwork doc
+                if let info = await model.assetInfo(url), info.mimeType.isEmpty {
+                    cache.patchworkDocs.insert(url)
+                }
+                continue
+            }
             if let image = PImage(data: data) {
                 cache.images[url] = image
             } else {
@@ -241,6 +278,29 @@ final class EditorCore {
                 }
             }
         }
+    }
+
+    func isPatchworkDoc(_ url: String) -> Bool {
+        cache.patchworkDocs.contains(url)
+    }
+
+    func inlineVideoSize(for url: String) -> CGSize? {
+        guard let thumb = cache.videoThumbs[url] else { return nil }
+        return RichText.fitted(thumb.size)
+    }
+
+    func videoFileURL(for url: String) -> URL? {
+        cache.fileURLs[url]
+    }
+
+    func insertPatchworkEmbed(url: String, tool: String?) {
+        cache.patchworkDocs.insert(url)
+        var block = BlockValue.embed(url: url)
+        if let tool, !tool.isEmpty {
+            block.attrs["tool"] = .string(tool)
+        }
+        insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
+        inline.setNeedsReconcile()
     }
 
     private func prepareVideo(url: String, name: String, data: Data) async {
@@ -285,6 +345,7 @@ final class EditorCore {
         }
         lastKnownJSON = SpanNode.encodeList(RichText.spans(from: attributed))
         refreshFormattingState()
+        inline.setNeedsReconcile()
     }
 
     private func remoteChanged(_ url: String) {
@@ -335,10 +396,15 @@ final class EditorCore {
 
     func refreshFormattingState() {
         guard let view else { return }
-        if view.pTypingAttributes[.amDisplayOnly] != nil {
-            var attrs = view.pTypingAttributes
-            attrs.removeValue(forKey: .amDisplayOnly)
-            view.pTypingAttributes = attrs
+        var typing = view.pTypingAttributes
+        if typing[.amTableBox] != nil || typing[.attachment] != nil
+            || (typing[.amBlock] as? BlockBox)?.value.isAtomic == true {
+            // typing next to an attachment must never inherit its attributes,
+            // or the typed text would vanish into the atomic block on save
+            view.pTypingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        } else if typing[.amDisplayOnly] != nil {
+            typing.removeValue(forKey: .amDisplayOnly)
+            view.pTypingAttributes = typing
         }
         let block = blockAtSelection()
         controller.currentStyleKey = block.styleKey
@@ -523,13 +589,10 @@ final class EditorCore {
     // MARK: attachment interaction
 
     @discardableResult
-    func openAttachment(at charIndex: Int) -> Bool {
+    func openAttachment(at charIndex: Int, includeImages: Bool = true) -> Bool {
         guard let storage = view?.pStorage, charIndex < storage.length else { return false }
         let attrs = storage.attributes(at: charIndex, effectiveRange: nil)
-        if let table = attrs[.amTableBox] as? TableBox {
-            controller.sheet = .table(TableHandle(box: table))
-            return true
-        }
+        guard attrs[.amTableBox] == nil else { return false }
         guard let box = attrs[.amBlock] as? BlockBox, box.value.isEmbedBlock else { return false }
         let block = box.value
         if block.type == "html" {
@@ -537,6 +600,11 @@ final class EditorCore {
             return true
         }
         guard let url = block.embedUrl else { return false }
+        if let image = cache.images[url] {
+            guard includeImages else { return false }
+            controller.sheet = .info(assetUrl: url, name: cache.names[url] ?? "Image", image: image)
+            return true
+        }
         let name = cache.names[url] ?? "attachment"
         let kind = AssetCache.kind(forName: name)
         guard kind == "audio" || kind == "video" else { return false }
@@ -563,15 +631,6 @@ final class EditorCore {
             in: range,
             with: RichText.embedAttachment(for: newBlock, cache: cache)
         )
-        scheduleSave()
-    }
-
-    func updateTable(_ box: TableBox, grid: TableGrid) {
-        guard let storage = view?.pStorage else { return }
-        box.grid = grid
-        box.raw = nil
-        guard let range = range(whereTableBox: box, in: storage) else { return }
-        storage.replaceCharacters(in: range, with: RichText.tableAttachment(for: box))
         scheduleSave()
     }
 
@@ -624,19 +683,6 @@ final class EditorCore {
         return found
     }
 
-    private func range(whereTableBox box: TableBox, in storage: NSTextStorage) -> NSRange? {
-        var found: NSRange?
-        storage.enumerateAttribute(
-            .amTableBox,
-            in: NSRange(location: 0, length: storage.length)
-        ) { value, range, stop in
-            if (value as? TableBox) === box {
-                found = range
-                stop.pointee = true
-            }
-        }
-        return found
-    }
 
     // MARK: attachments
 
@@ -715,7 +761,12 @@ final class EditorCore {
     func insertTable() {
         let box = TableBox(raw: nil, grid: .empty(rows: 3, columns: 3))
         insertBlockAttachment(RichText.tableAttachment(for: box))
-        controller.sheet = .table(TableHandle(box: box))
+        inline.setNeedsReconcile()
+    }
+
+    func tableChanged(_ box: TableBox) {
+        scheduleSave()
+        inline.setNeedsReconcile()
     }
 
     func insertHtmlBlock() {
@@ -787,6 +838,10 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         get { typingAttributes }
         set { typingAttributes = newValue }
     }
+    var pLayoutManager: NSLayoutManager? { layoutManager }
+    var pTextContainer: NSTextContainer? { textContainer }
+    var pTextOrigin: CGPoint { textContainerOrigin }
+    var pSelf: PView { self }
 
     func pInsertText(_ text: String) {
         insertText(text, replacementRange: selectedRange())
@@ -809,8 +864,10 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         return super.performDragOperation(sender)
     }
 
+    /// Media/table/html attachments open on click; images open their info
+    /// sheet on double-click so a single click still places the selection.
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 1, let core,
+        if event.clickCount <= 2, let core,
            let layoutManager, let textContainer, let storage = textStorage {
             let point = convert(event.locationInWindow, from: nil)
             let containerPoint = CGPoint(
@@ -826,7 +883,7 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
                 let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
                 if charIndex < storage.length,
                    storage.attribute(.attachment, at: charIndex, effectiveRange: nil) != nil,
-                   core.openAttachment(at: charIndex) {
+                   core.openAttachment(at: charIndex, includeImages: event.clickCount == 2) {
                     return
                 }
             }
@@ -895,6 +952,7 @@ struct RichTextEditor: NSViewRepresentable {
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.core = context.coordinator.core
+        layoutManager.delegate = context.coordinator
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -913,11 +971,19 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate, NSLayoutManagerDelegate {
         let core: EditorCore
 
         init(core: EditorCore) {
             self.core = core
+        }
+
+        func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            didCompleteLayoutFor textContainer: NSTextContainer?,
+            atEnd layoutFinishedFlag: Bool
+        ) {
+            core.inline.setNeedsReconcile()
         }
 
         func textDidChange(_ notification: Notification) {
@@ -966,6 +1032,12 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         get { typingAttributes }
         set { typingAttributes = newValue }
     }
+    var pLayoutManager: NSLayoutManager? { layoutManager }
+    var pTextContainer: NSTextContainer? { textContainer }
+    var pTextOrigin: CGPoint {
+        CGPoint(x: textContainerInset.left, y: textContainerInset.top)
+    }
+    var pSelf: PView { self }
 
     func pInsertText(_ text: String) {
         insertText(text)
@@ -1026,6 +1098,7 @@ struct RichTextEditor: UIViewRepresentable {
         textView.delegate = context.coordinator
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
+        layoutManager.delegate = context.coordinator
 
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -1047,11 +1120,20 @@ struct RichTextEditor: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate,
+        NSLayoutManagerDelegate {
         let core: EditorCore
 
         init(core: EditorCore) {
             self.core = core
+        }
+
+        func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            didCompleteLayoutFor textContainer: NSTextContainer?,
+            atEnd layoutFinishedFlag: Bool
+        ) {
+            core.inline.setNeedsReconcile()
         }
 
         func textViewDidChange(_ textView: UITextView) {

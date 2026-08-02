@@ -283,6 +283,9 @@ final class AssetCache {
     var names: [String: String] = [:]
     var fileURLs: [String: URL] = [:]
     var videoThumbs: [String: PImage] = [:]
+    /// Embedded automerge docs that aren't file assets — rendered by the
+    /// patchwork web runtime instead of natively.
+    var patchworkDocs: Set<String> = []
 
     static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
     static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
@@ -467,13 +470,11 @@ enum RichText {
         let url = block.embedUrl
         var displayName: String?
         if block.type == "html" {
-            attachment.image = PImage.symbol("chevron.left.forwardslash.chevron.right")
-            attachment.bounds = CGRect(x: 0, y: -3, width: 22, height: 16)
-            let firstLine = (block.htmlSource ?? "")
-                .split(separator: "\n", omittingEmptySubsequences: true)
-                .first
-                .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
-            displayName = firstLine.isEmpty ? "HTML" : String(firstLine.prefix(48))
+            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 220))
+        } else if let url, cache.patchworkDocs.contains(url) {
+            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 300))
         } else if let url, let image = cache.images[url] {
             attachment.image = image
             attachment.bounds = CGRect(origin: .zero, size: Self.fitted(image.size))
@@ -506,7 +507,7 @@ enum RichText {
         return string
     }
 
-    private static func fitted(_ original: CGSize) -> CGSize {
+    static func fitted(_ original: CGSize) -> CGSize {
         let maxWidth: CGFloat = 420
         let maxHeight: CGFloat = 340
         var size = original
@@ -563,11 +564,17 @@ enum RichText {
         return spans
     }
 
+    /// The attachment only reserves space in the text flow; the live
+    /// TableInlineView is positioned over it by InlineViewManager.
     static func tableAttachment(for box: TableBox) -> NSAttributedString {
         let attachment = NSTextAttachment()
-        let image = tableImage(box.grid)
-        attachment.image = image
-        attachment.bounds = CGRect(origin: .zero, size: image.size)
+        attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+        let cols = max(box.grid.columnCount, 1)
+        let rows = max(box.grid.rows.count, 1)
+        attachment.bounds = CGRect(
+            origin: .zero,
+            size: CGSize(width: CGFloat(cols) * 150, height: CGFloat(rows) * 29)
+        )
         let string = NSMutableAttributedString(attachment: attachment)
         string.addAttributes([
             .font: PFont.systemFont(ofSize: bodySize),
@@ -578,70 +585,6 @@ enum RichText {
         return string
     }
 
-    static func tableImage(_ grid: TableGrid) -> PImage {
-        let font = PFont.systemFont(ofSize: 12)
-        let headerFont = PFont.systemFont(ofSize: 12, weight: .semibold)
-        let pad: CGFloat = 8
-        let rowHeight: CGFloat = 26
-        let cols = max(grid.columnCount, 1)
-        let rowCount = max(grid.rows.count, 1)
-        var widths = [CGFloat](repeating: 64, count: cols)
-        for (r, row) in grid.rows.enumerated() {
-            for (c, cell) in row.enumerated() {
-                let f = grid.hasHeader && r == 0 ? headerFont : font
-                let w = (cell as NSString).size(withAttributes: [.font: f]).width + pad * 2
-                widths[c] = min(180, max(widths[c], w))
-            }
-        }
-        let size = CGSize(
-            width: widths.reduce(0, +) + 1,
-            height: rowHeight * CGFloat(rowCount) + 1
-        )
-        let rows = grid.rows
-        let hasHeader = grid.hasHeader
-        return PImage.draw(size: size) { ctx in
-            let line = PColor.pSecondaryLabel.withAlphaComponent(0.35)
-            if hasHeader, !rows.isEmpty {
-                ctx.setFillColor(PColor.pSecondaryLabel.withAlphaComponent(0.12).cgColor)
-                ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: rowHeight))
-            }
-            ctx.setStrokeColor(line.cgColor)
-            ctx.setLineWidth(1)
-            var x: CGFloat = 0.5
-            for width in widths {
-                ctx.move(to: CGPoint(x: x, y: 0))
-                ctx.addLine(to: CGPoint(x: x, y: size.height))
-                x += width
-            }
-            ctx.move(to: CGPoint(x: size.width - 0.5, y: 0))
-            ctx.addLine(to: CGPoint(x: size.width - 0.5, y: size.height))
-            for r in 0...rowCount {
-                let y = min(rowHeight * CGFloat(r) + 0.5, size.height - 0.5)
-                ctx.move(to: CGPoint(x: 0, y: y))
-                ctx.addLine(to: CGPoint(x: size.width, y: y))
-            }
-            ctx.strokePath()
-            for (r, row) in rows.enumerated() {
-                var cellX: CGFloat = 0
-                for (c, cell) in row.enumerated() {
-                    let f = hasHeader && r == 0 ? headerFont : font
-                    let attrs: [NSAttributedString.Key: Any] = [
-                        .font: f,
-                        .foregroundColor: PColor.pLabel,
-                    ]
-                    let textSize = (cell as NSString).size(withAttributes: attrs)
-                    let rect = CGRect(
-                        x: cellX + pad,
-                        y: rowHeight * CGFloat(r) + (rowHeight - textSize.height) / 2,
-                        width: widths[c] - pad * 2,
-                        height: textSize.height
-                    )
-                    (cell as NSString).draw(in: rect, withAttributes: attrs)
-                    cellX += widths[c]
-                }
-            }
-        }
-    }
 
     static func spans(from attr: NSAttributedString, trailingBlock: BlockValue? = nil) -> [SpanNode] {
         let str = attr.string as NSString
@@ -663,11 +606,32 @@ enum RichText {
             if contentLength > 0, str.character(at: NSMaxRange(range) - 1) == 0x0A {
                 contentLength -= 1
             }
-            if range.length > 0,
-               let table = attr.attribute(.amTableBox, at: range.location, effectiveRange: nil) as? TableBox {
-                spans.append(contentsOf: table.spans)
-                previousBlock = .paragraph
-                continue
+            if range.length > 0 {
+                var table: TableBox?
+                attr.enumerateAttribute(.amTableBox, in: range) { value, _, stop in
+                    if let box = value as? TableBox {
+                        table = box
+                        stop.pointee = true
+                    }
+                }
+                if let table {
+                    spans.append(contentsOf: table.spans)
+                    // text typed on the attachment's line survives as its own
+                    // paragraph after the table
+                    var stray = ""
+                    attr.enumerateAttributes(in: range) { runAttrs, runRange, _ in
+                        guard runAttrs[.amDisplayOnly] == nil else { return }
+                        stray += str.substring(with: runRange)
+                            .replacingOccurrences(of: "\u{FFFC}", with: "")
+                    }
+                    stray = stray.trimmingCharacters(in: .newlines)
+                    if !stray.isEmpty {
+                        spans.append(.block(.paragraph))
+                        spans.append(.text(stray, [:]))
+                    }
+                    previousBlock = .paragraph
+                    continue
+                }
             }
             var block: BlockValue
             if range.length > 0,

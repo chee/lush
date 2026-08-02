@@ -85,7 +85,9 @@ struct richtextApp: App {
             ContentView()
                 .environment(model)
                 .task {
+                    async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
+                    await server
                 }
         }
         .windowToolbarStyle(.unified(showsTitle: false))
@@ -103,7 +105,9 @@ struct richtextApp: App {
             ContentView()
                 .environment(model)
                 .task {
+                    async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
+                    await server
                 }
         }
         .commands {

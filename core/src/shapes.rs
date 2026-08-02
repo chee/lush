@@ -481,6 +481,18 @@ pub fn set_vision_metadata(
     Ok(())
 }
 
+/// Vision / transcription metadata of a file doc, if any has been written.
+pub fn asset_vision(doc: &Automerge) -> Option<(String, String)> {
+    let (_, cv) = doc.get(ROOT, "@computervision").ok()??;
+    let description = read_str(doc, &cv, "description").unwrap_or_default();
+    let ocr = read_str(doc, &cv, "ocr").unwrap_or_default();
+    if description.is_empty() && ocr.is_empty() {
+        None
+    } else {
+        Some((description, ocr))
+    }
+}
+
 /// Searchable text of a file doc: its name plus any vision metadata.
 pub fn asset_search_text(doc: &Automerge) -> String {
     let mut parts = Vec::new();

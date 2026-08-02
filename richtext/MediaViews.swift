@@ -3,6 +3,69 @@ import AVFoundation
 import AVKit
 import WebKit
 
+enum HtmlPreview {
+    static func wrapped(_ body: String) -> String {
+        """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+        :root { color-scheme: light dark; }
+        body { font: -apple-system-body; font-family: -apple-system, sans-serif; margin: 12px; }
+        </style></head><body>\(body)</body></html>
+        """
+    }
+}
+
+struct VideoInlineView: View {
+    let fileURL: URL
+    let size: CGSize
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        VideoPlayer(player: player)
+            .frame(width: size.width, height: size.height)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .onAppear {
+                if player == nil {
+                    player = AVPlayer(url: fileURL)
+                }
+            }
+            .onDisappear {
+                player?.pause()
+            }
+    }
+}
+
+struct HtmlInlineView: View {
+    let html: String
+    let onEdit: () -> Void
+    @State private var page = WebPage()
+
+    var body: some View {
+        WebView(page)
+            .onAppear {
+                page.load(html: HtmlPreview.wrapped(html), baseURL: URL(string: "about:blank")!)
+            }
+            .overlay(alignment: .topTrailing) {
+                Button {
+                    onEdit()
+                } label: {
+                    Image(systemName: "pencil.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .background(Circle().fill(.background))
+                }
+                .buttonStyle(.plain)
+                .padding(4)
+            }
+            .frame(width: 460, height: 220)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(.separator)
+            )
+    }
+}
+
 struct EditorSheetView: View {
     let sheet: EditorSheet
     let controller: EditorController
@@ -10,7 +73,11 @@ struct EditorSheetView: View {
     var body: some View {
         switch sheet {
         case .audio(let assetUrl, let fileURL, let name):
-            AudioPlayerSheet(fileURL: fileURL, name: name) { data in
+            AudioPlayerSheet(
+                fileURL: fileURL,
+                name: name,
+                fetchVision: { await controller.assetVision(assetUrl) }
+            ) { data in
                 let base = (name as NSString).deletingPathExtension
                 controller.replaceTrimmedAudio(
                     assetUrl: assetUrl,
@@ -22,8 +89,90 @@ struct EditorSheetView: View {
             VideoPlayerSheet(fileURL: fileURL, name: name)
         case .html(let handle):
             HtmlEditorSheet(html: handle.html) { controller.saveHtml(handle, html: $0) }
-        case .table(let handle):
-            TableEditorSheet(grid: handle.box.grid) { controller.saveTable(handle, grid: $0) }
+        case .info(let assetUrl, let name, let image):
+            AssetInfoSheet(name: name, image: image) {
+                await controller.assetVision(assetUrl)
+            }
+        case .patchworkCreate:
+            PatchworkCreateSheet(controller: controller)
+        }
+    }
+}
+
+struct AssetInfoSheet: View {
+    let name: String
+    let image: PImage?
+    let fetch: () async -> AssetVision?
+    @Environment(\.dismiss) private var dismiss
+    @State private var vision: AssetVision?
+    @State private var loaded = false
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text(name)
+                .font(.headline)
+                .lineLimit(1)
+            if let image {
+                #if os(macOS)
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 240)
+                #else
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxHeight: 240)
+                #endif
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let vision {
+                        if !vision.description.isEmpty {
+                            CopyableText(title: "Description", text: vision.description)
+                        }
+                        if !vision.ocr.isEmpty {
+                            CopyableText(title: "Text", text: vision.ocr)
+                        }
+                    } else if loaded {
+                        Text("No description or recognized text yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(20)
+        #if os(macOS)
+        .frame(minWidth: 440, minHeight: 380)
+        #endif
+        .task {
+            vision = await fetch()
+            loaded = true
+        }
+    }
+}
+
+struct CopyableText: View {
+    let title: String
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Copy") { Clipboard.copy(text) }
+                    .font(.caption)
+            }
+            Text(text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -31,6 +180,7 @@ struct EditorSheetView: View {
 struct AudioPlayerSheet: View {
     let fileURL: URL
     let name: String
+    let fetchVision: () async -> AssetVision?
     let onTrimmed: (Data) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVAudioPlayer?
@@ -42,6 +192,7 @@ struct AudioPlayerSheet: View {
     @State private var trimEnd: TimeInterval = 0.01
     @State private var exporting = false
     @State private var exportFailed = false
+    @State private var transcript: String?
 
     var body: some View {
         VStack(spacing: 16) {
@@ -99,6 +250,25 @@ struct AudioPlayerSheet: View {
                 }
             }
 
+            if let transcript {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Transcript")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Copy") { Clipboard.copy(transcript) }
+                            .font(.caption)
+                    }
+                    ScrollView {
+                        Text(transcript)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 140)
+                }
+            }
+
             Button("Done") { dismiss() }
                 .keyboardShortcut(.defaultAction)
         }
@@ -112,6 +282,11 @@ struct AudioPlayerSheet: View {
             player = loaded
             duration = max(loaded?.duration ?? 0.01, 0.01)
             trimEnd = duration
+            Task {
+                if let ocr = await fetchVision()?.ocr, !ocr.isEmpty {
+                    transcript = ocr
+                }
+            }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard let player else { continue }
@@ -267,7 +442,7 @@ struct HtmlEditorSheet: View {
         .frame(minWidth: 680, minHeight: 460)
         #endif
         .onChange(of: html, initial: true) {
-            page.load(html: wrapped(html), baseURL: URL(string: "about:blank")!)
+            page.load(html: HtmlPreview.wrapped(html), baseURL: URL(string: "about:blank")!)
         }
     }
 
@@ -294,97 +469,5 @@ struct HtmlEditorSheet: View {
             )
     }
 
-    private func wrapped(_ body: String) -> String {
-        """
-        <!doctype html><html><head><meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-        :root { color-scheme: light dark; }
-        body { font: -apple-system-body; font-family: -apple-system, sans-serif; margin: 12px; }
-        </style></head><body>\(body)</body></html>
-        """
-    }
 }
 
-struct TableEditorSheet: View {
-    @State var grid: TableGrid
-    let onSave: (TableGrid) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Toggle("Header row", isOn: $grid.hasHeader)
-                    .fixedSize()
-                Spacer()
-                Button("Add Row", systemImage: "plus") { addRow() }
-                Button("Remove Row", systemImage: "minus") { removeRow() }
-                    .disabled(grid.rows.count <= 1)
-                Button("Add Column", systemImage: "plus") { addColumn() }
-                Button("Remove Column", systemImage: "minus") { removeColumn() }
-                    .disabled(grid.columnCount <= 1)
-            }
-            .labelStyle(.titleOnly)
-            ScrollView([.vertical, .horizontal]) {
-                Grid(horizontalSpacing: 6, verticalSpacing: 6) {
-                    ForEach(0..<grid.rows.count, id: \.self) { r in
-                        GridRow {
-                            ForEach(0..<grid.columnCount, id: \.self) { c in
-                                TextField("", text: cellBinding(r, c))
-                                    .textFieldStyle(.roundedBorder)
-                                    .font(grid.hasHeader && r == 0 ? .body.bold() : .body)
-                                    .frame(width: 150)
-                            }
-                        }
-                    }
-                }
-                .padding(2)
-            }
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Save") {
-                    onSave(grid)
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(16)
-        #if os(macOS)
-        .frame(minWidth: 560, minHeight: 360)
-        #endif
-    }
-
-    private func cellBinding(_ r: Int, _ c: Int) -> Binding<String> {
-        Binding(
-            get: {
-                guard r < grid.rows.count, c < grid.rows[r].count else { return "" }
-                return grid.rows[r][c]
-            },
-            set: { value in
-                guard r < grid.rows.count, c < grid.rows[r].count else { return }
-                grid.rows[r][c] = value
-            }
-        )
-    }
-
-    private func addRow() {
-        grid.rows.append(Array(repeating: "", count: max(grid.columnCount, 1)))
-    }
-
-    private func removeRow() {
-        guard grid.rows.count > 1 else { return }
-        grid.rows.removeLast()
-    }
-
-    private func addColumn() {
-        grid.rows = grid.rows.map { $0 + [""] }
-    }
-
-    private func removeColumn() {
-        guard grid.columnCount > 1 else { return }
-        grid.rows = grid.rows.map { Array($0.dropLast()) }
-    }
-}

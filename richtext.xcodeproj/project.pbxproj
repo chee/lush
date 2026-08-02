@@ -6,8 +6,15 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		F0872FA4301F62AD003F9B3B /* PatchworkWeb.bundle in Resources */ = {isa = PBXBuildFile; fileRef = F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */; };
+		F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA6301F718C003F9B3B /* PatchworkServerKit */; };
+		F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA9301F756A003F9B3B /* PatchworkServerKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		F001D308301E8AA900E154BD /* richtext.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = richtext.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -36,6 +43,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */,
+				F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -47,6 +56,7 @@
 			children = (
 				F001D30A301E8AA900E154BD /* richtext */,
 				F001D309301E8AA900E154BD /* Products */,
+				F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */,
 			);
 			sourceTree = "<group>";
 		};
@@ -78,6 +88,8 @@
 			);
 			name = richtext;
 			packageProductDependencies = (
+				F0872FA6301F718C003F9B3B /* PatchworkServerKit */,
+				F0872FA9301F756A003F9B3B /* PatchworkServerKit */,
 			);
 			productName = richtext;
 			productReference = F001D308301E8AA900E154BD /* richtext.app */;
@@ -107,6 +119,9 @@
 			);
 			mainGroup = F001D2FF301E8AA900E154BD;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				F0872FA8301F756A003F9B3B /* XCLocalSwiftPackageReference "PatchworkServerKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = F001D309301E8AA900E154BD /* Products */;
 			projectDirPath = "";
@@ -122,6 +137,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F0872FA4301F62AD003F9B3B /* PatchworkWeb.bundle in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -414,6 +430,24 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		F0872FA8301F756A003F9B3B /* XCLocalSwiftPackageReference "PatchworkServerKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = PatchworkServerKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		F0872FA6301F718C003F9B3B /* PatchworkServerKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PatchworkServerKit;
+		};
+		F0872FA9301F756A003F9B3B /* PatchworkServerKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = PatchworkServerKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = F001D300301E8AA900E154BD /* Project object */;
 }

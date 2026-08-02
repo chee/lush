@@ -1346,6 +1346,7 @@ dependencies = [
  "anyhow",
  "async-lock",
  "automerge",
+ "blake3",
  "bs58",
  "clap",
  "future_form",
