@@ -15,8 +15,21 @@
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER).exampledocument</string>
 		</dict>
 	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>party.chee.richtext</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>richtext</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>richtext records audio to attach voice memos to your notes.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>richtext reads your Apple Notes to import them.</string>
 	<key>UTImportedTypeDeclarations</key>
 	<array>
 		<dict>

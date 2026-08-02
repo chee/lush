@@ -4,7 +4,7 @@ use automerge::{
     hydrate,
     iter::Span,
     marks::{MarkSet, UpdateSpansConfig},
-    transaction::Transactable,
+    transaction::{CommitOptions, Transactable},
     Automerge, ObjType, ReadDoc, ScalarValue, ROOT,
 };
 use serde::{Deserialize, Serialize};
@@ -239,6 +239,30 @@ fn json_spans_to_spans(spans: &[SpanJson]) -> Vec<Span> {
             }
         })
         .collect()
+}
+
+pub fn update_spans_from_json_at(
+    doc: &mut Automerge,
+    spans: &[SpanJson],
+    timestamp: i64,
+) -> anyhow::Result<bool> {
+    let content = match doc.get(ROOT, "content")? {
+        Some((_, id)) => id,
+        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+    };
+    let before = doc.get_heads();
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(timestamp),
+        |t| {
+            t.update_spans(
+                &content,
+                UpdateSpansConfig::default(),
+                json_spans_to_spans(spans),
+            )?;
+            Ok::<_, automerge::AutomergeError>(())
+        },
+    ))?;
+    Ok(doc.get_heads() != before)
 }
 
 pub fn update_spans_from_json(doc: &mut Automerge, spans: &[SpanJson]) -> anyhow::Result<bool> {

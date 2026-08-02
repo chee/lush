@@ -1,6 +1,47 @@
 import SwiftUI
 
 struct SettingsView: View {
+    var body: some View {
+        #if os(macOS)
+        TabView {
+            Tab("Sync", systemImage: "arrow.triangle.2.circlepath") {
+                SyncSettingsPane()
+            }
+            Tab("Editor", systemImage: "textformat") {
+                EditorSettingsPane()
+            }
+            Tab("Patchwork", systemImage: "shippingbox") {
+                PatchworkSettingsPane()
+            }
+            Tab("Import", systemImage: "square.and.arrow.down") {
+                ImportSettingsPane()
+            }
+        }
+        .frame(width: 540, height: 480)
+        #else
+        List {
+            NavigationLink {
+                SyncSettingsPane()
+            } label: {
+                Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+            }
+            NavigationLink {
+                EditorSettingsPane()
+            } label: {
+                Label("Editor", systemImage: "textformat")
+            }
+            NavigationLink {
+                PatchworkSettingsPane()
+            } label: {
+                Label("Patchwork", systemImage: "shippingbox")
+            }
+        }
+        .navigationTitle("Settings")
+        #endif
+    }
+}
+
+struct SyncSettingsPane: View {
     @Environment(NotesModel.self) private var model
     @State private var folderText = ""
     @State private var copiedUrl: String?
@@ -125,10 +166,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        #if os(macOS)
-        .frame(width: 480)
-        .fixedSize(horizontal: false, vertical: true)
-        #endif
+        .navigationTitle("Sync")
     }
 
     private func folderName(_ url: String) -> String {
@@ -137,3 +175,128 @@ struct SettingsView: View {
         return name.isEmpty ? "Notes" : name
     }
 }
+
+struct EditorSettingsPane: View {
+    @Environment(NotesModel.self) private var model
+    @State private var fontDesign = EditorSettings.design
+    @State private var fontSize = EditorSettings.bodySize
+
+    var body: some View {
+        Form {
+            Section {
+                if let url = model.quickNoteUrl {
+                    HStack {
+                        Label(
+                            model.node(for: url)?.displayName ?? "Note",
+                            systemImage: "bolt.circle"
+                        )
+                        Spacer()
+                        Button("Clear") { model.setQuickNote(nil) }
+                    }
+                } else {
+                    Text("No Quick Note set.")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Quick Note")
+            } footer: {
+                Text("The Quick Note opens from the widget and Shortcuts. Set one from a note's context menu.")
+            }
+            Section("Type") {
+                Picker("Font", selection: $fontDesign) {
+                    ForEach(EditorSettings.designs, id: \.key) { design in
+                        Text(design.label).tag(design.key)
+                    }
+                }
+                .onChange(of: fontDesign) {
+                    EditorSettings.setDesign(fontDesign)
+                }
+                HStack {
+                    Text("Size")
+                    Slider(value: $fontSize, in: 11...24, step: 1)
+                        .onChange(of: fontSize) {
+                            EditorSettings.setBodySize(fontSize)
+                        }
+                    Text("\(Int(fontSize))pt")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Editor")
+    }
+}
+
+struct PatchworkSettingsPane: View {
+    @State private var moduleText = ""
+    @State private var moduleUrls = PatchworkWeb.moduleUrls
+
+    var body: some View {
+        Form {
+            Section {
+                ForEach(moduleUrls, id: \.self) { url in
+                    HStack {
+                        Text(url)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button("Remove") {
+                            moduleUrls.removeAll { $0 == url }
+                            PatchworkWeb.setModuleUrls(moduleUrls)
+                        }
+                    }
+                }
+                TextField("automerge:… module settings url", text: $moduleText)
+                    .font(.body.monospaced())
+                Button("Add Modules") {
+                    let url = moduleText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard url.hasPrefix("automerge:"), !moduleUrls.contains(url) else { return }
+                    moduleUrls.append(url)
+                    PatchworkWeb.setModuleUrls(moduleUrls)
+                    moduleText = ""
+                }
+                .disabled(
+                    !moduleText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .hasPrefix("automerge:")
+                )
+            } header: {
+                Text("Modules")
+            } footer: {
+                Text("Paste module settings doc URLs; their datatypes and tools show up when embedding Patchwork documents. Takes effect for newly opened embeds.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Patchwork")
+    }
+}
+
+#if os(macOS)
+struct ImportSettingsPane: View {
+    @Environment(NotesModel.self) private var model
+
+    var body: some View {
+        Form {
+            Section {
+                Button("Import from Apple Notes…") {
+                    Task { await model.importAppleNotes() }
+                }
+                .disabled(model.folderUrl == nil)
+                if !model.importStatus.isEmpty {
+                    Text(model.importStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Apple Notes")
+            } footer: {
+                Text("Copies every note from Apple Notes into an “Apple Notes” folder here, keeping their folders and edit dates. Already-imported notes are skipped, so it's safe to run again. macOS will ask permission to control Notes the first time.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Import")
+    }
+}
+#endif

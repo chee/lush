@@ -339,6 +339,165 @@ final class NotesModel {
         }.value
     }
 
+    #if os(macOS)
+    var importStatus: String = ""
+
+    func importAppleNotes() async {
+        guard let core, let target = folderUrl else { return }
+        importStatus = "Reading Apple Notes… (this can take a while)"
+        await Task.yield()
+        let notes: [AppleNotesImporter.ImportedNote]
+        do {
+            notes = try AppleNotesImporter.fetchNotes()
+        } catch {
+            importStatus = "Couldn't read Apple Notes: \(error.localizedDescription)"
+            return
+        }
+        guard !notes.isEmpty else {
+            importStatus = "No notes found."
+            return
+        }
+        let importFolder: String
+        do {
+            importFolder = try core.folderEntriesOf(url: target)
+                .first { $0.kind == "folder" && $0.name == "Apple Notes" }?
+                .url
+                ?? core.createSubfolderIn(folderUrl: target, title: "Apple Notes")
+        } catch {
+            importStatus = "Import failed: \(error.localizedDescription)"
+            return
+        }
+        var subfolders: [String: String] = [:]
+        for entry in core.folderEntriesOf(url: importFolder) where entry.kind == "folder" {
+            subfolders[entry.name] = entry.url
+        }
+        var existing: [String: Set<String>] = [:]
+        var done = 0
+        var skipped = 0
+        var failed = 0
+        for note in notes {
+            let folderName = note.folder.isEmpty ? "Notes" : note.folder
+            do {
+                let sub: String
+                if let known = subfolders[folderName] {
+                    sub = known
+                } else {
+                    sub = try core.createSubfolderIn(folderUrl: importFolder, title: folderName)
+                    subfolders[folderName] = sub
+                }
+                if existing[sub] == nil {
+                    existing[sub] = Set(core.folderEntriesOf(url: sub).map(\.name))
+                }
+                if existing[sub]?.contains(note.name) == true {
+                    skipped += 1
+                    continue
+                }
+                let url = try core.createNoteIn(folderUrl: sub, title: note.name)
+                let spans = AppleNotesImporter.spans(fromHTML: note.html)
+                if !spans.isEmpty {
+                    try core.updateNoteSpansAt(
+                        url: url,
+                        spansJson: SpanNode.encodeList(spans),
+                        timestamp: Int64(note.modified.timeIntervalSince1970)
+                    )
+                }
+                existing[sub]?.insert(note.name)
+                done += 1
+            } catch {
+                failed += 1
+            }
+            if (done + skipped + failed) % 5 == 0 {
+                importStatus = "Imported \(done), skipped \(skipped)…"
+                await Task.yield()
+            }
+        }
+        var summary = "Imported \(done) notes"
+        if skipped > 0 { summary += ", skipped \(skipped) already imported" }
+        if failed > 0 { summary += ", \(failed) failed" }
+        importStatus = summary + "."
+        refreshNotes()
+    }
+    #endif
+
+    // Quick note ------------------------------------------------------------
+
+    private static let quickNoteKey = "quickNoteUrl"
+    var quickNoteUrl: String? = UserDefaults.standard.string(forKey: quickNoteKey)
+
+    func setQuickNote(_ url: String?) {
+        quickNoteUrl = url
+        UserDefaults.standard.set(url, forKey: Self.quickNoteKey)
+    }
+
+    /// Every folder in the tree as (url, "parent / child") choices, skipping
+    /// the moving items' own subtrees.
+    func folderChoices(excluding excluded: Set<String> = []) -> [(url: String, path: String)] {
+        var out: [(String, String)] = []
+        func walk(_ nodes: [FolderNode], prefix: String) {
+            for node in nodes where node.kind == "folder" {
+                if excluded.contains(node.url) { continue }
+                let path = prefix.isEmpty
+                    ? node.displayName
+                    : "\(prefix) / \(node.displayName)"
+                out.append((node.url, path))
+                walk(node.children ?? [], prefix: path)
+            }
+        }
+        walk(folderTree, prefix: "")
+        return out
+    }
+
+    // Pins & recents --------------------------------------------------------
+
+    private static let pinnedKey = "pinnedNotes"
+    var pinnedUrls: [String] = UserDefaults.standard.stringArray(forKey: pinnedKey) ?? []
+
+    func isPinned(_ url: String) -> Bool {
+        pinnedUrls.contains(url)
+    }
+
+    func togglePin(_ url: String) {
+        if let index = pinnedUrls.firstIndex(of: url) {
+            pinnedUrls.remove(at: index)
+        } else {
+            pinnedUrls.insert(url, at: 0)
+        }
+        UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+    }
+
+    var pinnedNodes: [FolderNode] {
+        pinnedUrls.compactMap { node(for: $0) }
+    }
+
+    func noteModified(_ url: String) -> Date {
+        guard let core else { return Date(timeIntervalSince1970: 0) }
+        var seconds = TimeInterval(core.noteModified(url: url))
+        if seconds > 4_000_000_000 {
+            seconds /= 1000
+        }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    func recentNotes(limit: Int = 100) -> [(node: FolderNode, modified: Date)] {
+        var all: [FolderNode] = []
+        func walk(_ nodes: [FolderNode]) {
+            for node in nodes {
+                if node.kind == "rich" {
+                    all.append(node)
+                }
+                if let children = node.children {
+                    walk(children)
+                }
+            }
+        }
+        walk(folderTree)
+        return Array(
+            all.map { ($0, noteModified($0.url)) }
+                .sorted { $0.1 > $1.1 }
+                .prefix(limit)
+        )
+    }
+
     func updateTitleIfNeeded(_ url: String, title: String) async {
         guard let core else { return }
         let name = title.isEmpty ? "Untitled" : title

@@ -106,6 +106,43 @@ final class InlineViewManager {
         for resize in resizes {
             resizeAttachment(at: resize.location, to: resize.size)
         }
+        if containerWidth > 80 {
+            clampImageAttachments(in: storage, layoutManager: layoutManager, to: containerWidth)
+        }
+    }
+
+    /// Images and posters carry their ideal size; keep their bounds within
+    /// the column, growing back if the column widens.
+    private func clampImageAttachments(
+        in storage: NSTextStorage,
+        layoutManager: NSLayoutManager,
+        to containerWidth: CGFloat
+    ) {
+        storage.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, range, _ in
+            guard let attachment = value as? FittingImageAttachment else { return }
+            let ideal = attachment.idealSize
+            guard ideal.width > 0, ideal.height > 0 else { return }
+            let width = min(ideal.width, containerWidth)
+            let target = CGSize(width: width, height: ideal.height * width / ideal.width)
+            let current = attachment.bounds.size
+            guard abs(current.width - target.width) > 1
+                || abs(current.height - target.height) > 1 else { return }
+            attachment.bounds = CGRect(origin: .zero, size: target)
+            let charRange = NSRange(location: range.location, length: 1)
+            layoutManager.invalidateLayout(forCharacterRange: charRange, actualCharacterRange: nil)
+            layoutManager.invalidateDisplay(forCharacterRange: charRange)
+        }
+    }
+
+    func resetHosts() {
+        for host in hosts.values {
+            host.view.removeFromSuperview()
+        }
+        hosts.removeAll()
+        setNeedsReconcile()
     }
 
     private func resizeAttachment(at location: Int, to size: CGSize) {
@@ -178,7 +215,10 @@ final class InlineViewManager {
         if core.isPatchworkDoc(url) {
             let (view, _, retained) = makeHosting(PatchworkBoxView(
                 docUrl: url,
-                toolId: block.attrs["tool"]?.stringValue
+                toolId: block.attrs["tool"]?.stringValue,
+                onSelectTool: { [weak core] tool in
+                    core?.updateEmbedTool(box, tool: tool)
+                }
             ))
             return Host(
                 view: view,
@@ -195,6 +235,29 @@ final class InlineViewManager {
                     guard size.width > width else { return size }
                     let scale = width / size.width
                     return CGSize(width: width, height: size.height * scale)
+                },
+                retained: retained
+            )
+        }
+        if let name = core.cache.names[url],
+           AssetCache.kind(forName: name) == "audio",
+           let fileURL = core.cache.fileURLs[url] {
+            let cache = core.cache
+            let root = AudioInlineView(
+                name: name,
+                fileURL: fileURL,
+                transcript: cache.transcripts[url]
+            ) { [weak core] in
+                core?.controller.sheet = .audio(assetUrl: url, fileURL: fileURL, name: name)
+            }
+            let (view, _, retained) = makeHosting(root)
+            return Host(
+                view: view,
+                preferredSize: { width in
+                    CGSize(
+                        width: min(460, width),
+                        height: cache.transcripts[url] != nil ? 132 : 84
+                    )
                 },
                 retained: retained
             )

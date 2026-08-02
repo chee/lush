@@ -21,6 +21,17 @@ impl From<anyhow::Error> for CoreError {
     }
 }
 
+/// The pinned automerge fragments branch can panic on some change graphs
+/// (change_graph.rs fragment-level assertions). Turn panics in write paths
+/// into errors so a single bad doc can't abort a batch operation.
+fn guarded<T>(f: impl FnOnce() -> Result<T, CoreError>) -> Result<T, CoreError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        Err(CoreError::General {
+            msg: "internal error (automerge panic); the change was not saved".into(),
+        })
+    })
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct NoteInfo {
     pub url: String,
@@ -599,17 +610,116 @@ impl Core {
     }
 
     pub fn update_note_spans(&self, url: String, spans_json: String) -> Result<(), CoreError> {
-        let repo = self.repo.clone();
-        self.runtime.block_on(async move {
-            let id = DocId::from_url(&url)?;
-            let spans: Vec<shapes::SpanJson> = serde_json::from_str(&spans_json)?;
-            repo.change_doc(id, |doc| {
-                shapes::update_spans_from_json(doc, &spans)?;
-                Ok(())
-            })
-            .await?;
-            Ok::<_, anyhow::Error>(())
-        })?;
-        Ok(())
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                let spans: Vec<shapes::SpanJson> = serde_json::from_str(&spans_json)?;
+                repo.change_doc(id, |doc| {
+                    shapes::update_spans_from_json(doc, &spans)?;
+                    Ok(())
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Like `update_note_spans`, but the commit is stamped with the given
+    /// unix-seconds timestamp — used by importers to preserve edit dates.
+    pub fn update_note_spans_at(
+        &self,
+        url: String,
+        spans_json: String,
+        timestamp: i64,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                let spans: Vec<shapes::SpanJson> = serde_json::from_str(&spans_json)?;
+                repo.change_doc(id, |doc| {
+                    shapes::update_spans_from_json_at(doc, &spans, timestamp)?;
+                    Ok(())
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Unix seconds of the newest change in the doc (0 when unknown).
+    pub fn note_modified(&self, url: String) -> i64 {
+        let Ok(id) = DocId::from_url(&url) else {
+            return 0;
+        };
+        self.runtime
+            .block_on(self.repo.read_doc(id, |doc| {
+                Ok(doc
+                    .get_changes(&[])
+                    .iter()
+                    .map(|c| c.timestamp())
+                    .max()
+                    .unwrap_or(0))
+            }))
+            .unwrap_or(0)
+    }
+
+    /// Create a note inside a specific folder doc.
+    pub fn create_note_in(&self, folder_url: String, title: String) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let folder = DocId::from_url(&folder_url)?;
+                let note = repo
+                    .create_doc(|doc| shapes::init_rich_note(doc, &title))
+                    .await?;
+                repo.change_doc(folder, |doc| {
+                    shapes::add_folder_entry(
+                        doc,
+                        &shapes::DocLink {
+                            name: title.clone(),
+                            kind: "rich".into(),
+                            url: note.to_url(),
+                        },
+                    )
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(note.to_url())
+            })?;
+            Ok(url)
+        })
+    }
+
+    /// Create a folder doc inside a specific folder doc.
+    pub fn create_subfolder_in(
+        &self,
+        folder_url: String,
+        title: String,
+    ) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let folder = DocId::from_url(&folder_url)?;
+                let sub = repo
+                    .create_doc(|doc| shapes::init_folder(doc, &title))
+                    .await?;
+                repo.change_doc(folder, |doc| {
+                    shapes::add_folder_entry(
+                        doc,
+                        &shapes::DocLink {
+                            name: title.clone(),
+                            kind: "folder".into(),
+                            url: sub.to_url(),
+                        },
+                    )
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(sub.to_url())
+            })?;
+            Ok(url)
+        })
     }
 }

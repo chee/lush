@@ -63,6 +63,152 @@ struct HtmlInlineView: View {
     }
 }
 
+/// Inline voice-memo box: play button, waveform with progress, name and
+/// transcript. The scissors button opens the full player sheet for trimming.
+struct AudioInlineView: View {
+    let name: String
+    let fileURL: URL
+    let transcript: String?
+    let onOpen: () -> Void
+    @State private var player: AVAudioPlayer?
+    @State private var playing = false
+    @State private var progress: Double = 0
+    @State private var levels: [Float] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    togglePlayback()
+                } label: {
+                    Image(systemName: playing ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                    WaveformView(levels: levels, progress: progress)
+                        .frame(height: 26)
+                }
+                Button {
+                    player?.pause()
+                    playing = false
+                    onOpen()
+                } label: {
+                    Image(systemName: "scissors")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            if let transcript {
+                Text(transcript)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.secondary.opacity(0.2))
+        )
+        .task {
+            let url = fileURL
+            levels = await Task.detached { WaveformView.levels(for: url) }.value
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard let player, playing else { continue }
+                progress = player.duration > 0 ? player.currentTime / player.duration : 0
+                if !player.isPlaying {
+                    playing = false
+                    progress = 0
+                }
+            }
+        }
+        .onDisappear {
+            player?.stop()
+        }
+    }
+
+    private func togglePlayback() {
+        if player == nil {
+            player = try? AVAudioPlayer(contentsOf: fileURL)
+            player?.prepareToPlay()
+        }
+        guard let player else { return }
+        if playing {
+            player.pause()
+            playing = false
+        } else {
+            player.play()
+            playing = true
+        }
+    }
+}
+
+struct WaveformView: View {
+    let levels: [Float]
+    let progress: Double
+
+    var body: some View {
+        Canvas { context, size in
+            let bars = levels.isEmpty ? [Float](repeating: 0.3, count: 40) : levels
+            let barWidth = size.width / CGFloat(bars.count)
+            let playedX = size.width * CGFloat(progress)
+            for (index, level) in bars.enumerated() {
+                let height = max(2, CGFloat(level) * size.height)
+                let x = CGFloat(index) * barWidth
+                let rect = CGRect(
+                    x: x + barWidth * 0.15,
+                    y: (size.height - height) / 2,
+                    width: barWidth * 0.7,
+                    height: height
+                )
+                let played = x < playedX
+                context.fill(
+                    Path(roundedRect: rect, cornerRadius: barWidth * 0.35),
+                    with: .color(played ? Color.accentColor : Color.secondary.opacity(0.45))
+                )
+            }
+        }
+    }
+
+    static func levels(for fileURL: URL, bars: Int = 48) -> [Float] {
+        guard let file = try? AVAudioFile(forReading: fileURL) else { return [] }
+        let frameCount = AVAudioFrameCount(file.length)
+        guard frameCount > 0,
+              let buffer = AVAudioPCMBuffer(
+                pcmFormat: file.processingFormat,
+                frameCapacity: frameCount
+              ),
+              (try? file.read(into: buffer)) != nil,
+              let samples = buffer.floatChannelData?[0]
+        else { return [] }
+        let total = Int(buffer.frameLength)
+        guard total > 0 else { return [] }
+        let binSize = max(total / bars, 1)
+        var peaks: [Float] = []
+        var maxPeak: Float = 0.001
+        for bin in 0..<bars {
+            let start = bin * binSize
+            guard start < total else { break }
+            var peak: Float = 0
+            for i in start..<min(start + binSize, total) {
+                peak = max(peak, abs(samples[i]))
+            }
+            peaks.append(peak)
+            maxPeak = max(maxPeak, peak)
+        }
+        return peaks.map { $0 / maxPeak }
+    }
+}
+
 struct EditorSheetView: View {
     let sheet: EditorSheet
     let controller: EditorController

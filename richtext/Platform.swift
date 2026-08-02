@@ -5,6 +5,7 @@ typealias PFont = NSFont
 typealias PColor = NSColor
 typealias PImage = NSImage
 typealias PView = NSView
+typealias PFontDescriptor = NSFontDescriptor
 #else
 import UIKit
 
@@ -12,6 +13,7 @@ typealias PFont = UIFont
 typealias PColor = UIColor
 typealias PImage = UIImage
 typealias PView = UIView
+typealias PFontDescriptor = UIFontDescriptor
 #endif
 
 enum Clipboard {

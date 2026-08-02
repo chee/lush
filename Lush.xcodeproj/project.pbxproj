@@ -110,7 +110,7 @@
 					};
 				};
 			};
-			buildConfigurationList = F001D303301E8AA900E154BD /* Build configuration list for PBXProject "richtext" */;
+			buildConfigurationList = F001D303301E8AA900E154BD /* Build configuration list for PBXProject "Lush" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -159,7 +159,8 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				AUTOMATION_APPLE_EVENTS = NO;
+				AUTOMATION_APPLE_EVENTS = YES;
+				CODE_SIGN_ENTITLEMENTS = richtext/richtext.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R2MP6EU7T3;
@@ -174,7 +175,7 @@
 				ENABLE_RESOURCE_ACCESS_CAMERA = YES;
 				ENABLE_RESOURCE_ACCESS_CONTACTS = YES;
 				ENABLE_RESOURCE_ACCESS_LOCATION = YES;
-				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = NO;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				ENABLE_RESOURCE_ACCESS_PRINTING = YES;
 				ENABLE_RESOURCE_ACCESS_USB = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
@@ -199,6 +200,9 @@
 				"LIBRARY_SEARCH_PATHS[arch=*]" = "$(SRCROOT)/core/lib/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
+				NEW_SETTING = "";
+				NEW_SETTING1 = "";
+				NEW_SETTING2 = "";
 				OTHER_LDFLAGS = "-lrichtext_core";
 				PRODUCT_BUNDLE_IDENTIFIER = com.inkandswitch.patchwork.richtext;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -228,7 +232,8 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				AUTOMATION_APPLE_EVENTS = NO;
+				AUTOMATION_APPLE_EVENTS = YES;
+				CODE_SIGN_ENTITLEMENTS = richtext/richtext.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R2MP6EU7T3;
@@ -243,7 +248,7 @@
 				ENABLE_RESOURCE_ACCESS_CAMERA = YES;
 				ENABLE_RESOURCE_ACCESS_CONTACTS = YES;
 				ENABLE_RESOURCE_ACCESS_LOCATION = YES;
-				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = NO;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				ENABLE_RESOURCE_ACCESS_PRINTING = YES;
 				ENABLE_RESOURCE_ACCESS_USB = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
@@ -268,6 +273,9 @@
 				"LIBRARY_SEARCH_PATHS[arch=*]" = "$(SRCROOT)/core/lib/$(PLATFORM_NAME)";
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
+				NEW_SETTING = "";
+				NEW_SETTING1 = "";
+				NEW_SETTING2 = "";
 				OTHER_LDFLAGS = "-lrichtext_core";
 				PRODUCT_BUNDLE_IDENTIFIER = com.inkandswitch.patchwork.richtext;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -411,7 +419,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		F001D303301E8AA900E154BD /* Build configuration list for PBXProject "richtext" */ = {
+		F001D303301E8AA900E154BD /* Build configuration list for PBXProject "Lush" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				F001D318301E8AAA00E154BD /* Debug */,

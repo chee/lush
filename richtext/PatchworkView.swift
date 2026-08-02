@@ -62,12 +62,24 @@ enum PatchworkWeb {
         return hex
     }
 
+    private static let moduleUrlsKey = "patchworkModuleUrls"
+
+    static var moduleUrls: [String] {
+        UserDefaults.standard.stringArray(forKey: moduleUrlsKey) ?? []
+    }
+
+    static func setModuleUrls(_ urls: [String]) {
+        UserDefaults.standard.set(urls, forKey: moduleUrlsKey)
+    }
+
     @MainActor
     static var configScriptTag: String {
         let localPort = LocalSyncServer.wsPort.map { ", \"localWsPort\": \($0)" } ?? ""
+        let modules = (try? JSONSerialization.data(withJSONObject: moduleUrls))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         return """
         <script>window.__patchwork_CONFIG = {"publicEndpoint": "\(endpoint)", \
-        "signerSeedHex": "\(signerSeedHex)"\(localPort)};</script>
+        "signerSeedHex": "\(signerSeedHex)", "moduleUrls": \(modules)\(localPort)};</script>
         """
     }
 
@@ -335,9 +347,15 @@ enum PatchworkWeb {
       registerPatchworkViewElement({ repo })
 
       status("loading tools…")
+      const sources = { system: "/modules.json" }
+      for (const [index, moduleUrl] of (config.moduleUrls ?? []).entries()) {
+        if (isValidAutomergeUrl(moduleUrl)) {
+          sources[`user${index}`] = moduleUrl
+        }
+      }
       const watcher = new ModuleWatcher(
         repo,
-        { system: "/modules.json" },
+        sources,
         (name, mod) => {
           if (Array.isArray(mod?.plugins)) registerPlugins(mod.plugins, name)
         },
@@ -357,22 +375,22 @@ enum PatchworkWeb {
         return repo
       }
       status("finding document…")
+      let doc
+      try {
+        const handle = await Promise.race([
+          repo.find(docUrl),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("timed out")), 15000),
+          ),
+        ])
+        doc = handle.doc()
+      } catch (error) {
+        console.warn("richtext: could not load embedded doc", error)
+      }
+      const type = String(doc?.["@patchwork"]?.type ?? "")
+      const firstToolFor = (t) =>
+        (getSupportedToolsForType(t) ?? []).filter((tool) => !tool.unlisted)[0]?.id
       if (!toolId) {
-        let doc
-        try {
-          const handle = await Promise.race([
-            repo.find(docUrl),
-            new Promise((_, reject) =>
-              setTimeout(() => reject(new Error("timed out")), 15000),
-            ),
-          ])
-          doc = handle.doc()
-        } catch (error) {
-          console.warn("richtext: could not load embedded doc", error)
-        }
-        const type = String(doc?.["@patchwork"]?.type ?? "")
-        const firstToolFor = (t) =>
-          (getSupportedToolsForType(t) ?? []).filter((tool) => !tool.unlisted)[0]?.id
         toolId = firstToolFor(type)
         const suggested = doc?.["@patchwork"]?.suggestedImportUrl
         if (!toolId && suggested && isValidAutomergeUrl(String(suggested))) {
@@ -395,6 +413,14 @@ enum PatchworkWeb {
       const provider = document.createElement("repo-provider")
       provider.appendChild(view)
       document.body.replaceChildren(provider)
+      const tools = (getSupportedToolsForType(type) ?? [])
+        .filter((tool) => !tool.unlisted)
+        .map((tool) => ({ id: tool.id, name: tool.name ?? tool.id }))
+      window.webkit?.messageHandlers?.richtext?.postMessage({
+        kind: "tools",
+        tools,
+        current: toolId ?? null,
+      })
       return repo
     }
 
@@ -587,13 +613,50 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 }
 
+struct ToolChoice: Identifiable, Equatable {
+    let id: String
+    let name: String
+}
+
+final class PatchworkEmbedBridge: NSObject, WKScriptMessageHandler {
+    let onTools: @MainActor ([ToolChoice], String?) -> Void
+
+    init(onTools: @escaping @MainActor ([ToolChoice], String?) -> Void) {
+        self.onTools = onTools
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "richtext",
+              let body = message.body as? [String: Any],
+              body["kind"] as? String == "tools",
+              let rawTools = body["tools"] as? [[String: Any]]
+        else { return }
+        let tools = rawTools.compactMap { raw -> ToolChoice? in
+            guard let id = raw["id"] as? String else { return nil }
+            return ToolChoice(id: id, name: raw["name"] as? String ?? id)
+        }
+        let current = body["current"] as? String
+        Task { @MainActor in
+            self.onTools(tools, current)
+        }
+    }
+}
+
 #if os(macOS)
 struct PatchworkWebView: NSViewRepresentable {
     let docUrl: String
     let toolId: String?
+    var onTools: (@MainActor ([ToolChoice], String?) -> Void)?
+
+    func makeCoordinator() -> PatchworkEmbedBridge? {
+        onTools.map { PatchworkEmbedBridge(onTools: $0) }
+    }
 
     func makeNSView(context: Context) -> WKWebView {
-        Self.makeWebView(docUrl: docUrl, toolId: toolId)
+        Self.makeWebView(docUrl: docUrl, toolId: toolId, bridge: context.coordinator)
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}
@@ -602,9 +665,14 @@ struct PatchworkWebView: NSViewRepresentable {
 struct PatchworkWebView: UIViewRepresentable {
     let docUrl: String
     let toolId: String?
+    var onTools: (@MainActor ([ToolChoice], String?) -> Void)?
+
+    func makeCoordinator() -> PatchworkEmbedBridge? {
+        onTools.map { PatchworkEmbedBridge(onTools: $0) }
+    }
 
     func makeUIView(context: Context) -> WKWebView {
-        Self.makeWebView(docUrl: docUrl, toolId: toolId)
+        Self.makeWebView(docUrl: docUrl, toolId: toolId, bridge: context.coordinator)
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
@@ -639,12 +707,16 @@ func makePatchworkWebView(
 
 extension PatchworkWebView {
     @MainActor
-    static func makeWebView(docUrl: String, toolId: String?) -> WKWebView {
+    static func makeWebView(
+        docUrl: String,
+        toolId: String?,
+        bridge: PatchworkEmbedBridge? = nil
+    ) -> WKWebView {
         var query = [URLQueryItem(name: "doc-url", value: docUrl)]
         if let toolId, !toolId.isEmpty {
             query.append(URLQueryItem(name: "tool-id", value: toolId))
         }
-        return makePatchworkWebView(query: query)
+        return makePatchworkWebView(query: query, messageHandler: bridge)
     }
 }
 
@@ -745,11 +817,17 @@ struct PatchworkCreateSheet: View {
 struct PatchworkBoxView: View {
     let docUrl: String
     let toolId: String?
+    var onSelectTool: ((String?) -> Void)?
+    @State private var tools: [ToolChoice] = []
+    @State private var currentTool: String?
 
     var body: some View {
         Group {
             if PatchworkWeb.available {
-                PatchworkWebView(docUrl: docUrl, toolId: toolId)
+                PatchworkWebView(docUrl: docUrl, toolId: toolId) { tools, current in
+                    self.tools = tools
+                    self.currentTool = current
+                }
             } else {
                 VStack(spacing: 6) {
                     Image(systemName: "shippingbox")
@@ -771,5 +849,32 @@ struct PatchworkBoxView: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(.separator)
         )
+        .overlay(alignment: .topTrailing) {
+            if let onSelectTool, !tools.isEmpty {
+                Menu {
+                    ForEach(tools) { tool in
+                        Button {
+                            onSelectTool(tool.id)
+                        } label: {
+                            if tool.id == currentTool {
+                                Label(tool.name, systemImage: "checkmark")
+                            } else {
+                                Text(tool.name)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Default") { onSelectTool(nil) }
+                } label: {
+                    Image(systemName: "ellipsis.circle.fill")
+                        .foregroundStyle(.secondary)
+                        .background(Circle().fill(.background))
+                }
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(4)
+            }
+        }
     }
 }

@@ -11,6 +11,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)/Contents/Developer"
+
+      - name: Download prebuilt assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download ci-assets --dir "$RUNNER_TEMP/assets"
+          ditto -x -k "$RUNNER_TEMP/assets/PatchworkServerFFI.xcframework.zip" PatchworkServerKit/Artifacts
+          ditto -x -k "$RUNNER_TEMP/assets/PatchworkWeb.bundle.zip" .
+
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

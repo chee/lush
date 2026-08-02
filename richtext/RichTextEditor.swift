@@ -34,6 +34,17 @@ enum EditorSheet: Identifiable {
 
 @MainActor @Observable
 final class EditorController {
+    static let styles: [(key: String, label: String)] = [
+        ("paragraph", "Body"),
+        ("heading1", "Title"),
+        ("heading2", "Heading"),
+        ("heading3", "Subheading"),
+        ("unordered-list-item", "Bulleted List"),
+        ("ordered-list-item", "Numbered List"),
+        ("blockquote", "Quote"),
+        ("code-block", "Code"),
+    ]
+
     var currentStyleKey: String = "paragraph"
     var strongActive = false
     var emActive = false
@@ -59,6 +70,10 @@ final class EditorController {
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
     func insertPatchworkDoc() { sheet = .patchworkCreate }
+
+    #if os(iOS)
+    func dismissKeyboard() { core?.endEditing() }
+    #endif
 
     func insertPatchworkEmbed(url: String, tool: String?) {
         core?.insertPatchworkEmbed(url: url, tool: tool)
@@ -219,6 +234,7 @@ final class EditorCore {
     let cache = AssetCache()
 
     let inline = InlineViewManager()
+    private var settingsObserver: (any NSObjectProtocol)?
 
     init(noteUrl: String, model: NotesModel, controller: EditorController) {
         self.noteUrl = noteUrl
@@ -228,6 +244,21 @@ final class EditorCore {
         inline.core = self
         model.noteChanged = { [weak self] url in
             self?.remoteChanged(url)
+        }
+        settingsObserver = NotificationCenter.default.addObserver(
+            forName: EditorSettings.changed,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.load()
+            }
+        }
+    }
+
+    deinit {
+        if let settingsObserver {
+            NotificationCenter.default.removeObserver(settingsObserver)
         }
     }
 
@@ -274,8 +305,16 @@ final class EditorCore {
                 let info = await model.assetInfo(url)
                 let name = info?.name.isEmpty == false ? info!.name : "attachment"
                 cache.names[url] = name
-                if AssetCache.kind(forName: name) == "video" {
+                switch AssetCache.kind(forName: name) {
+                case "video":
                     await prepareVideo(url: url, name: name, data: data)
+                case "audio":
+                    cache.fileURLs[url] = Self.mediaFile(for: url, name: name, data: data)
+                    if let vision = await model.assetVision(url), !vision.ocr.isEmpty {
+                        cache.transcripts[url] = vision.ocr
+                    }
+                default:
+                    break
                 }
             }
         }
@@ -283,6 +322,12 @@ final class EditorCore {
 
     func isPatchworkDoc(_ url: String) -> Bool {
         cache.patchworkDocs.contains(url)
+    }
+
+    func endEditing() {
+        #if os(iOS)
+        (view as? UITextView)?.resignFirstResponder()
+        #endif
     }
 
     func inlineVideoSize(for url: String) -> CGSize? {
@@ -742,8 +787,13 @@ final class EditorCore {
                 }
             } else {
                 self.cache.names[url] = name
-                if AssetCache.kind(forName: name) == "video" {
+                switch AssetCache.kind(forName: name) {
+                case "video":
                     await self.prepareVideo(url: url, name: name, data: data)
+                case "audio":
+                    self.cache.fileURLs[url] = Self.mediaFile(for: url, name: name, data: data)
+                default:
+                    break
                 }
                 self.transcribeIfAudio(url: url, data: data, name: name)
             }
@@ -754,12 +804,18 @@ final class EditorCore {
     private func transcribeIfAudio(url: String, data: Data, name: String) {
         guard AssetCache.kind(forName: name) == "audio" else { return }
         let ext = (name as NSString).pathExtension.lowercased()
-        Task.detached { [weak model] in
+        Task.detached { [weak model, weak self] in
             guard let transcript = await Transcriber.transcribe(data, fileExtension: ext),
                   !transcript.isEmpty
             else { return }
             await model?.updateAssetVision(url, description: "voice recording", ocr: transcript)
+            await self?.transcriptReady(url: url, transcript: transcript)
         }
+    }
+
+    private func transcriptReady(url: String, transcript: String) {
+        cache.transcripts[url] = transcript
+        inline.resetHosts()
     }
 
     func insertTable() {
@@ -956,6 +1012,10 @@ struct RichTextEditor: NSViewRepresentable {
 
         let textView = EditorTextView(frame: .zero, textContainer: container)
         textView.isRichText = true
+        // image-only pasteboards (screenshots) otherwise fail paste
+        // validation and ⌘V just beeps; our paste override intercepts the
+        // image before NSTextView's own graphics handling runs
+        textView.importsGraphics = true
         textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
@@ -1126,6 +1186,14 @@ struct RichTextEditor: UIViewRepresentable {
         tap.cancelsTouchesInView = false
         textView.addGestureRecognizer(tap)
 
+        let accessory = UIHostingController(
+            rootView: FormatAccessoryBar(controller: controller)
+        )
+        accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 46)
+        accessory.view.backgroundColor = .clear
+        textView.inputAccessoryView = accessory.view
+        context.coordinator.accessory = accessory
+
         context.coordinator.core.view = textView
         context.coordinator.core.load()
         return textView
@@ -1141,6 +1209,7 @@ struct RichTextEditor: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate,
         NSLayoutManagerDelegate {
         let core: EditorCore
+        var accessory: UIHostingController<FormatAccessoryBar>?
 
         init(core: EditorCore) {
             self.core = core
@@ -1208,6 +1277,83 @@ struct RichTextEditor: UIViewRepresentable {
                   ) != nil
             else { return }
             core.openAttachment(at: charIndex)
+        }
+    }
+}
+
+/// Notes-style formatting bar above the keyboard.
+struct FormatAccessoryBar: View {
+    let controller: EditorController
+
+    var body: some View {
+        HStack(spacing: 18) {
+            Menu {
+                ForEach(EditorController.styles, id: \.key) { style in
+                    Button {
+                        controller.applyStyle(style.key)
+                    } label: {
+                        if controller.currentStyleKey == style.key {
+                            Label(style.label, systemImage: "checkmark")
+                        } else {
+                            Text(style.label)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "textformat")
+            }
+            Divider()
+                .frame(height: 22)
+            barButton("bold", active: controller.strongActive) {
+                controller.toggleStrong()
+            }
+            barButton("italic", active: controller.emActive) {
+                controller.toggleEm()
+            }
+            barButton("chevron.left.forwardslash.chevron.right", active: controller.codeActive) {
+                controller.toggleCode()
+            }
+            Menu {
+                ForEach(Highlight.names, id: \.self) { name in
+                    Button {
+                        controller.applyHighlight(name)
+                    } label: {
+                        if controller.highlightActive == name {
+                            Label(name.capitalized, systemImage: "checkmark")
+                        } else {
+                            Text(name.capitalized)
+                        }
+                    }
+                }
+                Divider()
+                Button("None") { controller.applyHighlight(nil) }
+            } label: {
+                Image(systemName: "highlighter")
+                    .foregroundStyle(
+                        controller.highlightActive != nil ? Color.accentColor : Color.primary
+                    )
+            }
+            Spacer()
+            Button {
+                controller.dismissKeyboard()
+            } label: {
+                Image(systemName: "keyboard.chevron.compact.down")
+            }
+        }
+        .font(.system(size: 17))
+        .padding(.horizontal, 16)
+        .frame(maxHeight: .infinity)
+        .background(.bar)
+    }
+
+    private func barButton(
+        _ symbol: String,
+        active: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .foregroundStyle(active ? Color.accentColor : Color.primary)
         }
     }
 }

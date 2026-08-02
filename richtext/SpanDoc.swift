@@ -285,7 +285,11 @@ final class TableBox: NSObject {
 
 /// An attachment whose `bounds` is the ideal size; at layout time it scales
 /// itself down to fit the line fragment, so images reflow with the column.
+/// InlineViewManager also clamps `bounds` to the container width outright
+/// (belt and braces — TextKit caches attachment metrics aggressively).
 final class FittingImageAttachment: NSTextAttachment {
+    var idealSize: CGSize = .zero
+
     override func attachmentBounds(
         for textContainer: NSTextContainer?,
         proposedLineFragment lineFrag: CGRect,
@@ -323,6 +327,7 @@ final class AssetCache {
     /// Embedded automerge docs that aren't file assets — rendered by the
     /// patchwork web runtime instead of natively.
     var patchworkDocs: Set<String> = []
+    var transcripts: [String: String] = [:]
 
     static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
     static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
@@ -335,21 +340,82 @@ final class AssetCache {
     }
 }
 
+/// User-adjustable editor typography, persisted in UserDefaults. Views that
+/// render text re-load when `changed` is posted.
+enum EditorSettings {
+    static let changed = Notification.Name("io.richtext.editorSettingsChanged")
+    private static let sizeKey = "editorBodySize"
+    private static let designKey = "editorFontDesign"
+
+    static let designs: [(key: String, label: String)] = [
+        ("system", "System"),
+        ("serif", "Serif"),
+        ("rounded", "Rounded"),
+        ("mono", "Monospaced"),
+    ]
+
+    static var defaultBodySize: Double {
+        #if os(iOS)
+        17
+        #else
+        14
+        #endif
+    }
+
+    static var bodySize: Double {
+        let saved = UserDefaults.standard.double(forKey: sizeKey)
+        return saved > 0 ? saved : defaultBodySize
+    }
+
+    static func setBodySize(_ size: Double) {
+        UserDefaults.standard.set(size, forKey: sizeKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static var design: String {
+        UserDefaults.standard.string(forKey: designKey) ?? "system"
+    }
+
+    static func setDesign(_ design: String) {
+        UserDefaults.standard.set(design, forKey: designKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static func font(ofSize size: CGFloat, weight: PFont.Weight = .regular) -> PFont {
+        let base = PFont.systemFont(ofSize: size, weight: weight)
+        let systemDesign: PFontDescriptor.SystemDesign
+        switch design {
+        case "serif": systemDesign = .serif
+        case "rounded": systemDesign = .rounded
+        case "mono": systemDesign = .monospaced
+        default: return base
+        }
+        guard let descriptor = base.fontDescriptor.withDesign(systemDesign) else {
+            return base
+        }
+        #if os(macOS)
+        return PFont(descriptor: descriptor, size: size) ?? base
+        #else
+        return PFont(descriptor: descriptor, size: size)
+        #endif
+    }
+}
+
 enum RichText {
-    static let bodySize: CGFloat = 14
+    static var bodySize: CGFloat { EditorSettings.bodySize }
 
     static func baseFont(for block: BlockValue) -> PFont {
         switch block.type {
         case "heading":
             switch block.headingLevel ?? 1 {
-            case 1: return .systemFont(ofSize: 24, weight: .bold)
-            case 2: return .systemFont(ofSize: 19, weight: .bold)
-            default: return .systemFont(ofSize: 16, weight: .semibold)
+            case 1: return EditorSettings.font(ofSize: bodySize + 10, weight: .bold)
+            case 2: return EditorSettings.font(ofSize: bodySize + 5, weight: .bold)
+            default: return EditorSettings.font(ofSize: bodySize + 2, weight: .semibold)
             }
         case "code-block":
-            return .monospacedSystemFont(ofSize: 13, weight: .regular)
+            return .monospacedSystemFont(ofSize: bodySize - 1, weight: .regular)
         default:
-            return .systemFont(ofSize: bodySize)
+            return EditorSettings.font(ofSize: bodySize)
         }
     }
 
@@ -524,10 +590,21 @@ enum RichText {
             attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 300))
         } else if let url, let image = cache.images[url] {
             attachment.image = image
-            attachment.bounds = CGRect(origin: .zero, size: Self.fitted(image.size))
+            let size = Self.fitted(image.size)
+            attachment.bounds = CGRect(origin: .zero, size: size)
+            (attachment as? FittingImageAttachment)?.idealSize = size
         } else if let url, let thumb = cache.videoThumbs[url] {
             attachment.image = thumb
-            attachment.bounds = CGRect(origin: .zero, size: Self.fitted(thumb.size))
+            let size = Self.fitted(thumb.size)
+            attachment.bounds = CGRect(origin: .zero, size: size)
+            (attachment as? FittingImageAttachment)?.idealSize = size
+        } else if let url, let name = cache.names[url],
+                  AssetCache.kind(forName: name) == "audio",
+                  cache.fileURLs[url] != nil {
+            // rendered by the live AudioInlineView; reserve the box
+            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+            let height: CGFloat = cache.transcripts[url] != nil ? 132 : 84
+            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: height))
         } else if let url, let name = cache.names[url] {
             let symbol = switch AssetCache.kind(forName: name) {
             case "audio": "waveform.circle.fill"
