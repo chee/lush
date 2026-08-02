@@ -1,0 +1,598 @@
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    future::IntoFuture,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context, Result};
+use automerge::{Automerge, ChangeHash};
+use future_form::Sendable;
+use sedimentree_core::{
+    blob::Blob,
+    collections::Map,
+    depth::CountLeadingZeroBytes,
+    id::SedimentreeId,
+    loose_commit::id::CommitId,
+};
+use sedimentree_fs_storage::FsStorage;
+use subduction_core::{
+    collections::bounded_sharded_map::BoundedShardedMap,
+    handler::sync::SyncHandler,
+    handshake::audience::Audience,
+    nonce_cache::NonceCache,
+    peer::id::PeerId,
+    policy::open::OpenPolicy,
+    remote_heads::{RemoteHeads, RemoteHeadsObserver},
+    storage::powerbox::StoragePowerbox,
+    subduction::Subduction,
+    timeout::call::CallTimeout,
+    transport::message::MessageTransport,
+};
+use subduction_crypto::signer::memory::MemorySigner;
+use subduction_websocket::tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn};
+use tokio::sync::{broadcast, mpsc, Mutex};
+
+pub const DEFAULT_SERVER: &str = "wss://subduction.sync.inkandswitch.com";
+
+const SYNC_TIMEOUT: CallTimeout = CallTimeout::Uncapped;
+
+type Conn = MessageTransport<TokioWebSocketClient<MemorySigner>>;
+type Handler = SyncHandler<
+    Sendable,
+    FsStorage,
+    Conn,
+    OpenPolicy,
+    CountLeadingZeroBytes,
+    TokioSpawn,
+    256,
+    HeadsObserver,
+>;
+type Core = Subduction<
+    'static,
+    Sendable,
+    FsStorage,
+    Conn,
+    Handler,
+    OpenPolicy,
+    MemorySigner,
+    TimeoutTokio,
+    TokioSpawn,
+    CountLeadingZeroBytes,
+    256,
+>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocId(pub [u8; 16]);
+
+impl DocId {
+    pub fn random() -> Self {
+        let mut bytes = [0u8; 16];
+        rand::fill(&mut bytes);
+        DocId(bytes)
+    }
+
+    pub fn from_url(url: &str) -> Result<Self> {
+        let stripped = url.trim().strip_prefix("automerge:").unwrap_or(url.trim());
+        let stripped = stripped.split('#').next().unwrap_or(stripped);
+        let decoded = bs58::decode(stripped)
+            .with_check(None)
+            .into_vec()
+            .with_context(|| format!("invalid automerge url: {url}"))?;
+        let bytes: [u8; 16] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("document id is {} bytes, expected 16", decoded.len()))?;
+        Ok(DocId(bytes))
+    }
+
+    pub fn to_url(self) -> String {
+        format!("automerge:{}", bs58::encode(self.0).with_check().into_string())
+    }
+
+    pub fn sedimentree_id(self) -> SedimentreeId {
+        let mut padded = [0u8; 32];
+        padded[..16].copy_from_slice(&self.0);
+        SedimentreeId::new(padded)
+    }
+
+    pub fn from_sedimentree_id(sid: SedimentreeId) -> Self {
+        let bytes = sid.as_bytes();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&bytes[..16]);
+        DocId(out)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RepoEvent {
+    DocChanged(DocId),
+    Connected,
+    Disconnected,
+}
+
+#[derive(Clone)]
+struct HeadsObserver {
+    tx: mpsc::UnboundedSender<(SedimentreeId, Vec<CommitId>)>,
+}
+
+impl RemoteHeadsObserver for HeadsObserver {
+    fn on_remote_heads(&self, id: SedimentreeId, _peer: PeerId, heads: RemoteHeads) {
+        let _ = self.tx.send((id, heads.heads));
+    }
+}
+
+struct DocState {
+    doc: Automerge,
+    known: HashSet<ChangeHash>,
+}
+
+pub struct Repo {
+    core: Arc<Core>,
+    signer: MemorySigner,
+    server_url: String,
+    docs: Mutex<HashMap<DocId, DocState>>,
+    events: broadcast::Sender<RepoEvent>,
+    connected: std::sync::atomic::AtomicBool,
+}
+
+fn load_or_create_signer(path: &Path) -> Result<MemorySigner> {
+    if let Ok(contents) = std::fs::read(path) {
+        if contents.len() == 32 {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&contents);
+            return Ok(MemorySigner::from_bytes(&seed));
+        }
+    }
+    let mut seed = [0u8; 32];
+    rand::fill(&mut seed);
+    std::fs::write(path, seed).context("writing identity key")?;
+    Ok(MemorySigner::from_bytes(&seed))
+}
+
+/// `Automerge::fragments` can panic on some change graphs (an upstream bug
+/// where a level-1 change escapes the cached fragment clock). Treat panics as
+/// "fragments unavailable" and fall back to per-change commits.
+fn safe_fragments<R>(doc: &Automerge, levels: R) -> Option<Vec<automerge::Fragment>>
+where
+    R: std::ops::RangeBounds<usize>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.fragments(levels))).ok()
+}
+
+fn safe_bundles(doc: &Automerge, frags: &[automerge::Fragment]) -> Option<Vec<Vec<u8>>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        doc.bundle_fragments(frags.iter().cloned())
+    }))
+    .ok()
+}
+
+fn fragment_heads(doc: &Automerge) -> HashSet<ChangeHash> {
+    match safe_fragments(doc, 0..) {
+        Some(frags) => frags.into_iter().map(|f| f.head).collect(),
+        None => doc.get_changes(&[]).iter().map(|c| c.hash()).collect(),
+    }
+}
+
+impl Repo {
+    pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
+        std::fs::create_dir_all(&data_dir).context("creating data dir")?;
+        let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
+        let storage =
+            FsStorage::new(data_dir.join("sedimentree")).context("opening sedimentree storage")?;
+
+        let (heads_tx, mut heads_rx) = mpsc::unbounded_channel();
+
+        let sedimentrees = Arc::new(BoundedShardedMap::new());
+        let connections = Arc::new(async_lock::Mutex::new(Map::new()));
+        let subscriptions = Arc::new(async_lock::Mutex::new(Map::new()));
+        let powerbox = StoragePowerbox::new(storage, Arc::new(OpenPolicy));
+        let handler = Arc::new(SyncHandler::with_remote_heads_observer(
+            sedimentrees.clone(),
+            connections.clone(),
+            subscriptions.clone(),
+            powerbox.clone(),
+            CountLeadingZeroBytes,
+            HeadsObserver { tx: heads_tx },
+            TokioSpawn,
+        ));
+        let send_counter = handler.send_counter().clone();
+        let (core, listener_fut, manager_fut) = Subduction::new(
+            handler,
+            None,
+            signer.clone(),
+            sedimentrees,
+            connections,
+            subscriptions,
+            powerbox,
+            send_counter,
+            NonceCache::default(),
+            TimeoutTokio,
+            Duration::from_secs(30),
+            CountLeadingZeroBytes,
+            TokioSpawn,
+        );
+
+        tokio::spawn(async move {
+            if let Err(e) = listener_fut.await {
+                tracing::error!(error = %e, "subduction listener exited");
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = manager_fut.await {
+                tracing::error!(error = %e, "subduction manager exited");
+            }
+        });
+
+        let (events, _) = broadcast::channel(256);
+        let repo = Arc::new(Repo {
+            core,
+            signer,
+            server_url,
+            docs: Mutex::new(HashMap::new()),
+            events,
+            connected: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                while let Some((sid, heads)) = heads_rx.recv().await {
+                    repo.on_remote_heads(sid, heads).await;
+                }
+            });
+        }
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move { repo.connect_loop().await });
+        }
+
+        Ok(repo)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<RepoEvent> {
+        self.events.subscribe()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub async fn wait_connected(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.is_connected() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    async fn connect_loop(self: Arc<Self>) {
+        let uri: tungstenite::http::Uri = match self.server_url.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!(error = %e, url = %self.server_url, "invalid server url");
+                return;
+            }
+        };
+        let host = uri.host().unwrap_or("localhost").to_string();
+        let mut backoff = Duration::from_millis(500);
+        loop {
+            let audience = Audience::discover(host.as_bytes());
+            match TokioWebSocketClient::new(uri.clone(), self.signer.clone(), audience).await {
+                Ok((authenticated, listener_task, sender_task, keepalive_task)) => {
+                    tracing::info!(peer = %authenticated.peer_id(), "connected to sync server");
+                    let listener = tokio::spawn(listener_task.into_future());
+                    let sender = tokio::spawn(sender_task.into_future());
+                    let keepalive = tokio::spawn(async move {
+                        keepalive_task.await;
+                    });
+                    if let Err(e) = self
+                        .core
+                        .add_connection(authenticated.map(MessageTransport::new))
+                        .await
+                    {
+                        tracing::error!(error = %e, "failed to register connection");
+                    } else {
+                        backoff = Duration::from_millis(500);
+                        self.connected
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = self.events.send(RepoEvent::Connected);
+                        let repo = self.clone();
+                        tokio::spawn(async move { repo.resync_all().await });
+                        // wait for the connection to die
+                        let _ = listener.await;
+                    }
+                    sender.abort();
+                    keepalive.abort();
+                    self.connected
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = self.events.send(RepoEvent::Disconnected);
+                    tracing::info!("disconnected from sync server");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "connection failed");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn resync_all(self: Arc<Self>) {
+        let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
+        for id in ids {
+            if let Err(e) = self
+                .core
+                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                .await
+            {
+                tracing::warn!(error = %e, "resync failed");
+                continue;
+            }
+            self.apply_from_storage(id).await;
+        }
+    }
+
+    async fn on_remote_heads(&self, sid: SedimentreeId, heads: Vec<CommitId>) {
+        let id = DocId::from_sedimentree_id(sid);
+        let tracked = self.docs.lock().await.contains_key(&id);
+        if !tracked {
+            return;
+        }
+        let changed = self.apply_from_storage(id).await;
+        if changed {
+            return;
+        }
+        // reported heads we don't hold yet: pull, then re-apply
+        let missing = {
+            let docs = self.docs.lock().await;
+            let Some(state) = docs.get(&id) else { return };
+            heads.iter().any(|h| {
+                let hash = ChangeHash(*h.as_bytes());
+                !state.known.contains(&hash)
+            })
+        };
+        if missing {
+            if let Err(e) = self.core.sync_with_all_peers(sid, true, SYNC_TIMEOUT).await {
+                tracing::warn!(error = %e, "sync after remote heads failed");
+            }
+            self.apply_from_storage(id).await;
+        }
+    }
+
+    /// Load every locally stored blob for the doc into the in-memory automerge
+    /// document. Returns true (and emits DocChanged) if the doc advanced.
+    async fn apply_from_storage(&self, id: DocId) -> bool {
+        let blobs = match self.core.get_blobs(id.sedimentree_id()).await {
+            Ok(Some(blobs)) => blobs,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(error = %e, "get_blobs failed");
+                return false;
+            }
+        };
+        let mut docs = self.docs.lock().await;
+        let Some(state) = docs.get_mut(&id) else {
+            return false;
+        };
+        let before = state.doc.get_heads();
+        for blob in blobs.iter() {
+            if let Err(e) = state.doc.load_incremental(blob.as_slice()) {
+                tracing::warn!(error = %e, "load_incremental failed");
+            }
+        }
+        if state.doc.get_heads() == before {
+            return false;
+        }
+        state.known.extend(fragment_heads(&state.doc));
+        drop(docs);
+        let _ = self.events.send(RepoEvent::DocChanged(id));
+        true
+    }
+
+    /// Push any automerge fragments not yet in the sedimentree.
+    async fn save_doc(&self, id: DocId) -> Result<()> {
+        let sid = id.sedimentree_id();
+        // (head, parents, blob) for new loose commits, plus new level-1+ fragments
+        let (new_commits, new_cached) = {
+            let mut docs = self.docs.lock().await;
+            let state = docs
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            let fragment_path = (|| {
+                let loose: Vec<_> = safe_fragments(&state.doc, 0..=0)?
+                    .into_iter()
+                    .filter(|f| !state.known.contains(&f.head))
+                    .collect();
+                let cached: Vec<_> = safe_fragments(&state.doc, 1..)?
+                    .into_iter()
+                    .filter(|f| !state.known.contains(&f.head))
+                    .collect();
+                let loose_bytes = safe_bundles(&state.doc, &loose)?;
+                let cached_bytes = safe_bundles(&state.doc, &cached)?;
+                Some((loose, loose_bytes, cached, cached_bytes))
+            })();
+            match fragment_path {
+                Some((loose, loose_bytes, cached, cached_bytes)) => {
+                    for f in loose.iter().chain(cached.iter()) {
+                        state.known.insert(f.head);
+                    }
+                    let commits = loose
+                        .into_iter()
+                        .zip(loose_bytes)
+                        .map(|(f, bytes)| (f.head, f.boundary.clone(), bytes))
+                        .collect::<Vec<_>>();
+                    (commits, cached.into_iter().zip(cached_bytes).collect::<Vec<_>>())
+                }
+                None => {
+                    // fragments() panicked: ship each new raw change as its
+                    // own loose commit (level-0 fragments are single changes)
+                    tracing::warn!(
+                        doc = %id.to_url(),
+                        "fragments() unavailable; falling back to raw changes"
+                    );
+                    let commits = state
+                        .doc
+                        .get_changes(&[])
+                        .iter()
+                        .filter(|c| !state.known.contains(&c.hash()))
+                        .map(|c| (c.hash(), c.deps().to_vec(), c.raw_bytes().to_vec()))
+                        .collect::<Vec<_>>();
+                    for (hash, _, _) in &commits {
+                        state.known.insert(*hash);
+                    }
+                    (commits, Vec::new())
+                }
+            }
+        };
+        for (head, parents, bytes) in new_commits {
+            let parents: BTreeSet<CommitId> =
+                parents.iter().map(|h| CommitId::new(h.0)).collect();
+            self.core
+                .add_commit(sid, CommitId::new(head.0), parents, Blob::new(bytes))
+                .await
+                .map_err(|e| anyhow!("add_commit failed: {e}"))?;
+        }
+        for (f, bytes) in new_cached {
+            let boundary: BTreeSet<CommitId> =
+                f.boundary.iter().map(|h| CommitId::new(h.0)).collect();
+            let checkpoints: Vec<CommitId> =
+                f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
+            self.core
+                .add_fragment(
+                    sid,
+                    CommitId::new(f.head.0),
+                    boundary,
+                    &checkpoints,
+                    Blob::new(bytes),
+                )
+                .await
+                .map_err(|e| anyhow!("add_fragment failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Load a doc from local storage into memory (if not already tracked) and
+    /// kick off a network sync + subscription in the background.
+    pub async fn ensure_doc(self: &Arc<Self>, id: DocId) -> Result<()> {
+        {
+            let mut docs = self.docs.lock().await;
+            if !docs.contains_key(&id) {
+                let mut doc = Automerge::new();
+                if let Ok(Some(blobs)) = self.core.get_blobs(id.sedimentree_id()).await {
+                    for blob in blobs.iter() {
+                        let _ = doc.load_incremental(blob.as_slice());
+                    }
+                }
+                let known = fragment_heads(&doc);
+                docs.insert(id, DocState { doc, known });
+            }
+        }
+        let repo = self.clone();
+        tokio::spawn(async move {
+            repo.wait_connected(Duration::from_secs(15)).await;
+            if let Err(e) = repo
+                .core
+                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                .await
+            {
+                tracing::warn!(error = %e, "initial sync failed");
+            }
+            repo.apply_from_storage(id).await;
+        });
+        Ok(())
+    }
+
+    /// Block until a doc has content (or the timeout passes). Used when
+    /// opening a doc we've never seen locally.
+    pub async fn wait_for_doc(self: &Arc<Self>, id: DocId, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let docs = self.docs.lock().await;
+                if let Some(state) = docs.get(&id) {
+                    if !state.doc.get_heads().is_empty() {
+                        return true;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    pub async fn create_doc<F>(self: &Arc<Self>, init: F) -> Result<DocId>
+    where
+        F: FnOnce(&mut Automerge) -> Result<()>,
+    {
+        let id = DocId::random();
+        let mut doc = Automerge::new();
+        init(&mut doc)?;
+        self.docs.lock().await.insert(
+            id,
+            DocState {
+                doc,
+                known: HashSet::new(),
+            },
+        );
+        self.save_doc(id).await?;
+        let repo = self.clone();
+        tokio::spawn(async move {
+            repo.wait_connected(Duration::from_secs(15)).await;
+            if let Err(e) = repo
+                .core
+                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                .await
+            {
+                tracing::warn!(error = %e, "sync of new doc failed");
+            }
+        });
+        Ok(id)
+    }
+
+    /// Run a mutation against a tracked doc, then persist + broadcast the
+    /// resulting commits. Returns the mutation's value.
+    pub async fn change_doc<F, T>(self: &Arc<Self>, id: DocId, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Automerge) -> Result<T>,
+    {
+        let value = {
+            let mut docs = self.docs.lock().await;
+            let state = docs
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            f(&mut state.doc)?
+        };
+        self.save_doc(id).await?;
+        Ok(value)
+    }
+
+    pub async fn read_doc<F, T>(&self, id: DocId, f: F) -> Result<T>
+    where
+        F: FnOnce(&Automerge) -> Result<T>,
+    {
+        let docs = self.docs.lock().await;
+        let state = docs
+            .get(&id)
+            .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+        f(&state.doc)
+    }
+
+    /// One-shot: sync a doc and wait for the server to hold our heads.
+    pub async fn flush(&self, id: DocId) -> Result<()> {
+        if !self.wait_connected(Duration::from_secs(15)).await {
+            return Err(anyhow!("not connected to sync server"));
+        }
+        self.core
+            .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+            .await
+            .map_err(|e| anyhow!("sync failed: {e}"))?;
+        Ok(())
+    }
+}

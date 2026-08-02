@@ -1,0 +1,171 @@
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use richtext_core::{
+    repo::{DocId, Repo, RepoEvent, DEFAULT_SERVER},
+    shapes,
+};
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long, default_value = "/tmp/rtcli-data")]
+    data: PathBuf,
+    #[arg(long, default_value = DEFAULT_SERVER)]
+    server: String,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Fetch a doc from the sync server and dump it
+    Fetch { url: String },
+    /// Create a patchwork folder doc
+    InitFolder {
+        #[arg(default_value = "Notes")]
+        title: String,
+    },
+    /// Create a rich note inside a folder
+    AddNote {
+        folder: String,
+        #[arg(default_value = "Untitled")]
+        title: String,
+    },
+    /// Watch a doc for remote changes
+    Watch { url: String },
+    /// Append text to a note's content
+    Append { url: String, text: String },
+    /// Dump a doc as raw JSON
+    Json { url: String },
+}
+
+async fn dump(repo: &Arc<Repo>, id: DocId) -> Result<()> {
+    let (title, spans, links) = repo
+        .read_doc(id, |doc| {
+            Ok((
+                shapes::doc_title(doc),
+                shapes::spans_to_json(doc)?,
+                shapes::folder_entries(doc)?,
+            ))
+        })
+        .await?;
+    println!("url:   {}", id.to_url());
+    println!("title: {title}");
+    if !links.is_empty() {
+        println!("docs:");
+        for l in links {
+            println!("  {} ({}) -> {}", l.name, l.kind, l.url);
+        }
+    }
+    if !spans.is_empty() {
+        println!("spans: {}", serde_json::to_string_pretty(&spans)?);
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn".into()),
+        )
+        .init();
+    let args = Args::parse();
+    let repo = Repo::start(args.data, args.server).await?;
+
+    match args.command {
+        Command::Fetch { url } => {
+            let id = DocId::from_url(&url)?;
+            repo.ensure_doc(id).await?;
+            if !repo.wait_for_doc(id, Duration::from_secs(20)).await {
+                eprintln!("timed out waiting for doc");
+            }
+            dump(&repo, id).await?;
+        }
+        Command::InitFolder { title } => {
+            let id = repo
+                .create_doc(|doc| shapes::init_folder(doc, &title))
+                .await?;
+            repo.flush(id).await?;
+            println!("{}", id.to_url());
+        }
+        Command::AddNote { folder, title } => {
+            let folder_id = DocId::from_url(&folder)?;
+            repo.ensure_doc(folder_id).await?;
+            if !repo.wait_for_doc(folder_id, Duration::from_secs(20)).await {
+                anyhow::bail!("folder doc never arrived");
+            }
+            let note_id = repo
+                .create_doc(|doc| shapes::init_rich_note(doc, &title))
+                .await?;
+            repo.change_doc(folder_id, |doc| {
+                shapes::add_folder_entry(
+                    doc,
+                    &shapes::DocLink {
+                        name: title.clone(),
+                        kind: "rich".into(),
+                        url: note_id.to_url(),
+                    },
+                )
+            })
+            .await?;
+            repo.flush(note_id).await?;
+            repo.flush(folder_id).await?;
+            println!("{}", note_id.to_url());
+        }
+        Command::Append { url, text } => {
+            let id = DocId::from_url(&url)?;
+            repo.ensure_doc(id).await?;
+            if !repo.wait_for_doc(id, Duration::from_secs(20)).await {
+                anyhow::bail!("doc never arrived");
+            }
+            repo.change_doc(id, |doc| {
+                let mut spans = shapes::spans_to_json(doc)?;
+                spans.push(shapes::SpanJson::Text {
+                    value: text.clone(),
+                    marks: None,
+                });
+                shapes::update_spans_from_json(doc, &spans)?;
+                Ok(())
+            })
+            .await?;
+            repo.flush(id).await?;
+            dump(&repo, id).await?;
+        }
+        Command::Json { url } => {
+            let id = DocId::from_url(&url)?;
+            repo.ensure_doc(id).await?;
+            if !repo.wait_for_doc(id, Duration::from_secs(30)).await {
+                anyhow::bail!("doc never arrived");
+            }
+            let json = repo
+                .read_doc(id, |doc| {
+                    Ok(serde_json::to_string(&automerge::AutoSerde::from(doc))?)
+                })
+                .await?;
+            println!("{json}");
+        }
+        Command::Watch { url } => {
+            let id = DocId::from_url(&url)?;
+            let mut events = repo.subscribe();
+            repo.ensure_doc(id).await?;
+            repo.wait_for_doc(id, Duration::from_secs(20)).await;
+            dump(&repo, id).await?;
+            println!("--- watching (ctrl-c to stop) ---");
+            while let Ok(event) = events.recv().await {
+                match event {
+                    RepoEvent::DocChanged(changed) if changed == id => {
+                        println!("--- changed ---");
+                        dump(&repo, id).await?;
+                    }
+                    RepoEvent::Connected => println!("[connected]"),
+                    RepoEvent::Disconnected => println!("[disconnected]"),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}

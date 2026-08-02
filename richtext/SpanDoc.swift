@@ -1,0 +1,738 @@
+import SwiftUI
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+enum JSONValue: Codable, Equatable {
+    case string(String)
+    case int(Int64)
+    case number(Double)
+    case bool(Bool)
+    case null
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    init(from decoder: Decoder) throws {
+        let single = try decoder.singleValueContainer()
+        if single.decodeNil() {
+            self = .null
+        } else if let b = try? single.decode(Bool.self) {
+            self = .bool(b)
+        } else if let i = try? single.decode(Int64.self) {
+            self = .int(i)
+        } else if let d = try? single.decode(Double.self) {
+            self = .number(d)
+        } else if let s = try? single.decode(String.self) {
+            self = .string(s)
+        } else if let a = try? single.decode([JSONValue].self) {
+            self = .array(a)
+        } else {
+            self = .object(try single.decode([String: JSONValue].self))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var single = encoder.singleValueContainer()
+        switch self {
+        case .string(let s): try single.encode(s)
+        case .int(let i): try single.encode(i)
+        case .number(let d): try single.encode(d)
+        case .bool(let b): try single.encode(b)
+        case .null: try single.encodeNil()
+        case .array(let a): try single.encode(a)
+        case .object(let o): try single.encode(o)
+        }
+    }
+
+    var intValue: Int? {
+        switch self {
+        case .int(let i): return Int(i)
+        case .number(let d): return Int(d)
+        default: return nil
+        }
+    }
+
+    var stringValue: String? {
+        if case .string(let s) = self { return s }
+        return nil
+    }
+}
+
+struct BlockValue: Codable, Equatable {
+    var type: String
+    var parents: [String]
+    var attrs: [String: JSONValue]
+    var isEmbed: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case type, parents, attrs, isEmbed
+    }
+
+    init(type: String, parents: [String] = [], attrs: [String: JSONValue] = [:], isEmbed: Bool = false) {
+        self.type = type
+        self.parents = parents
+        self.attrs = attrs
+        self.isEmbed = isEmbed
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decodeIfPresent(String.self, forKey: .type) ?? "paragraph"
+        parents = try c.decodeIfPresent([String].self, forKey: .parents) ?? []
+        attrs = try c.decodeIfPresent([String: JSONValue].self, forKey: .attrs) ?? [:]
+        isEmbed = try c.decodeIfPresent(Bool.self, forKey: .isEmbed) ?? false
+    }
+
+    static let paragraph = BlockValue(type: "paragraph")
+
+    static func heading(level: Int) -> BlockValue {
+        BlockValue(type: "heading", attrs: ["level": .int(Int64(level))])
+    }
+
+    var headingLevel: Int? {
+        guard type == "heading" else { return nil }
+        return attrs["level"]?.intValue ?? 1
+    }
+
+    var isEmbedBlock: Bool {
+        isEmbed || type == "embed" || type == "image" || type == "html"
+    }
+
+    /// Blocks that live behind a single attachment character and must never
+    /// be restyled or split by ordinary text editing.
+    var isAtomic: Bool {
+        isEmbedBlock || type == "table"
+    }
+
+    var embedUrl: String? {
+        attrs["url"]?.stringValue ?? attrs["src"]?.stringValue
+    }
+
+    static func embed(url: String) -> BlockValue {
+        BlockValue(type: "embed", attrs: ["url": .string(url)], isEmbed: true)
+    }
+
+    static func html(_ source: String) -> BlockValue {
+        BlockValue(type: "html", attrs: ["html": .string(source)], isEmbed: true)
+    }
+
+    var htmlSource: String? {
+        attrs["html"]?.stringValue
+    }
+
+    /// Stable identifier for the format picker.
+    var styleKey: String {
+        switch type {
+        case "heading": return "heading\(headingLevel ?? 1)"
+        default: return type
+        }
+    }
+
+    static func fromStyleKey(_ key: String) -> BlockValue {
+        switch key {
+        case "heading1": return .heading(level: 1)
+        case "heading2": return .heading(level: 2)
+        case "heading3": return .heading(level: 3)
+        default: return BlockValue(type: key)
+        }
+    }
+}
+
+enum SpanNode: Codable, Equatable {
+    case block(BlockValue)
+    case text(String, [String: JSONValue])
+
+    enum CodingKeys: String, CodingKey {
+        case type, value, marks
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(String.self, forKey: .type)
+        if kind == "block" {
+            self = .block(try c.decode(BlockValue.self, forKey: .value))
+        } else {
+            let text = try c.decode(String.self, forKey: .value)
+            let marks = try c.decodeIfPresent([String: JSONValue].self, forKey: .marks) ?? [:]
+            self = .text(text, marks)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .block(let b):
+            try c.encode("block", forKey: .type)
+            try c.encode(b, forKey: .value)
+        case .text(let text, let marks):
+            try c.encode("text", forKey: .type)
+            try c.encode(text, forKey: .value)
+            if !marks.isEmpty {
+                try c.encode(marks, forKey: .marks)
+            }
+        }
+    }
+
+    static func decodeList(_ json: String) -> [SpanNode] {
+        guard let data = json.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([SpanNode].self, from: data)) ?? []
+    }
+
+    static func encodeList(_ spans: [SpanNode]) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(spans) else { return "[]" }
+        return String(data: data, encoding: .utf8) ?? "[]"
+    }
+}
+
+extension NSAttributedString.Key {
+    static let amBlock = NSAttributedString.Key("io.richtext.amBlock")
+    /// Marks display-only text (like attachment filenames) that must never
+    /// round-trip into the document.
+    static let amDisplayOnly = NSAttributedString.Key("io.richtext.displayOnly")
+    static let amHighlight = NSAttributedString.Key("io.richtext.highlight")
+    static let amTableBox = NSAttributedString.Key("io.richtext.tableBox")
+}
+
+/// Palette from wordgard rich.css: backgrounds are the hue mixed over the
+/// page fill at 16% (light) / 26% (dark), inks are hand-tuned per scheme.
+enum Highlight {
+    static let names = ["pink", "yellow", "sky", "sea", "mint"]
+
+    private static let palette: [String: (hue: Int, lightInk: Int, darkInk: Int)] = [
+        "pink": (0xFF4D97, 0x8D1A4C, 0xFFB0D2),
+        "yellow": (0xFFCC33, 0x6B4600, 0xFFDF94),
+        "sky": (0x3BA6FF, 0x084881, 0xA8D6FF),
+        "sea": (0x1CC4BB, 0x07524F, 0x8CE7DE),
+        "mint": (0x4FDF9C, 0x0D5C3A, 0xA3F2C8),
+    ]
+
+    static func background(_ name: String) -> PColor {
+        let entry = palette[name] ?? palette["pink"]!
+        return dynamic(
+            light: PColor(rgb: entry.hue, alpha: 0.16),
+            dark: PColor(rgb: entry.hue, alpha: 0.26)
+        )
+    }
+
+    static func ink(_ name: String) -> PColor {
+        let entry = palette[name] ?? palette["pink"]!
+        return dynamic(light: PColor(rgb: entry.lightInk), dark: PColor(rgb: entry.darkInk))
+    }
+
+    private static func dynamic(light: PColor, dark: PColor) -> PColor {
+        #if os(macOS)
+        NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+        }
+        #else
+        UIColor { traits in
+            traits.userInterfaceStyle == .dark ? dark : light
+        }
+        #endif
+    }
+}
+
+struct TableGrid: Equatable {
+    var rows: [[String]]
+    var hasHeader: Bool
+
+    var columnCount: Int { rows.map(\.count).max() ?? 0 }
+
+    static func empty(rows: Int, columns: Int) -> TableGrid {
+        TableGrid(
+            rows: Array(repeating: Array(repeating: "", count: columns), count: rows),
+            hasHeader: true
+        )
+    }
+}
+
+/// Carries a whole table (as parsed grid + the original spans for a lossless
+/// round-trip) behind a single attachment character.
+final class TableBox: NSObject {
+    var raw: [SpanNode]?
+    var grid: TableGrid
+
+    init(raw: [SpanNode]?, grid: TableGrid) {
+        self.raw = raw
+        self.grid = grid
+    }
+
+    var spans: [SpanNode] {
+        raw ?? RichText.tableSpans(grid)
+    }
+}
+
+final class BlockBox: NSObject {
+    let value: BlockValue
+    init(_ value: BlockValue) { self.value = value }
+
+    override func isEqual(_ object: Any?) -> Bool {
+        (object as? BlockBox)?.value == value
+    }
+
+    override var hash: Int { value.type.hashValue }
+}
+
+@MainActor
+final class AssetCache {
+    var images: [String: PImage] = [:]
+    var names: [String: String] = [:]
+    var fileURLs: [String: URL] = [:]
+    var videoThumbs: [String: PImage] = [:]
+
+    static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
+    static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
+
+    static func kind(forName name: String) -> String {
+        let ext = (name as NSString).pathExtension.lowercased()
+        if audioExtensions.contains(ext) { return "audio" }
+        if videoExtensions.contains(ext) { return "video" }
+        return "file"
+    }
+}
+
+enum RichText {
+    static let bodySize: CGFloat = 14
+
+    static func baseFont(for block: BlockValue) -> PFont {
+        switch block.type {
+        case "heading":
+            switch block.headingLevel ?? 1 {
+            case 1: return .systemFont(ofSize: 24, weight: .bold)
+            case 2: return .systemFont(ofSize: 19, weight: .bold)
+            default: return .systemFont(ofSize: 16, weight: .semibold)
+            }
+        case "code-block":
+            return .monospacedSystemFont(ofSize: 13, weight: .regular)
+        default:
+            return .systemFont(ofSize: bodySize)
+        }
+    }
+
+    static func paragraphStyle(for block: BlockValue) -> NSParagraphStyle {
+        let ps = NSMutableParagraphStyle()
+        ps.paragraphSpacing = 6
+        var indent: CGFloat = 0
+        // nested structures (list nesting, columns, table cells) indent by depth
+        indent += CGFloat(block.parents.count) * 20
+        switch block.type {
+        case "heading":
+            ps.paragraphSpacingBefore = 10
+        case "unordered-list-item", "ordered-list-item":
+            indent += 20
+        case "blockquote":
+            indent += 16
+        default:
+            break
+        }
+        ps.firstLineHeadIndent = indent
+        ps.headIndent = indent
+        return ps
+    }
+
+    static func attributes(block: BlockValue, marks: [String: JSONValue]) -> [NSAttributedString.Key: Any] {
+        var font = baseFont(for: block)
+        var bold = false
+        var italic = false
+        if case .bool(true)? = marks["strong"], block.type != "heading" {
+            bold = true
+        }
+        if case .bool(true)? = marks["em"] {
+            italic = true
+        }
+        if bold || italic {
+            font = font.addingTraits(bold: bold, italic: italic)
+        }
+        if case .bool(true)? = marks["code"] {
+            let size = font.pointSize - 1
+            font = PFont.monospacedSystemFont(ofSize: size, weight: .regular)
+                .addingTraits(bold: bold, italic: italic)
+        }
+        var out: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .paragraphStyle: paragraphStyle(for: block),
+            .foregroundColor: block.type == "blockquote" ? PColor.pSecondaryLabel : PColor.pLabel,
+            .amBlock: BlockBox(block),
+        ]
+        if case .bool(true)? = marks["code"] {
+            out[.backgroundColor] = PColor.pLabel.withAlphaComponent(0.08)
+        }
+        if block.type == "code-block" {
+            out[.backgroundColor] = PColor.pLabel.withAlphaComponent(0.05)
+        }
+        if let name = marks["highlight"]?.stringValue {
+            out[.amHighlight] = name
+            out[.backgroundColor] = Highlight.background(name)
+            out[.foregroundColor] = Highlight.ink(name)
+        }
+        if let link = marks["link"]?.stringValue, let url = URL(string: link) {
+            out[.link] = url
+            out[.underlineStyle] = NSUnderlineStyle.single.rawValue
+        }
+        return out
+    }
+
+    static func marks(from attrs: [NSAttributedString.Key: Any], block: BlockValue) -> [String: JSONValue] {
+        var marks: [String: JSONValue] = [:]
+        if let font = attrs[.font] as? PFont {
+            if font.hasBoldTrait, block.type != "heading" {
+                marks["strong"] = .bool(true)
+            }
+            if font.hasItalicTrait {
+                marks["em"] = .bool(true)
+            }
+            if block.type != "code-block", font.hasMonoSpaceTrait {
+                marks["code"] = .bool(true)
+            }
+        }
+        if let link = attrs[.link] {
+            if let url = link as? URL {
+                marks["link"] = .string(url.absoluteString)
+            } else if let s = link as? String {
+                marks["link"] = .string(s)
+            }
+        }
+        if let name = attrs[.amHighlight] as? String {
+            marks["highlight"] = .string(name)
+        }
+        return marks
+    }
+
+    @MainActor
+    static func attributed(from spans: [SpanNode], cache: AssetCache) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        var block = BlockValue.paragraph
+        var sawAnything = false
+        var i = 0
+        while i < spans.count {
+            let node = spans[i]
+            if case .block(let b) = node, b.type == "table" {
+                var j = i + 1
+                collecting: while j < spans.count {
+                    switch spans[j] {
+                    case .block(let child):
+                        guard child.parents.first == "table" else { break collecting }
+                        j += 1
+                    case .text:
+                        j += 1
+                    }
+                }
+                let slice = Array(spans[i..<j])
+                let box = TableBox(raw: slice, grid: parseTable(slice))
+                if sawAnything {
+                    out.append(NSAttributedString(
+                        string: "\n",
+                        attributes: attributes(block: block, marks: [:])
+                    ))
+                }
+                out.append(tableAttachment(for: box))
+                block = BlockValue(type: "table")
+                sawAnything = true
+                i = j
+                continue
+            }
+            switch node {
+            case .block(let b):
+                if sawAnything {
+                    out.append(NSAttributedString(
+                        string: "\n",
+                        attributes: attributes(block: block, marks: [:])
+                    ))
+                }
+                block = b
+                sawAnything = true
+                if b.isEmbedBlock {
+                    out.append(embedAttachment(for: b, cache: cache))
+                }
+            case .text(let text, let marks):
+                guard !block.isEmbedBlock else { break }
+                out.append(NSAttributedString(
+                    string: text,
+                    attributes: attributes(block: block, marks: marks)
+                ))
+                sawAnything = true
+            }
+            i += 1
+        }
+        return out
+    }
+
+    @MainActor
+    static func embedAttachment(for block: BlockValue, cache: AssetCache) -> NSAttributedString {
+        let attachment = NSTextAttachment()
+        let url = block.embedUrl
+        var displayName: String?
+        if block.type == "html" {
+            attachment.image = PImage.symbol("chevron.left.forwardslash.chevron.right")
+            attachment.bounds = CGRect(x: 0, y: -3, width: 22, height: 16)
+            let firstLine = (block.htmlSource ?? "")
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .first
+                .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            displayName = firstLine.isEmpty ? "HTML" : String(firstLine.prefix(48))
+        } else if let url, let image = cache.images[url] {
+            attachment.image = image
+            attachment.bounds = CGRect(origin: .zero, size: Self.fitted(image.size))
+        } else if let url, let thumb = cache.videoThumbs[url] {
+            attachment.image = thumb
+            attachment.bounds = CGRect(origin: .zero, size: Self.fitted(thumb.size))
+        } else if let url, let name = cache.names[url] {
+            let symbol = switch AssetCache.kind(forName: name) {
+            case "audio": "waveform.circle.fill"
+            case "video": "play.rectangle.fill"
+            default: "doc.fill"
+            }
+            attachment.image = PImage.symbol(symbol)
+            attachment.bounds = CGRect(x: 0, y: -4, width: 20, height: 20)
+            displayName = name
+        } else {
+            attachment.image = PImage.symbol("photo")
+            attachment.bounds = CGRect(x: 0, y: 0, width: 48, height: 36)
+        }
+        let string = NSMutableAttributedString(attachment: attachment)
+        var attrs = attributes(block: block, marks: [:])
+        attrs.removeValue(forKey: .backgroundColor)
+        string.addAttributes(attrs, range: NSRange(location: 0, length: string.length))
+        if let displayName {
+            var nameAttrs = attrs
+            nameAttrs[.font] = PFont.systemFont(ofSize: bodySize, weight: .medium)
+            nameAttrs[.amDisplayOnly] = true
+            string.append(NSAttributedString(string: "  \(displayName)", attributes: nameAttrs))
+        }
+        return string
+    }
+
+    private static func fitted(_ original: CGSize) -> CGSize {
+        let maxWidth: CGFloat = 420
+        let maxHeight: CGFloat = 340
+        var size = original
+        if size.width > 0, size.height > 0 {
+            let scale = min(1, min(maxWidth / size.width, maxHeight / size.height))
+            size = CGSize(width: size.width * scale, height: size.height * scale)
+        }
+        return size
+    }
+
+    // MARK: tables
+
+    static func parseTable(_ spans: [SpanNode]) -> TableGrid {
+        var rows: [[String]] = []
+        var hasHeader = false
+        for node in spans {
+            switch node {
+            case .block(let b):
+                switch b.type {
+                case "table-row":
+                    rows.append([])
+                case "table-cell", "table-header-cell":
+                    if rows.isEmpty { rows.append([]) }
+                    rows[rows.count - 1].append("")
+                    if b.type == "table-header-cell", rows.count == 1 {
+                        hasHeader = true
+                    }
+                default:
+                    break
+                }
+            case .text(let text, _):
+                if !rows.isEmpty, !rows[rows.count - 1].isEmpty {
+                    rows[rows.count - 1][rows[rows.count - 1].count - 1] += text
+                }
+            }
+        }
+        let cols = rows.map(\.count).max() ?? 0
+        rows = rows.map { $0 + Array(repeating: "", count: cols - $0.count) }
+        return TableGrid(rows: rows, hasHeader: hasHeader)
+    }
+
+    static func tableSpans(_ grid: TableGrid) -> [SpanNode] {
+        var spans: [SpanNode] = [.block(BlockValue(type: "table"))]
+        for (rowIndex, row) in grid.rows.enumerated() {
+            spans.append(.block(BlockValue(type: "table-row", parents: ["table"])))
+            let cellType = grid.hasHeader && rowIndex == 0 ? "table-header-cell" : "table-cell"
+            for cell in row {
+                spans.append(.block(BlockValue(type: cellType, parents: ["table", "table-row"])))
+                if !cell.isEmpty {
+                    spans.append(.text(cell, [:]))
+                }
+            }
+        }
+        return spans
+    }
+
+    static func tableAttachment(for box: TableBox) -> NSAttributedString {
+        let attachment = NSTextAttachment()
+        let image = tableImage(box.grid)
+        attachment.image = image
+        attachment.bounds = CGRect(origin: .zero, size: image.size)
+        let string = NSMutableAttributedString(attachment: attachment)
+        string.addAttributes([
+            .font: PFont.systemFont(ofSize: bodySize),
+            .paragraphStyle: paragraphStyle(for: .paragraph),
+            .amBlock: BlockBox(BlockValue(type: "table")),
+            .amTableBox: box,
+        ], range: NSRange(location: 0, length: string.length))
+        return string
+    }
+
+    static func tableImage(_ grid: TableGrid) -> PImage {
+        let font = PFont.systemFont(ofSize: 12)
+        let headerFont = PFont.systemFont(ofSize: 12, weight: .semibold)
+        let pad: CGFloat = 8
+        let rowHeight: CGFloat = 26
+        let cols = max(grid.columnCount, 1)
+        let rowCount = max(grid.rows.count, 1)
+        var widths = [CGFloat](repeating: 64, count: cols)
+        for (r, row) in grid.rows.enumerated() {
+            for (c, cell) in row.enumerated() {
+                let f = grid.hasHeader && r == 0 ? headerFont : font
+                let w = (cell as NSString).size(withAttributes: [.font: f]).width + pad * 2
+                widths[c] = min(180, max(widths[c], w))
+            }
+        }
+        let size = CGSize(
+            width: widths.reduce(0, +) + 1,
+            height: rowHeight * CGFloat(rowCount) + 1
+        )
+        let rows = grid.rows
+        let hasHeader = grid.hasHeader
+        return PImage.draw(size: size) { ctx in
+            let line = PColor.pSecondaryLabel.withAlphaComponent(0.35)
+            if hasHeader, !rows.isEmpty {
+                ctx.setFillColor(PColor.pSecondaryLabel.withAlphaComponent(0.12).cgColor)
+                ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: rowHeight))
+            }
+            ctx.setStrokeColor(line.cgColor)
+            ctx.setLineWidth(1)
+            var x: CGFloat = 0.5
+            for width in widths {
+                ctx.move(to: CGPoint(x: x, y: 0))
+                ctx.addLine(to: CGPoint(x: x, y: size.height))
+                x += width
+            }
+            ctx.move(to: CGPoint(x: size.width - 0.5, y: 0))
+            ctx.addLine(to: CGPoint(x: size.width - 0.5, y: size.height))
+            for r in 0...rowCount {
+                let y = min(rowHeight * CGFloat(r) + 0.5, size.height - 0.5)
+                ctx.move(to: CGPoint(x: 0, y: y))
+                ctx.addLine(to: CGPoint(x: size.width, y: y))
+            }
+            ctx.strokePath()
+            for (r, row) in rows.enumerated() {
+                var cellX: CGFloat = 0
+                for (c, cell) in row.enumerated() {
+                    let f = hasHeader && r == 0 ? headerFont : font
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: f,
+                        .foregroundColor: PColor.pLabel,
+                    ]
+                    let textSize = (cell as NSString).size(withAttributes: attrs)
+                    let rect = CGRect(
+                        x: cellX + pad,
+                        y: rowHeight * CGFloat(r) + (rowHeight - textSize.height) / 2,
+                        width: widths[c] - pad * 2,
+                        height: textSize.height
+                    )
+                    (cell as NSString).draw(in: rect, withAttributes: attrs)
+                    cellX += widths[c]
+                }
+            }
+        }
+    }
+
+    static func spans(from attr: NSAttributedString, trailingBlock: BlockValue? = nil) -> [SpanNode] {
+        let str = attr.string as NSString
+        var spans: [SpanNode] = []
+        var paragraphRanges: [NSRange] = []
+        var location = 0
+        while location < str.length {
+            let r = str.paragraphRange(for: NSRange(location: location, length: 0))
+            paragraphRanges.append(r)
+            location = NSMaxRange(r)
+        }
+        if str.length == 0 || str.hasSuffix("\n") {
+            paragraphRanges.append(NSRange(location: str.length, length: 0))
+        }
+
+        var previousBlock = BlockValue.paragraph
+        for range in paragraphRanges {
+            var contentLength = range.length
+            if contentLength > 0, str.character(at: NSMaxRange(range) - 1) == 0x0A {
+                contentLength -= 1
+            }
+            if range.length > 0,
+               let table = attr.attribute(.amTableBox, at: range.location, effectiveRange: nil) as? TableBox {
+                spans.append(contentsOf: table.spans)
+                previousBlock = .paragraph
+                continue
+            }
+            var block: BlockValue
+            if range.length > 0,
+               let box = attr.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox {
+                block = box.value
+            } else if range.length == 0, let trailingBlock {
+                block = trailingBlock
+            } else {
+                block = previousBlock
+            }
+            if block.isEmbedBlock {
+                let content = contentLength > 0
+                    ? str.substring(with: NSRange(location: range.location, length: contentLength))
+                    : ""
+                if content.contains("\u{FFFC}") {
+                    spans.append(.block(block))
+                    previousBlock = block
+                    continue
+                }
+                block = .paragraph
+            }
+            spans.append(.block(block))
+            previousBlock = block
+
+            guard contentLength > 0 else { continue }
+            let contentRange = NSRange(location: range.location, length: contentLength)
+            var pendingText = ""
+            var pendingMarks: [String: JSONValue] = [:]
+            attr.enumerateAttributes(in: contentRange) { runAttrs, runRange, _ in
+                guard runAttrs[.amDisplayOnly] == nil else { return }
+                let text = str.substring(with: runRange)
+                    .replacingOccurrences(of: "\u{FFFC}", with: "")
+                guard !text.isEmpty else { return }
+                let marks = self.marks(from: runAttrs, block: block)
+                if marks == pendingMarks {
+                    pendingText += text
+                } else {
+                    if !pendingText.isEmpty {
+                        spans.append(.text(pendingText, pendingMarks))
+                    }
+                    pendingText = text
+                    pendingMarks = marks
+                }
+            }
+            if !pendingText.isEmpty {
+                spans.append(.text(pendingText, pendingMarks))
+            }
+        }
+        return spans
+    }
+
+    /// First non-empty line of text, for use as the note's title.
+    static func title(from spans: [SpanNode]) -> String {
+        for node in spans {
+            if case .text(let text, _) = node {
+                let line = text
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .first
+                    .map(String.init)?
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                if !line.isEmpty {
+                    return String(line.prefix(60))
+                }
+            }
+        }
+        return ""
+    }
+}
