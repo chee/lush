@@ -18,12 +18,10 @@ enum HtmlPreview {
 
 struct VideoInlineView: View {
     let fileURL: URL
-    let size: CGSize
     @State private var player: AVPlayer?
 
     var body: some View {
         VideoPlayer(player: player)
-            .frame(width: size.width, height: size.height)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .onAppear {
                 if player == nil {
@@ -57,7 +55,6 @@ struct HtmlInlineView: View {
                 .buttonStyle(.plain)
                 .padding(4)
             }
-            .frame(width: 460, height: 220)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(
                 RoundedRectangle(cornerRadius: 8)

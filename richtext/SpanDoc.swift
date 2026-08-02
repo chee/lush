@@ -103,7 +103,7 @@ struct BlockValue: Codable, Equatable {
     /// Blocks that live behind a single attachment character and must never
     /// be restyled or split by ordinary text editing.
     var isAtomic: Bool {
-        isEmbedBlock || type == "table"
+        isEmbedBlock || type == "table" || type == "columns"
     }
 
     var embedUrl: String? {
@@ -195,6 +195,23 @@ extension NSAttributedString.Key {
     static let amDisplayOnly = NSAttributedString.Key("io.richtext.displayOnly")
     static let amHighlight = NSAttributedString.Key("io.richtext.highlight")
     static let amTableBox = NSAttributedString.Key("io.richtext.tableBox")
+    static let amColumnsBox = NSAttributedString.Key("io.richtext.columnsBox")
+}
+
+/// A columns layout behind one attachment character: per-column span lists
+/// (parents prefix stripped), plus the original spans until first edit.
+final class ColumnsBox: NSObject {
+    var raw: [SpanNode]?
+    var columns: [[SpanNode]]
+
+    init(raw: [SpanNode]?, columns: [[SpanNode]]) {
+        self.raw = raw
+        self.columns = columns
+    }
+
+    var spans: [SpanNode] {
+        raw ?? RichText.columnsSpans(columns)
+    }
 }
 
 /// Palette from wordgard rich.css: backgrounds are the hue mixed over the
@@ -263,6 +280,26 @@ final class TableBox: NSObject {
 
     var spans: [SpanNode] {
         raw ?? RichText.tableSpans(grid)
+    }
+}
+
+/// An attachment whose `bounds` is the ideal size; at layout time it scales
+/// itself down to fit the line fragment, so images reflow with the column.
+final class FittingImageAttachment: NSTextAttachment {
+    override func attachmentBounds(
+        for textContainer: NSTextContainer?,
+        proposedLineFragment lineFrag: CGRect,
+        glyphPosition position: CGPoint,
+        characterIndex charIndex: Int
+    ) -> CGRect {
+        var size = bounds.size
+        let padding = textContainer?.lineFragmentPadding ?? 5
+        let available = lineFrag.width - padding * 2
+        if available > 40, size.width > available, size.width > 0 {
+            let scale = available / size.width
+            size = CGSize(width: available, height: size.height * scale)
+        }
+        return CGRect(origin: bounds.origin, size: size)
     }
 }
 
@@ -413,27 +450,33 @@ enum RichText {
         var i = 0
         while i < spans.count {
             let node = spans[i]
-            if case .block(let b) = node, b.type == "table" {
+            if case .block(let b) = node, b.type == "table" || b.type == "columns" {
+                let root = b.type
                 var j = i + 1
                 collecting: while j < spans.count {
                     switch spans[j] {
                     case .block(let child):
-                        guard child.parents.first == "table" else { break collecting }
+                        guard child.parents.first == root else { break collecting }
                         j += 1
                     case .text:
                         j += 1
                     }
                 }
                 let slice = Array(spans[i..<j])
-                let box = TableBox(raw: slice, grid: parseTable(slice))
                 if sawAnything {
                     out.append(NSAttributedString(
                         string: "\n",
                         attributes: attributes(block: block, marks: [:])
                     ))
                 }
-                out.append(tableAttachment(for: box))
-                block = BlockValue(type: "table")
+                if root == "table" {
+                    out.append(tableAttachment(for: TableBox(raw: slice, grid: parseTable(slice))))
+                } else {
+                    out.append(columnsAttachment(
+                        for: ColumnsBox(raw: slice, columns: parseColumns(slice))
+                    ))
+                }
+                block = BlockValue(type: root)
                 sawAnything = true
                 i = j
                 continue
@@ -466,8 +509,12 @@ enum RichText {
 
     @MainActor
     static func embedAttachment(for block: BlockValue, cache: AssetCache) -> NSAttributedString {
-        let attachment = NSTextAttachment()
         let url = block.embedUrl
+        let isLiveBox = block.type == "html"
+            || url.map { cache.patchworkDocs.contains($0) } == true
+        let attachment: NSTextAttachment = isLiveBox
+            ? NSTextAttachment()
+            : FittingImageAttachment()
         var displayName: String?
         if block.type == "html" {
             attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
@@ -566,6 +613,70 @@ enum RichText {
 
     /// The attachment only reserves space in the text flow; the live
     /// TableInlineView is positioned over it by InlineViewManager.
+    // MARK: columns
+
+    static func parseColumns(_ spans: [SpanNode]) -> [[SpanNode]] {
+        var columns: [[SpanNode]] = []
+        for node in spans.dropFirst() {
+            switch node {
+            case .block(let b) where b.type == "column" && b.parents == ["columns"]:
+                columns.append([])
+            case .block(var b):
+                if columns.isEmpty { columns.append([]) }
+                b.parents = Array(b.parents.dropFirst(2))
+                columns[columns.count - 1].append(.block(b))
+            case .text:
+                if columns.isEmpty { columns.append([]) }
+                columns[columns.count - 1].append(node)
+            }
+        }
+        if columns.isEmpty {
+            columns = [[], []]
+        }
+        return columns.map { $0.isEmpty ? [.block(.paragraph)] : $0 }
+    }
+
+    static func columnsSpans(_ columns: [[SpanNode]]) -> [SpanNode] {
+        var out: [SpanNode] = [.block(BlockValue(type: "columns"))]
+        for column in columns {
+            out.append(.block(BlockValue(type: "column", parents: ["columns"])))
+            for node in column {
+                if case .block(var b) = node {
+                    b.parents = ["columns", "column"] + b.parents
+                    out.append(.block(b))
+                } else {
+                    out.append(node)
+                }
+            }
+        }
+        return out
+    }
+
+    static func columnsAttachment(for box: ColumnsBox) -> NSAttributedString {
+        let attachment = NSTextAttachment()
+        attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+        attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 120))
+        let string = NSMutableAttributedString(attachment: attachment)
+        string.addAttributes([
+            .font: PFont.systemFont(ofSize: bodySize),
+            .paragraphStyle: paragraphStyle(for: .paragraph),
+            .amBlock: BlockBox(BlockValue(type: "columns")),
+            .amColumnsBox: box,
+        ], range: NSRange(location: 0, length: string.length))
+        return string
+    }
+
+    @MainActor
+    static func measuredHeight(of spans: [SpanNode], width: CGFloat, cache: AssetCache) -> CGFloat {
+        let attr = attributed(from: spans, cache: cache)
+        let rect = attr.boundingRect(
+            with: CGSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        )
+        return ceil(rect.height)
+    }
+
     static func tableAttachment(for box: TableBox) -> NSAttributedString {
         let attachment = NSTextAttachment()
         attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
@@ -573,7 +684,7 @@ enum RichText {
         let rows = max(box.grid.rows.count, 1)
         attachment.bounds = CGRect(
             origin: .zero,
-            size: CGSize(width: CGFloat(cols) * 150, height: CGFloat(rows) * 29)
+            size: CGSize(width: CGFloat(cols) * 150 + 2, height: CGFloat(rows) * 30 + 2)
         )
         let string = NSMutableAttributedString(attachment: attachment)
         string.addAttributes([
@@ -607,15 +718,23 @@ enum RichText {
                 contentLength -= 1
             }
             if range.length > 0 {
-                var table: TableBox?
+                var boxSpans: [SpanNode]?
                 attr.enumerateAttribute(.amTableBox, in: range) { value, _, stop in
                     if let box = value as? TableBox {
-                        table = box
+                        boxSpans = box.spans
                         stop.pointee = true
                     }
                 }
-                if let table {
-                    spans.append(contentsOf: table.spans)
+                if boxSpans == nil {
+                    attr.enumerateAttribute(.amColumnsBox, in: range) { value, _, stop in
+                        if let box = value as? ColumnsBox {
+                            boxSpans = box.spans
+                            stop.pointee = true
+                        }
+                    }
+                }
+                if let boxSpans {
+                    spans.append(contentsOf: boxSpans)
                     // text typed on the attachment's line survives as its own
                     // paragraph after the table
                     var stray = ""

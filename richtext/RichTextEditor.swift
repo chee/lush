@@ -56,6 +56,7 @@ final class EditorController {
     func toggleCode() { core?.toggleMark("code") }
     func applyHighlight(_ name: String?) { core?.setHighlight(name) }
     func insertTable() { core?.insertTable() }
+    func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
     func insertPatchworkDoc() { sheet = .patchworkCreate }
 
@@ -215,7 +216,7 @@ final class EditorCore {
 
     private var saveTask: Task<Void, Never>?
     private var lastKnownJSON = ""
-    private let cache = AssetCache()
+    let cache = AssetCache()
 
     let inline = InlineViewManager()
 
@@ -397,7 +398,8 @@ final class EditorCore {
     func refreshFormattingState() {
         guard let view else { return }
         var typing = view.pTypingAttributes
-        if typing[.amTableBox] != nil || typing[.attachment] != nil
+        if typing[.amTableBox] != nil || typing[.amColumnsBox] != nil
+            || typing[.attachment] != nil
             || (typing[.amBlock] as? BlockBox)?.value.isAtomic == true {
             // typing next to an attachment must never inherit its attributes,
             // or the typed text would vanish into the atomic block on save
@@ -468,7 +470,8 @@ final class EditorCore {
             storage.beginEditing()
             storage.enumerateAttributes(in: paragraphRange) { runAttrs, runRange, _ in
                 let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
-                guard !oldBlock.isAtomic, runAttrs[.amTableBox] == nil else { return }
+                guard !oldBlock.isAtomic, runAttrs[.amTableBox] == nil,
+                      runAttrs[.amColumnsBox] == nil else { return }
                 let marks = RichText.marks(from: runAttrs, block: oldBlock)
                 storage.setAttributes(
                     RichText.attributes(block: block, marks: marks),
@@ -506,7 +509,8 @@ final class EditorCore {
         storage.beginEditing()
         storage.enumerateAttributes(in: selection) { runAttrs, runRange, _ in
             let block = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
-            guard !block.isAtomic, runAttrs[.amTableBox] == nil else { return }
+            guard !block.isAtomic, runAttrs[.amTableBox] == nil,
+                  runAttrs[.amColumnsBox] == nil else { return }
             var marks = RichText.marks(from: runAttrs, block: block)
             marks[mark] = value
             var newAttrs = RichText.attributes(block: block, marks: marks)
@@ -765,6 +769,20 @@ final class EditorCore {
     }
 
     func tableChanged(_ box: TableBox) {
+        scheduleSave()
+        inline.setNeedsReconcile()
+    }
+
+    func insertColumns() {
+        let box = ColumnsBox(
+            raw: nil,
+            columns: [[.block(.paragraph)], [.block(.paragraph)]]
+        )
+        insertBlockAttachment(RichText.columnsAttachment(for: box))
+        inline.setNeedsReconcile()
+    }
+
+    func columnsChanged(_ box: ColumnsBox) {
         scheduleSave()
         inline.setNeedsReconcile()
     }

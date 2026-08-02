@@ -27,11 +27,13 @@ enum LocalSyncServer {
     }
 
     static var irohNodeId: String? { controller.irohNodeId }
+    static var friends: [String] { controller.friends }
     #else
     static func startIfNeeded() async {}
     static var wsPort: UInt16? { nil }
     static func addFriend(_ nodeId: String) throws {}
     static var irohNodeId: String? { nil }
+    static var friends: [String] { [] }
     #endif
 }
 
@@ -251,6 +253,57 @@ enum PatchworkWeb {
       }
     }
 
+    // Trimmed port of Patchwork's importPackageFromFolderDocUrl: pin the tool
+    // doc to its heads, fetch its package.json through the resolver, pick the
+    // entry point, and dynamically import it so its plugins can register.
+    function resolveEntry(pkg) {
+      const conditions = ["patchwork", "browser", "import", "default"]
+      const pick = (value) => {
+        if (typeof value === "string") return value
+        if (value && typeof value === "object") {
+          for (const key of conditions) {
+            if (key in value) {
+              const found = pick(value[key])
+              if (found) return found
+            }
+          }
+        }
+        return undefined
+      }
+      if (pkg.exports) {
+        const dot =
+          typeof pkg.exports === "string" || !("." in pkg.exports)
+            ? pkg.exports
+            : pkg.exports["."]
+        const found = pick(dot)
+        if (found) return found
+      }
+      return pkg.module ?? pkg.main
+    }
+
+    async function importToolPackage(repo, toolUrl) {
+      let url = toolUrl
+      const { heads } = parseAutomergeUrl(url)
+      if (!heads) {
+        const handle = await repo.find(url)
+        url = handle.view(handle.heads()).url
+      }
+      const base = new URL(`/${encodeURIComponent(url)}/`, location.href)
+      const response = await fetch(new URL("package.json", base))
+      if (!response.ok) {
+        throw new Error(`no package.json in tool doc ${toolUrl}`)
+      }
+      const entry = resolveEntry(await response.json())
+      if (!entry) {
+        throw new Error(`no entry point in tool doc ${toolUrl}`)
+      }
+      const mod = await import(new URL(entry.replace(/^\.\//, ""), base).href)
+      if (Array.isArray(mod?.plugins)) {
+        registerPlugins(mod.plugins, url)
+      }
+      return mod
+    }
+
     async function boot() {
       const config = window.__patchwork_CONFIG ?? {}
       status("loading wasm…")
@@ -305,6 +358,7 @@ enum PatchworkWeb {
       }
       status("finding document…")
       if (!toolId) {
+        let doc
         try {
           const handle = await Promise.race([
             repo.find(docUrl),
@@ -312,13 +366,27 @@ enum PatchworkWeb {
               setTimeout(() => reject(new Error("timed out")), 15000),
             ),
           ])
-          const doc = handle.doc()
-          const type = doc?.["@patchwork"]?.type
-          toolId = (getSupportedToolsForType(String(type ?? "")) ?? []).filter(
-            (tool) => !tool.unlisted,
-          )[0]?.id
+          doc = handle.doc()
         } catch (error) {
-          console.warn("richtext: could not pick a default tool", error)
+          console.warn("richtext: could not load embedded doc", error)
+        }
+        const type = String(doc?.["@patchwork"]?.type ?? "")
+        const firstToolFor = (t) =>
+          (getSupportedToolsForType(t) ?? []).filter((tool) => !tool.unlisted)[0]?.id
+        toolId = firstToolFor(type)
+        const suggested = doc?.["@patchwork"]?.suggestedImportUrl
+        if (!toolId && suggested && isValidAutomergeUrl(String(suggested))) {
+          try {
+            status("importing tool…")
+            const mod = await importToolPackage(repo, String(suggested))
+            toolId =
+              firstToolFor(type) ??
+              (mod?.plugins ?? []).find(
+                (plugin) => plugin?.type === "patchwork:tool",
+              )?.id
+          } catch (error) {
+            console.warn("richtext: suggested tool import failed", error)
+          }
         }
       }
       const view = document.createElement("patchwork-view")
@@ -697,7 +765,6 @@ struct PatchworkBoxView: View {
                 .padding(12)
             }
         }
-        .frame(width: 460, height: 300)
         .background(.background)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(

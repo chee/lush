@@ -14,7 +14,7 @@ final class InlineViewManager {
 
     private struct Host {
         let view: PView
-        let measure: () -> CGSize
+        let preferredSize: (CGFloat) -> CGSize
         let retained: AnyObject?
     }
 
@@ -36,6 +36,10 @@ final class InlineViewManager {
               let textContainer = view.pTextContainer
         else { return }
         let origin = view.pTextOrigin
+        let containerWidth = max(
+            textContainer.size.width - textContainer.lineFragmentPadding * 2,
+            0
+        )
         var seen = Set<ObjectIdentifier>()
         var resizes: [(location: Int, size: CGSize)] = []
         let full = NSRange(location: 0, length: storage.length)
@@ -51,13 +55,24 @@ final class InlineViewManager {
             var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
             rect.origin.x += origin.x
             rect.origin.y += origin.y
-            let natural = host.measure()
-            if natural.width > 1, natural.height > 1,
-               abs(natural.width - rect.width) > 1 || abs(natural.height - rect.height) > 1 {
-                resizes.append((location, natural))
-                rect.size = natural
+            guard containerWidth > 80 else {
+                host.view.frame = rect
+                return
             }
-            host.view.frame = rect
+            let desired = host.preferredSize(containerWidth)
+            guard desired.width > 1, desired.height > 1 else {
+                host.view.frame = rect
+                return
+            }
+            // compare against the attachment's own bounds, not the layout
+            // rect — TextKit clamps wide attachments to the line fragment,
+            // and chasing that difference loops layout forever
+            let bounds = (storage.attribute(.attachment, at: location, effectiveRange: nil)
+                as? NSTextAttachment)?.bounds.size ?? rect.size
+            if abs(desired.width - bounds.width) > 1 || abs(desired.height - bounds.height) > 1 {
+                resizes.append((location, desired))
+            }
+            host.view.frame = CGRect(origin: rect.origin, size: desired)
         }
 
         storage.enumerateAttribute(.amTableBox, in: full) { value, range, _ in
@@ -65,6 +80,14 @@ final class InlineViewManager {
             let id = ObjectIdentifier(box)
             seen.insert(id)
             let host = hosts[id] ?? makeTableHost(for: box)
+            hosts[id] = host
+            place(host, at: range.location)
+        }
+        storage.enumerateAttribute(.amColumnsBox, in: full) { value, range, _ in
+            guard let box = value as? ColumnsBox else { return }
+            let id = ObjectIdentifier(box)
+            guard let host = hosts[id] ?? makeColumnsHost(for: box) else { return }
+            seen.insert(id)
             hosts[id] = host
             place(host, at: range.location)
         }
@@ -102,7 +125,39 @@ final class InlineViewManager {
         let root = TableInlineView(box: box) { [weak self] in
             self?.core?.tableChanged(box)
         }
-        return makeHost(root)
+        let (view, _, retained) = makeHosting(root)
+        return Host(
+            view: view,
+            preferredSize: { width in
+                CGSize(
+                    width: min(CGFloat(max(box.grid.columnCount, 1)) * 150 + 2, width),
+                    height: CGFloat(max(box.grid.rows.count, 1)) * 30 + 2
+                )
+            },
+            retained: retained
+        )
+    }
+
+    private func makeColumnsHost(for box: ColumnsBox) -> Host? {
+        guard let core else { return nil }
+        let cache = core.cache
+        let root = ColumnsInlineView(box: box, cache: cache) { [weak self] in
+            self?.core?.columnsChanged(box)
+        }
+        let (view, _, retained) = makeHosting(root)
+        return Host(
+            view: view,
+            preferredSize: { width in
+                let count = max(box.columns.count, 1)
+                let chrome = CGFloat(count - 1) * 17 + 12
+                let columnWidth = max((width - chrome) / CGFloat(count), 60)
+                let tallest = box.columns
+                    .map { RichText.measuredHeight(of: $0, width: columnWidth - 4, cache: cache) }
+                    .max() ?? 40
+                return CGSize(width: width, height: max(tallest + 26, 80))
+            },
+            retained: retained
+        )
     }
 
     private func makeEmbedHost(for box: BlockBox) -> Host? {
@@ -110,40 +165,59 @@ final class InlineViewManager {
         let block = box.value
         if block.type == "html" {
             let html = block.htmlSource ?? ""
-            return makeHost(HtmlInlineView(html: html) { [weak core] in
+            let (view, _, retained) = makeHosting(HtmlInlineView(html: html) { [weak core] in
                 core?.controller.sheet = .html(HtmlBlockHandle(box: box, html: html))
             })
+            return Host(
+                view: view,
+                preferredSize: { width in CGSize(width: min(460, width), height: 220) },
+                retained: retained
+            )
         }
         guard let url = block.embedUrl else { return nil }
         if core.isPatchworkDoc(url) {
-            return makeHost(PatchworkBoxView(
+            let (view, _, retained) = makeHosting(PatchworkBoxView(
                 docUrl: url,
                 toolId: block.attrs["tool"]?.stringValue
             ))
+            return Host(
+                view: view,
+                preferredSize: { width in CGSize(width: min(460, width), height: 300) },
+                retained: retained
+            )
         }
         if let size = core.inlineVideoSize(for: url),
            let fileURL = core.videoFileURL(for: url) {
-            return makeHost(VideoInlineView(fileURL: fileURL, size: size))
+            let (view, _, retained) = makeHosting(VideoInlineView(fileURL: fileURL))
+            return Host(
+                view: view,
+                preferredSize: { width in
+                    guard size.width > width else { return size }
+                    let scale = width / size.width
+                    return CGSize(width: width, height: size.height * scale)
+                },
+                retained: retained
+            )
         }
         return nil
     }
 
-    private func makeHost(_ root: some View) -> Host {
+    private func makeHosting(_ root: some View) -> (PView, () -> CGSize, AnyObject?) {
         #if os(macOS)
         let hosting = NSHostingView(rootView: root)
-        return Host(view: hosting, measure: { hosting.fittingSize }, retained: nil)
+        return (hosting, { hosting.fittingSize }, nil)
         #else
         let controller = UIHostingController(rootView: root)
         controller.view.backgroundColor = .clear
-        return Host(
-            view: controller.view,
-            measure: {
+        return (
+            controller.view,
+            {
                 controller.sizeThatFits(in: CGSize(
                     width: CGFloat.greatestFiniteMagnitude,
                     height: CGFloat.greatestFiniteMagnitude
                 ))
             },
-            retained: controller
+            controller
         )
         #endif
     }
@@ -164,18 +238,19 @@ struct TableInlineView: View {
     private var line: Color { Color.secondary.opacity(0.35) }
 
     var body: some View {
-        Grid(horizontalSpacing: 0, verticalSpacing: 0) {
-            ForEach(0..<grid.rows.count, id: \.self) { r in
-                GridRow {
-                    ForEach(0..<max(grid.columnCount, 1), id: \.self) { c in
-                        TextField("", text: cellBinding(r, c), axis: .vertical)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13, weight: isHeader(r) ? .semibold : .regular))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .frame(width: cellWidth, alignment: .topLeading)
-                            .background(isHeader(r) ? Color.secondary.opacity(0.12) : .clear)
-                            .overlay(Rectangle().strokeBorder(line, lineWidth: 0.5))
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(horizontalSpacing: 0, verticalSpacing: 0) {
+                ForEach(0..<grid.rows.count, id: \.self) { r in
+                    GridRow {
+                        ForEach(0..<max(grid.columnCount, 1), id: \.self) { c in
+                            TextField("", text: cellBinding(r, c))
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 13, weight: isHeader(r) ? .semibold : .regular))
+                                .padding(.horizontal, 8)
+                                .frame(width: cellWidth, height: 30, alignment: .leading)
+                                .background(isHeader(r) ? Color.secondary.opacity(0.12) : .clear)
+                                .overlay(Rectangle().strokeBorder(line, lineWidth: 0.5))
+                        }
                     }
                 }
             }
@@ -217,7 +292,6 @@ struct TableInlineView: View {
             .fixedSize()
             .padding(3)
         }
-        .fixedSize()
     }
 
     private func isHeader(_ row: Int) -> Bool {

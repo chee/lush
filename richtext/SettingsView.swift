@@ -4,6 +4,9 @@ struct SettingsView: View {
     @Environment(NotesModel.self) private var model
     @State private var folderText = ""
     @State private var copiedUrl: String?
+    @State private var peerText = ""
+    @State private var peerError: String?
+    @State private var copiedNodeId = false
 
     var body: some View {
         Form {
@@ -64,6 +67,61 @@ struct SettingsView: View {
                 Text("Add a folder")
             } footer: {
                 Text("Paste a Patchwork folder URL to show it in the sidebar alongside your other folders.")
+            }
+            Section {
+                if let nodeId = LocalSyncServer.irohNodeId {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("This device")
+                            Text(nodeId)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
+                        Button(copiedNodeId ? "Copied" : "Copy") {
+                            Clipboard.copy(nodeId)
+                            copiedNodeId = true
+                            Task {
+                                try? await Task.sleep(for: .seconds(2))
+                                copiedNodeId = false
+                            }
+                        }
+                    }
+                    ForEach(LocalSyncServer.friends, id: \.self) { friend in
+                        Text(friend)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    TextField("friend's node id", text: $peerText)
+                        .font(.body.monospaced())
+                    Button("Add Peer") {
+                        let nodeId = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !nodeId.isEmpty else { return }
+                        do {
+                            try LocalSyncServer.addFriend(nodeId)
+                            peerText = ""
+                            peerError = nil
+                        } catch {
+                            peerError = error.localizedDescription
+                        }
+                    }
+                    .disabled(
+                        peerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                    if let peerError {
+                        Text(peerError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                } else {
+                    Text("The local sync server isn't running.")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Peers (iroh)")
+            } footer: {
+                Text("Share this device's node id and add a friend's; their patchwork embeds then sync device-to-device.")
             }
         }
         .formStyle(.grouped)

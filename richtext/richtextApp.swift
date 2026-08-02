@@ -69,6 +69,8 @@ struct FormatCommands: Commands {
             Divider()
             Button("Insert Table") { editor?.insertTable() }
                 .keyboardShortcut("t", modifiers: [.command, .option])
+            Button("Insert Columns") { editor?.insertColumns() }
+                .keyboardShortcut("2", modifiers: [.command, .option])
             Button("Insert HTML Block") { editor?.insertHtmlBlock() }
                 .keyboardShortcut("h", modifiers: [.command, .option])
         }

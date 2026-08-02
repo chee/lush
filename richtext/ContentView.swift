@@ -82,7 +82,40 @@ struct ContentView: View {
                 }
                 .disabled(model.folderUrl == nil)
             }
+            #if os(iOS)
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                }
+            }
+            DefaultToolbarItem(kind: .search, placement: .bottomBar)
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    model.createNote()
+                    selectedItemUrl = model.selectedNoteUrl
+                } label: {
+                    Label("New Note", systemImage: "square.and.pencil")
+                }
+                .disabled(model.folderUrl == nil)
+            }
+            #endif
         }
+        #if os(iOS)
+        .sheet(isPresented: $showingSettings) {
+            NavigationStack {
+                SettingsView()
+                    .environment(model)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingSettings = false }
+                        }
+                    }
+            }
+        }
+        #endif
         .onChange(of: searchText) {
             searchHits = model.search(searchText)
         }
@@ -225,29 +258,7 @@ struct ContentView: View {
                 }
                 .disabled(model.folderUrl == nil)
             }
-            #if os(iOS)
-            ToolbarItem {
-                Button {
-                    showingSettings = true
-                } label: {
-                    Label("Settings", systemImage: "gearshape")
-                }
-            }
-            #endif
         }
-        #if os(iOS)
-        .sheet(isPresented: $showingSettings) {
-            NavigationStack {
-                SettingsView()
-                    .environment(model)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") { showingSettings = false }
-                        }
-                    }
-            }
-        }
-        #endif
     }
 
     @ViewBuilder
@@ -290,6 +301,11 @@ struct ContentView: View {
                                 editor.insertTable()
                             } label: {
                                 Label("Table", systemImage: "tablecells")
+                            }
+                            Button {
+                                editor.insertColumns()
+                            } label: {
+                                Label("Columns", systemImage: "rectangle.split.2x1")
                             }
                             Button {
                                 editor.insertHtmlBlock()
