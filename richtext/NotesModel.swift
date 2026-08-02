@@ -112,9 +112,9 @@ final class NotesModel {
                 .filter { $0.kind == "folder" }
                 .map { folderNode(url: $0.url, name: $0.name, parent: url) }
             children += entries
-                .filter { $0.kind == "rich" }
+                .filter { $0.kind == "lush" || $0.kind == "rich" }
                 .map {
-                    FolderNode(url: $0.url, name: $0.name, kind: "rich", parentUrl: url, children: nil)
+                    FolderNode(url: $0.url, name: $0.name, kind: $0.kind, parentUrl: url, children: nil)
                 }
             return FolderNode(url: url, name: name, kind: "folder", parentUrl: parent, children: children)
         }
@@ -198,7 +198,7 @@ final class NotesModel {
         notes = core.listNotes()
         folderTitle = core.folderTitle()
         core.prefetchNotes(urls: notes.map(\.url))
-        for note in notes where note.kind == "rich" {
+        for note in notes where note.kind == "lush" || note.kind == "rich" {
             previews[note.url] = core.notePreview(url: note.url)
         }
         if let selected = selectedNoteUrl, !notes.contains(where: { $0.url == selected }) {
@@ -482,7 +482,7 @@ final class NotesModel {
         var all: [FolderNode] = []
         func walk(_ nodes: [FolderNode]) {
             for node in nodes {
-                if node.kind == "rich" {
+                if node.kind == "lush" || node.kind == "rich" {
                     all.append(node)
                 }
                 if let children = node.children {

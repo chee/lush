@@ -304,7 +304,7 @@ struct ContentView: View {
                 ? Array(selectedItemUrls)
                 : [node.url]
             let many = targets.count > 1
-            if node.kind == "rich", !many {
+            if (node.kind == "lush" || node.kind == "rich"), !many {
                 Button(model.isPinned(node.url) ? "Unpin" : "Pin") {
                     model.togglePin(node.url)
                 }
@@ -349,7 +349,7 @@ struct ContentView: View {
                     .id(url)
             } else if !model.status.isEmpty {
                 ContentUnavailableView {
-                    Label("Rich Text", systemImage: "doc.richtext")
+                    Label("Note", systemImage: "doc.richtext")
                 } description: {
                     Text(model.status)
                 }
@@ -566,7 +566,7 @@ struct FolderScreen: View {
 
     @ViewBuilder
     private func nodeMenu(_ node: FolderNode) -> some View {
-        if node.kind == "rich" {
+        if node.kind == "lush" || node.kind == "rich" {
             Button(model.isPinned(node.url) ? "Unpin" : "Pin") {
                 model.togglePin(node.url)
             }
