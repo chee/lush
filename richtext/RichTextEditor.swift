@@ -683,6 +683,22 @@ final class EditorCore {
         scheduleSave()
     }
 
+    func updateEmbedTool(_ box: BlockBox, tool: String?) {
+        guard let storage = view?.pStorage else { return }
+        guard let range = range(whereBlockBox: box, in: storage) else { return }
+        guard let url = box.value.embedUrl else { return }
+        var newBlock = BlockValue.embed(url: url)
+        if let tool, !tool.isEmpty {
+            newBlock.attrs["tool"] = .string(tool)
+        }
+        storage.replaceCharacters(
+            in: range,
+            with: RichText.embedAttachment(for: newBlock, cache: cache)
+        )
+        scheduleSave()
+        inline.setNeedsReconcile()
+    }
+
     func replaceAsset(oldUrl: String, data: Data, name: String, fileExtension: String, mime: String) {
         Task { [weak self] in
             guard let self else { return }

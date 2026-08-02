@@ -181,6 +181,8 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = richtext/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Lush;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -204,7 +206,7 @@
 				NEW_SETTING1 = "";
 				NEW_SETTING2 = "";
 				OTHER_LDFLAGS = "-lrichtext_core";
-				PRODUCT_BUNDLE_IDENTIFIER = com.inkandswitch.patchwork.richtext;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
@@ -254,6 +256,8 @@
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = richtext/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Lush;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -277,7 +281,7 @@
 				NEW_SETTING1 = "";
 				NEW_SETTING2 = "";
 				OTHER_LDFLAGS = "-lrichtext_core";
-				PRODUCT_BUNDLE_IDENTIFIER = com.inkandswitch.patchwork.richtext;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
