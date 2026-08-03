@@ -193,8 +193,8 @@ struct SyncSettingsPane: View {
                 Section("Sync Log") {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(model.syncLog.reversed(), id: \.self) { entry in
-                                Text(entry)
+                            ForEach((0..<model.syncLog.count).reversed(), id: \.self) { i in
+                                Text(model.syncLog[i])
                                     .font(.caption.monospaced())
                                     .foregroundStyle(.secondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -221,7 +221,7 @@ struct EditorSettingsPane: View {
     @Environment(NotesModel.self) private var model
     @State private var fontDesign = EditorSettings.design
     @State private var fontSize = EditorSettings.bodySize
-    @State private var autoInsertDateline = EditorSettings.autoInsertDateline
+    @State private var autoInsertLogline = EditorSettings.autoInsertLogline
 
     var body: some View {
         Form {
@@ -264,10 +264,10 @@ struct EditorSettingsPane: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Section("Dateline") {
-                Toggle("Add dateline when context changes", isOn: $autoInsertDateline)
-                    .onChange(of: autoInsertDateline) {
-                        EditorSettings.setAutoInsertDateline(autoInsertDateline)
+            Section("Logline") {
+                Toggle("Add logline when context changes", isOn: $autoInsertLogline)
+                    .onChange(of: autoInsertLogline) {
+                        EditorSettings.setAutoInsertLogline(autoInsertLogline)
                     }
             }
         }

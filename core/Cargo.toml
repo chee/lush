@@ -8,13 +8,13 @@ name = "lush_core"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [[bin]]
-name = "rtcli"
-path = "src/bin/rtcli.rs"
+name = "lush"
+path = "src/bin/lush.rs"
 
 [dependencies]
-automerge = { git = "https://github.com/automerge/automerge", rev = "f335096d911bffc90962fbe61de71e98cc959a8b" }
+automerge = { git = "https://github.com/automerge/automerge", branch = "main" }
 sedimentree_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["std"] }
-sedimentree_fs_storage = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec" }
+subduction_redb_storage = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec" }
 subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["system_time"] }
 subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["std"] }
 subduction_websocket = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["tokio_client"] }

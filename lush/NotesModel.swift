@@ -14,6 +14,7 @@ final class NotesModel {
     var selectedNoteUrl: String? {
         didSet { UserDefaults.standard.set(selectedNoteUrl, forKey: Self.lastOpenNoteKey) }
     }
+    var pendingFocusUrl: String?
     var status: String = "Starting…"
     var previews: [String: String] = [:]
     private(set) var contextMetas: [String: NoteContextMeta] = [:]
@@ -25,7 +26,6 @@ final class NotesModel {
     func appendSyncEvent(_ message: String) {
         let ts = Date().formatted(.dateTime.hour().minute().second())
         let entry = "[\(ts)] \(message)"
-        print(entry)
         if syncLog.count >= 100 { syncLog.removeFirst() }
         syncLog.append(entry)
     }
@@ -37,7 +37,10 @@ final class NotesModel {
     @ObservationIgnored private var noteObservers: [UUID: @MainActor (String) -> Void] = [:]
     @ObservationIgnored private var delegateBridge: DelegateBridge?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    private(set) var thumbnails: [String: Data] = [:]
+    @ObservationIgnored private var pendingRefreshTask: Task<Void, Never>?
     private var lastKnownCounts: [String: Int] = [:]
+    @ObservationIgnored private var folderNodeCache: [String: (heads: [String], node: FolderNode)] = [:]
 
     /// Open editors register here to hear about local and remote changes.
     func addNoteObserver(_ handler: @escaping @MainActor (String) -> Void) -> UUID {
@@ -100,29 +103,37 @@ final class NotesModel {
             self.delegateBridge = delegateBridge
             core.setDelegate(delegate: delegateBridge)
             connected = core.isConnected()
-            status = saved.isEmpty ? "Creating folder…" : "Opening folder…"
-            let first = saved.first
-            let url = try await Task.detached {
-                try core.ensureFolder(existingUrl: first)
-            }.value
-            if saved.isEmpty {
+
+            if let first = saved.first {
+                // Returning user: set folder immediately and return to the UI.
+                // startFolderUrl sets self.folder in Rust and loads the doc
+                // from redb in the background; docChanged fires when ready.
+                try core.startFolderUrl(url: first)
+                rootFolderUrls = saved
+                persistRoots()
+                folderUrl = first
+                status = ""
+                core.prefetchNotes(urls: Array(saved.dropFirst()))
+                refreshNotes()
+                startPolling()
+                if let last = UserDefaults.standard.string(forKey: Self.lastOpenNoteKey) {
+                    selectedNoteUrl = last
+                }
+                appendSyncEvent("Started: \(saved.count) root folder(s)")
+            } else {
+                // Fresh install: create the folder doc (one-time wait, acceptable).
+                status = "Creating folder…"
+                let url = try await Task.detached {
+                    try core.ensureFolder(existingUrl: nil)
+                }.value
                 saved = [url]
-            }
-            rootFolderUrls = saved
-            persistRoots()
-            folderUrl = url
-            // remaining roots arrive in the background; the tree fills in as
-            // their docs land
-            core.prefetchNotes(urls: Array(saved.dropFirst()))
-            refreshNotes()
-            status = ""
-            appendSyncEvent("Started: \(saved.count) root folder(s), \(folderTree.flatMap { [$0] + ($0.children ?? []) }.count) items visible so far")
-            for url in rootFolderUrls {
-                lastKnownCounts[url] = core.folderEntriesOf(url: url).count
-            }
-            startPolling()
-            if let last = UserDefaults.standard.string(forKey: Self.lastOpenNoteKey) {
-                selectedNoteUrl = last
+                rootFolderUrls = saved
+                persistRoots()
+                folderUrl = url
+                status = ""
+                refreshNotes()
+                startPolling()
+                appendSyncEvent("Started: new folder created")
             }
         } catch {
             status = "Failed to start: \(error.localizedDescription)"
@@ -142,11 +153,29 @@ final class NotesModel {
 
     func createFolder() {
         guard let core else { return }
-        do {
-            _ = try core.createSubfolder(title: "New Folder")
-            refreshNotes()
-        } catch {
-            status = "Couldn't create folder: \(error.localizedDescription)"
+        Task.detached { [core, weak self] in
+            do {
+                _ = try core.createSubfolder(title: "New Folder")
+                await MainActor.run { [weak self] in self?.refreshNotes() }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't create folder: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func createSubfolder(in folderUrl: String) {
+        guard let core else { return }
+        Task.detached { [core, weak self, folderUrl] in
+            do {
+                _ = try core.createSubfolderIn(folderUrl: folderUrl, title: "New Folder")
+                await MainActor.run { [weak self] in self?.refreshNotes() }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't create folder: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -162,33 +191,65 @@ final class NotesModel {
         refreshNotes()
     }
 
-    private func buildTree() {
-        guard let core, let root = rootFolderUrl else {
-            folderTree = []
-            return
-        }
+    private nonisolated static func computeTree(
+        core: Core,
+        rootFolderUrls: [String],
+        cache: [String: (heads: [String], node: FolderNode)]
+    ) -> (tree: [FolderNode], newCache: [String: (heads: [String], node: FolderNode)]) {
         let rootUrls = Set(rootFolderUrls)
         var visited = Set<String>()
+        var newCache = cache
         func folderNode(url: String, name: String, parent: String?) -> FolderNode {
             guard visited.insert(url).inserted else {
                 return FolderNode(url: url, name: name, kind: "folder", parentUrl: parent, children: [])
             }
+            let currentHeads = core.docHeads(url: url)
+            if let cached = newCache[url], cached.heads == currentHeads {
+                var hit = cached.node
+                hit = FolderNode(url: hit.url, name: hit.name, kind: hit.kind, parentUrl: parent, children: hit.children)
+                return hit
+            }
             let entries = core.folderEntriesOf(url: url)
-            print("[buildTree] \(url.suffix(12)) → \(entries.count) entries: \(entries.map { "[\($0.kind)] \($0.name)" }.joined(separator: ", "))")
             var children: [FolderNode] = entries
                 .filter { $0.kind == "folder" && !rootUrls.contains($0.url) }
                 .map { folderNode(url: $0.url, name: $0.name, parent: url) }
             children += entries
                 .filter { $0.kind != "folder" }
-                .map {
-                    FolderNode(url: $0.url, name: $0.name, kind: $0.kind, parentUrl: url, children: nil)
-                }
-            return FolderNode(url: url, name: name, kind: "folder", parentUrl: parent, children: children)
+                .map { FolderNode(url: $0.url, name: $0.name, kind: $0.kind, parentUrl: url, children: nil) }
+            let node = FolderNode(url: url, name: name, kind: "folder", parentUrl: parent, children: children)
+            newCache[url] = (heads: currentHeads, node: node)
+            return node
         }
-        _ = root
-        folderTree = rootFolderUrls.map { url in
+        let tree = rootFolderUrls.map { url in
             let name = core.noteTitle(url: url)
             return folderNode(url: url, name: name.isEmpty ? "Notes" : name, parent: nil)
+        }
+        return (tree, newCache)
+    }
+
+    private nonisolated static func visibleNotes(in tree: [FolderNode]) -> [FolderNode] {
+        var out: [FolderNode] = []
+        func walk(_ nodes: [FolderNode]) {
+            for node in nodes {
+                if node.kind == "lush" || node.kind == "rich" { out.append(node) }
+                if let children = node.children { walk(children) }
+            }
+        }
+        walk(tree)
+        return out
+    }
+
+    private func buildTree() {
+        guard let core else { folderTree = []; return }
+        let rootUrls = rootFolderUrls
+        let cache = folderNodeCache
+        Task.detached { [core, rootUrls, cache, weak self] in
+            let (tree, newCache) = Self.computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
+            guard let self else { return }
+            await MainActor.run {
+                self.folderTree = tree
+                self.folderNodeCache = newCache
+            }
         }
     }
 
@@ -205,21 +266,7 @@ final class NotesModel {
         return find(folderTree)
     }
 
-    private var visibleNoteNodes: [FolderNode] {
-        var out: [FolderNode] = []
-        func walk(_ nodes: [FolderNode]) {
-            for node in nodes {
-                if node.kind == "lush" || node.kind == "rich" {
-                    out.append(node)
-                }
-                if let children = node.children {
-                    walk(children)
-                }
-            }
-        }
-        walk(folderTree)
-        return out
-    }
+    private var visibleNoteNodes: [FolderNode] { Self.visibleNotes(in: folderTree) }
 
     /// Sidebar selection: folders become the target for new items; notes open
     /// in the editor (and retarget creation to their parent folder).
@@ -294,22 +341,51 @@ final class NotesModel {
 
     func refreshNotes() {
         guard let core else { return }
-        notes = core.listNotes()
-        folderTitle = core.folderTitle()
-        core.prefetchNotes(urls: notes.map(\.url))
-        buildTree()
-        let visibleNotes = visibleNoteNodes
-        for note in visibleNotes {
-            previews[note.url] = core.notePreview(url: note.url)
+        let rootUrls = rootFolderUrls
+        let cache = folderNodeCache
+        Task.detached { [core, rootUrls, cache, weak self] in
+            let notes = core.listNotes()
+            let folderTitle = core.folderTitle()
+            let (tree, newCache) = Self.computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
+            let visible = Self.visibleNotes(in: tree)
+            core.prefetchNotes(urls: notes.map(\.url))
+            let (newPreviews, newThumbnails) = await withTaskGroup(
+                of: (String, String, Data?).self,
+                returning: ([String: String], [String: Data]).self
+            ) { group in
+                for note in visible {
+                    group.addTask { [core] in
+                        let preview = core.notePreview(url: note.url)
+                        let thumbnail = core.noteThumbnailBytes(url: note.url).map { Data($0) }
+                        return (note.url, preview, thumbnail)
+                    }
+                }
+                var previews: [String: String] = [:]
+                var thumbnails: [String: Data] = [:]
+                for await (url, preview, thumbnail) in group {
+                    previews[url] = preview
+                    if let thumb = thumbnail { thumbnails[url] = thumb }
+                }
+                return (previews, thumbnails)
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.notes = notes
+                self.folderTitle = folderTitle
+                self.folderTree = tree
+                self.folderNodeCache = newCache
+                self.previews.merge(newPreviews) { _, new in new }
+                self.thumbnails.merge(newThumbnails) { _, new in new }
+                if let selected = self.selectedNoteUrl, self.node(for: selected) == nil {
+                    self.selectedNoteUrl = nil
+                }
+                let liveUrls = Set(visible.map(\.url))
+                self.contextMetas = self.contextMetas.filter { liveUrls.contains($0.key) }
+                self.scheduleSemanticIndex(for: visible.filter { $0.kind == "rich" }.map {
+                    NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
+                })
+            }
         }
-        if let selected = selectedNoteUrl, node(for: selected) == nil {
-            selectedNoteUrl = nil
-        }
-        let liveUrls = Set(visibleNotes.map(\.url))
-        contextMetas = contextMetas.filter { liveUrls.contains($0.key) }
-        scheduleSemanticIndex(for: visibleNotes.filter { $0.kind == "rich" }.map {
-            NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
-        })
     }
 
     func forceSync() {
@@ -332,25 +408,32 @@ final class NotesModel {
 
     private func startPolling() {
         pollTask?.cancel()
-        pollTask = Task { @MainActor [weak self] in
+        pollTask = Task.detached { [weak self] in
             var interval: Duration = .seconds(5)
             var elapsed = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: interval)
-                guard let self, !Task.isCancelled else { break }
-                guard let core = self.core else { break }
-                var anyChanged = false
-                for url in self.rootFolderUrls {
-                    let count = core.folderEntriesOf(url: url).count
-                    let last = self.lastKnownCounts[url] ?? -1
-                    if count != last {
-                        self.appendSyncEvent("[poll] \(url.suffix(12)): \(last) → \(count) entries")
-                        self.lastKnownCounts[url] = count
-                        anyChanged = true
-                    }
+                guard !Task.isCancelled else { break }
+                guard let (core, rootUrls, knownCounts) = await MainActor.run(body: { [weak self] () -> (Core, [String], [String: Int])? in
+                    guard let self, let core = self.core else { return nil }
+                    return (core, self.rootFolderUrls, self.lastKnownCounts)
+                }) else { break }
+                var newCounts: [String: Int] = [:]
+                for url in rootUrls {
+                    newCounts[url] = core.folderEntriesOf(url: url).count
                 }
-                if anyChanged {
-                    self.refreshNotes()
+                await MainActor.run { [weak self, newCounts] in
+                    guard let self else { return }
+                    var anyChanged = false
+                    for (url, count) in newCounts {
+                        let last = knownCounts[url] ?? -1
+                        if count != last {
+                            self.appendSyncEvent("[poll] \(url.suffix(12)): \(last) → \(count) entries")
+                            self.lastKnownCounts[url] = count
+                            anyChanged = true
+                        }
+                    }
+                    if anyChanged { self.refreshNotes() }
                 }
                 elapsed += Int(interval.components.seconds)
                 if elapsed >= 60 { interval = .seconds(30) }
@@ -403,26 +486,37 @@ final class NotesModel {
         contextMetas[url] = meta
     }
 
+    private var pendingRefreshUrls: Set<String> = []
+
     func docChanged(url: String) {
-        let isRoot = rootFolderUrls.contains(url)
-        let inTree = isFolderInTree(url)
-        if isRoot {
-            appendSyncEvent("docChanged: root \(url.suffix(12)) — rebuilding tree")
-        }
-        if url == folderUrl || isRoot {
-            refreshNotes()
-        } else if inTree {
-            buildTree()
-            if node(for: url)?.isNote == true, let core {
-                previews[url] = core.notePreview(url: url)
-            }
-        } else if notes.contains(where: { $0.url == url }), let core {
-            previews[url] = core.notePreview(url: url)
-        }
+        folderNodeCache.removeValue(forKey: url)
+        thumbnails.removeValue(forKey: url)
+        notifyNoteObservers(url)
         if node(for: url)?.isNote == true || notes.contains(where: { $0.url == url && $0.kind == "rich" }) {
             scheduleSemanticIndex(url: url)
         }
-        notifyNoteObservers(url)
+        pendingRefreshUrls.insert(url)
+        pendingRefreshTask?.cancel()
+        pendingRefreshTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled, let self else { return }
+            let urls = self.pendingRefreshUrls
+            self.pendingRefreshUrls = []
+            let needsFullRefresh = urls.contains(where: {
+                $0 == self.folderUrl || self.rootFolderUrls.contains($0)
+            })
+            if needsFullRefresh {
+                self.refreshNotes()
+            } else {
+                let treeChanged = urls.contains(where: { self.isFolderInTree($0) })
+                if treeChanged { self.buildTree() }
+                for u in urls {
+                    if self.notes.contains(where: { $0.url == u }), let core = self.core {
+                        self.previews[u] = core.notePreview(url: u)
+                    }
+                }
+            }
+        }
     }
 
     private func isFolderInTree(_ url: String) -> Bool {
@@ -438,14 +532,42 @@ final class NotesModel {
 
     func createNote(snap: ContextSnapshot? = nil) {
         guard let core else { return }
-        do {
-            let url = try core.createNote(title: "")
-            let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
-            try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial))
-            refreshNotes()
-            selectedNoteUrl = url
-        } catch {
-            status = "Couldn't create note: \(error.localizedDescription)"
+        Task.detached { [core, weak self, snap] in
+            do {
+                let url = try core.createNoteDoc(title: "")
+                let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
+                try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial))
+                try? core.linkNoteToFolder(noteUrl: url, title: "")
+                await MainActor.run { [weak self] in
+                    self?.pendingFocusUrl = url
+                    self?.selectedNoteUrl = url
+                    self?.refreshNotes()
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't create note: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func createNote(inFolder folderUrl: String) {
+        guard let core else { return }
+        Task.detached { [core, weak self, folderUrl] in
+            do {
+                let url = try core.createNoteIn(folderUrl: folderUrl, title: "")
+                let initial: [SpanNode] = [.block(.creationBlock(snap: nil)), .block(.heading(level: 1))]
+                try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial))
+                await MainActor.run { [weak self] in
+                    self?.pendingFocusUrl = url
+                    self?.selectedNoteUrl = url
+                    self?.refreshNotes()
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't create note: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -521,15 +643,12 @@ final class NotesModel {
 
     func updateSpans(_ url: String, json: String) async {
         guard let core else { return }
-        await Task.detached {
-            do {
-                try core.updateNoteSpans(url: url, spansJson: json)
-            } catch {
-                // keep typing; the next debounce will retry
-            }
+        let (preview, title) = await Task.detached {
+            do { try core.updateNoteSpans(url: url, spansJson: json) } catch {}
+            return (core.notePreview(url: url), core.noteTitle(url: url))
         }.value
-        previews[url] = core.notePreview(url: url)
-        semanticSearch.index(url: url, name: core.noteTitle(url: url), spansJson: json)
+        previews[url] = preview
+        semanticSearch.index(url: url, name: title, spansJson: json)
     }
 
     func updateDocument(
@@ -632,9 +751,9 @@ final class NotesModel {
         return await task.value
     }
 
-    func search(_ query: String) -> [SearchHit] {
+    func search(_ query: String) async -> [SearchHit] {
         guard let core, !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
-        let exact = core.searchNotes(query: query)
+        let exact = await Task.detached { core.searchNotes(query: query) }.value
         let seen = Set(exact.map(\.url))
         return exact + semanticSearch.search(query, excluding: seen)
     }
@@ -730,10 +849,9 @@ final class NotesModel {
     func importAppleNotes() async {
         guard let core, let target = folderUrl else { return }
         importStatus = "Reading Apple Notes… (this can take a while)"
-        await Task.yield()
         let notes: [AppleNotesImporter.ImportedNote]
         do {
-            notes = try AppleNotesImporter.fetchNotes()
+            notes = try await Task.detached { try AppleNotesImporter.fetchNotes() }.value
         } catch {
             importStatus = "Couldn't read Apple Notes: \(error.localizedDescription)"
             return
@@ -752,50 +870,53 @@ final class NotesModel {
             importStatus = "Import failed: \(error.localizedDescription)"
             return
         }
-        var subfolders: [String: String] = [:]
-        for entry in core.folderEntriesOf(url: importFolder) where entry.kind == "folder" {
-            subfolders[entry.name] = entry.url
-        }
-        var existing: [String: Set<String>] = [:]
-        var done = 0
-        var skipped = 0
-        var failed = 0
-        for note in notes {
-            let folderName = note.folder.isEmpty ? "Notes" : note.folder
-            do {
-                let sub: String
-                if let known = subfolders[folderName] {
-                    sub = known
-                } else {
-                    sub = try core.createSubfolderIn(folderUrl: importFolder, title: folderName)
-                    subfolders[folderName] = sub
-                }
-                if existing[sub] == nil {
-                    existing[sub] = Set(core.folderEntriesOf(url: sub).map(\.name))
-                }
-                if existing[sub]?.contains(note.name) == true {
-                    skipped += 1
-                    continue
-                }
-                let url = try core.createNoteIn(folderUrl: sub, title: note.name)
-                let spans = AppleNotesImporter.spans(fromHTML: note.html)
-                if !spans.isEmpty {
-                    try core.updateNoteSpansAt(
-                        url: url,
-                        spansJson: SpanNode.encodeList(spans),
-                        timestamp: Int64(note.modified.timeIntervalSince1970)
-                    )
-                }
-                existing[sub]?.insert(note.name)
-                done += 1
-            } catch {
-                failed += 1
+        let (done, skipped, failed) = await Task.detached { [weak self] in
+            var subfolders: [String: String] = [:]
+            for entry in core.folderEntriesOf(url: importFolder) where entry.kind == "folder" {
+                subfolders[entry.name] = entry.url
             }
-            if (done + skipped + failed) % 5 == 0 {
-                importStatus = "Imported \(done), skipped \(skipped)…"
-                await Task.yield()
+            var existing: [String: Set<String>] = [:]
+            var done = 0, skipped = 0, failed = 0
+            for note in notes {
+                let folderName = note.folder.isEmpty ? "Notes" : note.folder
+                do {
+                    let sub: String
+                    if let known = subfolders[folderName] {
+                        sub = known
+                    } else {
+                        sub = try core.createSubfolderIn(folderUrl: importFolder, title: folderName)
+                        subfolders[folderName] = sub
+                    }
+                    if existing[sub] == nil {
+                        existing[sub] = Set(core.folderEntriesOf(url: sub).map(\.name))
+                    }
+                    if existing[sub]?.contains(note.name) == true {
+                        skipped += 1
+                        continue
+                    }
+                    let url = try core.createNoteIn(folderUrl: sub, title: note.name)
+                    let spans = await MainActor.run { AppleNotesImporter.spans(fromHTML: note.html) }
+                    if !spans.isEmpty {
+                        try core.updateNoteSpansAt(
+                            url: url,
+                            spansJson: SpanNode.encodeList(spans),
+                            timestamp: Int64(note.modified.timeIntervalSince1970)
+                        )
+                    }
+                    existing[sub]?.insert(note.name)
+                    done += 1
+                } catch {
+                    failed += 1
+                }
+                if (done + skipped + failed) % 5 == 0 {
+                    let d = done, s = skipped
+                    await MainActor.run { [weak self] in
+                        self?.importStatus = "Imported \(d), skipped \(s)…"
+                    }
+                }
             }
-        }
+            return (done, skipped, failed)
+        }.value
         var summary = "Imported \(done) notes"
         if skipped > 0 { summary += ", skipped \(skipped) already imported" }
         if failed > 0 { summary += ", \(failed) failed" }
@@ -891,15 +1012,16 @@ final class NotesModel {
             return
         }
         let parent = node?.parentUrl ?? folderUrl
-        await Task.detached {
+        let (preview, spansJson) = await Task.detached {
             if let parent {
                 try? core.renameEntry(folderUrl: parent, url: url, title: name)
             } else {
                 try? core.renameNote(url: url, title: name)
             }
+            return (core.notePreview(url: url), (try? core.noteSpansJson(url: url)) ?? "[]")
         }.value
-        previews[url] = core.notePreview(url: url)
-        semanticSearch.index(url: url, name: name, spansJson: (try? core.noteSpansJson(url: url)) ?? "[]")
+        previews[url] = preview
+        semanticSearch.index(url: url, name: name, spansJson: spansJson)
         refreshNotes()
     }
 

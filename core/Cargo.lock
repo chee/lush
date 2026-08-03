@@ -196,7 +196,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "automerge"
 version = "0.10.0"
-source = "git+https://github.com/automerge/automerge?rev=f335096d911bffc90962fbe61de71e98cc959a8b#f335096d911bffc90962fbe61de71e98cc959a8b"
+source = "git+https://github.com/automerge/automerge?branch=main#5994c3967077976ad79656a6bb933f0a6c24be96"
 dependencies = [
  "cfg-if",
  "flate2",
@@ -911,8 +911,8 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hexane"
-version = "1.0.0-alpha.3"
-source = "git+https://github.com/automerge/automerge?rev=f335096d911bffc90962fbe61de71e98cc959a8b#f335096d911bffc90962fbe61de71e98cc959a8b"
+version = "1.0.0-alpha.4"
+source = "git+https://github.com/automerge/automerge?branch=main#5994c3967077976ad79656a6bb933f0a6c24be96"
 dependencies = [
  "leb128",
  "thiserror",
@@ -1041,11 +1041,11 @@ dependencies = [
  "rand 0.9.5",
  "rusqlite",
  "sedimentree_core",
- "sedimentree_fs_storage",
  "serde",
  "serde_json",
  "subduction_core",
  "subduction_crypto",
+ "subduction_redb_storage",
  "subduction_websocket",
  "thiserror",
  "tokio",
@@ -1401,6 +1401,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
+name = "redb"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1543,22 +1552,6 @@ dependencies = [
  "serde",
  "siphasher 1.0.3",
  "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "sedimentree_fs_storage"
-version = "0.11.0"
-source = "git+https://github.com/inkandswitch/subduction?rev=9c0fbfd06bd499d4a8b53548788119d33af0d1ec#9c0fbfd06bd499d4a8b53548788119d33af0d1ec"
-dependencies = [
- "async-lock",
- "future_form",
- "hex",
- "sedimentree_core",
- "subduction_core",
- "subduction_crypto",
- "thiserror",
- "tokio",
  "tracing",
 ]
 
@@ -1793,6 +1786,22 @@ dependencies = [
  "sedimentree_core",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "subduction_redb_storage"
+version = "0.1.0"
+source = "git+https://github.com/inkandswitch/subduction?rev=9c0fbfd06bd499d4a8b53548788119d33af0d1ec#9c0fbfd06bd499d4a8b53548788119d33af0d1ec"
+dependencies = [
+ "future_form",
+ "futures",
+ "redb",
+ "sedimentree_core",
+ "subduction_core",
+ "subduction_crypto",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2304,9 +2313,9 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.6"
+version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"

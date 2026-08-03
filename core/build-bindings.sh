@@ -15,7 +15,6 @@ lipo -create \
   -output lib/macosx/liblush_core.a
 cp target/aarch64-apple-ios/release/liblush_core.a lib/iphoneos/
 cp target/aarch64-apple-ios-sim/release/liblush_core.a lib/iphonesimulator/
-~/.cargo/bin/cargo build --release --target aarch64-apple-darwin
 ~/.cargo/bin/cargo run --release --target aarch64-apple-darwin --bin uniffi-bindgen -- generate \
   --library target/aarch64-apple-darwin/release/liblush_core.dylib \
   --language swift --out-dir bindings

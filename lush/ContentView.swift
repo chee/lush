@@ -26,12 +26,15 @@ struct ContentView: View {
     @State private var selectedItemUrls: Set<String> = []
     @State private var searchText = ""
     @State private var searchHits: [SearchHit] = []
+    @State private var searchTask: Task<Void, Never>?
     @State private var renamingUrl: String?
     @State private var renameText = ""
     @FocusState private var renameFocus: String?
+    @FocusState private var sidebarFocused: Bool
     @State private var expanded: Set<String> = []
     @State private var moveTarget: MoveTarget?
     @State private var pinnedExpanded = true
+    @State private var showingNewPatchwork = false
 
     private static let expandedKey = "expandedFolders"
     private static let seededRootsKey = "seededRoots"
@@ -48,6 +51,7 @@ struct ContentView: View {
             detail
         }
         .onChange(of: selectedItemUrls) {
+            sidebarFocused = true
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
             let url = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
             if let node = model.node(for: url), node.kind == "folder" {
@@ -74,6 +78,13 @@ struct ContentView: View {
             IncomingContentSheet(content: content)
                 .environment(model)
         }
+        .sheet(isPresented: $showingNewPatchwork) {
+            NewPatchworkDocSheet { url, _ in
+                model.selectedNoteUrl = url
+                selectedItemUrls = [url]
+            }
+            .environment(model)
+        }
         #else
         NavigationStack(path: $path) {
             FolderScreen(folderUrl: nil) { path.append($0) }
@@ -90,7 +101,7 @@ struct ContentView: View {
                         ScriptEditorView(url: url)
                             .environment(model)
                     case .recents:
-                        RecentsScreen()
+                        RecentsScreen(push: { path.append($0) })
                     }
                 }
         }
@@ -128,6 +139,7 @@ struct ContentView: View {
             }
         case .quickNote:
             if let url = model.quickNoteUrl {
+                model.pendingFocusUrl = url
                 open(url)
             } else {
                 model.createNote(snap: contextTracker.snapshot)
@@ -136,11 +148,13 @@ struct ContentView: View {
                 }
             }
         case .note(let url):
+            model.pendingFocusUrl = url
             open(url)
         case .search(let query):
             #if os(macOS)
             searchText = query
-            searchHits = model.search(query)
+            searchTask?.cancel()
+            searchTask = Task { searchHits = await model.search(query) }
             #endif
         }
     }
@@ -176,7 +190,7 @@ struct ContentView: View {
                                 .listRowInsets(sidebarRowInsets(depth: 1))
                                 .listRowBackground(selectionBackground("pinned:\(node.url)", greyWhen: node.url))
                                 .contextMenu {
-                                    Button("Unpin") { model.togglePin(node.url) }
+                                    singleNoteContextMenu(for: node, showInFolder: true)
                                 }
                         }
                     }
@@ -200,27 +214,7 @@ struct ContentView: View {
                     .listRowInsets(sidebarRowInsets(depth: 0))
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
-                            Button(model.isPinned(node.url) ? "Unpin" : "Pin") {
-                                model.togglePin(node.url)
-                            }
-                            Button(
-                                model.quickNoteUrl == node.url
-                                    ? "Unset Quick Note" : "Set as Quick Note"
-                            ) {
-                                model.setQuickNote(
-                                    model.quickNoteUrl == node.url ? nil : node.url
-                                )
-                            }
-                            if node.parentUrl != nil {
-                                Button("Move…") { moveTarget = MoveTarget(urls: [node.url]) }
-                            }
-                            Button("Rename") { beginRename(node) }
-                            Button("Copy Note URL") { Clipboard.copy(node.url) }
-                            if node.parentUrl != nil {
-                                Button("Delete", role: .destructive) {
-                                    model.removeEntry(parentUrl: node.parentUrl, url: node.url)
-                                }
-                            }
+                            singleNoteContextMenu(for: node, showInFolder: true)
                         }
                     }
                 }
@@ -245,6 +239,24 @@ struct ContentView: View {
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search notes")
         .toolbar {
             ToolbarItem {
+                ControlGroup {
+                    Button {
+                        model.createNote(snap: contextTracker.snapshot)
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    Menu {
+                        Button("Note") { model.createNote(snap: contextTracker.snapshot) }
+                        if PatchworkWeb.available {
+                            Button("Patchwork Doc…") { showingNewPatchwork = true }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down.compact")
+                    }
+                }
+                .disabled(model.folderUrl == nil)
+            }
+            ToolbarItem {
                 Button {
                     model.createFolder()
                 } label: {
@@ -254,16 +266,19 @@ struct ContentView: View {
             }
         }
         .onChange(of: searchText) {
-            searchHits = model.search(searchText)
+            searchTask?.cancel()
+            searchTask = Task { searchHits = await model.search(searchText) }
         }
         .onChange(of: model.notes) {
             if !searchText.isEmpty {
-                searchHits = model.search(searchText)
+                searchTask?.cancel()
+                searchTask = Task { searchHits = await model.search(searchText) }
             }
         }
         .onChange(of: model.folderTree) {
             if !searchText.isEmpty {
-                searchHits = model.search(searchText)
+                searchTask?.cancel()
+                searchTask = Task { searchHits = await model.search(searchText) }
             }
         }
         .onKeyPress(.return) {
@@ -296,13 +311,14 @@ struct ContentView: View {
             }
             return .handled
         }
+        .focused($sidebarFocused)
         .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 6) {
                 Circle()
                     .fill(model.connected ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
-                Text(model.connected ? "Synced" : "Offline")
+                Text(model.connected ? "Connected to Sync Server" : "Offline")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -473,6 +489,10 @@ struct ContentView: View {
 
     @ViewBuilder
     private func folderContextMenu(for node: FolderNode) -> some View {
+        Menu("New") {
+            Button("Note") { model.createNote(inFolder: node.url) }
+            Button("Folder") { model.createSubfolder(in: node.url) }
+        }
         if !model.rootFolderUrls.contains(node.url) {
             Button("Pin Folder to Sidebar") {
                 Task { await model.addRootFolder(node.url) }
@@ -572,10 +592,20 @@ struct ContentView: View {
         .navigationTitle("")
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                Button {
-                    model.createNote(snap: contextTracker.snapshot)
-                } label: {
-                    Label("New Note", systemImage: "square.and.pencil")
+                ControlGroup {
+                    Button {
+                        model.createNote(snap: contextTracker.snapshot)
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    Menu {
+                        Button("Note") { model.createNote(snap: contextTracker.snapshot) }
+                        if PatchworkWeb.available {
+                            Button("Patchwork Doc…") { showingNewPatchwork = true }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down.compact")
+                    }
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -588,7 +618,7 @@ struct ContentView: View {
             ScriptEditorView(url: url)
                 .environment(model)
                 .id(url)
-        } else if model.node(for: url)?.isNote != false {
+        } else if model.node(for: url)?.isNote != false && !url.hasPrefix("automerge:") {
             NoteDetail(noteUrl: url)
                 .id(url)
         } else {
@@ -609,6 +639,47 @@ struct ContentView: View {
         renameFocus = nil
         guard !name.isEmpty, name != node.name else { return }
         model.renameEntry(parentUrl: node.parentUrl, url: node.url, to: name)
+    }
+
+    private func showNoteInFolder(_ node: FolderNode) {
+        searchText = ""
+        var url: String? = node.parentUrl
+        while let u = url {
+            expanded.insert(u)
+            url = model.node(for: u)?.parentUrl
+        }
+        UserDefaults.standard.set(Array(expanded), forKey: Self.expandedKey)
+        selectedItemUrls = [node.url]
+        Task { await model.selectItem(node.url) }
+    }
+
+    @ViewBuilder
+    private func singleNoteContextMenu(for node: FolderNode, showInFolder: Bool = false) -> some View {
+        if node.kind == "lush" || node.kind == "rich" {
+            Button("Open in New Window") {
+                openWindow(id: "note-detail", value: node.url)
+            }
+            Divider()
+            Button(model.isPinned(node.url) ? "Unpin" : "Pin") {
+                model.togglePin(node.url)
+            }
+            Button(model.quickNoteUrl == node.url ? "Unset Quick Note" : "Set as Quick Note") {
+                model.setQuickNote(model.quickNoteUrl == node.url ? nil : node.url)
+            }
+            if showInFolder {
+                Button("Show in Folder") { showNoteInFolder(node) }
+            }
+        }
+        if node.parentUrl != nil {
+            Button("Move…") { moveTarget = MoveTarget(urls: [node.url]) }
+        }
+        Button("Rename") { beginRename(node) }
+        Button("Copy Note URL") { Clipboard.copy(node.url) }
+        if node.parentUrl != nil {
+            Button("Delete", role: .destructive) {
+                model.removeEntry(parentUrl: node.parentUrl, url: node.url)
+            }
+        }
     }
 
     #endif
@@ -661,38 +732,48 @@ struct NoteRowView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 4) {
-                Text(node.displayName)
-                    .font(.body)
-                    .lineLimit(1)
-                if !node.isNote && node.kind != "lush:script" {
-                    Text(node.kind)
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text(node.displayName)
+                        .font(.body)
+                        .lineLimit(1)
+                    if !node.isNote && node.kind != "lush:script" {
+                        Text(node.kind)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
+                    }
+                    Spacer(minLength: 0)
+                }
+                if !secondLine.isEmpty {
+                    Text(secondLine)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if let preview = model.previews[node.url], !preview.isEmpty {
+                    Text(preview)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
+                if showFolder, let parent = node.parentUrl,
+                   let parentNode = model.node(for: parent) {
+                    Label(parentNode.displayName, systemImage: "folder")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
                 }
-                Spacer(minLength: 0)
             }
-            if !secondLine.isEmpty {
-                Text(secondLine)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            if let preview = model.previews[node.url], !preview.isEmpty {
-                Text(preview)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(2)
-            }
-            if showFolder, let parent = node.parentUrl,
-               let parentNode = model.node(for: parent) {
-                Label(parentNode.displayName, systemImage: "folder")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            if let data = model.thumbnails[node.url],
+               let thumbnail = thumbnailImage(from: data) {
+                thumbnail
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 44, height: 44)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
             }
         }
         .padding(.vertical, 2)
@@ -701,6 +782,16 @@ struct NoteRowView: View {
         #endif
         .task { await model.loadContextMeta(url: node.url) }
     }
+}
+
+private func thumbnailImage(from data: Data) -> Image? {
+    #if os(macOS)
+    guard let ns = NSImage(data: data) else { return nil }
+    return Image(nsImage: ns)
+    #else
+    guard let ui = UIImage(data: data) else { return nil }
+    return Image(uiImage: ui)
+    #endif
 }
 
 func highlighted(_ snippet: String, query: String) -> AttributedString {
@@ -723,6 +814,7 @@ struct FolderScreen: View {
     @State private var searchText = ""
     @State private var searchHits: [SearchHit] = []
     @State private var showingSettings = false
+    @State private var showingNewPatchwork = false
     @State private var renameTarget: FolderNode?
     @State private var renameText = ""
     @State private var moveTarget: MoveTarget?
@@ -753,7 +845,12 @@ struct FolderScreen: View {
                         NavigationLink(value: NavRoute.note(node.url)) {
                             NoteRowView(node: node, showFolder: true)
                         }
-                        .contextMenu { nodeMenu(node) }
+                        .contextMenu {
+                            nodeMenu(node)
+                            if let parentUrl = node.parentUrl {
+                                Button("Show in Folder") { push(.folder(parentUrl)) }
+                            }
+                        }
                     }
                 } header: {
                     Text("Pinned")
@@ -798,6 +895,9 @@ struct FolderScreen: View {
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
                             nodeMenu(node)
+                            if let parentUrl = node.parentUrl {
+                                Button("Show in Folder") { push(.folder(parentUrl)) }
+                            }
                         }
                     }
                 }
@@ -834,24 +934,40 @@ struct FolderScreen: View {
                 }
                 .disabled(model.folderUrl == nil)
             }
-            DefaultToolbarItem(kind: .search, placement: .bottomBar)
-            ToolbarSpacer(.flexible, placement: .bottomBar)
-            ToolbarItem(placement: .bottomBar) {
+        }
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Spacer()
                 Menu {
                     Button {
                         model.createNote(snap: contextTracker.snapshot)
                         if let url = model.selectedNoteUrl { push(.note(url)) }
                     } label: {
-                        Label("New Note", systemImage: "square.and.pencil")
+                        Label("Note", systemImage: "square.and.pencil")
+                    }
+                    if PatchworkWeb.available {
+                        Button {
+                            showingNewPatchwork = true
+                        } label: {
+                            Label("Patchwork Doc…", systemImage: "shippingbox")
+                        }
                     }
                 } label: {
-                    Label("New Note", systemImage: "square.and.pencil")
-                } primaryAction: {
-                    model.createNote(snap: contextTracker.snapshot)
-                    if let url = model.selectedNoteUrl { push(.note(url)) }
+                    Image(systemName: "square.and.pencil")
+                        .font(.title2)
+                        .padding(16)
+                        .background(.regularMaterial, in: Circle())
                 }
                 .disabled(model.folderUrl == nil)
+                .padding(.trailing)
             }
+            .padding(.bottom, 8)
+        }
+        .sheet(isPresented: $showingNewPatchwork) {
+            NewPatchworkDocSheet { url, _ in
+                push(.patchwork(url))
+            }
+            .environment(model)
         }
         .sheet(isPresented: $showingSettings) {
             NavigationStack {
@@ -899,6 +1015,12 @@ struct FolderScreen: View {
                 model.setQuickNote(model.quickNoteUrl == node.url ? nil : node.url)
             }
         }
+        if node.kind == "folder" {
+            Menu("New") {
+                Button("Note") { model.createNote(inFolder: node.url) }
+                Button("Folder") { model.createSubfolder(in: node.url) }
+            }
+        }
         if node.kind == "folder", !model.rootFolderUrls.contains(node.url) {
             Button("Pin Folder to Sidebar") {
                 Task { await model.addRootFolder(node.url) }
@@ -937,8 +1059,11 @@ struct FolderScreen: View {
 }
 
 struct RecentsScreen: View {
+    let push: (NavRoute) -> Void
     @Environment(NotesModel.self) private var model
     @State private var moveTarget: MoveTarget?
+    @State private var renameTarget: FolderNode?
+    @State private var renameText = ""
 
     var body: some View {
         List(model.recentNotes(), id: \.node.url) { entry in
@@ -963,14 +1088,45 @@ struct RecentsScreen: View {
                         model.quickNoteUrl == entry.node.url ? nil : entry.node.url
                     )
                 }
+                if let parentUrl = entry.node.parentUrl {
+                    Button("Show in Folder") { push(.folder(parentUrl)) }
+                }
                 Button("Move…") { moveTarget = MoveTarget(urls: [entry.node.url]) }
+                Button("Rename") {
+                    renameText = entry.node.name
+                    renameTarget = entry.node
+                }
                 Button("Copy Note URL") { Clipboard.copy(entry.node.url) }
+                if entry.node.parentUrl != nil {
+                    Button("Delete", role: .destructive) {
+                        model.removeEntry(parentUrl: entry.node.parentUrl, url: entry.node.url)
+                    }
+                }
             }
         }
         .navigationTitle("Recents")
         .sheet(item: $moveTarget) { target in
             MoveSheet(urls: target.urls)
                 .environment(model)
+        }
+        .alert(
+            "Rename",
+            isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            )
+        ) {
+            TextField("Name", text: $renameText)
+            Button("Save") {
+                if let node = renameTarget {
+                    let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !name.isEmpty, name != node.name {
+                        model.renameEntry(parentUrl: node.parentUrl, url: node.url, to: name)
+                    }
+                }
+                renameTarget = nil
+            }
+            Button("Cancel", role: .cancel) { renameTarget = nil }
         }
     }
 }
@@ -1091,9 +1247,9 @@ struct NoteDetail: View {
                     }
                     Divider()
                     Button {
-                        editor.insertDateline()
+                        editor.insertLogline()
                     } label: {
-                        Label("Dateline", systemImage: "clock")
+                        Label("Logline", systemImage: "clock")
                     }
                     Button {
                         editor.insertTable()
@@ -1435,7 +1591,7 @@ struct PatchworkDetail: View {
     var body: some View {
         Group {
             if PatchworkWeb.available {
-                PatchworkWebView(docUrl: docUrl, toolId: nil)
+                PatchworkDetailWebViewWrapper(docUrl: docUrl)
             } else {
                 ContentUnavailableView(
                     "Patchwork Unavailable",

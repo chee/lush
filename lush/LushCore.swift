@@ -555,6 +555,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func createNote(title: String) throws  -> String
     
     /**
+     * Create a note doc immediately without waiting for the folder to be in
+     * memory. The caller is responsible for linking it to a folder separately.
+     */
+    func createNoteDoc(title: String) throws  -> String
+    
+    /**
      * Create a note inside a specific folder doc.
      */
     func createNoteIn(folderUrl: String, title: String) throws  -> String
@@ -576,6 +582,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func docChangeCount(url: String)  -> UInt32
     
     /**
+     * Current automerge heads for any doc we hold locally. Returns an empty
+     * vec if the doc isn't tracked or has no changes.
+     */
+    func docHeads(url: String)  -> [String]
+    
+    /**
      * Open an existing folder doc (waiting for it to arrive if needed) or
      * create a fresh one. Returns the folder's automerge URL.
      */
@@ -591,6 +603,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func folderUrl()  -> String?
     
     func isConnected()  -> Bool
+    
+    /**
+     * Link a note into the current folder. The folder doc is loaded from
+     * local storage on demand if not already in memory.
+     */
+    func linkNoteToFolder(noteUrl: String, title: String) throws 
     
     func listNotes()  -> [NoteInfo]
     
@@ -609,6 +627,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func noteSpansJson(url: String) throws  -> String
     
     func noteSpansSnapshot(url: String) throws  -> NoteSpansSnapshot
+    
+    /**
+     * Bytes of the first embedded image in a note, if the asset is already
+     * held locally. Returns None without any network I/O.
+     */
+    func noteThumbnailBytes(url: String)  -> Data?
     
     func noteTitle(url: String)  -> String
     
@@ -647,7 +671,20 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func setDelegate(delegate: CoreDelegate) 
     
+    /**
+     * Flush all pending saves and do a best-effort final sync before the app
+     * exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
+     */
+    func shutdown() 
+    
     func spliceNoteText(url: String, index: UInt64, deleteCount: Int64, insert: String, title: String, heads: [String]) throws  -> [String]
+    
+    /**
+     * Set the active folder immediately from a known URL, then load the doc
+     * from local storage in the background. Returns before any I/O completes,
+     * so the UI can be ready immediately.
+     */
+    func startFolderUrl(url: String) throws 
     
     /**
      * Write Vision OCR + description onto a UnixFileEntry doc.
@@ -785,6 +822,18 @@ open func createNote(title: String)throws  -> String  {
 }
     
     /**
+     * Create a note doc immediately without waiting for the folder to be in
+     * memory. The caller is responsible for linking it to a folder separately.
+     */
+open func createNoteDoc(title: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_create_note_doc(self.uniffiClonePointer(),
+        FfiConverterString.lower(title),$0
+    )
+})
+}
+    
+    /**
      * Create a note inside a specific folder doc.
      */
 open func createNoteIn(folderUrl: String, title: String)throws  -> String  {
@@ -844,6 +893,18 @@ open func docChangeCount(url: String) -> UInt32  {
 }
     
     /**
+     * Current automerge heads for any doc we hold locally. Returns an empty
+     * vec if the doc isn't tracked or has no changes.
+     */
+open func docHeads(url: String) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_doc_heads(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+    /**
      * Open an existing folder doc (waiting for it to arrive if needed) or
      * create a fresh one. Returns the folder's automerge URL.
      */
@@ -885,6 +946,18 @@ open func isConnected() -> Bool  {
     uniffi_lush_core_fn_method_core_is_connected(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Link a note into the current folder. The folder doc is loaded from
+     * local storage on demand if not already in memory.
+     */
+open func linkNoteToFolder(noteUrl: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_link_note_to_folder(self.uniffiClonePointer(),
+        FfiConverterString.lower(noteUrl),
+        FfiConverterString.lower(title),$0
+    )
+}
 }
     
 open func listNotes() -> [NoteInfo]  {
@@ -936,6 +1009,18 @@ open func noteSpansJson(url: String)throws  -> String  {
 open func noteSpansSnapshot(url: String)throws  -> NoteSpansSnapshot  {
     return try  FfiConverterTypeNoteSpansSnapshot_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_note_spans_snapshot(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+    /**
+     * Bytes of the first embedded image in a note, if the asset is already
+     * held locally. Returns None without any network I/O.
+     */
+open func noteThumbnailBytes(url: String) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_note_thumbnail_bytes(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -1029,6 +1114,16 @@ open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
 }
 }
     
+    /**
+     * Flush all pending saves and do a best-effort final sync before the app
+     * exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
+     */
+open func shutdown()  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_shutdown(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
 open func spliceNoteText(url: String, index: UInt64, deleteCount: Int64, insert: String, title: String, heads: [String])throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_splice_note_text(self.uniffiClonePointer(),
@@ -1040,6 +1135,18 @@ open func spliceNoteText(url: String, index: UInt64, deleteCount: Int64, insert:
         FfiConverterSequenceString.lower(heads),$0
     )
 })
+}
+    
+    /**
+     * Set the active folder immediately from a known URL, then load the doc
+     * from local storage in the background. Returns before any I/O completes,
+     * so the UI can be ready immediately.
+     */
+open func startFolderUrl(url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_start_folder_url(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+}
 }
     
     /**
@@ -1775,6 +1882,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeAssetInfo: FfiConverterRustBuffer {
     typealias SwiftType = AssetInfo?
 
@@ -1928,6 +2059,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_create_note() != 43728) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_create_note_doc() != 48812) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_create_note_in() != 47187) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1946,6 +2080,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_doc_change_count() != 49864) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_doc_heads() != 4598) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_ensure_folder() != 6376) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1959,6 +2096,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_is_connected() != 16465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 10426) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_list_notes() != 43939) {
@@ -1977,6 +2117,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_note_spans_snapshot() != 8051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_note_thumbnail_bytes() != 37100) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_note_title() != 56454) {
@@ -2006,7 +2149,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_shutdown() != 44681) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_splice_note_text() != 25441) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_start_folder_url() != 43861) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_update_asset_vision() != 689) {

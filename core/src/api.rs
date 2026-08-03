@@ -105,7 +105,7 @@ pub struct Core {
     folder: std::sync::Mutex<Option<DocId>>,
 }
 
-const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl Core {
     fn start_index_updates(self: &Arc<Self>) {
@@ -209,7 +209,7 @@ impl Core {
         let Ok(id) = DocId::from_url(&url) else { return 0 };
         self.runtime
             .block_on(self.repo.read_doc(id, |doc| {
-                Ok(doc.get_changes(&[]).unwrap_or_default().len() as u32)
+                Ok(doc.get_changes(&[]).len() as u32)
             }))
             .unwrap_or(0)
     }
@@ -227,11 +227,6 @@ impl Core {
                 Some(url) => {
                     let id = DocId::from_url(&url)?;
                     repo.ensure_doc(id).await?;
-                    if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
-                        anyhow::bail!("folder doc not found locally or on the server");
-                    }
-                    repo.change_doc(id, |doc| shapes::normalize_strings(doc))
-                        .await?;
                     Ok(id)
                 }
                 None => {
@@ -242,6 +237,19 @@ impl Core {
         })?;
         *self.folder.lock().unwrap() = Some(id);
         Ok(id.to_url())
+    }
+
+    /// Set the active folder immediately from a known URL, then load the doc
+    /// from local storage in the background. Returns before any I/O completes,
+    /// so the UI can be ready immediately.
+    pub fn start_folder_url(&self, url: String) -> Result<(), CoreError> {
+        let id = DocId::from_url(&url)?;
+        *self.folder.lock().unwrap() = Some(id);
+        let repo = self.repo.clone();
+        self.runtime.spawn(async move {
+            let _ = repo.ensure_doc(id).await;
+        });
+        Ok(())
     }
 
     pub fn folder_url(&self) -> Option<String> {
@@ -303,6 +311,34 @@ impl Core {
                     })
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Bytes of the first embedded image in a note, if the asset is already
+    /// held locally. Returns None without any network I/O.
+    pub fn note_thumbnail_bytes(&self, url: String) -> Option<Vec<u8>> {
+        let id = DocId::from_url(&url).ok()?;
+        let embed_urls = self
+            .runtime
+            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::embed_urls(doc))))
+            .ok()?;
+        let first_url = embed_urls.into_iter().next()?;
+        let asset_id = DocId::from_url(&first_url).ok()?;
+        self.runtime
+            .block_on(self.repo.read_doc(asset_id, |doc| {
+                shapes::file_bytes(doc).ok_or_else(|| anyhow::anyhow!("no bytes"))
+            }))
+            .ok()
+    }
+
+    /// Current automerge heads for any doc we hold locally. Returns an empty
+    /// vec if the doc isn't tracked or has no changes.
+    pub fn doc_heads(&self, url: String) -> Vec<String> {
+        let Ok(id) = DocId::from_url(&url) else {
+            return Vec::new();
+        };
+        self.runtime
+            .block_on(self.repo.read_doc(id, |doc| Ok(encode_heads(doc.get_heads()))))
             .unwrap_or_default()
     }
 
@@ -450,6 +486,49 @@ impl Core {
         })?;
         self.reindex_doc(DocId::from_url(&url)?);
         Ok(url)
+    }
+
+    /// Create a note doc immediately without waiting for the folder to be in
+    /// memory. The caller is responsible for linking it to a folder separately.
+    pub fn create_note_doc(&self, title: String) -> Result<String, CoreError> {
+        let repo = self.repo.clone();
+        let url = self.runtime.block_on(async move {
+            let note = repo
+                .create_doc(|doc| shapes::init_rich_note(doc, &title))
+                .await?;
+            Ok::<_, anyhow::Error>(note.to_url())
+        })?;
+        self.reindex_doc(DocId::from_url(&url)?);
+        Ok(url)
+    }
+
+    /// Link a note into the current folder. The folder doc is loaded from
+    /// local storage on demand if not already in memory.
+    pub fn link_note_to_folder(&self, note_url: String, title: String) -> Result<(), CoreError> {
+        let folder = self
+            .folder
+            .lock()
+            .unwrap()
+            .ok_or_else(|| CoreError::General {
+                msg: "no folder open".into(),
+            })?;
+        let repo = self.repo.clone();
+        self.runtime.block_on(async move {
+            repo.change_doc(folder, |doc| {
+                shapes::add_folder_entry(
+                    doc,
+                    &shapes::DocLink {
+                        name: title,
+                        kind: "rich".into(),
+                        url: note_url,
+                        lush: None,
+                    },
+                )
+            })
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(())
     }
 
     pub fn delete_note(&self, url: String) -> Result<(), CoreError> {
@@ -824,7 +903,6 @@ impl Core {
             .block_on(self.repo.read_doc(id, |doc| {
                 Ok(doc
                     .get_changes(&[])
-                    .unwrap_or_default()
                     .iter()
                     .map(|c| c.timestamp())
                     .max()
@@ -859,6 +937,13 @@ impl Core {
             self.reindex_doc(DocId::from_url(&url)?);
             Ok(url)
         })
+    }
+
+    /// Flush all pending saves and do a best-effort final sync before the app
+    /// exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
+    pub fn shutdown(&self) {
+        let repo = self.repo.clone();
+        self.runtime.block_on(async move { repo.shutdown().await });
     }
 
     /// Create a folder doc inside a specific folder doc.

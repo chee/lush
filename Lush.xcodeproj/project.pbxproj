@@ -17,9 +17,22 @@
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		F09B1ABE3020EA4300417560 /* Exceptions for "lush" folder in "Lush" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = F001D307301E8AA900E154BD /* Lush */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		F09B1AA13020DCF500417560 /* lush */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F09B1ABE3020EA4300417560 /* Exceptions for "lush" folder in "Lush" target */,
+			);
 			path = lush;
 			sourceTree = "<group>";
 		};

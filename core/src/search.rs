@@ -22,8 +22,12 @@ pub struct IndexedDoc {
 
 impl SearchIndex {
     pub fn open(data_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("search.sqlite3");
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path).or_else(|_| {
+            let _ = std::fs::remove_file(&db_path);
+            Connection::open(&db_path)
+        })?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(

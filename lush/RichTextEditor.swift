@@ -70,7 +70,7 @@ final class EditorController {
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
-    func insertDateline() { core?.insertDateline() }
+    func insertLogline() { core?.insertLogline() }
     func insertPatchworkDoc() { sheet = .patchworkCreate }
 
     #if os(iOS)
@@ -173,13 +173,22 @@ final class ListMarkerLayoutManager: NSLayoutManager {
             let isNumber = block.type == "ordered-list-item"
             guard isBullet || isNumber else { continue }
 
-            let glyphIndex = glyphIndexForCharacter(at: paragraph.location)
-            let lineRect = lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-            let baseline = origin.y + lineRect.minY + self.location(forGlyphAt: glyphIndex).y
-            let indent = (storage.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil)
-                as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
             let itemFont = storage.attribute(.font, at: paragraph.location, effectiveRange: nil)
                 as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
+            let indent = (storage.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil)
+                as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
+            // Force layout so empty paragraphs (just \n) have glyph info.
+            ensureLayout(forCharacterRange: paragraph)
+            let glyphIndex = glyphIndexForCharacter(at: paragraph.location)
+            var lineRect: CGRect = glyphIndex < numberOfGlyphs
+                ? lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+                : .zero
+            // Empty final paragraphs use extraLineFragmentRect.
+            if lineRect == .zero { lineRect = extraLineFragmentRect }
+            guard lineRect != .zero else { continue }
+            // Use font ascender for the baseline — glyph location y is 0
+            // for paragraph-separator null glyphs on empty lines.
+            let baseline = origin.y + lineRect.minY + itemFont.ascender
             let diameter: CGFloat = 6.5
             if isBullet {
                 let rect = CGRect(
@@ -376,7 +385,7 @@ final class EditorCore {
     }
 
     private func checkContextChange() {
-        guard EditorSettings.autoInsertDateline else { return }
+        guard EditorSettings.autoInsertLogline else { return }
         guard let tracker = contextTracker else { return }
         let snap = tracker.snapshot
         guard snap.hasSubstantialChange(from: lastContextSnap) else { return }
@@ -384,7 +393,7 @@ final class EditorCore {
         insertContextBlockAtEnd(BlockValue.contextBlock(from: snap))
     }
 
-    func insertDateline() {
+    func insertLogline() {
         let snap = contextTracker?.snapshot ?? ContextSnapshot(timestamp: Date())
         insertBlockAttachment(RichText.embedAttachment(for: BlockValue.contextBlock(from: snap), cache: cache))
         inline.setNeedsReconcile()
@@ -423,7 +432,9 @@ final class EditorCore {
             session.heads = snapshot.heads
             session.loaded = true
             session.loadTask = nil
-            self.apply(spans: spans, focus: true)
+            let shouldFocus = self.model.pendingFocusUrl == url
+            if shouldFocus { self.model.pendingFocusUrl = nil }
+            self.apply(spans: spans, focus: shouldFocus)
         }
     }
 
@@ -437,16 +448,31 @@ final class EditorCore {
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async {
-        for node in spans {
+        let urls: [String] = spans.compactMap { node -> String? in
             guard case .block(let block) = node,
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
                   cache.images[url] == nil, cache.names[url] == nil,
                   !cache.patchworkDocs.contains(url)
-            else { continue }
-            guard let data = await model.assetBytes(url) else {
-                // present locally but not a file asset → a patchwork doc
+            else { return nil }
+            return url
+        }
+        guard !urls.isEmpty else { return }
+        let model = self.model
+        let fetched: [(String, Data?)] = await withTaskGroup(of: (String, Data?).self) { group in
+            for url in urls {
+                group.addTask {
+                    let data = await model.assetBytes(url)
+                    return (url, data)
+                }
+            }
+            var results: [(String, Data?)] = []
+            for await pair in group { results.append(pair) }
+            return results
+        }
+        for (url, data) in fetched {
+            guard let data else {
                 if let info = await model.assetInfo(url), info.mimeType.isEmpty {
                     cache.patchworkDocs.insert(url)
                 }
@@ -1265,6 +1291,33 @@ final class EditorCore {
         return true
     }
 
+    /// Tab in a list: increase indent by one level. Returns true when handled.
+    @discardableResult
+    func nestListItem() -> Bool {
+        let block = blockAtSelection()
+        guard block.type == "unordered-list-item" || block.type == "ordered-list-item" else {
+            return false
+        }
+        var nested = block
+        nested.parents.append(block.type)
+        applyBlockStyle(nested)
+        return true
+    }
+
+    /// Shift+Tab in a list: decrease indent by one level. Returns true when handled.
+    @discardableResult
+    func unnestListItem() -> Bool {
+        let block = blockAtSelection()
+        guard block.type == "unordered-list-item" || block.type == "ordered-list-item" else {
+            return false
+        }
+        guard !block.parents.isEmpty else { return false }
+        var unnested = block
+        unnested.parents.removeLast()
+        applyBlockStyle(unnested)
+        return true
+    }
+
     // MARK: attachment interaction
 
     @discardableResult
@@ -1745,6 +1798,12 @@ struct RichTextEditor: NSViewRepresentable {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
                 return core.handleReturn()
             }
+            if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                return core.nestListItem()
+            }
+            if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                return core.unnestListItem()
+            }
             return false
         }
 
@@ -1798,6 +1857,16 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         textStorage.replaceCharacters(in: range, with: attributed)
         core?.scheduleSave()
     }
+
+    override var keyCommands: [UIKeyCommand]? {
+        [
+            UIKeyCommand(input: "\t", modifierFlags: [], action: #selector(handleTabKey)),
+            UIKeyCommand(input: "\t", modifierFlags: .shift, action: #selector(handleShiftTabKey)),
+        ]
+    }
+
+    @objc private func handleTabKey() { core?.nestListItem() }
+    @objc private func handleShiftTabKey() { core?.unnestListItem() }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)), UIPasteboard.general.hasImages {

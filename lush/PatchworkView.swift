@@ -853,6 +853,42 @@ struct PatchworkCreateSheet: View {
     }
 }
 
+struct NewPatchworkDocSheet: View {
+    let onPick: @MainActor (String, String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("New Patchwork Document")
+                    .font(.headline)
+                Spacer()
+                Button("Cancel") { dismiss() }
+            }
+            if PatchworkWeb.available {
+                PatchworkPickerView { url, tool in
+                    onPick(url, tool)
+                    dismiss()
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(.separator)
+                )
+            } else {
+                Text("Add PatchworkWeb.bundle to the app to create Patchwork documents.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding(16)
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 480)
+        #endif
+    }
+}
+
 struct PatchworkBoxView: View {
     let docUrl: String
     let toolId: String?
@@ -924,3 +960,34 @@ struct PatchworkBoxView: View {
         }
     }
 }
+
+@MainActor
+final class PatchworkDetailCache {
+    static let shared = PatchworkDetailCache()
+    private var views: [String: WKWebView] = [:]
+
+    func webView(for docUrl: String) -> WKWebView {
+        if let existing = views[docUrl] { return existing }
+        let view = PatchworkWebView.makeWebView(docUrl: docUrl, toolId: nil, bridge: nil)
+        views[docUrl] = view
+        return view
+    }
+}
+
+#if os(macOS)
+struct PatchworkDetailWebViewWrapper: NSViewRepresentable {
+    let docUrl: String
+    func makeNSView(context: Context) -> WKWebView {
+        PatchworkDetailCache.shared.webView(for: docUrl)
+    }
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+}
+#else
+struct PatchworkDetailWebViewWrapper: UIViewRepresentable {
+    let docUrl: String
+    func makeUIView(context: Context) -> WKWebView {
+        PatchworkDetailCache.shared.webView(for: docUrl)
+    }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+#endif

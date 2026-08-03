@@ -354,7 +354,7 @@ enum EditorSettings {
     static let changed = Notification.Name("io.lush.editorSettingsChanged")
     private static let sizeKey = "editorBodySize"
     private static let designKey = "editorFontDesign"
-    private static let autoInsertDatelineKey = "editorAutoInsertDateline"
+    private static let autoInsertLoglineKey = "editorAutoInsertLogline"
 
     static let designs: [(key: String, label: String)] = [
         ("system", "System"),
@@ -415,12 +415,12 @@ enum EditorSettings {
         NotificationCenter.default.post(name: changed, object: nil)
     }
 
-    static var autoInsertDateline: Bool {
-        UserDefaults.standard.bool(forKey: autoInsertDatelineKey)
+    static var autoInsertLogline: Bool {
+        UserDefaults.standard.bool(forKey: autoInsertLoglineKey)
     }
 
-    static func setAutoInsertDateline(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: autoInsertDatelineKey)
+    static func setAutoInsertLogline(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: autoInsertLoglineKey)
         NotificationCenter.default.post(name: changed, object: nil)
     }
 

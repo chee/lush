@@ -9,7 +9,7 @@ use lush_core::{
 
 #[derive(Parser)]
 struct Args {
-    #[arg(long, default_value = "/tmp/rtcli-data")]
+    #[arg(long, default_value = "/tmp/lush-data")]
     data: PathBuf,
     #[arg(long, default_value = DEFAULT_SERVER)]
     server: String,

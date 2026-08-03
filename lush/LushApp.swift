@@ -78,8 +78,8 @@ struct FormatCommands: Commands {
             Button("Record Audio") { editor?.recorderVisible.toggle() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
-            Button("Insert Dateline") { editor?.insertDateline() }
-                .keyboardShortcut("d", modifiers: [.command, .option])
+            Button("Insert Logline") { editor?.insertLogline() }
+                .keyboardShortcut("l", modifiers: [.command])
             Button("Insert Table") { editor?.insertTable() }
                 .keyboardShortcut("t", modifiers: [.command, .option])
             Button("Insert Columns") { editor?.insertColumns() }
