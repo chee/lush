@@ -137,6 +137,7 @@ struct DocState {
     doc: Automerge,
     known: HashSet<ChangeHash>,
     fragments_unavailable: bool,
+    last_attempted_heads: Option<HashSet<ChangeHash>>,
 }
 
 pub struct Repo {
@@ -348,59 +349,79 @@ impl Repo {
     }
 
     async fn resync_all(self: Arc<Self>) {
-        let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
-        for id in ids {
-            if let Err(e) = self
-                .core
-                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-                .await
-            {
-                tracing::warn!(error = %e, "resync failed");
-                let _ = self.events.send(RepoEvent::SyncEvent(format!(
-                    "resync {}: sync_with_all_peers failed: {e}",
-                    &id.to_url()[11..23]
-                )));
-                continue;
+        {
+            let mut docs = self.docs.lock().await;
+            for state in docs.values_mut() {
+                state.last_attempted_heads = None;
             }
-            self.apply_from_storage(id).await;
+        }
+        let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
+        let handles: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                let repo = self.clone();
+                tokio::spawn(async move {
+                    match repo
+                        .core
+                        .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                        .await
+                    {
+                        Err(e) => {
+                            tracing::warn!(error = %e, "resync failed");
+                            let _ = repo.events.send(RepoEvent::SyncEvent(format!(
+                                "resync {}: sync_with_all_peers failed: {e}",
+                                &id.to_url()[11..23]
+                            )));
+                        }
+                        Ok(_) => {
+                            repo.apply_from_storage(id).await;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.await;
         }
     }
 
     async fn on_remote_heads(&self, sid: SedimentreeId, heads: Vec<CommitId>) {
         let id = DocId::from_sedimentree_id(sid);
-        let tracked = self.docs.lock().await.contains_key(&id);
-        if !tracked {
-            return;
-        }
-        let changed = self.apply_from_storage(id).await;
-        if changed {
-            return;
-        }
-        let missing = {
-            let docs = self.docs.lock().await;
-            let Some(state) = docs.get(&id) else { return };
-            heads.iter().any(|h| {
-                let hash = ChangeHash(*h.as_bytes());
-                !state.known.contains(&hash)
-            })
-        };
-        if missing {
-            let short = &id.to_url()[11..23];
-            let _ = self.events.send(RepoEvent::SyncEvent(format!(
-                "{short}: server has heads we're missing — pulling"
-            )));
-            if let Err(e) = self
-                .core
-                .sync_with_all_peers(sid, true, SYNC_TIMEOUT)
-                .await
-            {
-                tracing::warn!(error = %e, "sync after remote heads failed");
-                let _ = self.events.send(RepoEvent::SyncEvent(format!(
-                    "{short}: pull failed: {e}"
-                )));
+        let ch_heads: HashSet<ChangeHash> =
+            heads.iter().map(|h| ChangeHash(*h.as_bytes())).collect();
+        let should_pull = {
+            let mut docs = self.docs.lock().await;
+            let Some(state) = docs.get_mut(&id) else { return };
+            let changes: HashSet<ChangeHash> =
+                state.doc.get_changes(&[]).iter().map(|c| c.hash()).collect();
+            if ch_heads.iter().all(|h| changes.contains(h)) {
+                return;
             }
-            self.apply_from_storage(id).await;
+            if state.last_attempted_heads.as_ref() == Some(&ch_heads) {
+                return;
+            }
+            state.last_attempted_heads = Some(ch_heads);
+            true
+        };
+        if !should_pull {
+            return;
         }
+        let short = &id.to_url()[11..23];
+        let _ = self.events.send(RepoEvent::SyncEvent(format!(
+            "{short}: server has heads we're missing — pulling"
+        )));
+        if let Err(e) = self
+            .core
+            .sync_with_all_peers(sid, true, SYNC_TIMEOUT)
+            .await
+        {
+            tracing::warn!(error = %e, "sync after remote heads failed");
+            let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                "{short}: pull failed: {e}"
+            )));
+            return;
+        }
+        self.apply_from_storage(id).await;
     }
 
     /// Load every locally stored blob for the doc into the in-memory automerge
@@ -429,11 +450,17 @@ impl Repo {
         }
         let short = &id.to_url()[11..23];
         if state.doc.get_heads() == before {
+            if load_errors > 0 {
+                let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                    "{short}: {load_errors}/{blob_count} blobs failed to apply"
+                )));
+            }
             return false;
         }
         let (known, fragments_unavailable) = known_hashes(&state.doc, state.fragments_unavailable);
         state.known.extend(known);
         state.fragments_unavailable = fragments_unavailable;
+        state.last_attempted_heads = None;
         let new_heads = state.doc.get_heads().len();
         drop(docs);
         let _ = self.events.send(RepoEvent::SyncEvent(format!(
@@ -621,6 +648,7 @@ impl Repo {
                         doc,
                         known,
                         fragments_unavailable,
+                        last_attempted_heads: None,
                     },
                 );
                 let _ = self.events.send(RepoEvent::DocChanged(id));
@@ -652,10 +680,7 @@ impl Repo {
                     }
                 };
                 repo.apply_from_storage(id).await;
-                if repo.doc_has_heads(id).await {
-                    break;
-                }
-                if ok {
+                if repo.doc_has_heads(id).await || !ok {
                     break;
                 }
             }
@@ -705,6 +730,7 @@ impl Repo {
                 doc,
                 known: HashSet::new(),
                 fragments_unavailable: false,
+                last_attempted_heads: None,
             },
         );
         self.save_doc(id).await?;

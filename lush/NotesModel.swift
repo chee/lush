@@ -571,6 +571,17 @@ final class NotesModel {
         }
     }
 
+    func addDocToCurrentFolder(url: String) {
+        guard let core else { return }
+        Task.detached { [core, weak self, url] in
+            try? core.linkNoteToFolder(noteUrl: url, title: "")
+            await MainActor.run { [weak self] in
+                self?.selectedNoteUrl = url
+                self?.refreshNotes()
+            }
+        }
+    }
+
     func createScript() {
         guard let core, let folderUrl else { return }
         do {
@@ -608,6 +619,41 @@ final class NotesModel {
         } catch {
             status = "Couldn't move: \(error.localizedDescription)"
         }
+    }
+
+    private static let childOrderKey = "folderChildOrder"
+
+    var childOrder: [String: [String]] =
+        (UserDefaults.standard.object(forKey: "folderChildOrder") as? [String: [String]]) ?? [:] {
+        didSet { UserDefaults.standard.set(childOrder, forKey: Self.childOrderKey) }
+    }
+
+    func orderedChildren(_ children: [FolderNode], in folderUrl: String) -> [FolderNode] {
+        let folders = children.filter { $0.kind == "folder" }
+        let notes = children.filter { $0.kind != "folder" }
+        guard let order = childOrder[folderUrl], !order.isEmpty else { return folders + notes }
+        var byUrl = Dictionary(uniqueKeysWithValues: notes.map { ($0.url, $0) })
+        var ordered: [FolderNode] = order.compactMap { byUrl.removeValue(forKey: $0) }
+        ordered += notes.filter { byUrl[$0.url] != nil }
+        return folders + ordered
+    }
+
+    func reorderChild(_ url: String, before targetUrl: String) {
+        guard url != targetUrl,
+              let movingNode = node(for: url),
+              let targetNode = node(for: targetUrl),
+              movingNode.parentUrl == targetNode.parentUrl,
+              let folderUrl = movingNode.parentUrl,
+              let folder = node(for: folderUrl),
+              let rawChildren = folder.children
+        else { return }
+        var urls = orderedChildren(rawChildren, in: folderUrl)
+            .filter { $0.kind != "folder" }
+            .map(\.url)
+        urls.removeAll { $0 == url }
+        guard let targetIndex = urls.firstIndex(of: targetUrl) else { return }
+        urls.insert(url, at: targetIndex)
+        childOrder[folderUrl] = urls
     }
 
     // Editor support -----------------------------------------------------

@@ -80,7 +80,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingNewPatchwork) {
             NewPatchworkDocSheet { url, _ in
-                model.selectedNoteUrl = url
+                model.addDocToCurrentFolder(url: url)
                 selectedItemUrls = [url]
             }
             .environment(model)
@@ -186,7 +186,9 @@ struct ContentView: View {
                                     Task { await model.selectItem(node.url) }
                                 }
                                 .tag("pinned:\(node.url)")
-                                .onDrag { NSItemProvider(object: node.url as NSString) }
+                                .onDrag({ NSItemProvider(object: node.url as NSString) }, preview: {
+                                    DragPreviewView(name: node.displayName)
+                                })
                                 .listRowInsets(sidebarRowInsets(depth: 1))
                                 .listRowBackground(selectionBackground("pinned:\(node.url)", greyWhen: node.url))
                                 .contextMenu {
@@ -210,7 +212,9 @@ struct ContentView: View {
                     .contentShape(Rectangle())
                     .onTapGesture { Task { await model.selectItem(hit.url) } }
                     .tag(hit.url)
-                    .onDrag { NSItemProvider(object: hit.url as NSString) }
+                    .onDrag({ NSItemProvider(object: hit.url as NSString) }, preview: {
+                        DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
+                    })
                     .listRowInsets(sidebarRowInsets(depth: 0))
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
@@ -239,28 +243,16 @@ struct ContentView: View {
         .searchable(text: $searchText, placement: .sidebar, prompt: "Search notes")
         .toolbar {
             ToolbarItem {
-                ControlGroup {
-                    Button {
-                        model.createNote(snap: contextTracker.snapshot)
-                    } label: {
-                        Image(systemName: "square.and.pencil")
+                Menu {
+                    Button("Note") { model.createNote(snap: contextTracker.snapshot) }
+                    Button("Folder") { model.createFolder() }
+                    if PatchworkWeb.available {
+                        Button("Patchwork Doc…") { showingNewPatchwork = true }
                     }
-                    Menu {
-                        Button("Note") { model.createNote(snap: contextTracker.snapshot) }
-                        if PatchworkWeb.available {
-                            Button("Patchwork Doc…") { showingNewPatchwork = true }
-                        }
-                    } label: {
-                        Image(systemName: "chevron.down.compact")
-                    }
-                }
-                .disabled(model.folderUrl == nil)
-            }
-            ToolbarItem {
-                Button {
-                    model.createFolder()
                 } label: {
-                    Label("New Folder", systemImage: "folder.badge.plus")
+                    Image(systemName: "square.and.pencil")
+                } primaryAction: {
+                    model.createNote(snap: contextTracker.snapshot)
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -337,7 +329,7 @@ struct ContentView: View {
                         .tag(node.url)
                         .listRowInsets(sidebarRowInsets(depth: depth))
                     if expanded.contains(node.url) {
-                        nodeRows(node.children ?? [], depth: depth + 1)
+                        nodeRows(model.orderedChildren(node.children ?? [], in: node.url), depth: depth + 1)
                     }
                 } else {
                     noteRow(for: node, depth: depth)
@@ -480,7 +472,9 @@ struct ContentView: View {
         .padding(.top, depth == 0 ? 12 : 2)
         .padding(.bottom, depth == 0 ? 5 : 2)
         .contentShape(Rectangle())
-        .onDrag { NSItemProvider(object: node.url as NSString) }
+        .onDrag({ NSItemProvider(object: node.url as NSString) }, preview: {
+            DragPreviewView(name: node.displayName, isFolder: true)
+        })
         .modifier(FolderDropTarget(node: node, model: model))
         .contextMenu {
             folderContextMenu(for: node)
@@ -531,7 +525,16 @@ struct ContentView: View {
                 }
             }
             .tag(node.url)
-            .onDrag { NSItemProvider(object: node.url as NSString) }
+            .onDrag({
+                let urls = selectedItemUrls.contains(node.url)
+                    ? Array(selectedItemUrls)
+                    : [node.url]
+                return NSItemProvider(object: urls.joined(separator: "\n") as NSString)
+            }, preview: {
+                let count = selectedItemUrls.contains(node.url) ? selectedItemUrls.count : 1
+                DragPreviewView(name: node.displayName, count: count)
+            })
+            .modifier(NoteReorderDropTarget(node: node, model: model))
             .contextMenu {
                 let targets = selectedItemUrls.contains(node.url)
                     ? Array(selectedItemUrls)
@@ -592,20 +595,16 @@ struct ContentView: View {
         .navigationTitle("")
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                ControlGroup {
-                    Button {
-                        model.createNote(snap: contextTracker.snapshot)
-                    } label: {
-                        Image(systemName: "square.and.pencil")
+                Menu {
+                    Button("Note") { model.createNote(snap: contextTracker.snapshot) }
+                    Button("Folder") { model.createFolder() }
+                    if PatchworkWeb.available {
+                        Button("Patchwork Doc…") { showingNewPatchwork = true }
                     }
-                    Menu {
-                        Button("Note") { model.createNote(snap: contextTracker.snapshot) }
-                        if PatchworkWeb.available {
-                            Button("Patchwork Doc…") { showingNewPatchwork = true }
-                        }
-                    } label: {
-                        Image(systemName: "chevron.down.compact")
-                    }
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                } primaryAction: {
+                    model.createNote(snap: contextTracker.snapshot)
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -618,7 +617,7 @@ struct ContentView: View {
             ScriptEditorView(url: url)
                 .environment(model)
                 .id(url)
-        } else if model.node(for: url)?.isNote != false && !url.hasPrefix("automerge:") {
+        } else if model.node(for: url)?.isNote == true || (!url.hasPrefix("automerge:") && model.node(for: url)?.isNote != false) {
             NoteDetail(noteUrl: url)
                 .id(url)
         } else {
@@ -778,7 +777,9 @@ struct NoteRowView: View {
         }
         .padding(.vertical, 2)
         #if os(macOS)
-        .onDrag { NSItemProvider(object: node.url as NSString) }
+        .onDrag({ NSItemProvider(object: node.url as NSString) }, preview: {
+            DragPreviewView(name: node.displayName)
+        })
         #endif
         .task { await model.loadContextMeta(url: node.url) }
     }
@@ -965,6 +966,7 @@ struct FolderScreen: View {
         }
         .sheet(isPresented: $showingNewPatchwork) {
             NewPatchworkDocSheet { url, _ in
+                model.addDocToCurrentFolder(url: url)
                 push(.patchwork(url))
             }
             .environment(model)
@@ -1186,6 +1188,7 @@ struct NoteDetail: View {
     @State private var renameText = ""
     @State private var showingRename = false
     @State private var moveTarget: MoveTarget?
+    @State private var editorDropTargeted = false
     #if os(iOS)
     @State private var photoItem: PhotosPickerItem?
     #endif
@@ -1213,9 +1216,38 @@ struct NoteDetail: View {
                 }
         }
         .focusedSceneValue(\.editorController, editor)
-        .dropDestination(for: String.self) { urls, _ in
-            guard let url = urls.first(where: { $0.hasPrefix("automerge:") }) else { return false }
-            editor.insertPatchworkEmbed(url: url, tool: nil)
+        .overlay {
+            if editorDropTargeted {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.accentColor.opacity(0.6), lineWidth: 2)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onDrop(
+            of: [UTType.plainText.identifier, UTType.fileURL.identifier],
+            isTargeted: $editorDropTargeted
+        ) { providers in
+            for provider in providers {
+                if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
+                    provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                        guard let url = droppedString(from: item), url.hasPrefix("automerge:") else { return }
+                        Task { @MainActor in editor.insertPatchworkEmbed(url: url, tool: nil) }
+                    }
+                } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                        let fileUrl: URL?
+                        if let u = item as? URL { fileUrl = u }
+                        else if let data = item as? Data { fileUrl = URL(dataRepresentation: data, relativeTo: nil) }
+                        else { return }
+                        guard let fileUrl else { return }
+                        let scoped = fileUrl.startAccessingSecurityScopedResource()
+                        defer { if scoped { fileUrl.stopAccessingSecurityScopedResource() } }
+                        guard let data = try? Data(contentsOf: fileUrl) else { return }
+                        let name = fileUrl.lastPathComponent
+                        Task { @MainActor in editor.insertData(data, name: name) }
+                    }
+                }
+            }
             return true
         }
         .toolbar {
@@ -1438,16 +1470,55 @@ struct NoteDetail: View {
     #endif
 }
 
+private struct DragPreviewView: View {
+    let name: String
+    var count: Int = 1
+    var isFolder: Bool = false
+
+    var body: some View {
+        Label(
+            count > 1 ? "\(count) items" : name,
+            systemImage: isFolder ? "folder.fill" : "doc.text.fill"
+        )
+        .lineLimit(1)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(alignment: .topTrailing) {
+            if count > 1 {
+                Text("\(count)")
+                    .font(.caption2.bold())
+                    .foregroundStyle(.white)
+                    .frame(width: 18, height: 18)
+                    .background(Color.accentColor, in: Circle())
+                    .offset(x: 6, y: -6)
+            }
+        }
+    }
+}
+
 private struct FolderDropTarget: ViewModifier {
     let node: FolderNode
     let model: NotesModel
+    @State private var isTargeted = false
 
     func body(content: Content) -> some View {
         if node.kind == "folder" {
-            content.onDrop(
-                of: [UTType.plainText.identifier],
-                delegate: FolderMoveDropDelegate(node: node, model: model)
-            )
+            content
+                .background {
+                    if isTargeted {
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(Color.accentColor.opacity(0.12))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 5)
+                                    .strokeBorder(Color.accentColor.opacity(0.5), lineWidth: 1.5)
+                            )
+                    }
+                }
+                .onDrop(
+                    of: [UTType.plainText.identifier],
+                    delegate: FolderMoveDropDelegate(node: node, model: model, isTargeted: $isTargeted)
+                )
         } else {
             content
         }
@@ -1457,46 +1528,108 @@ private struct FolderDropTarget: ViewModifier {
 private struct FolderMoveDropDelegate: DropDelegate {
     let node: FolderNode
     let model: NotesModel
+    @Binding var isTargeted: Bool
+
+    func dropEntered(info: DropInfo) { isTargeted = true }
+    func dropExited(info: DropInfo) { isTargeted = false }
 
     func validateDrop(info: DropInfo) -> Bool {
         info.hasItemsConforming(to: [UTType.plainText.identifier])
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        return DropProposal(operation: .move)
+        DropProposal(operation: .move)
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        isTargeted = false
         guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
             return false
         }
         let targetUrl = node.url
         provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-            guard let moved = Self.string(from: item) else { return }
+            guard let payload = droppedString(from: item) else { return }
+            let moved = payload.components(separatedBy: "\n").filter { !$0.isEmpty }
             Task { @MainActor in
-                if model.rootFolderUrls.contains(moved),
-                   model.rootFolderUrls.contains(targetUrl) {
-                    model.reorderRootFolder(moved, adjacentTo: targetUrl)
-                } else {
-                    model.moveItem(moved, into: targetUrl)
+                for url in moved {
+                    if model.rootFolderUrls.contains(url),
+                       model.rootFolderUrls.contains(targetUrl) {
+                        model.reorderRootFolder(url, adjacentTo: targetUrl)
+                    } else {
+                        model.moveItem(url, into: targetUrl)
+                    }
                 }
             }
         }
         return true
     }
+}
 
-    private static func string(from item: NSSecureCoding?) -> String? {
-        if let string = item as? String {
-            return string
-        }
-        if let string = item as? NSString {
-            return string as String
-        }
-        if let data = item as? Data {
-            return String(data: data, encoding: .utf8)
-        }
-        return nil
+private struct NoteReorderDropTarget: ViewModifier {
+    let node: FolderNode
+    let model: NotesModel
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .top) {
+                if isTargeted {
+                    Rectangle()
+                        .fill(Color.accentColor)
+                        .frame(height: 2)
+                }
+            }
+            .onDrop(
+                of: [UTType.plainText.identifier],
+                delegate: NoteReorderDropDelegate(node: node, model: model, isTargeted: $isTargeted)
+            )
     }
+}
+
+private struct NoteReorderDropDelegate: DropDelegate {
+    let node: FolderNode
+    let model: NotesModel
+    @Binding var isTargeted: Bool
+
+    func dropEntered(info: DropInfo) { isTargeted = true }
+    func dropExited(info: DropInfo) { isTargeted = false }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [UTType.plainText.identifier])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        isTargeted = false
+        guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
+            return false
+        }
+        let targetNode = node
+        provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+            guard let payload = droppedString(from: item) else { return }
+            let urls = payload.components(separatedBy: "\n").filter { !$0.isEmpty }
+            Task { @MainActor in
+                for url in urls {
+                    if model.node(for: url)?.parentUrl == targetNode.parentUrl {
+                        model.reorderChild(url, before: targetNode.url)
+                    } else if let parent = targetNode.parentUrl {
+                        model.moveItem(url, into: parent)
+                    }
+                }
+            }
+        }
+        return true
+    }
+}
+
+private func droppedString(from item: NSSecureCoding?) -> String? {
+    if let s = item as? String { return s }
+    if let s = item as? NSString { return s as String }
+    if let d = item as? Data { return String(data: d, encoding: .utf8) }
+    return nil
 }
 
 struct FolderColumnBrowser: View {
@@ -1587,11 +1720,24 @@ struct FolderColumnBrowser: View {
 struct PatchworkDetail: View {
     let docUrl: String
     @Environment(NotesModel.self) private var model
+    @State private var tools: [ToolChoice] = []
+    @State private var toolInput: String = ""
+    @State private var appliedToolId: String?
 
     var body: some View {
         Group {
             if PatchworkWeb.available {
-                PatchworkDetailWebViewWrapper(docUrl: docUrl)
+                PatchworkWebView(
+                    docUrl: docUrl,
+                    toolId: appliedToolId,
+                    onTools: { newTools, current in
+                        tools = newTools
+                        if toolInput.isEmpty {
+                            toolInput = current ?? ""
+                        }
+                    }
+                )
+                .id(appliedToolId)
             } else {
                 ContentUnavailableView(
                     "Patchwork Unavailable",
@@ -1601,6 +1747,34 @@ struct PatchworkDetail: View {
             }
         }
         .navigationTitle(model.node(for: docUrl)?.displayName ?? "")
+        .onChange(of: docUrl) {
+            tools = []
+            toolInput = ""
+            appliedToolId = nil
+        }
+        .toolbar {
+            ToolbarItem {
+                HStack(spacing: 4) {
+                    TextField("tool-id", text: $toolInput)
+                        .frame(width: 200)
+                        .onSubmit {
+                            let id = toolInput.trimmingCharacters(in: .whitespaces)
+                            appliedToolId = id.isEmpty ? nil : id
+                        }
+                    Menu {
+                        ForEach(tools) { tool in
+                            Button(tool.name) {
+                                toolInput = tool.id
+                                appliedToolId = tool.id
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down.compact")
+                    }
+                    .disabled(tools.isEmpty)
+                }
+            }
+        }
     }
 }
 
