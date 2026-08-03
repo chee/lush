@@ -197,13 +197,13 @@ enum SpanNode: Codable, Equatable {
 }
 
 extension NSAttributedString.Key {
-    static let amBlock = NSAttributedString.Key("io.richtext.amBlock")
+    static let amBlock = NSAttributedString.Key("io.lush.amBlock")
     /// Marks display-only text (like attachment filenames) that must never
     /// round-trip into the document.
-    static let amDisplayOnly = NSAttributedString.Key("io.richtext.displayOnly")
-    static let amHighlight = NSAttributedString.Key("io.richtext.highlight")
-    static let amTableBox = NSAttributedString.Key("io.richtext.tableBox")
-    static let amColumnsBox = NSAttributedString.Key("io.richtext.columnsBox")
+    static let amDisplayOnly = NSAttributedString.Key("io.lush.displayOnly")
+    static let amHighlight = NSAttributedString.Key("io.lush.highlight")
+    static let amTableBox = NSAttributedString.Key("io.lush.tableBox")
+    static let amColumnsBox = NSAttributedString.Key("io.lush.columnsBox")
 }
 
 /// A columns layout behind one attachment character: per-column span lists
@@ -351,7 +351,7 @@ final class AssetCache {
 /// User-adjustable editor typography, persisted in UserDefaults. Views that
 /// render text re-load when `changed` is posted.
 enum EditorSettings {
-    static let changed = Notification.Name("io.richtext.editorSettingsChanged")
+    static let changed = Notification.Name("io.lush.editorSettingsChanged")
     private static let sizeKey = "editorBodySize"
     private static let designKey = "editorFontDesign"
     private static let autoInsertDatelineKey = "editorAutoInsertDateline"

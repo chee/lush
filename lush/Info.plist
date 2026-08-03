@@ -10,13 +10,12 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>party.chee.richtext</string>
+			<string>party.chee.lush</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>lush</string>
 			</array>
 		</dict>
 	</array>
-
 </dict>
 </plist>

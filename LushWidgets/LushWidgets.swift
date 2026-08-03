@@ -1,5 +1,5 @@
 // Widget extension sources — add via File > New > Target > Widget Extension
-// (name it RichtextWidgets, uncheck "Include Configuration App Intent"),
+// (name it LushWidgets, uncheck "Include Configuration App Intent"),
 // then replace the generated Swift file with this one.
 import WidgetKit
 import SwiftUI
@@ -50,11 +50,11 @@ struct LaunchWidgetView: View {
 
 struct NewNoteWidget: Widget {
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: "party.chee.richtext.new-note", provider: LaunchProvider()) { _ in
+        StaticConfiguration(kind: "party.chee.lush.new-note", provider: LaunchProvider()) { _ in
             LaunchWidgetView(
                 symbol: "square.and.pencil",
                 title: "New Note",
-                url: URL(string: "richtext://new-note")!
+                url: URL(string: "lush://new-note")!
             )
         }
         .configurationDisplayName("New Note")
@@ -65,11 +65,11 @@ struct NewNoteWidget: Widget {
 
 struct QuickNoteWidget: Widget {
     var body: some WidgetConfiguration {
-        StaticConfiguration(kind: "party.chee.richtext.quick-note", provider: LaunchProvider()) { _ in
+        StaticConfiguration(kind: "party.chee.lush.quick-note", provider: LaunchProvider()) { _ in
             LaunchWidgetView(
                 symbol: "bolt.circle",
                 title: "Quick Note",
-                url: URL(string: "richtext://quick-note")!
+                url: URL(string: "lush://quick-note")!
             )
         }
         .configurationDisplayName("Quick Note")
@@ -79,7 +79,7 @@ struct QuickNoteWidget: Widget {
 }
 
 @main
-struct RichtextWidgets: WidgetBundle {
+struct LushWidgets: WidgetBundle {
     var body: some Widget {
         NewNoteWidget()
         QuickNoteWidget()

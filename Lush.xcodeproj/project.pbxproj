@@ -17,23 +17,10 @@
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		F001D314301E8AAA00E154BD /* Exceptions for "richtext" folder in "Lush" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				Info.plist,
-			);
-			target = F001D307301E8AA900E154BD /* Lush */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		F001D30A301E8AA900E154BD /* richtext */ = {
+		F09B1AA13020DCF500417560 /* lush */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				F001D314301E8AAA00E154BD /* Exceptions for "richtext" folder in "Lush" target */,
-			);
-			path = richtext;
+			path = lush;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -54,9 +41,9 @@
 		F001D2FF301E8AA900E154BD = {
 			isa = PBXGroup;
 			children = (
-				F001D30A301E8AA900E154BD /* richtext */,
 				F001D309301E8AA900E154BD /* Products */,
 				F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */,
+				F09B1AA13020DCF500417560 /* lush */,
 			);
 			sourceTree = "<group>";
 		};
@@ -84,7 +71,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				F001D30A301E8AA900E154BD /* richtext */,
+				F09B1AA13020DCF500417560 /* lush */,
 			);
 			name = Lush;
 			packageProductDependencies = (
@@ -159,11 +146,11 @@
 		F001D316301E8AAA00E154BD /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = YES;
-				CODE_SIGN_ENTITLEMENTS = richtext/richtext.entitlements;
+				CODE_SIGN_ENTITLEMENTS = lush/lush.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R2MP6EU7T3;
@@ -183,11 +170,11 @@
 				ENABLE_RESOURCE_ACCESS_USB = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = richtext/Info.plist;
+				INFOPLIST_FILE = lush/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Lush;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSAppleEventsUsageDescription = "richtext reads your Apple Notes to import them.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "richtext records audio to attach voice memos to your notes.";
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Lush reads your Apple Notes to import them.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Lush records audio to attach voice memos to your notes. hehe";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -209,7 +196,7 @@
 				NEW_SETTING = "";
 				NEW_SETTING1 = "";
 				NEW_SETTING2 = "";
-				OTHER_LDFLAGS = "-lrichtext_core";
+				OTHER_LDFLAGS = "-llush_core";
 				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -236,11 +223,11 @@
 		F001D317301E8AAA00E154BD /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = "$(ARCHS_STANDARD)";
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = YES;
-				CODE_SIGN_ENTITLEMENTS = richtext/richtext.entitlements;
+				CODE_SIGN_ENTITLEMENTS = lush/lush.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R2MP6EU7T3;
@@ -260,11 +247,11 @@
 				ENABLE_RESOURCE_ACCESS_USB = YES;
 				ENABLE_USER_SELECTED_FILES = readwrite;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_FILE = richtext/Info.plist;
+				INFOPLIST_FILE = lush/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Lush;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				INFOPLIST_KEY_NSAppleEventsUsageDescription = "richtext reads your Apple Notes to import them.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "richtext records audio to attach voice memos to your notes.";
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Lush reads your Apple Notes to import them.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Lush records audio to attach voice memos to your notes. hehe";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -286,7 +273,7 @@
 				NEW_SETTING = "";
 				NEW_SETTING1 = "";
 				NEW_SETTING2 = "";
-				OTHER_LDFLAGS = "-lrichtext_core";
+				OTHER_LDFLAGS = "-llush_core";
 				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -314,6 +301,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
@@ -367,6 +355,7 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -376,6 +365,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
@@ -422,6 +412,8 @@
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;

@@ -117,6 +117,7 @@ pub enum RepoEvent {
     DocChanged(DocId),
     Connected,
     Disconnected,
+    SyncEvent(String),
 }
 
 #[derive(Clone)]
@@ -354,6 +355,7 @@ impl Repo {
 
     async fn resync_all(self: Arc<Self>) {
         let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
+        let _ = self.events.send(RepoEvent::SyncEvent(format!("resync_all: syncing {} tracked docs", ids.len())));
         for id in ids {
             if let Err(e) = self
                 .core
@@ -361,6 +363,7 @@ impl Repo {
                 .await
             {
                 tracing::warn!(error = %e, "resync failed");
+                let _ = self.events.send(RepoEvent::SyncEvent(format!("resync {}: sync_with_all_peers failed: {e}", &id.to_url()[11..23])));
                 continue;
             }
             self.apply_from_storage(id).await;
@@ -387,10 +390,30 @@ impl Repo {
             })
         };
         if missing {
-            if let Err(e) = self.core.sync_with_all_peers(sid, true, SYNC_TIMEOUT).await {
-                tracing::warn!(error = %e, "sync after remote heads failed");
+            let short = &id.to_url()[11..23];
+            let _ = self.events.send(RepoEvent::SyncEvent(format!("{short}: server has heads we're missing — pulling")));
+            let sync_ok = match self.core.sync_with_all_peers(sid, true, SYNC_TIMEOUT).await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sync after remote heads failed");
+                    let _ = self.events.send(RepoEvent::SyncEvent(format!("{short}: pull failed: {e}")));
+                    false
+                }
+            };
+            let advanced = self.apply_from_storage(id).await;
+            if sync_ok && !advanced {
+                // Sync succeeded but no new data arrived. This means those
+                // CommitIds are already in our sedimentree but under different
+                // automerge fragment boundaries (cross-client fragment mismatch).
+                // Add them directly to state.known so we don't loop forever.
+                let mut docs = self.docs.lock().await;
+                if let Some(state) = docs.get_mut(&id) {
+                    for h in &heads {
+                        state.known.insert(ChangeHash(*h.as_bytes()));
+                    }
+                }
+                let _ = self.events.send(RepoEvent::SyncEvent(format!("{short}: heads already in sedimentree (fragment boundary mismatch) — marking known")));
             }
-            self.apply_from_storage(id).await;
         }
     }
 
@@ -405,23 +428,36 @@ impl Repo {
                 return false;
             }
         };
+        let blob_count = blobs.len();
         let mut docs = self.docs.lock().await;
         let Some(state) = docs.get_mut(&id) else {
             return false;
         };
         let before = state.doc.get_heads();
+        let mut load_errors = 0u32;
         for blob in blobs.iter() {
             if let Err(e) = state.doc.load_incremental(blob.as_slice()) {
                 tracing::warn!(error = %e, "load_incremental failed");
+                load_errors += 1;
             }
         }
+        let short = &id.to_url()[11..23];
         if state.doc.get_heads() == before {
+            if blob_count > 0 {
+                let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                    "{short}: {blob_count} blobs, doc unchanged (load_errors={load_errors})"
+                )));
+            }
             return false;
         }
         let (known, fragments_unavailable) = known_hashes(&state.doc, state.fragments_unavailable);
         state.known.extend(known);
         state.fragments_unavailable = fragments_unavailable;
+        let new_heads = state.doc.get_heads().len();
         drop(docs);
+        let _ = self.events.send(RepoEvent::SyncEvent(format!(
+            "{short}: doc advanced, {blob_count} blobs, {new_heads} heads (load_errors={load_errors})"
+        )));
         let _ = self.events.send(RepoEvent::DocChanged(id));
         true
     }
@@ -597,12 +633,15 @@ impl Repo {
         let repo = self.clone();
         tokio::spawn(async move {
             repo.wait_connected(Duration::from_secs(15)).await;
+            let short = &id.to_url()[11..23];
+            let _ = repo.events.send(RepoEvent::SyncEvent(format!("{short}: syncing with server")));
             if let Err(e) = repo
                 .core
                 .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
                 .await
             {
                 tracing::warn!(error = %e, "initial sync failed");
+                let _ = repo.events.send(RepoEvent::SyncEvent(format!("{short}: sync failed: {e}")));
             }
             repo.apply_from_storage(id).await;
         });
@@ -752,6 +791,12 @@ impl Repo {
             .get(&id)
             .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
         f(&state.doc)
+    }
+
+    /// Remove a doc from in-memory tracking so the next `ensure_doc` call
+    /// reloads from storage and re-syncs. Useful when in-memory state is stuck.
+    pub async fn drop_doc(&self, id: DocId) {
+        self.docs.lock().await.remove(&id);
     }
 
     /// One-shot: sync a doc and wait for the server to hold our heads.

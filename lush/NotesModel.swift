@@ -1,5 +1,8 @@
 import Foundation
 import Observation
+#if os(macOS)
+import AppKit
+#endif
 
 @Observable @MainActor
 final class NotesModel {
@@ -17,6 +20,15 @@ final class NotesModel {
     var rootFolderUrl: String? { rootFolderUrls.first }
     var rootFolderUrls: [String] = []
     var folderTree: [FolderNode] = []
+    private(set) var syncLog: [String] = []
+
+    func appendSyncEvent(_ message: String) {
+        let ts = Date().formatted(.dateTime.hour().minute().second())
+        let entry = "[\(ts)] \(message)"
+        print(entry)
+        if syncLog.count >= 100 { syncLog.removeFirst() }
+        syncLog.append(entry)
+    }
     private let semanticSearch = SemanticSearchIndex()
     private var semanticIndexTasks: [String: Task<Void, Never>] = [:]
     private var previewUpdateTasks: [String: Task<Void, Never>] = [:]
@@ -24,6 +36,8 @@ final class NotesModel {
     @ObservationIgnored private var noteWriteTasks: [String: Task<[String]?, Never>] = [:]
     @ObservationIgnored private var noteObservers: [UUID: @MainActor (String) -> Void] = [:]
     @ObservationIgnored private var delegateBridge: DelegateBridge?
+    @ObservationIgnored private var pollTask: Task<Void, Never>?
+    private var lastKnownCounts: [String: Int] = [:]
 
     /// Open editors register here to hear about local and remote changes.
     func addNoteObserver(_ handler: @escaping @MainActor (String) -> Void) -> UUID {
@@ -72,7 +86,7 @@ final class NotesModel {
                 for: .applicationSupportDirectory,
                 in: .userDomainMask
             )[0]
-            let dataDir = support.appendingPathComponent("RichtextCore", isDirectory: true)
+            let dataDir = support.appendingPathComponent("LushCore", isDirectory: true)
             var saved = UserDefaults.standard.stringArray(forKey: Self.foldersDefaultsKey) ?? []
             if saved.isEmpty,
                let legacy = UserDefaults.standard.string(forKey: Self.folderDefaultsKey) {
@@ -102,6 +116,11 @@ final class NotesModel {
             core.prefetchNotes(urls: Array(saved.dropFirst()))
             refreshNotes()
             status = ""
+            appendSyncEvent("Started: \(saved.count) root folder(s), \(folderTree.flatMap { [$0] + ($0.children ?? []) }.count) items visible so far")
+            for url in rootFolderUrls {
+                lastKnownCounts[url] = core.folderEntriesOf(url: url).count
+            }
+            startPolling()
             if let last = UserDefaults.standard.string(forKey: Self.lastOpenNoteKey) {
                 selectedNoteUrl = last
             }
@@ -155,6 +174,7 @@ final class NotesModel {
                 return FolderNode(url: url, name: name, kind: "folder", parentUrl: parent, children: [])
             }
             let entries = core.folderEntriesOf(url: url)
+            print("[buildTree] \(url.suffix(12)) → \(entries.count) entries: \(entries.map { "[\($0.kind)] \($0.name)" }.joined(separator: ", "))")
             var children: [FolderNode] = entries
                 .filter { $0.kind == "folder" && !rootUrls.contains($0.url) }
                 .map { folderNode(url: $0.url, name: $0.name, parent: url) }
@@ -292,6 +312,69 @@ final class NotesModel {
         })
     }
 
+    func forceSync() {
+        guard let core else { return }
+        appendSyncEvent("Force sync: resyncing \(rootFolderUrls.count) root folder(s)")
+        for url in rootFolderUrls {
+            let changes = core.docChangeCount(url: url)
+            appendSyncEvent("  \(url.suffix(12)): \(core.folderEntriesOf(url: url).count) entries, \(changes) changes locally")
+            try? core.resyncDoc(url: url)
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            refreshNotes()
+            for url in rootFolderUrls {
+                let changes = core.docChangeCount(url: url)
+                appendSyncEvent("  post-sync \(url.suffix(12)): \(core.folderEntriesOf(url: url).count) entries, \(changes) changes")
+            }
+        }
+    }
+
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { @MainActor [weak self] in
+            var interval: Duration = .seconds(5)
+            var elapsed = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard let self, !Task.isCancelled else { break }
+                guard let core = self.core else { break }
+                var anyChanged = false
+                for url in self.rootFolderUrls {
+                    let count = core.folderEntriesOf(url: url).count
+                    let last = self.lastKnownCounts[url] ?? -1
+                    if count != last {
+                        self.appendSyncEvent("[poll] \(url.suffix(12)): \(last) → \(count) entries")
+                        self.lastKnownCounts[url] = count
+                        anyChanged = true
+                    }
+                }
+                if anyChanged {
+                    self.refreshNotes()
+                }
+                elapsed += Int(interval.components.seconds)
+                if elapsed >= 60 { interval = .seconds(30) }
+            }
+        }
+    }
+
+    func clearStorage() {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dataDir = support.appendingPathComponent("LushCore", isDirectory: true)
+        do {
+            try FileManager.default.removeItem(at: dataDir)
+            appendSyncEvent("Cleared local storage — quitting")
+        } catch {
+            appendSyncEvent("Clear failed: \(error.localizedDescription)")
+            return
+        }
+        #if os(macOS)
+        NSApplication.shared.terminate(nil)
+        #else
+        exit(0)
+        #endif
+    }
+
     func loadFolder(url: String) async {
         guard let core else { return }
         do {
@@ -321,9 +404,14 @@ final class NotesModel {
     }
 
     func docChanged(url: String) {
-        if url == folderUrl || rootFolderUrls.contains(url) {
+        let isRoot = rootFolderUrls.contains(url)
+        let inTree = isFolderInTree(url)
+        if isRoot {
+            appendSyncEvent("docChanged: root \(url.suffix(12)) — rebuilding tree")
+        }
+        if url == folderUrl || isRoot {
             refreshNotes()
-        } else if isFolderInTree(url) {
+        } else if inTree {
             buildTree()
             if node(for: url)?.isNote == true, let core {
                 previews[url] = core.notePreview(url: url)
@@ -887,6 +975,13 @@ private final class DelegateBridge: CoreDelegate {
     func onConnectionChanged(connected: Bool) {
         Task { @MainActor [model] in
             model?.connected = connected
+            model?.appendSyncEvent(connected ? "Connected to subduction server" : "Disconnected from subduction server")
+        }
+    }
+
+    func onSyncEvent(message: String) {
+        Task { @MainActor [model] in
+            model?.appendSyncEvent(message)
         }
     }
 }

@@ -21,7 +21,7 @@ struct VideoInlineView: View {
     @State private var player: AVPlayer?
 
     var body: some View {
-        VideoPlayer(player: player)
+        PlatformVideoPlayer(player: player)
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .onAppear {
                 if player == nil {
@@ -33,6 +33,33 @@ struct VideoInlineView: View {
             }
     }
 }
+
+#if os(macOS)
+struct PlatformVideoPlayer: NSViewRepresentable {
+    let player: AVPlayer?
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player !== player {
+            nsView.player = player
+        }
+    }
+}
+#else
+struct PlatformVideoPlayer: View {
+    let player: AVPlayer?
+
+    var body: some View {
+        VideoPlayer(player: player)
+    }
+}
+#endif
 
 struct HtmlInlineView: View {
     let html: String
@@ -632,7 +659,7 @@ struct VideoPlayerSheet: View {
             Text(name)
                 .font(.headline)
                 .lineLimit(1)
-            VideoPlayer(player: player)
+            PlatformVideoPlayer(player: player)
                 .frame(minHeight: 280)
             Button("Done") { dismiss() }
                 .keyboardShortcut(.defaultAction)
@@ -740,4 +767,3 @@ struct HtmlEditorSheet: View {
     }
 
 }
-

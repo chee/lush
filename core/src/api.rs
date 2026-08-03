@@ -94,6 +94,7 @@ pub struct AssetVision {
 pub trait CoreDelegate: Send + Sync {
     fn on_doc_changed(&self, url: String);
     fn on_connection_changed(&self, connected: bool);
+    fn on_sync_event(&self, message: String);
 }
 
 #[derive(uniffi::Object)]
@@ -112,9 +113,15 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         self.runtime.spawn(async move {
-            while let Ok(event) = events.recv().await {
-                if let RepoEvent::DocChanged(id) = event {
-                    index_doc(repo.clone(), index.clone(), id).await;
+            loop {
+                match events.recv().await {
+                    Ok(RepoEvent::DocChanged(id)) => {
+                        tokio::spawn(index_doc(repo.clone(), index.clone(), id));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("index missed {n} events");
+                    }
+                    _ => break,
                 }
             }
         });
@@ -172,14 +179,39 @@ impl Core {
     pub fn set_delegate(&self, delegate: Box<dyn CoreDelegate>) {
         let mut events = self.repo.subscribe();
         self.runtime.spawn(async move {
-            while let Ok(event) = events.recv().await {
-                match event {
-                    RepoEvent::DocChanged(id) => delegate.on_doc_changed(id.to_url()),
-                    RepoEvent::Connected => delegate.on_connection_changed(true),
-                    RepoEvent::Disconnected => delegate.on_connection_changed(false),
+            loop {
+                match events.recv().await {
+                    Ok(RepoEvent::DocChanged(id)) => delegate.on_doc_changed(id.to_url()),
+                    Ok(RepoEvent::Connected) => delegate.on_connection_changed(true),
+                    Ok(RepoEvent::Disconnected) => delegate.on_connection_changed(false),
+                    Ok(RepoEvent::SyncEvent(msg)) => delegate.on_sync_event(msg),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("delegate missed {n} events");
+                        delegate.on_sync_event(format!("[warn] delegate missed {n} events — some updates may be delayed"));
+                    }
+                    Err(_) => break,
                 }
             }
         });
+    }
+
+    pub fn resync_doc(&self, url: String) -> Result<(), CoreError> {
+        let repo = self.repo.clone();
+        let id = DocId::from_url(&url)?;
+        self.runtime.block_on(async move {
+            repo.drop_doc(id).await;
+            repo.ensure_doc(id).await
+        })?;
+        Ok(())
+    }
+
+    pub fn doc_change_count(&self, url: String) -> u32 {
+        let Ok(id) = DocId::from_url(&url) else { return 0 };
+        self.runtime
+            .block_on(self.repo.read_doc(id, |doc| {
+                Ok(doc.get_changes(&[]).unwrap_or_default().len() as u32)
+            }))
+            .unwrap_or(0)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -502,7 +534,7 @@ impl Core {
                 let _ = repo
                     .change_doc(id, |doc| shapes::normalize_strings(doc))
                     .await;
-                index_doc(repo.clone(), index.clone(), id).await;
+                tokio::spawn(index_doc(repo.clone(), index.clone(), id));
                 if let Ok(entries) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
                     for entry in entries {
                         queue.push(entry.url);

@@ -374,7 +374,7 @@ enum PatchworkWeb {
       const repo = new Repo({
         storage: new IndexedDBStorageAdapter(),
         signer,
-        peerId: `richtext-${Math.random().toString(36).slice(2, 10)}`,
+        peerId: `lush-${Math.random().toString(36).slice(2, 10)}`,
         enableRemoteHeadsGossiping: true,
         subductionWebsocketEndpoints: endpoints,
       })
@@ -424,7 +424,7 @@ enum PatchworkWeb {
         ])
         doc = handle.doc()
       } catch (error) {
-        console.warn("richtext: could not load embedded doc", error)
+        console.warn("lush: could not load embedded doc", error)
       }
       const type = String(doc?.["@patchwork"]?.type ?? "")
       const firstToolFor = (t) =>
@@ -442,7 +442,7 @@ enum PatchworkWeb {
                 (plugin) => plugin?.type === "patchwork:tool",
               )?.id
           } catch (error) {
-            console.warn("richtext: suggested tool import failed", error)
+            console.warn("lush: suggested tool import failed", error)
           }
         }
       }
@@ -455,7 +455,7 @@ enum PatchworkWeb {
       const tools = (getSupportedToolsForType(type) ?? [])
         .filter((tool) => !tool.unlisted)
         .map((tool) => ({ id: tool.id, name: tool.name ?? tool.id }))
-      window.webkit?.messageHandlers?.richtext?.postMessage({
+      window.webkit?.messageHandlers?.lush?.postMessage({
         kind: "tools",
         tools,
         current: toolId ?? null,
@@ -465,10 +465,10 @@ enum PatchworkWeb {
 
     // Create-and-embed picker: list registered datatypes, create a doc of the
     // chosen one (or take a pasted automerge: url), and hand the result to the
-    // native side through the "richtext" message handler.
+    // native side through the "lush" message handler.
     function renderPicker(repo) {
       const post = (url, tool) => {
-        window.webkit?.messageHandlers?.richtext?.postMessage({
+        window.webkit?.messageHandlers?.lush?.postMessage({
           url,
           tool: tool ?? null,
         })
@@ -668,7 +668,7 @@ final class PatchworkEmbedBridge: NSObject, WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == "richtext",
+        guard message.name == "lush",
               let body = message.body as? [String: Any],
               body["kind"] as? String == "tools",
               let rawTools = body["tools"] as? [[String: Any]]
@@ -727,7 +727,7 @@ func makePatchworkWebView(
     let configuration = WKWebViewConfiguration()
     configuration.setURLSchemeHandler(handler, forURLScheme: "lushweb")
     if let messageHandler {
-        configuration.userContentController.add(messageHandler, name: "richtext")
+        configuration.userContentController.add(messageHandler, name: "lush")
     }
     let webView = WKWebView(frame: .zero, configuration: configuration)
     webView.isInspectable = true
@@ -770,7 +770,7 @@ final class PatchworkPickerBridge: NSObject, WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == "richtext",
+        guard message.name == "lush",
               let body = message.body as? [String: Any],
               let url = body["url"] as? String, url.hasPrefix("automerge:")
         else { return }

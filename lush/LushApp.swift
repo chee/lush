@@ -104,7 +104,7 @@ struct EditCommands: Commands {
 #endif
 
 @main
-struct richtextApp: App {
+struct LushApp: App {
     @State private var model = NotesModel()
     @State private var contextTracker = ContextTracker()
 

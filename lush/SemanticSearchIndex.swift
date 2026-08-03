@@ -24,7 +24,7 @@ final class SemanticSearchIndex {
             for: .applicationSupportDirectory,
             in: .userDomainMask
         )[0]
-        let dir = support.appendingPathComponent("RichtextCore", isDirectory: true)
+        let dir = support.appendingPathComponent("LushCore", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("semantic-search.json")
     }

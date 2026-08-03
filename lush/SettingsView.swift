@@ -48,6 +48,7 @@ struct SyncSettingsPane: View {
     @State private var peerText = ""
     @State private var peerError: String?
     @State private var copiedNodeId = false
+    @State private var showingClearConfirm = false
 
     var body: some View {
         Form {
@@ -163,6 +164,46 @@ struct SyncSettingsPane: View {
                 Text("Peers (iroh)")
             } footer: {
                 Text("Share this device's node id and add a friend's; their patchwork embeds then sync device-to-device.")
+            }
+            Section {
+                Button("Force Resync") {
+                    model.forceSync()
+                }
+                Button("Clear Local Storage…", role: .destructive) {
+                    showingClearConfirm = true
+                }
+                .confirmationDialog(
+                    "Clear all locally cached data and quit?",
+                    isPresented: $showingClearConfirm,
+                    titleVisibility: .visible
+                ) {
+                    Button("Clear and Quit", role: .destructive) {
+                        model.clearStorage()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("The app will quit and re-sync everything from the server on next launch.")
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Force Resync re-fetches all root folders from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch.")
+            }
+            if !model.syncLog.isEmpty {
+                Section("Sync Log") {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(model.syncLog.reversed(), id: \.self) { entry in
+                                Text(entry)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .frame(maxHeight: 200)
+                }
             }
         }
         .formStyle(.grouped)

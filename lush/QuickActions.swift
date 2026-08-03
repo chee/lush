@@ -64,7 +64,7 @@ struct OpenQuickNoteIntent: AppIntent {
     }
 }
 
-struct RichtextShortcuts: AppShortcutsProvider {
+struct LushShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
             intent: NewNoteIntent(),
