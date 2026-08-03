@@ -11,21 +11,28 @@ final class AppRouter {
         case newNote
         case quickNote
         case note(String)
+        case search(String)
     }
 
     var pending: Action?
 
     func handle(_ url: URL) {
-        guard url.scheme == "richtext" else { return }
+        guard url.scheme == "lush" else { return }
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         switch url.host() {
-        case "new-note":
+        case "new":
             pending = .newNote
-        case "quick-note":
-            pending = .quickNote
-        case "note":
-            let target = String(url.path.dropFirst())
-            if target.hasPrefix("automerge:") {
-                pending = .note(target)
+        case "show":
+            if let doc = components?.queryItems?.first(where: { $0.name == "doc" })?.value {
+                if doc == "quick" {
+                    pending = .quickNote
+                } else if doc.hasPrefix("automerge:") {
+                    pending = .note(doc)
+                }
+            }
+        case "search":
+            if let q = components?.queryItems?.first(where: { $0.name == "q" })?.value {
+                pending = .search(q)
             }
         default:
             break

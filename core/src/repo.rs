@@ -10,11 +10,12 @@ use anyhow::{anyhow, Context, Result};
 use automerge::{Automerge, ChangeHash};
 use future_form::Sendable;
 use sedimentree_core::{
-    blob::Blob,
+    blob::{Blob, BlobMeta},
     collections::Map,
     depth::CountLeadingZeroBytes,
+    fragment::Fragment,
     id::SedimentreeId,
-    loose_commit::id::CommitId,
+    loose_commit::{id::CommitId, LooseCommit},
 };
 use sedimentree_fs_storage::FsStorage;
 use subduction_core::{
@@ -32,7 +33,10 @@ use subduction_core::{
 };
 use subduction_crypto::signer::memory::MemorySigner;
 use subduction_websocket::tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::{
+    sync::{broadcast, mpsc, Mutex},
+    task::JoinHandle,
+};
 
 pub const DEFAULT_SERVER: &str = "wss://subduction.sync.inkandswitch.com";
 
@@ -88,7 +92,10 @@ impl DocId {
     }
 
     pub fn to_url(self) -> String {
-        format!("automerge:{}", bs58::encode(self.0).with_check().into_string())
+        format!(
+            "automerge:{}",
+            bs58::encode(self.0).with_check().into_string()
+        )
     }
 
     pub fn sedimentree_id(self) -> SedimentreeId {
@@ -126,6 +133,7 @@ impl RemoteHeadsObserver for HeadsObserver {
 struct DocState {
     doc: Automerge,
     known: HashSet<ChangeHash>,
+    fragments_unavailable: bool,
 }
 
 pub struct Repo {
@@ -133,6 +141,7 @@ pub struct Repo {
     signer: MemorySigner,
     server_url: String,
     docs: Mutex<HashMap<DocId, DocState>>,
+    pending_saves: Mutex<HashMap<DocId, JoinHandle<()>>>,
     events: broadcast::Sender<RepoEvent>,
     connected: std::sync::atomic::AtomicBool,
 }
@@ -158,7 +167,9 @@ fn safe_fragments<R>(doc: &Automerge, levels: R) -> Option<Vec<automerge::Fragme
 where
     R: std::ops::RangeBounds<usize>,
 {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.fragments(levels))).ok()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.fragments(levels)))
+        .ok()
+        .and_then(Result::ok)
 }
 
 fn safe_bundles(doc: &Automerge, frags: &[automerge::Fragment]) -> Option<Vec<Vec<u8>>> {
@@ -166,12 +177,30 @@ fn safe_bundles(doc: &Automerge, frags: &[automerge::Fragment]) -> Option<Vec<Ve
         doc.bundle_fragments(frags.iter().cloned())
     }))
     .ok()
+    .and_then(Result::ok)
 }
 
-fn fragment_heads(doc: &Automerge) -> HashSet<ChangeHash> {
+fn known_hashes(doc: &Automerge, fragments_unavailable: bool) -> (HashSet<ChangeHash>, bool) {
+    if fragments_unavailable {
+        return (
+            doc.get_changes(&[])
+                .unwrap_or_default()
+                .iter()
+                .map(|c| c.hash())
+                .collect(),
+            true,
+        );
+    }
     match safe_fragments(doc, 0..) {
-        Some(frags) => frags.into_iter().map(|f| f.head).collect(),
-        None => doc.get_changes(&[]).iter().map(|c| c.hash()).collect(),
+        Some(frags) => (frags.into_iter().map(|f| f.head).collect(), false),
+        None => (
+            doc.get_changes(&[])
+                .unwrap_or_default()
+                .iter()
+                .map(|c| c.hash())
+                .collect(),
+            true,
+        ),
     }
 }
 
@@ -231,6 +260,7 @@ impl Repo {
             signer,
             server_url,
             docs: Mutex::new(HashMap::new()),
+            pending_saves: Mutex::new(HashMap::new()),
             events,
             connected: std::sync::atomic::AtomicBool::new(false),
         });
@@ -388,7 +418,9 @@ impl Repo {
         if state.doc.get_heads() == before {
             return false;
         }
-        state.known.extend(fragment_heads(&state.doc));
+        let (known, fragments_unavailable) = known_hashes(&state.doc, state.fragments_unavailable);
+        state.known.extend(known);
+        state.fragments_unavailable = fragments_unavailable;
         drop(docs);
         let _ = self.events.send(RepoEvent::DocChanged(id));
         true
@@ -396,84 +428,147 @@ impl Repo {
 
     /// Push any automerge fragments not yet in the sedimentree.
     async fn save_doc(&self, id: DocId) -> Result<()> {
+        if let Some(handle) = self.pending_saves.lock().await.remove(&id) {
+            handle.abort();
+        }
+        self.save_doc_now(id).await
+    }
+
+    async fn save_doc_now(&self, id: DocId) -> Result<()> {
         let sid = id.sedimentree_id();
-        // (head, parents, blob) for new loose commits, plus new level-1+ fragments
-        let (new_commits, new_cached) = {
+        let (new_commits, new_cached, accepted_hashes) = {
             let mut docs = self.docs.lock().await;
             let state = docs
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
-            let fragment_path = (|| {
-                let loose: Vec<_> = safe_fragments(&state.doc, 0..=0)?
-                    .into_iter()
-                    .filter(|f| !state.known.contains(&f.head))
-                    .collect();
-                let cached: Vec<_> = safe_fragments(&state.doc, 1..)?
-                    .into_iter()
-                    .filter(|f| !state.known.contains(&f.head))
-                    .collect();
-                let loose_bytes = safe_bundles(&state.doc, &loose)?;
-                let cached_bytes = safe_bundles(&state.doc, &cached)?;
-                Some((loose, loose_bytes, cached, cached_bytes))
-            })();
-            match fragment_path {
-                Some((loose, loose_bytes, cached, cached_bytes)) => {
-                    for f in loose.iter().chain(cached.iter()) {
-                        state.known.insert(f.head);
+            let fragment_path = if state.fragments_unavailable {
+                None
+            } else {
+                safe_fragments(&state.doc, 0..).and_then(|fragments| {
+                    let mut loose = Vec::new();
+                    let mut cached = Vec::new();
+                    for fragment in fragments {
+                        if state.known.contains(&fragment.head) {
+                            continue;
+                        }
+                        if fragment.level == 0 {
+                            loose.push(fragment);
+                        } else {
+                            cached.push(fragment);
+                        }
                     }
+                    let loose_bytes = safe_bundles(&state.doc, &loose)?;
+                    let cached_bytes = safe_bundles(&state.doc, &cached)?;
+                    Some((loose, loose_bytes, cached, cached_bytes))
+                })
+            };
+            let (commits, cached, accepted_hashes) = match fragment_path {
+                Some((loose, loose_bytes, cached, cached_bytes)) => {
+                    let accepted_hashes = loose
+                        .iter()
+                        .chain(cached.iter())
+                        .map(|f| f.head)
+                        .collect::<Vec<_>>();
                     let commits = loose
                         .into_iter()
                         .zip(loose_bytes)
-                        .map(|(f, bytes)| (f.head, f.boundary.clone(), bytes))
+                        .map(|(f, bytes)| {
+                            let blob = Blob::new(bytes);
+                            let commit = LooseCommit::new(
+                                sid,
+                                CommitId::new(f.head.0),
+                                f.boundary.iter().map(|h| CommitId::new(h.0)).collect(),
+                                BlobMeta::new(&blob),
+                            );
+                            (commit, blob)
+                        })
                         .collect::<Vec<_>>();
-                    (commits, cached.into_iter().zip(cached_bytes).collect::<Vec<_>>())
+                    let cached = cached
+                        .into_iter()
+                        .zip(cached_bytes)
+                        .map(|(f, bytes)| {
+                            let blob = Blob::new(bytes);
+                            let boundary: BTreeSet<CommitId> =
+                                f.boundary.iter().map(|h| CommitId::new(h.0)).collect();
+                            let checkpoints: Vec<CommitId> =
+                                f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
+                            let fragment = Fragment::new(
+                                sid,
+                                CommitId::new(f.head.0),
+                                boundary,
+                                &checkpoints,
+                                BlobMeta::new(&blob),
+                            );
+                            (fragment, blob)
+                        })
+                        .collect::<Vec<_>>();
+                    (commits, cached, accepted_hashes)
                 }
                 None => {
+                    state.fragments_unavailable = true;
                     // fragments() panicked: ship each new raw change as its
                     // own loose commit (level-0 fragments are single changes)
                     tracing::warn!(
                         doc = %id.to_url(),
                         "fragments() unavailable; falling back to raw changes"
                     );
-                    let commits = state
+                    let changes = state
                         .doc
                         .get_changes(&[])
-                        .iter()
+                        .unwrap_or_default()
+                        .into_iter()
                         .filter(|c| !state.known.contains(&c.hash()))
-                        .map(|c| (c.hash(), c.deps().to_vec(), c.raw_bytes().to_vec()))
                         .collect::<Vec<_>>();
-                    for (hash, _, _) in &commits {
-                        state.known.insert(*hash);
-                    }
-                    (commits, Vec::new())
+                    let accepted_hashes = changes.iter().map(|c| c.hash()).collect::<Vec<_>>();
+                    let commits = changes
+                        .into_iter()
+                        .map(|c| {
+                            let blob = Blob::new(c.raw_bytes().to_vec());
+                            let commit = LooseCommit::new(
+                                sid,
+                                CommitId::new(c.hash().0),
+                                c.deps().iter().map(|h| CommitId::new(h.0)).collect(),
+                                BlobMeta::new(&blob),
+                            );
+                            (commit, blob)
+                        })
+                        .collect::<Vec<_>>();
+                    (commits, Vec::new(), accepted_hashes)
                 }
-            }
+            };
+            (commits, cached, accepted_hashes)
         };
-        for (head, parents, bytes) in new_commits {
-            let parents: BTreeSet<CommitId> =
-                parents.iter().map(|h| CommitId::new(h.0)).collect();
-            self.core
-                .add_commit(sid, CommitId::new(head.0), parents, Blob::new(bytes))
-                .await
-                .map_err(|e| anyhow!("add_commit failed: {e}"))?;
+
+        if new_commits.is_empty() && new_cached.is_empty() {
+            return Ok(());
         }
-        for (f, bytes) in new_cached {
-            let boundary: BTreeSet<CommitId> =
-                f.boundary.iter().map(|h| CommitId::new(h.0)).collect();
-            let checkpoints: Vec<CommitId> =
-                f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
-            self.core
-                .add_fragment(
-                    sid,
-                    CommitId::new(f.head.0),
-                    boundary,
-                    &checkpoints,
-                    Blob::new(bytes),
-                )
-                .await
-                .map_err(|e| anyhow!("add_fragment failed: {e}"))?;
+
+        self.core
+            .store_built_batch(sid, new_commits, new_cached)
+            .await
+            .map_err(|e| anyhow!("store_built_batch failed: {e}"))?;
+
+        let mut docs = self.docs.lock().await;
+        if let Some(state) = docs.get_mut(&id) {
+            state.known.extend(accepted_hashes);
         }
+
         Ok(())
+    }
+
+    async fn schedule_save_doc(self: &Arc<Self>, id: DocId) {
+        if let Some(handle) = self.pending_saves.lock().await.remove(&id) {
+            handle.abort();
+        }
+        let repo = self.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            repo.pending_saves.lock().await.remove(&id);
+            if let Err(e) = repo.save_doc_now(id).await {
+                tracing::warn!(doc = %id.to_url(), error = %e, "deferred save failed");
+            }
+        });
+        self.pending_saves.lock().await.insert(id, handle);
     }
 
     /// Load a doc from local storage into memory (if not already tracked) and
@@ -488,8 +583,15 @@ impl Repo {
                         let _ = doc.load_incremental(blob.as_slice());
                     }
                 }
-                let known = fragment_heads(&doc);
-                docs.insert(id, DocState { doc, known });
+                let (known, fragments_unavailable) = known_hashes(&doc, false);
+                docs.insert(
+                    id,
+                    DocState {
+                        doc,
+                        known,
+                        fragments_unavailable,
+                    },
+                );
             }
         }
         let repo = self.clone();
@@ -539,6 +641,7 @@ impl Repo {
             DocState {
                 doc,
                 known: HashSet::new(),
+                fragments_unavailable: false,
             },
         );
         self.save_doc(id).await?;
@@ -570,6 +673,73 @@ impl Repo {
             f(&mut state.doc)?
         };
         self.save_doc(id).await?;
+        Ok(value)
+    }
+
+    /// Run a mutation against a fork at `heads`, then merge that fork back into
+    /// the current document before saving. This mirrors Automerge JS `changeAt`:
+    /// indexes from the rendered editor view are interpreted against the heads
+    /// that view actually saw.
+    pub async fn change_doc_at<F, T>(
+        self: &Arc<Self>,
+        id: DocId,
+        heads: Vec<ChangeHash>,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut Automerge) -> Result<T>,
+    {
+        let value = {
+            let mut docs = self.docs.lock().await;
+            let state = docs
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            if state.doc.get_heads() == heads {
+                f(&mut state.doc)?
+            } else {
+                let mut fork = state.doc.fork_at(&heads)?;
+                let before = fork.get_heads();
+                let value = f(&mut fork)?;
+                if fork.get_heads() != before {
+                    state.doc.merge(&mut fork)?;
+                }
+                value
+            }
+        };
+        self.save_doc(id).await?;
+        Ok(value)
+    }
+
+    /// Like `change_doc_at`, but persistence is debounced. This is for editor
+    /// keystroke patches where the in-memory doc must advance immediately but
+    /// sedimentree fragment building should not block every character.
+    pub async fn change_doc_at_deferred_save<F, T>(
+        self: &Arc<Self>,
+        id: DocId,
+        heads: Vec<ChangeHash>,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&mut Automerge) -> Result<T>,
+    {
+        let value = {
+            let mut docs = self.docs.lock().await;
+            let state = docs
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            if heads.is_empty() || state.doc.get_heads() == heads {
+                f(&mut state.doc)?
+            } else {
+                let mut fork = state.doc.fork_at(&heads)?;
+                let before = fork.get_heads();
+                let value = f(&mut fork)?;
+                if fork.get_heads() != before {
+                    state.doc.merge(&mut fork)?;
+                }
+                value
+            }
+        };
+        self.schedule_save_doc(id).await;
         Ok(value)
     }
 

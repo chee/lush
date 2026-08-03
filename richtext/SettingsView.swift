@@ -180,6 +180,7 @@ struct EditorSettingsPane: View {
     @Environment(NotesModel.self) private var model
     @State private var fontDesign = EditorSettings.design
     @State private var fontSize = EditorSettings.bodySize
+    @State private var autoInsertDateline = EditorSettings.autoInsertDateline
 
     var body: some View {
         Form {
@@ -221,6 +222,12 @@ struct EditorSettingsPane: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
+            }
+            Section("Dateline") {
+                Toggle("Add dateline when context changes", isOn: $autoInsertDateline)
+                    .onChange(of: autoInsertDateline) {
+                        EditorSettings.setAutoInsertDateline(autoInsertDateline)
+                    }
             }
         }
         .formStyle(.grouped)

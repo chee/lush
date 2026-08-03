@@ -1,4 +1,11 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+
+private extension NSResponder {
+    @objc(pasteAsPlainText:) func pasteAsPlainTextCommand(_ sender: Any?) {}
+}
+#endif
 
 struct EditorControllerFocusKey: FocusedValueKey {
     typealias Value = EditorController
@@ -71,6 +78,8 @@ struct FormatCommands: Commands {
             Button("Record Audio") { editor?.recorderVisible.toggle() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Divider()
+            Button("Insert Dateline") { editor?.insertDateline() }
+                .keyboardShortcut("d", modifiers: [.command, .option])
             Button("Insert Table") { editor?.insertTable() }
                 .keyboardShortcut("t", modifiers: [.command, .option])
             Button("Insert Columns") { editor?.insertColumns() }
@@ -81,26 +90,58 @@ struct FormatCommands: Commands {
     }
 }
 
+#if os(macOS)
+struct EditCommands: Commands {
+    var body: some Commands {
+        CommandGroup(after: .pasteboard) {
+            Button("Paste and Match Style") {
+                NSApp.sendAction(#selector(NSResponder.pasteAsPlainTextCommand(_:)), to: nil, from: nil)
+            }
+            .keyboardShortcut("v", modifiers: [.command, .option, .shift])
+        }
+    }
+}
+#endif
+
 @main
 struct richtextApp: App {
     @State private var model = NotesModel()
+    @State private var contextTracker = ContextTracker()
 
     var body: some Scene {
         #if os(macOS)
         WindowGroup {
             ContentView()
                 .environment(model)
+                .environment(contextTracker)
                 .task {
                     async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
                     await server
+                    contextTracker.start()
                 }
         }
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
+            EditCommands()
             FormatCommands()
             FolderCommands(model: model)
         }
+
+        WindowGroup(id: "note-detail", for: String.self) { $noteUrl in
+            if let url = noteUrl {
+                NoteDetail(noteUrl: url)
+                    .environment(model)
+                    .environment(contextTracker)
+                    .task {
+                        async let server: Void = LocalSyncServer.startIfNeeded()
+                        await model.start()
+                        await server
+                        contextTracker.start()
+                    }
+            }
+        }
+        .windowToolbarStyle(.unified(showsTitle: false))
 
         Settings {
             SettingsView()
@@ -110,10 +151,12 @@ struct richtextApp: App {
         WindowGroup {
             ContentView()
                 .environment(model)
+                .environment(contextTracker)
                 .task {
                     async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
                     await server
+                    contextTracker.start()
                 }
         }
         .commands {

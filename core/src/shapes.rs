@@ -3,7 +3,7 @@ use std::sync::Arc;
 use automerge::{
     hydrate,
     iter::Span,
-    marks::{MarkSet, UpdateSpansConfig},
+    marks::{ExpandMark, Mark, MarkSet, UpdateSpansConfig},
     transaction::{CommitOptions, Transactable},
     Automerge, ObjType, ReadDoc, ScalarValue, ROOT,
 };
@@ -26,9 +26,7 @@ pub enum SpanJson {
     },
 }
 
-fn tx<O>(
-    r: automerge::transaction::Result<O, automerge::AutomergeError>,
-) -> anyhow::Result<O> {
+fn tx<O>(r: automerge::transaction::Result<O, automerge::AutomergeError>) -> anyhow::Result<O> {
     r.map(|s| s.result).map_err(|f| anyhow::Error::new(f.error))
 }
 
@@ -242,6 +240,22 @@ fn json_spans_to_spans(spans: &[SpanJson]) -> Vec<Span> {
         .collect()
 }
 
+fn title_from_spans(spans: &[SpanJson]) -> String {
+    let mut title = String::new();
+    let mut seen_text = false;
+    for span in spans {
+        match span {
+            SpanJson::Block { .. } if seen_text => break,
+            SpanJson::Block { .. } => {}
+            SpanJson::Text { value, .. } => {
+                seen_text = true;
+                title.push_str(value);
+            }
+        }
+    }
+    title.trim().to_string()
+}
+
 pub fn update_spans_from_json_at(
     doc: &mut Automerge,
     spans: &[SpanJson],
@@ -260,6 +274,7 @@ pub fn update_spans_from_json_at(
                 UpdateSpansConfig::default(),
                 json_spans_to_spans(spans),
             )?;
+            set_note_title_tx(t, false, &title_from_spans(spans))?;
             Ok::<_, automerge::AutomergeError>(())
         },
     ))?;
@@ -278,6 +293,56 @@ pub fn update_spans_from_json(doc: &mut Automerge, spans: &[SpanJson]) -> anyhow
             UpdateSpansConfig::default(),
             json_spans_to_spans(spans),
         )?;
+        set_note_title_tx(t, false, &title_from_spans(spans))?;
+        Ok(())
+    }))?;
+    Ok(doc.get_heads() != before)
+}
+
+pub fn splice_note_text(
+    doc: &mut Automerge,
+    index: usize,
+    delete_count: i64,
+    insert: &str,
+    title: &str,
+) -> anyhow::Result<bool> {
+    let content = match doc.get(ROOT, "content")? {
+        Some((_, id)) => id,
+        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+    };
+    let before = doc.get_heads();
+    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
+        t.splice_text(&content, index, delete_count as isize, insert)?;
+        set_note_title_tx(t, false, title)?;
+        Ok(())
+    }))?;
+    Ok(doc.get_heads() != before)
+}
+
+pub fn apply_note_mark(
+    doc: &mut Automerge,
+    start: usize,
+    end: usize,
+    name: &str,
+    value: Option<Json>,
+    title: &str,
+) -> anyhow::Result<bool> {
+    let content = match doc.get(ROOT, "content")? {
+        Some((_, id)) => id,
+        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+    };
+    let before = doc.get_heads();
+    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
+        if let Some(value) = value {
+            t.mark(
+                &content,
+                Mark::new(name.to_string(), json_to_scalar(&value), start, end),
+                ExpandMark::Both,
+            )?;
+        } else {
+            t.unmark(&content, name, start, end, ExpandMark::Both)?;
+        }
+        set_note_title_tx(t, false, title)?;
         Ok(())
     }))?;
     Ok(doc.get_heads() != before)
@@ -311,10 +376,11 @@ pub fn init_script(doc: &mut Automerge, name: &str) -> anyhow::Result<()> {
     } else {
         format!("{name}.js")
     };
-    init_file_doc(doc, &filename, "js", "text/javascript", Vec::new())?;
+    init_file_doc(doc, &filename, "js", "application/javascript", Vec::new())?;
     tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
         let lush = t.put_object(ROOT, "@lush", ObjType::Map)?;
         put_text(t, &lush, "type", "script")?;
+        put_text(t, &ROOT, "content", "")?;
         Ok(())
     }))?;
     Ok(())
@@ -435,6 +501,15 @@ fn doc_patchwork_type(doc: &Automerge) -> Option<String> {
     string_at(doc, &pw, "type")
 }
 
+pub fn doc_kind(doc: &Automerge) -> String {
+    let kind = doc_patchwork_type(doc).unwrap_or_default();
+    if kind == "file" && lush_type(doc).as_deref() == Some("script") {
+        "lush:script".into()
+    } else {
+        kind
+    }
+}
+
 pub fn doc_title(doc: &Automerge) -> String {
     if let Some(t) = read_str(doc, &ROOT, "title") {
         return t;
@@ -449,18 +524,27 @@ pub fn doc_title(doc: &Automerge) -> String {
 }
 
 pub fn set_note_title(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
+    if doc_title(doc) == title {
+        return Ok(());
+    }
     let is_file = doc_patchwork_type(doc).as_deref() == Some("file");
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        if is_file {
-            set_text(t, &ROOT, "name", title)?;
-        } else {
-            set_text(t, &ROOT, "title", title)?;
-            if let Some((_, pw)) = t.get(ROOT, "@patchwork")? {
-                set_text(t, &pw, "title", title)?;
-            }
+    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| set_note_title_tx(t, is_file, title)))?;
+    Ok(())
+}
+
+fn set_note_title_tx<T: Transactable>(
+    t: &mut T,
+    is_file: bool,
+    title: &str,
+) -> Result<(), automerge::AutomergeError> {
+    if is_file {
+        set_text(t, &ROOT, "name", title)?;
+    } else {
+        set_text(t, &ROOT, "title", title)?;
+        if let Some((_, pw)) = t.get(ROOT, "@patchwork")? {
+            set_text(t, &pw, "title", title)?;
         }
-        Ok(())
-    }))?;
+    }
     Ok(())
 }
 
@@ -504,10 +588,20 @@ pub fn embed_urls(doc: &Automerge) -> Vec<String> {
     };
     let mut out = Vec::new();
     for span in spans {
-        let SpanJson::Block { value } = span else { continue };
-        let Some(obj) = value.as_object() else { continue };
-        let is_embed = obj.get("isEmbed").and_then(|v| v.as_bool()).unwrap_or(false)
-            || matches!(obj.get("type").and_then(|v| v.as_str()), Some("embed") | Some("image"));
+        let SpanJson::Block { value } = span else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        let is_embed = obj
+            .get("isEmbed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || matches!(
+                obj.get("type").and_then(|v| v.as_str()),
+                Some("embed") | Some("image")
+            );
         if !is_embed {
             continue;
         }
@@ -593,7 +687,13 @@ pub fn note_preview(doc: &Automerge) -> String {
     }
     let mut out = lines[1..].join(" ");
     if out.len() > 100 {
-        out.truncate(out.char_indices().take(100).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(100));
+        out.truncate(
+            out.char_indices()
+                .take(100)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(100),
+        );
     }
     out
 }
@@ -644,6 +744,58 @@ mod tests {
         let mut doc = Automerge::new();
         init_file_doc(&mut doc, "cat.png", "png", "image/png", vec![1, 2, 3]).unwrap();
         assert_eq!(file_bytes(&doc), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn text_insert_merges_with_concurrent_mark() {
+        let mut base = Automerge::new();
+        init_rich_note(&mut base, "hello world").unwrap();
+        update_spans_from_json(
+            &mut base,
+            &[
+                SpanJson::Block {
+                    value: json!({ "type": "paragraph", "parents": [] }),
+                },
+                SpanJson::Text {
+                    value: "hello world".into(),
+                    marks: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut inserted = base.fork();
+        let mut marked = base.fork();
+
+        // One block marker lives before the visible paragraph text, so visible
+        // "hello ".len() maps to Automerge text index 7.
+        splice_note_text(&mut inserted, 7, 0, "beautiful ", "hello beautiful world").unwrap();
+        apply_note_mark(
+            &mut marked,
+            1,
+            12,
+            "strong",
+            Some(json!(true)),
+            "hello world",
+        )
+        .unwrap();
+
+        marked.merge(&mut inserted).unwrap();
+        let spans = spans_to_json(&marked).unwrap();
+        assert_eq!(full_text(&marked), "hello beautiful world");
+        let text_spans = spans
+            .iter()
+            .filter_map(|span| match span {
+                SpanJson::Text { value, marks } => Some((value.as_str(), marks)),
+                SpanJson::Block { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text_spans.len(), 1, "{spans:?}");
+        assert_eq!(text_spans[0].0, "hello beautiful world");
+        assert_eq!(
+            text_spans[0].1.as_ref().and_then(|m| m.get("strong")),
+            Some(&json!(true))
+        );
     }
 }
 

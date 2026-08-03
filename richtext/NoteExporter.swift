@@ -1,0 +1,301 @@
+import Foundation
+#if os(macOS)
+import AppKit
+import UniformTypeIdentifiers
+#endif
+
+@MainActor
+enum NoteExporter {
+
+    // MARK: - Public entry point (macOS)
+
+    #if os(macOS)
+    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
+        let json = await model.spansJSON(for: noteUrl)
+        let spans = SpanNode.decodeList(json)
+
+        struct FetchedAsset {
+            let url: String
+            let data: Data
+            let name: String
+            let mime: String
+        }
+
+        var fetched: [FetchedAsset] = []
+        var usedNames = Set<String>()
+        for span in spans {
+            guard case .block(let b) = span, b.isEmbedBlock, let assetUrl = b.embedUrl else { continue }
+            guard let data = await model.assetBytes(assetUrl) else { continue }
+            let info = await model.assetInfo(assetUrl)
+            var name = info?.name.isEmpty == false ? info!.name : "attachment"
+            let original = name
+            var suffix = 2
+            while usedNames.contains(name) {
+                let ext = (original as NSString).pathExtension
+                let base = (original as NSString).deletingPathExtension
+                name = ext.isEmpty ? "\(base)-\(suffix)" : "\(base)-\(suffix).\(ext)"
+                suffix += 1
+            }
+            usedNames.insert(name)
+            let mime = info?.mimeType.isEmpty == false ? info!.mimeType : "application/octet-stream"
+            fetched.append(FetchedAsset(url: assetUrl, data: data, name: name, mime: mime))
+        }
+
+        let safeName = title.isEmpty ? "note" : title
+
+        if fetched.isEmpty {
+            let html = buildHTML(title: title, spans: spans, assetResolver: .none)
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.html]
+            panel.nameFieldStringValue = safeName + ".html"
+            panel.begin { response in
+                guard response == .OK, let dest = panel.url else { return }
+                try? html.write(to: dest, atomically: true, encoding: .utf8)
+            }
+        } else {
+            var pathMap: [String: String] = [:]
+            for asset in fetched { pathMap[asset.url] = "assets/\(asset.name)" }
+
+            let html = buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
+
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
+            let assetsDir = tmp.appendingPathComponent("assets", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
+                try Data(html.utf8).write(to: tmp.appendingPathComponent("index.html"))
+                for asset in fetched {
+                    try asset.data.write(to: assetsDir.appendingPathComponent(asset.name))
+                }
+            } catch {
+                return
+            }
+
+            let zipTmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lush-\(UUID().uuidString).zip")
+            guard zipDirectory(tmp, to: zipTmp) else {
+                try? FileManager.default.removeItem(at: tmp)
+                return
+            }
+            try? FileManager.default.removeItem(at: tmp)
+
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [UTType(filenameExtension: "zip") ?? .data]
+            panel.nameFieldStringValue = safeName + ".zip"
+            panel.begin { response in
+                defer { try? FileManager.default.removeItem(at: zipTmp) }
+                guard response == .OK, let dest = panel.url else { return }
+                let fm = FileManager.default
+                if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
+                try? fm.moveItem(at: zipTmp, to: dest)
+            }
+        }
+    }
+
+    private static func zipDirectory(_ dir: URL, to output: URL) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        process.arguments = ["-r", output.path, "."]
+        process.currentDirectoryURL = dir
+        try? process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+    #endif
+
+    // MARK: - HTML builder
+
+    private enum AssetResolver {
+        case none
+        case relativePaths([String: String])
+    }
+
+    private static func buildHTML(title: String, spans: [SpanNode], assetResolver: AssetResolver) -> String {
+        let body = htmlBody(from: spans, assetResolver: assetResolver)
+        let escaped = escape(title.isEmpty ? "Untitled" : title)
+        return """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>\(escaped)</title>
+        </head>
+        <body>
+        <article>
+        \(body)</article>
+        </body>
+        </html>
+        """
+    }
+
+    // MARK: - Segment rendering
+
+    private enum Segment {
+        case simple(BlockValue, [(String, [String: JSONValue])])
+        case table([SpanNode])
+        case columns([SpanNode])
+    }
+
+    private static func segmentize(_ spans: [SpanNode]) -> [Segment] {
+        var segments: [Segment] = []
+        var i = 0
+        while i < spans.count {
+            guard case .block(let b) = spans[i] else { i += 1; continue }
+            if b.type == "table" || b.type == "columns" {
+                let root = b.type
+                var j = i + 1
+                while j < spans.count {
+                    if case .block(let child) = spans[j], child.parents.first != root { break }
+                    j += 1
+                }
+                let slice = Array(spans[i..<j])
+                segments.append(root == "table" ? .table(slice) : .columns(slice))
+                i = j
+                continue
+            }
+            var runs: [(String, [String: JSONValue])] = []
+            var j = i + 1
+            while j < spans.count {
+                if case .block = spans[j] { break }
+                if case .text(let t, let m) = spans[j] { runs.append((t, m)) }
+                j += 1
+            }
+            segments.append(.simple(b, runs))
+            i = j
+        }
+        return segments
+    }
+
+    private static func htmlBody(from spans: [SpanNode], assetResolver: AssetResolver) -> String {
+        let segments = segmentize(spans)
+        var out = ""
+        var openLists: [(tag: String, depth: Int)] = []
+
+        func closeLists(to depth: Int = -1) {
+            while let last = openLists.last, last.depth > depth {
+                out += "</li></\(last.tag)>\n"
+                openLists.removeLast()
+            }
+        }
+
+        for segment in segments {
+            switch segment {
+            case .simple(let b, let runs):
+                if b.type == "context" { continue }
+                if b.isEmbedBlock {
+                    closeLists()
+                    if b.type == "html", let source = b.htmlSource {
+                        out += source + "\n"
+                    } else if let url = b.embedUrl {
+                        out += assetTag(url: url, assetResolver: assetResolver) + "\n"
+                    }
+                    continue
+                }
+                let content = runs.map { applyMarks(escape($0.0), marks: $0.1) }.joined()
+                let isList = b.type == "unordered-list-item" || b.type == "ordered-list-item"
+                let depth = b.parents.count
+                let listTag = b.type == "ordered-list-item" ? "ol" : "ul"
+                if isList {
+                    while let last = openLists.last, last.depth > depth {
+                        out += "</li></\(last.tag)>\n"
+                        openLists.removeLast()
+                    }
+                    if let last = openLists.last, last.depth == depth, last.tag != listTag {
+                        out += "</li></\(last.tag)>\n"
+                        openLists.removeLast()
+                    }
+                    if let last = openLists.last, last.depth == depth {
+                        out += "</li>\n<li>\(content)"
+                    } else {
+                        out += "<\(listTag)>\n<li>\(content)"
+                        openLists.append((tag: listTag, depth: depth))
+                    }
+                } else {
+                    closeLists()
+                    switch b.type {
+                    case "heading":
+                        let level = b.headingLevel ?? 1
+                        out += "<h\(level)>\(content)</h\(level)>\n"
+                    case "blockquote":
+                        out += "<blockquote><p>\(content)</p></blockquote>\n"
+                    case "code-block":
+                        out += "<pre><code>\(content)</code></pre>\n"
+                    default:
+                        out += "<p>\(content)</p>\n"
+                    }
+                }
+            case .table(let subSpans):
+                closeLists()
+                out += tableHTML(RichText.parseTable(subSpans)) + "\n"
+            case .columns(let subSpans):
+                closeLists()
+                let columns = RichText.parseColumns(subSpans)
+                out += "<div class=\"columns\">\n"
+                for col in columns {
+                    out += "<div class=\"column\">\n"
+                    out += htmlBody(from: col, assetResolver: assetResolver)
+                    out += "</div>\n"
+                }
+                out += "</div>\n"
+            }
+        }
+        closeLists()
+        return out
+    }
+
+    private static func applyMarks(_ text: String, marks: [String: JSONValue]) -> String {
+        var out = text
+        if case .bool(true)? = marks["code"] { out = "<code>\(out)</code>" }
+        if case .bool(true)? = marks["strong"] { out = "<strong>\(out)</strong>" }
+        if case .bool(true)? = marks["em"] { out = "<em>\(out)</em>" }
+        if let name = marks["highlight"]?.stringValue {
+            out = "<mark data-color=\"\(escape(name))\">\(out)</mark>"
+        }
+        if let link = marks["link"]?.stringValue {
+            out = "<a href=\"\(escape(link))\">\(out)</a>"
+        }
+        return out
+    }
+
+    private static func assetTag(url: String, assetResolver: AssetResolver) -> String {
+        switch assetResolver {
+        case .none:
+            return "<p><em>[attachment]</em></p>"
+        case .relativePaths(let pathMap):
+            guard let path = pathMap[url] else { return "<p><em>[attachment]</em></p>" }
+            let name = escape((path as NSString).lastPathComponent)
+            let ext = (path as NSString).pathExtension.lowercased()
+            let src = escape(path)
+            if AssetCache.videoExtensions.contains(ext) {
+                return "<video controls src=\"\(src)\"></video>"
+            } else if AssetCache.audioExtensions.contains(ext) {
+                return "<audio controls src=\"\(src)\"></audio>"
+            } else if ["jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif"].contains(ext) {
+                return "<img src=\"\(src)\" alt=\"\(name)\">"
+            } else {
+                return "<a href=\"\(src)\">\(name)</a>"
+            }
+        }
+    }
+
+    private static func tableHTML(_ grid: TableGrid) -> String {
+        var out = "<table>\n"
+        for (rowIdx, row) in grid.rows.enumerated() {
+            out += "<tr>\n"
+            let cellTag = grid.hasHeader && rowIdx == 0 ? "th" : "td"
+            for cell in row { out += "<\(cellTag)>\(escape(cell))</\(cellTag)>\n" }
+            out += "</tr>\n"
+        }
+        out += "</table>"
+        return out
+    }
+
+    private static func escape(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+}

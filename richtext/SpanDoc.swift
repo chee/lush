@@ -54,6 +54,14 @@ enum JSONValue: Codable, Equatable {
         }
     }
 
+    var doubleValue: Double? {
+        switch self {
+        case .number(let d): return d
+        case .int(let i): return Double(i)
+        default: return nil
+        }
+    }
+
     var stringValue: String? {
         if case .string(let s) = self { return s }
         return nil
@@ -223,7 +231,7 @@ enum Highlight {
         "pink": (0xFF4D97, 0x8D1A4C, 0xFFB0D2),
         "yellow": (0xFFCC33, 0x6B4600, 0xFFDF94),
         "sky": (0x3BA6FF, 0x084881, 0xA8D6FF),
-        "sea": (0x1CC4BB, 0x07524F, 0x8CE7DE),
+        "sea": (0x4F46E5, 0x312E81, 0x9EA3F5),
         "mint": (0x4FDF9C, 0x0D5C3A, 0xA3F2C8),
     ]
 
@@ -346,6 +354,7 @@ enum EditorSettings {
     static let changed = Notification.Name("io.richtext.editorSettingsChanged")
     private static let sizeKey = "editorBodySize"
     private static let designKey = "editorFontDesign"
+    private static let autoInsertDatelineKey = "editorAutoInsertDateline"
 
     static let designs: [(key: String, label: String)] = [
         ("system", "System"),
@@ -406,6 +415,15 @@ enum EditorSettings {
         NotificationCenter.default.post(name: changed, object: nil)
     }
 
+    static var autoInsertDateline: Bool {
+        UserDefaults.standard.bool(forKey: autoInsertDatelineKey)
+    }
+
+    static func setAutoInsertDateline(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: autoInsertDatelineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
     static func font(ofSize size: CGFloat, weight: PFont.Weight = .regular) -> PFont {
         let base = PFont.systemFont(ofSize: size, weight: weight)
         switch design {
@@ -461,7 +479,7 @@ enum RichText {
         case "heading":
             ps.paragraphSpacingBefore = 10
         case "unordered-list-item", "ordered-list-item":
-            indent += 20
+            indent += 32
         case "blockquote":
             indent += 16
         default:
@@ -609,6 +627,7 @@ enum RichText {
     static func embedAttachment(for block: BlockValue, cache: AssetCache) -> NSAttributedString {
         let url = block.embedUrl
         let isLiveBox = block.type == "html"
+            || block.type == "context"
             || url.map { cache.patchworkDocs.contains($0) } == true
         let attachment: NSTextAttachment = isLiveBox
             ? NSTextAttachment()
@@ -617,6 +636,9 @@ enum RichText {
         if block.type == "html" {
             attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
             attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 220))
+        } else if block.type == "context" {
+            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 28))
         } else if let url, cache.patchworkDocs.contains(url) {
             attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
             attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 300))
@@ -664,7 +686,11 @@ enum RichText {
     }
 
     static func fitted(_ original: CGSize) -> CGSize {
+        #if os(iOS)
+        let maxWidth: CGFloat = 340
+        #else
         let maxWidth: CGFloat = 420
+        #endif
         let maxHeight: CGFloat = 340
         var size = original
         if size.width > 0, size.height > 0 {

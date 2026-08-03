@@ -70,6 +70,7 @@ final class EditorController {
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
+    func insertDateline() { core?.insertDateline() }
     func insertPatchworkDoc() { sheet = .patchworkCreate }
 
     #if os(iOS)
@@ -179,15 +180,15 @@ final class ListMarkerLayoutManager: NSLayoutManager {
                 as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
             let itemFont = storage.attribute(.font, at: paragraph.location, effectiveRange: nil)
                 as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
+            let diameter: CGFloat = 6.5
             if isBullet {
-                let diameter: CGFloat = 6.5
                 let rect = CGRect(
                     x: origin.x + indent - diameter - 5,
                     y: baseline - itemFont.xHeight / 2 - diameter / 2,
                     width: diameter,
                     height: diameter
                 )
-                PColor.pSecondaryLabel.setFill()
+                PColor.pLabel.setFill()
                 #if os(macOS)
                 NSBezierPath(ovalIn: rect).fill()
                 #else
@@ -198,11 +199,10 @@ final class ListMarkerLayoutManager: NSLayoutManager {
                 let font = PFont.monospacedDigitSystemFont(ofSize: RichText.bodySize, weight: .regular)
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: font,
-                    .foregroundColor: PColor.pSecondaryLabel,
+                    .foregroundColor: PColor.pLabel,
                 ]
-                let size = marker.size(withAttributes: attrs)
                 let point = CGPoint(
-                    x: origin.x + indent - size.width - 5,
+                    x: origin.x + indent - diameter - 5,
                     y: baseline - font.ascender
                 )
                 marker.draw(at: point, withAttributes: attrs)
@@ -233,26 +233,67 @@ final class ListMarkerLayoutManager: NSLayoutManager {
 }
 
 @MainActor
+private final class EditorDocumentSession {
+    let noteUrl: String
+    let storage = NSTextStorage()
+    var heads: [String] = []
+    var lastKnownJSON = ""
+    var title = ""
+    var isApplyingDocumentState = false
+    var loaded = false
+    var loadTask: Task<NoteSpansSnapshot, Never>?
+
+    init(noteUrl: String) {
+        self.noteUrl = noteUrl
+    }
+}
+
+@MainActor
+private enum EditorDocumentSessions {
+    private static var sessions: [String: EditorDocumentSession] = [:]
+
+    static func session(for noteUrl: String) -> EditorDocumentSession {
+        if let session = sessions[noteUrl] {
+            return session
+        }
+        let session = EditorDocumentSession(noteUrl: noteUrl)
+        sessions[noteUrl] = session
+        return session
+    }
+}
+
+@MainActor
 final class EditorCore {
     weak var view: (any EditorTextViewLike)?
     let model: NotesModel
     let controller: EditorController
     var noteUrl: String
+    private var session: EditorDocumentSession
 
     private var saveTask: Task<Void, Never>?
-    private var lastKnownJSON = ""
+    private var localWriteHeadsTask: Task<[String]?, Never>?
+    private var localWritesInFlight = 0
+    private var pendingRemoteReload = false
+    private var isApplyingDocumentState = false
+    private var remoteReloadTask: Task<Void, Never>?
+    private var remoteReloadGeneration = 0
+    private var pendingTextSplice: PendingTextSplice?
+    private var queuedTextSplice: QueuedTextSplice?
+    private var textSpliceFlushTask: Task<Void, Never>?
     let cache = AssetCache()
 
     let inline = InlineViewManager()
     private var settingsObserver: (any NSObjectProtocol)?
+    private var noteObserverId: UUID?
 
     init(noteUrl: String, model: NotesModel, controller: EditorController) {
         self.noteUrl = noteUrl
+        self.session = EditorDocumentSessions.session(for: noteUrl)
         self.model = model
         self.controller = controller
         controller.core = self
         inline.core = self
-        model.noteChanged = { [weak self] url in
+        noteObserverId = model.addNoteObserver { [weak self] url in
             self?.remoteChanged(url)
         }
         settingsObserver = NotificationCenter.default.addObserver(
@@ -260,13 +301,22 @@ final class EditorCore {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.load()
             }
         }
     }
 
     deinit {
+        remoteReloadTask?.cancel()
+        textSpliceFlushTask?.cancel()
+        saveTask?.cancel()
+        contextMonitorTask?.cancel()
+        if let noteObserverId {
+            Task { @MainActor [model] in
+                model.removeNoteObserver(noteObserverId)
+            }
+        }
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
         }
@@ -274,23 +324,116 @@ final class EditorCore {
 
     // MARK: loading
 
+    var sharedStorage: NSTextStorage {
+        session.storage
+    }
+
     func switchTo(_ url: String) {
         pushNow()
+        remoteReloadTask?.cancel()
+        textSpliceFlushTask?.cancel()
+        pendingRemoteReload = false
+        pendingTextSplice = nil
+        queuedTextSplice = nil
+        textSpliceFlushTask = nil
         noteUrl = url
+        session = EditorDocumentSessions.session(for: url)
+        attachViewToSharedStorage()
+        lastContextSnap = contextTracker?.snapshot ?? ContextSnapshot()
         load()
+    }
+
+    func attachViewToSharedStorage() {
+        guard let layoutManager = view?.pLayoutManager else { return }
+        if layoutManager.textStorage !== session.storage {
+            layoutManager.textStorage?.removeLayoutManager(layoutManager)
+            session.storage.addLayoutManager(layoutManager)
+        }
+    }
+
+    func detachViewFromSharedStorage() {
+        guard let layoutManager = view?.pLayoutManager,
+              layoutManager.textStorage === session.storage
+        else { return }
+        session.storage.removeLayoutManager(layoutManager)
+    }
+
+    private weak var contextTracker: ContextTracker?
+    private var lastContextSnap = ContextSnapshot()
+    private var contextMonitorTask: Task<Void, Never>?
+
+    func startContext(_ tracker: ContextTracker) {
+        contextTracker = tracker
+        lastContextSnap = tracker.snapshot
+        contextMonitorTask?.cancel()
+        contextMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { break }
+                self?.checkContextChange()
+            }
+        }
+    }
+
+    private func checkContextChange() {
+        guard EditorSettings.autoInsertDateline else { return }
+        guard let tracker = contextTracker else { return }
+        let snap = tracker.snapshot
+        guard snap.hasSubstantialChange(from: lastContextSnap) else { return }
+        lastContextSnap = snap
+        insertContextBlockAtEnd(BlockValue.contextBlock(from: snap))
+    }
+
+    func insertDateline() {
+        let snap = contextTracker?.snapshot ?? ContextSnapshot(timestamp: Date())
+        insertBlockAttachment(RichText.embedAttachment(for: BlockValue.contextBlock(from: snap), cache: cache))
+        inline.setNeedsReconcile()
+    }
+
+    private func insertContextBlockAtEnd(_ block: BlockValue) {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return }
+        let saved = view.pSelectedRange
+        view.pSelectedRange = NSRange(location: max(0, storage.length - 1), length: 0)
+        insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
+        view.pSelectedRange = NSRange(location: min(saved.location, storage.length), length: 0)
     }
 
     func load() {
         let url = noteUrl
         Task { [weak self] in
             guard let self else { return }
-            let json = await self.model.spansJSON(for: url)
-            guard self.noteUrl == url else { return }
+            let session = self.session
+            if session.loaded {
+                self.syncFromSession()
+                return
+            }
+            let task: Task<NoteSpansSnapshot, Never>
+            if let loadTask = session.loadTask {
+                task = loadTask
+            } else {
+                task = Task { [model] in await model.spansSnapshot(for: url) }
+                session.loadTask = task
+            }
+            let snapshot = await task.value
+            guard self.noteUrl == url, self.session === session else { return }
+            let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
             await self.fetchMissingAssets(in: spans)
-            guard self.noteUrl == url else { return }
-            self.apply(spans: spans)
+            guard self.noteUrl == url, self.session === session else { return }
+            session.heads = snapshot.heads
+            session.loaded = true
+            session.loadTask = nil
+            self.apply(spans: spans, focus: true)
         }
+    }
+
+    private func syncFromSession() {
+        attachViewToSharedStorage()
+        guard let view else { return }
+        let location = min(view.pSelectedRange.location, session.storage.length)
+        view.pSelectedRange = NSRange(location: location, length: 0)
+        refreshFormattingState()
+        inline.setNeedsReconcile()
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async {
@@ -388,41 +531,307 @@ final class EditorCore {
         return file
     }
 
-    private func apply(spans: [SpanNode]) {
+    private func apply(spans: [SpanNode], focus: Bool = false) {
         guard let view, let storage = view.pStorage else { return }
         let attributed = RichText.attributed(from: spans, cache: cache)
         let selection = view.pSelectedRange
+        isApplyingDocumentState = true
+        session.isApplyingDocumentState = true
+        pendingTextSplice = nil
+        queuedTextSplice = nil
+        textSpliceFlushTask?.cancel()
+        textSpliceFlushTask = nil
+        defer {
+            isApplyingDocumentState = false
+            session.isApplyingDocumentState = false
+        }
         storage.setAttributedString(attributed)
-        let location = min(selection.location, attributed.length)
+        var location = min(selection.location, attributed.length)
+        if location == 0, attributed.length > 1 {
+            let str = attributed.string as NSString
+            var loc = 0
+            while loc < attributed.length {
+                if let box = attributed.attribute(.amBlock, at: loc, effectiveRange: nil) as? BlockBox,
+                   box.value.isEmbedBlock {
+                    loc = NSMaxRange(str.paragraphRange(for: NSRange(location: loc, length: 0)))
+                } else {
+                    break
+                }
+            }
+            location = loc
+        }
         view.pSelectedRange = NSRange(location: location, length: 0)
         if attributed.length == 0 {
             // Notes-style: an empty note starts with a Title line.
             view.pTypingAttributes = RichText.attributes(block: .heading(level: 1), marks: [:])
         }
-        lastKnownJSON = SpanNode.encodeList(RichText.spans(from: attributed))
+        let currentSpans = RichText.spans(from: attributed)
+        session.lastKnownJSON = SpanNode.encodeList(currentSpans)
+        session.title = RichText.title(from: currentSpans)
         refreshFormattingState()
         inline.setNeedsReconcile()
+        if location == attributed.length, location > 0,
+           let lastNonEmbed = spans.reversed().compactMap({ (s: SpanNode) -> BlockValue? in guard case .block(let b) = s, !b.isEmbedBlock else { return nil }; return b }).first {
+            view.pTypingAttributes = RichText.attributes(block: lastNonEmbed, marks: [:])
+            controller.currentStyleKey = lastNonEmbed.styleKey
+        }
+        if focus {
+            #if os(macOS)
+            view.pSelf.window?.makeFirstResponder(view.pSelf)
+            #else
+            view.pSelf.becomeFirstResponder()
+            #endif
+        }
     }
 
     private func remoteChanged(_ url: String) {
         guard url == noteUrl else { return }
-        Task { [weak self] in
+        guard localWritesInFlight == 0 else {
+            pendingRemoteReload = true
+            return
+        }
+        remoteReloadGeneration += 1
+        let generation = remoteReloadGeneration
+        remoteReloadTask?.cancel()
+        remoteReloadTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(40))
+            guard !Task.isCancelled else { return }
             guard let self else { return }
-            let json = await self.model.spansJSON(for: url)
-            guard self.noteUrl == url else { return }
+            let snapshot = await self.model.spansSnapshot(for: url)
+            guard !Task.isCancelled, self.noteUrl == url, self.remoteReloadGeneration == generation else { return }
+            let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
             await self.fetchMissingAssets(in: spans)
-            guard self.noteUrl == url else { return }
+            guard !Task.isCancelled, self.noteUrl == url, self.remoteReloadGeneration == generation else { return }
+            self.session.heads = snapshot.heads
             let canonical = SpanNode.encodeList(spans)
-            if canonical != self.lastKnownJSON {
+            if canonical != self.session.lastKnownJSON {
                 self.apply(spans: spans)
             }
         }
     }
 
+    private func beginLocalWrite() {
+        localWritesInFlight += 1
+    }
+
+    private func finishLocalWrite(for url: String) {
+        localWritesInFlight = max(0, localWritesInFlight - 1)
+        guard localWritesInFlight == 0, pendingRemoteReload, noteUrl == url else { return }
+        pendingRemoteReload = false
+        remoteChanged(url)
+    }
+
     // MARK: saving
 
+    private struct PendingTextSplice {
+        let index: UInt64
+        let deleteCount: Int64
+        let insert: String
+        let utf16Location: Int
+        let utf16Length: Int
+    }
+
+    private struct QueuedTextSplice {
+        let url: String
+        var index: UInt64
+        var deleteCount: Int64
+        var insert: String
+        var utf16EndLocation: Int
+        var title: String
+        let heads: [String]
+    }
+
+    private struct PreparedTextMark {
+        let start: UInt64
+        let end: UInt64
+        let valueJson: String?
+    }
+
+    func prepareTextSplice(range: NSRange, replacement: String) -> Bool {
+        pendingTextSplice = nil
+        guard let storage = view?.pStorage else { return false }
+        guard isPlainTextSpliceCandidate(in: storage, range: range, replacement: replacement) else {
+            return false
+        }
+        let deleteCount = editableScalarCount(in: storage, range: range)
+        let index: UInt64
+        if range.length == 0,
+           !replacement.isEmpty,
+           let queued = queuedTextSplice,
+           queued.url == noteUrl,
+           queued.deleteCount == 0,
+           range.location == queued.utf16EndLocation {
+            index = queued.index + UInt64(queued.insert.unicodeScalars.count)
+        } else if replacement.isEmpty,
+                  range.length > 0,
+                  let queued = queuedTextSplice,
+                  queued.url == noteUrl,
+                  queued.insert.isEmpty,
+                  range.location == queued.utf16EndLocation {
+            index = queued.index
+        } else if replacement.isEmpty,
+                  range.length > 0,
+                  deleteCount > 0,
+                  let queued = queuedTextSplice,
+                  queued.url == noteUrl,
+                  queued.insert.isEmpty,
+                  NSMaxRange(range) == queued.utf16EndLocation,
+                  queued.index >= UInt64(deleteCount) {
+            index = queued.index - UInt64(deleteCount)
+        } else {
+            guard let resolved = automergeTextPosition(in: storage, at: range.location) else {
+                return false
+            }
+            index = UInt64(resolved)
+        }
+        pendingTextSplice = PendingTextSplice(
+            index: index,
+            deleteCount: Int64(deleteCount),
+            insert: replacement,
+            utf16Location: range.location,
+            utf16Length: range.length
+        )
+        return true
+    }
+
+    func textDidChange() {
+        guard !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
+        guard let pending = pendingTextSplice else {
+            scheduleSave()
+            return
+        }
+        pendingTextSplice = nil
+        guard let storage = view?.pStorage else {
+            scheduleSave()
+            return
+        }
+        let title: String
+        if pending.index < 120 || session.title.isEmpty {
+            title = titleFromStorage(storage)
+            session.title = title
+        } else {
+            title = session.title
+        }
+        let url = noteUrl
+        if pending.deleteCount == 0,
+           let queued = queuedTextSplice,
+           queued.url == url,
+           queued.deleteCount == 0,
+           pending.utf16Length == 0,
+           pending.utf16Location == queued.utf16EndLocation,
+           pending.index == queued.index + UInt64(queued.insert.unicodeScalars.count) {
+            queuedTextSplice?.insert += pending.insert
+            queuedTextSplice?.utf16EndLocation += (pending.insert as NSString).length
+            queuedTextSplice?.title = title
+            scheduleQueuedTextSpliceFlush()
+            return
+        }
+        if pending.insert.isEmpty,
+           pending.deleteCount > 0,
+           let queued = queuedTextSplice,
+           queued.url == url,
+           queued.insert.isEmpty,
+           pending.utf16Location == queued.utf16EndLocation,
+           pending.index == queued.index {
+            queuedTextSplice?.deleteCount += pending.deleteCount
+            queuedTextSplice?.title = title
+            scheduleQueuedTextSpliceFlush()
+            return
+        }
+        if pending.insert.isEmpty,
+           pending.deleteCount > 0,
+           let queued = queuedTextSplice,
+           queued.url == url,
+           queued.insert.isEmpty,
+           NSMaxRange(NSRange(location: pending.utf16Location, length: pending.utf16Length)) == queued.utf16EndLocation,
+           pending.index + UInt64(pending.deleteCount) == queued.index {
+            queuedTextSplice?.index = pending.index
+            queuedTextSplice?.deleteCount += pending.deleteCount
+            queuedTextSplice?.utf16EndLocation = pending.utf16Location
+            queuedTextSplice?.title = title
+            scheduleQueuedTextSpliceFlush()
+            return
+        }
+        flushQueuedTextSplice()
+        queuedTextSplice = QueuedTextSplice(
+            url: url,
+            index: pending.index,
+            deleteCount: pending.deleteCount,
+            insert: pending.insert,
+            utf16EndLocation: pending.utf16Location + (pending.insert as NSString).length,
+            title: title,
+            heads: session.heads
+        )
+        scheduleQueuedTextSpliceFlush()
+    }
+
+    private func scheduleQueuedTextSpliceFlush() {
+        textSpliceFlushTask?.cancel()
+        textSpliceFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            self?.flushQueuedTextSplice()
+        }
+    }
+
+    private func flushQueuedTextSplice() {
+        textSpliceFlushTask?.cancel()
+        textSpliceFlushTask = nil
+        guard let queued = queuedTextSplice else { return }
+        queuedTextSplice = nil
+        let url = queued.url
+        let heads = queued.heads
+        let previousHeadsTask = localWriteHeadsTask
+        beginLocalWrite()
+        let task = Task { [weak self] () -> [String]? in
+            let chainedHeads = await previousHeadsTask?.value
+            guard let self else { return nil }
+            defer { self.finishLocalWrite(for: url) }
+            let writeHeads = chainedHeads ?? heads
+            let newHeads = await self.model.spliceNoteText(
+                url,
+                index: queued.index,
+                deleteCount: queued.deleteCount,
+                insert: queued.insert,
+                title: queued.title,
+                spansJson: nil,
+                heads: writeHeads,
+                origin: self.noteObserverId
+            )
+            guard self.noteUrl == url else { return nil }
+            guard let newHeads else {
+                self.scheduleSave()
+                return nil
+            }
+            self.session.heads = newHeads
+            return newHeads
+        }
+        localWriteHeadsTask = task
+    }
+
+    private func titleFromStorage(_ storage: NSAttributedString) -> String {
+        let string = storage.string as NSString
+        var title = ""
+        storage.enumerateAttributes(in: NSRange(location: 0, length: storage.length)) { attrs, range, stop in
+            guard attrs[.amDisplayOnly] == nil else { return }
+            let text = string.substring(with: range)
+                .replacingOccurrences(of: "\u{FFFC}", with: "")
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                let trimmed = String(line).trimmingCharacters(in: .whitespaces)
+                if !trimmed.isEmpty {
+                    title = String(trimmed.prefix(60))
+                    stop.pointee = true
+                    return
+                }
+            }
+        }
+        return title
+    }
+
     func scheduleSave() {
+        guard !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
+        flushQueuedTextSplice()
         saveTask?.cancel()
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
@@ -432,20 +841,182 @@ final class EditorCore {
     }
 
     func pushNow() {
+        guard !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
+        if queuedTextSplice != nil {
+            flushQueuedTextSplice()
+            return
+        }
         saveTask?.cancel()
         saveTask = nil
         guard let storage = view?.pStorage else { return }
         let typing = typingBlock()
         let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
         let json = SpanNode.encodeList(spans)
-        guard json != lastKnownJSON else { return }
-        lastKnownJSON = json
+        guard json != session.lastKnownJSON else { return }
+        session.lastKnownJSON = json
         let url = noteUrl
         let title = RichText.title(from: spans)
-        Task {
-            await model.updateSpans(url, json: json)
-            await model.updateTitleIfNeeded(url, title: title)
+        session.title = title
+        beginLocalWrite()
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.finishLocalWrite(for: url) }
+            await self.model.updateDocument(url, json: json, title: title, origin: self.noteObserverId)
         }
+    }
+
+    private func automergeTextPosition(in storage: NSAttributedString, at location: Int) -> Int? {
+        let string = storage.string as NSString
+        guard location >= 0, location <= string.length else { return nil }
+        guard string.length > 0 else { return nil }
+        var position = 0
+        var cursor = 0
+        while cursor < string.length {
+            let paragraph = string.paragraphRange(for: NSRange(location: cursor, length: 0))
+            let contentEnd = paragraphContentEnd(in: string, paragraph: paragraph)
+            position += 1
+            if location >= paragraph.location, location <= contentEnd {
+                let prefix = NSRange(location: paragraph.location, length: location - paragraph.location)
+                return position + editableScalarCount(in: storage, range: prefix)
+            }
+            position += editableScalarCount(
+                in: storage,
+                range: NSRange(location: paragraph.location, length: contentEnd - paragraph.location)
+            )
+            cursor = NSMaxRange(paragraph)
+        }
+        return position
+    }
+
+    private func paragraphContentEnd(in string: NSString, paragraph: NSRange) -> Int {
+        guard paragraph.length > 0 else { return paragraph.location }
+        let end = NSMaxRange(paragraph)
+        return string.character(at: end - 1) == 0x0A ? end - 1 : end
+    }
+
+    private func isPlainTextSpliceCandidate(
+        in storage: NSAttributedString,
+        range: NSRange,
+        replacement: String
+    ) -> Bool {
+        let string = storage.string as NSString
+        guard range.location >= 0,
+              range.length >= 0,
+              NSMaxRange(range) <= string.length
+        else { return false }
+        guard !hasMarkedText() else { return false }
+        guard !replacement.contains("\n"),
+              !replacement.contains("\u{FFFC}")
+        else { return false }
+        if range.length > 0 {
+            guard !string.substring(with: range).contains("\n") else { return false }
+            let paragraph = string.paragraphRange(for: NSRange(location: range.location, length: 0))
+            guard NSMaxRange(range) <= paragraphContentEnd(in: string, paragraph: paragraph) else {
+                return false
+            }
+            guard attributesArePlainEditable(in: storage, range: range) else {
+                return false
+            }
+        } else if storage.length > 0 {
+            guard insertionPointIsPlainEditable(in: storage, location: range.location) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func hasMarkedText() -> Bool {
+        #if os(macOS)
+        if let textView = view as? NSTextView {
+            return textView.hasMarkedText()
+        }
+        #else
+        if let textView = view as? UITextView {
+            return textView.markedTextRange != nil
+        }
+        #endif
+        return false
+    }
+
+    private func insertionPointIsPlainEditable(
+        in storage: NSAttributedString,
+        location: Int
+    ) -> Bool {
+        guard storage.length > 0 else { return true }
+        let probeLocations = [
+            min(location, storage.length - 1),
+            max(0, location - 1),
+        ]
+        for probe in Set(probeLocations) {
+            guard attributesArePlainEditable(
+                in: storage,
+                range: NSRange(location: probe, length: 1)
+            ) else { return false }
+        }
+        return true
+    }
+
+    private func attributesArePlainEditable(
+        in storage: NSAttributedString,
+        range: NSRange
+    ) -> Bool {
+        guard range.length > 0 else { return true }
+        var ok = true
+        storage.enumerateAttributes(in: range) { attrs, _, stop in
+            if attrs[.amDisplayOnly] != nil
+                || attrs[.attachment] != nil
+                || attrs[.amTableBox] != nil
+                || attrs[.amColumnsBox] != nil
+                || (attrs[.amBlock] as? BlockBox)?.value.isAtomic == true {
+                ok = false
+                stop.pointee = true
+            }
+        }
+        return ok
+    }
+
+    private func prepareTextMark(
+        range: NSRange,
+        value: JSONValue?
+    ) -> PreparedTextMark? {
+        guard let storage = view?.pStorage else { return nil }
+        guard range.length > 0,
+              isPlainTextSpliceCandidate(in: storage, range: range, replacement: "")
+        else { return nil }
+        guard let start = automergeTextPosition(in: storage, at: range.location) else {
+            return nil
+        }
+        let count = editableScalarCount(in: storage, range: range)
+        guard count > 0 else { return nil }
+        let valueJson: String?
+        if let value {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(value),
+                  let json = String(data: data, encoding: .utf8)
+            else { return nil }
+            valueJson = json
+        } else {
+            valueJson = nil
+        }
+        return PreparedTextMark(
+            start: UInt64(start),
+            end: UInt64(start + count),
+            valueJson: valueJson
+        )
+    }
+
+    private func editableScalarCount(in storage: NSAttributedString, range: NSRange) -> Int {
+        guard range.length > 0 else { return 0 }
+        let string = storage.string as NSString
+        var count = 0
+        storage.enumerateAttributes(in: range) { attrs, runRange, _ in
+            guard attrs[.amDisplayOnly] == nil else { return }
+            let text = string.substring(with: runRange)
+                .replacingOccurrences(of: "\u{FFFC}", with: "")
+            count += text.unicodeScalars.count
+        }
+        return count
     }
 
     // MARK: formatting
@@ -561,6 +1132,7 @@ final class EditorCore {
             refreshFormattingState()
             return
         }
+        let prepared = prepareTextMark(range: selection, value: value)
         storage.beginEditing()
         storage.enumerateAttributes(in: selection) { runAttrs, runRange, _ in
             let block = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
@@ -577,7 +1149,44 @@ final class EditorCore {
         storage.endEditing()
         view.pSelectedRange = selection
         refreshFormattingState()
-        scheduleSave()
+        guard let prepared else {
+            scheduleSave()
+            return
+        }
+        let typing = typingBlock()
+        let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
+        let json = SpanNode.encodeList(spans)
+        session.lastKnownJSON = json
+        let title = RichText.title(from: spans)
+        let url = noteUrl
+        let heads = session.heads
+        let previousHeadsTask = localWriteHeadsTask
+        beginLocalWrite()
+        let task = Task { [weak self] () -> [String]? in
+            let chainedHeads = await previousHeadsTask?.value
+            guard let self else { return nil }
+            defer { self.finishLocalWrite(for: url) }
+            let writeHeads = chainedHeads ?? heads
+            let newHeads = await self.model.applyNoteMark(
+                url,
+                start: prepared.start,
+                end: prepared.end,
+                name: mark,
+                valueJson: prepared.valueJson,
+                title: title,
+                spansJson: json,
+                heads: writeHeads,
+                origin: self.noteObserverId
+            )
+            guard self.noteUrl == url else { return nil }
+            guard let newHeads else {
+                self.scheduleSave()
+                return nil
+            }
+            self.session.heads = newHeads
+            return newHeads
+        }
+        localWriteHeadsTask = task
     }
 
     /// Custom Return behavior. Returns true when handled.
@@ -604,6 +1213,17 @@ final class EditorCore {
             return true
         }
         // paragraphs, lists, quotes and code blocks continue their block
+        // On iOS, UITextView does not reliably carry custom block attributes
+        // across paragraph boundaries when it handles the newline internally.
+        // Mirror the heading case: insert the newline ourselves and set attrs.
+        #if os(iOS)
+        if continuing {
+            view.pInsertText("\n")
+            view.pTypingAttributes = RichText.attributes(block: block, marks: [:])
+            refreshFormattingState()
+            return true
+        }
+        #endif
         return false
     }
 
@@ -967,6 +1587,14 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         super.paste(sender)
     }
 
+    override func pasteAsPlainText(_ sender: Any?) {
+        guard let text = NSPasteboard.general.string(forType: .string) else {
+            super.pasteAsPlainText(sender)
+            return
+        }
+        insertText(text, replacementRange: selectedRange())
+    }
+
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         if consumeAttachment(from: sender.draggingPasteboard) { return true }
         return super.performDragOperation(sender)
@@ -1028,13 +1656,14 @@ struct RichTextEditor: NSViewRepresentable {
     let noteUrl: String
     let model: NotesModel
     let controller: EditorController
+    let contextTracker: ContextTracker
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: EditorCore(noteUrl: noteUrl, model: model, controller: controller))
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let storage = NSTextStorage()
+        let storage = context.coordinator.core.sharedStorage
         let layoutManager = ListMarkerLayoutManager()
         storage.addLayoutManager(layoutManager)
         let container = NSTextContainer(size: NSSize(
@@ -1073,7 +1702,12 @@ struct RichTextEditor: NSViewRepresentable {
 
         context.coordinator.core.view = textView
         context.coordinator.core.load()
+        context.coordinator.core.startContext(contextTracker)
         return scroll
+    }
+
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        coordinator.core.detachViewFromSharedStorage()
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
@@ -1095,11 +1729,12 @@ struct RichTextEditor: NSViewRepresentable {
             didCompleteLayoutFor textContainer: NSTextContainer?,
             atEnd layoutFinishedFlag: Bool
         ) {
+            guard layoutFinishedFlag else { return }
             core.inline.setNeedsReconcile()
         }
 
         func textDidChange(_ notification: Notification) {
-            core.scheduleSave()
+            core.textDidChange()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -1123,6 +1758,10 @@ struct RichTextEditor: NSViewRepresentable {
                core.handleMarkdownTrigger(at: affectedCharRange.location) {
                 return false
             }
+            _ = core.prepareTextSplice(
+                range: affectedCharRange,
+                replacement: replacementString ?? ""
+            )
             return true
         }
     }
@@ -1182,19 +1821,28 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         }
         super.paste(sender)
     }
+
+    override func pasteAndMatchStyle(_ sender: Any?) {
+        guard let text = UIPasteboard.general.string else {
+            super.pasteAndMatchStyle(sender)
+            return
+        }
+        insertText(text)
+    }
 }
 
 struct RichTextEditor: UIViewRepresentable {
     let noteUrl: String
     let model: NotesModel
     let controller: EditorController
+    let contextTracker: ContextTracker
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: EditorCore(noteUrl: noteUrl, model: model, controller: controller))
     }
 
     func makeUIView(context: Context) -> EditorTextView {
-        let storage = NSTextStorage()
+        let storage = context.coordinator.core.sharedStorage
         let layoutManager = ListMarkerLayoutManager()
         storage.addLayoutManager(layoutManager)
         let container = NSTextContainer(size: CGSize(
@@ -1230,7 +1878,12 @@ struct RichTextEditor: UIViewRepresentable {
 
         context.coordinator.core.view = textView
         context.coordinator.core.load()
+        context.coordinator.core.startContext(contextTracker)
         return textView
+    }
+
+    static func dismantleUIView(_ uiView: EditorTextView, coordinator: Coordinator) {
+        coordinator.core.detachViewFromSharedStorage()
     }
 
     func updateUIView(_ uiView: EditorTextView, context: Context) {
@@ -1254,11 +1907,12 @@ struct RichTextEditor: UIViewRepresentable {
             didCompleteLayoutFor textContainer: NSTextContainer?,
             atEnd layoutFinishedFlag: Bool
         ) {
+            guard layoutFinishedFlag else { return }
             core.inline.setNeedsReconcile()
         }
 
         func textViewDidChange(_ textView: UITextView) {
-            core.scheduleSave()
+            core.textDidChange()
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -1277,6 +1931,7 @@ struct RichTextEditor: UIViewRepresentable {
                core.handleMarkdownTrigger(at: range.location) {
                 return false
             }
+            _ = core.prepareTextSplice(range: range, replacement: text)
             return true
         }
 
@@ -1290,6 +1945,9 @@ struct RichTextEditor: UIViewRepresentable {
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard let textView = gesture.view as? EditorTextView else { return }
             let point = gesture.location(in: textView)
+            // If the tap landed on a live inline view (audio, table, etc.),
+            // let that view handle the interaction instead of opening a sheet.
+            guard !core.inline.hasLiveView(at: point) else { return }
             let containerPoint = CGPoint(
                 x: point.x - textView.textContainerInset.left,
                 y: point.y - textView.textContainerInset.top

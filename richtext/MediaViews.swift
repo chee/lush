@@ -206,7 +206,7 @@ struct WaveformView: View {
         }
     }
 
-    static func levels(for fileURL: URL, bars: Int = 48) -> [Float] {
+    nonisolated static func levels(for fileURL: URL, bars: Int = 48) -> [Float] {
         guard let file = try? AVAudioFile(forReading: fileURL) else { return [] }
         let frameCount = AVAudioFrameCount(file.length)
         guard frameCount > 0,
@@ -574,7 +574,12 @@ struct AudioPlayerSheet: View {
             player.pause()
             playing = false
         } else {
-            if position >= duration - 0.05 {
+            if trimming {
+                if position < trimStart || position >= trimEnd - 0.05 {
+                    player.currentTime = trimStart
+                    position = trimStart
+                }
+            } else if position >= duration - 0.05 {
                 player.currentTime = 0
             }
             player.play()

@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreLocation
+import MapKit
 import MediaPlayer
 
 struct ContextSnapshot: Equatable {
@@ -38,13 +39,18 @@ extension BlockValue {
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
 
-    static func creationBlock() -> BlockValue {
+    static func creationBlock(snap: ContextSnapshot? = nil) -> BlockValue {
+        var attrs: [String: JSONValue] = [:]
         let fmt = ISO8601DateFormatter()
-        return BlockValue(
-            type: "context",
-            attrs: ["created": .string(fmt.string(from: Date()))],
-            isEmbed: true
-        )
+        attrs["created"] = .string(fmt.string(from: Date()))
+        if let snap {
+            if let loc = snap.locationName { attrs["location"] = .string(loc) }
+            if let lat = snap.latitude { attrs["lat"] = .number(lat) }
+            if let lon = snap.longitude { attrs["lon"] = .number(lon) }
+            if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
+            if let s = snap.nowPlaying { attrs["now_playing"] = .string(s) }
+        }
+        return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
 }
 
@@ -68,11 +74,27 @@ struct ContextInlineView: View {
             if let date = dateText {
                 Label(date, systemImage: isCreation ? "doc.badge.clock" : "clock")
             }
-            if let loc = block.attrs["location"]?.stringValue {
-                Label(loc, systemImage: "location")
-            }
             if let weather = block.attrs["weather"]?.stringValue {
                 Label(weather, systemImage: "cloud.sun")
+            }
+            if let loc = block.attrs["location"]?.stringValue {
+                let lat = block.attrs["lat"]?.doubleValue
+                let lon = block.attrs["lon"]?.doubleValue
+                if let lat, let lon,
+                   let url = URL(string: "https://maps.apple.com/?q=\(loc.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? loc)&ll=\(lat),\(lon)") {
+                    Button {
+                        #if os(macOS)
+                        NSWorkspace.shared.open(url)
+                        #else
+                        UIApplication.shared.open(url)
+                        #endif
+                    } label: {
+                        Label(loc, systemImage: "location")
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Label(loc, systemImage: "location")
+                }
             }
             if let song = block.attrs["now_playing"]?.stringValue {
                 Label(song, systemImage: "music.note")
@@ -151,10 +173,10 @@ final class ContextTracker {
         snapshot.longitude = loc.coordinate.longitude
         snapshot.timestamp = Date()
         Task {
-            let geocoder = CLGeocoder()
-            if let pm = try? await geocoder.reverseGeocodeLocation(loc).first {
-                snapshot.locationName = [pm.locality, pm.country]
-                    .compactMap { $0 }.joined(separator: ", ")
+            if let request = MKReverseGeocodingRequest(location: loc),
+               let mapItem = try? await request.mapItems.first,
+               let addr = mapItem.addressRepresentations {
+                snapshot.locationName = addr.cityWithContext ?? addr.cityName
             }
             await fetchWeather(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
         }

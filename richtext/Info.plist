@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDisplayName</key>
 	<string>Lush Notes</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Attaches your location to notes as context.</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -11,7 +13,7 @@
 			<string>party.chee.richtext</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>richtext</string>
+				<string>lush</string>
 			</array>
 		</dict>
 	</array>

@@ -56,12 +56,12 @@ final class InlineViewManager {
             rect.origin.x += origin.x
             rect.origin.y += origin.y
             guard containerWidth > 80 else {
-                host.view.frame = rect
+                if host.view.frame != rect { host.view.frame = rect }
                 return
             }
             let desired = host.preferredSize(containerWidth)
             guard desired.width > 1, desired.height > 1 else {
-                host.view.frame = rect
+                if host.view.frame != rect { host.view.frame = rect }
                 return
             }
             // compare against the attachment's own bounds, not the layout
@@ -72,7 +72,8 @@ final class InlineViewManager {
             if abs(desired.width - bounds.width) > 1 || abs(desired.height - bounds.height) > 1 {
                 resizes.append((location, desired))
             }
-            host.view.frame = CGRect(origin: rect.origin, size: desired)
+            let targetFrame = CGRect(origin: rect.origin, size: desired)
+            if host.view.frame != targetFrame { host.view.frame = targetFrame }
         }
 
         storage.enumerateAttribute(.amTableBox, in: full) { value, range, _ in
@@ -135,6 +136,10 @@ final class InlineViewManager {
             layoutManager.invalidateLayout(forCharacterRange: charRange, actualCharacterRange: nil)
             layoutManager.invalidateDisplay(forCharacterRange: charRange)
         }
+    }
+
+    func hasLiveView(at point: CGPoint) -> Bool {
+        hosts.values.contains { $0.view.frame.contains(point) }
     }
 
     func resetHosts() {
@@ -208,6 +213,14 @@ final class InlineViewManager {
             return Host(
                 view: view,
                 preferredSize: { width in CGSize(width: min(460, width), height: 220) },
+                retained: retained
+            )
+        }
+        if block.type == "context" {
+            let (view, _, retained) = makeHosting(ContextInlineView(block: block))
+            return Host(
+                view: view,
+                preferredSize: { width in CGSize(width: min(460, width), height: 28) },
                 retained: retained
             )
         }

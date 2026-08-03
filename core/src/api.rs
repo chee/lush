@@ -1,9 +1,11 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
+use automerge::ChangeHash;
 use tokio::runtime::Runtime;
 
 use crate::{
     repo::{DocId, Repo, RepoEvent, DEFAULT_SERVER},
+    search::{self, SearchIndex},
     shapes,
 };
 
@@ -48,6 +50,27 @@ pub struct NoteInfo {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct NoteSpansSnapshot {
+    pub spans_json: String,
+    pub heads: Vec<String>,
+}
+
+fn encode_heads(heads: Vec<ChangeHash>) -> Vec<String> {
+    heads.into_iter().map(|h| h.to_string()).collect()
+}
+
+fn decode_heads(heads: Vec<String>) -> Result<Vec<ChangeHash>, CoreError> {
+    heads
+        .into_iter()
+        .map(|head| {
+            ChangeHash::from_str(&head).map_err(|e| CoreError::General {
+                msg: format!("invalid change head {head}: {e}"),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct AssetInfo {
     pub name: String,
     pub mime_type: String,
@@ -77,10 +100,53 @@ pub trait CoreDelegate: Send + Sync {
 pub struct Core {
     runtime: Runtime,
     repo: Arc<Repo>,
+    index: Arc<SearchIndex>,
     folder: std::sync::Mutex<Option<DocId>>,
 }
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+
+impl Core {
+    fn start_index_updates(self: &Arc<Self>) {
+        let mut events = self.repo.subscribe();
+        let repo = self.repo.clone();
+        let index = self.index.clone();
+        self.runtime.spawn(async move {
+            while let Ok(event) = events.recv().await {
+                if let RepoEvent::DocChanged(id) = event {
+                    index_doc(repo.clone(), index.clone(), id).await;
+                }
+            }
+        });
+    }
+
+    fn reindex_doc(&self, id: DocId) {
+        let repo = self.repo.clone();
+        let index = self.index.clone();
+        self.runtime
+            .block_on(async move { index_doc(repo, index, id).await });
+    }
+}
+
+async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
+    let url = id.to_url();
+    let indexed = repo
+        .read_doc(id, |doc| Ok(search::indexed_doc(url.clone(), doc)))
+        .await;
+    match indexed {
+        Ok(doc) if doc.kind == "rich" || doc.kind == "file" => {
+            if let Err(e) = index.upsert(doc) {
+                tracing::warn!(error = %e, "search index update failed");
+            }
+        }
+        Ok(_) => {
+            if let Err(e) = index.remove(&url) {
+                tracing::warn!(error = %e, "search index remove failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "search index read failed"),
+    }
+}
 
 #[uniffi::export]
 impl Core {
@@ -90,12 +156,17 @@ impl Core {
             msg: format!("tokio runtime: {e}"),
         })?;
         let server = server_url.unwrap_or_else(|| DEFAULT_SERVER.to_string());
-        let repo = runtime.block_on(Repo::start(PathBuf::from(data_dir), server))?;
-        Ok(Arc::new(Core {
+        let data_dir = PathBuf::from(data_dir);
+        let index = Arc::new(SearchIndex::open(&data_dir)?);
+        let repo = runtime.block_on(Repo::start(data_dir, server))?;
+        let core = Arc::new(Core {
             runtime,
             repo,
+            index,
             folder: std::sync::Mutex::new(None),
-        }))
+        });
+        core.start_index_updates();
+        Ok(core)
     }
 
     pub fn set_delegate(&self, delegate: Box<dyn CoreDelegate>) {
@@ -127,10 +198,14 @@ impl Core {
                     if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
                         anyhow::bail!("folder doc not found locally or on the server");
                     }
-                    repo.change_doc(id, |doc| shapes::normalize_strings(doc)).await?;
+                    repo.change_doc(id, |doc| shapes::normalize_strings(doc))
+                        .await?;
                     Ok(id)
                 }
-                None => repo.create_doc(|doc| shapes::init_folder(doc, "Notes")).await,
+                None => {
+                    repo.create_doc(|doc| shapes::init_folder(doc, "Notes"))
+                        .await
+                }
             }
         })?;
         *self.folder.lock().unwrap() = Some(id);
@@ -162,7 +237,11 @@ impl Core {
                     .filter_map(|e| {
                         let kind = synthesize_kind(&e.kind, e.lush.as_deref());
                         if kind == "rich" || kind == "folder" || kind == "lush:script" {
-                            Some(NoteInfo { url: e.url, name: e.name, kind })
+                            Some(NoteInfo {
+                                url: e.url,
+                                name: e.name,
+                                kind,
+                            })
                         } else {
                             None
                         }
@@ -184,7 +263,11 @@ impl Core {
                     .into_iter()
                     .map(|e| {
                         let kind = synthesize_kind(&e.kind, e.lush.as_deref());
-                        NoteInfo { url: e.url, name: e.name, kind }
+                        NoteInfo {
+                            url: e.url,
+                            name: e.name,
+                            kind,
+                        }
                     })
                     .collect()
             })
@@ -226,11 +309,14 @@ impl Core {
             }
             let link = repo
                 .read_doc(from, |d| {
-                    Ok(shapes::folder_entries(d)?.into_iter().find(|e| e.url == url))
+                    Ok(shapes::folder_entries(d)?
+                        .into_iter()
+                        .find(|e| e.url == url))
                 })
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("entry not found in source folder"))?;
-            repo.change_doc(to, |d| shapes::add_folder_entry(d, &link)).await?;
+            repo.change_doc(to, |d| shapes::add_folder_entry(d, &link))
+                .await?;
             repo.change_doc(from, |d| shapes::remove_folder_entry(d, &url))
                 .await?;
             Ok::<_, anyhow::Error>(())
@@ -258,17 +344,17 @@ impl Core {
         title: String,
     ) -> Result<(), CoreError> {
         let repo = self.repo.clone();
+        let reindex_url = url.clone();
         self.runtime.block_on(async move {
             let id = DocId::from_url(&url)?;
             repo.change_doc(id, |doc| shapes::set_note_title(doc, &title))
                 .await?;
             let folder = DocId::from_url(&folder_url)?;
-            repo.change_doc(folder, |doc| {
-                shapes::rename_folder_entry(doc, &url, &title)
-            })
-            .await?;
+            repo.change_doc(folder, |doc| shapes::rename_folder_entry(doc, &url, &title))
+                .await?;
             Ok::<_, anyhow::Error>(())
         })?;
+        self.reindex_doc(DocId::from_url(&reindex_url)?);
         Ok(())
     }
 
@@ -330,6 +416,7 @@ impl Core {
             .await?;
             Ok::<_, anyhow::Error>(note.to_url())
         })?;
+        self.reindex_doc(DocId::from_url(&url)?);
         Ok(url)
     }
 
@@ -359,16 +446,16 @@ impl Core {
                 msg: "no folder open".into(),
             })?;
         let repo = self.repo.clone();
+        let reindex_url = url.clone();
         self.runtime.block_on(async move {
             let id = DocId::from_url(&url)?;
             repo.change_doc(id, |doc| shapes::set_note_title(doc, &title))
                 .await?;
-            repo.change_doc(folder, |doc| {
-                shapes::rename_folder_entry(doc, &url, &title)
-            })
-            .await?;
+            repo.change_doc(folder, |doc| shapes::rename_folder_entry(doc, &url, &title))
+                .await?;
             Ok::<_, anyhow::Error>(())
         })?;
+        self.reindex_doc(DocId::from_url(&reindex_url)?);
         Ok(())
     }
 
@@ -376,14 +463,17 @@ impl Core {
     /// locally (immediately for docs we already have).
     pub fn open_note(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
+        let reindex_url = url.clone();
         self.runtime.block_on(async move {
             let id = DocId::from_url(&url)?;
             repo.ensure_doc(id).await?;
             if repo.wait_for_doc(id, OPEN_TIMEOUT).await {
-                repo.change_doc(id, |doc| shapes::normalize_strings(doc)).await?;
+                repo.change_doc(id, |doc| shapes::normalize_strings(doc))
+                    .await?;
             }
             Ok::<_, anyhow::Error>(())
         })?;
+        self.reindex_doc(DocId::from_url(&reindex_url)?);
         Ok(())
     }
 
@@ -392,11 +482,14 @@ impl Core {
     /// strings are normalized to Text.
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
+        let index = self.index.clone();
         self.runtime.spawn(async move {
             let mut visited = std::collections::HashSet::new();
             let mut queue: Vec<String> = urls;
             while let Some(url) = queue.pop() {
-                let Ok(id) = DocId::from_url(&url) else { continue };
+                let Ok(id) = DocId::from_url(&url) else {
+                    continue;
+                };
                 if !visited.insert(id) || visited.len() > 500 {
                     continue;
                 }
@@ -409,6 +502,7 @@ impl Core {
                 let _ = repo
                     .change_doc(id, |doc| shapes::normalize_strings(doc))
                     .await;
+                index_doc(repo.clone(), index.clone(), id).await;
                 if let Ok(entries) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
                     for entry in entries {
                         queue.push(entry.url);
@@ -421,93 +515,14 @@ impl Core {
         });
     }
 
-    /// Case-insensitive full-text search across every note reachable from the
-    /// current folder, recursing into subfolders. Docs are held in memory by
-    /// prefetch, so this is a local scan.
+    /// Full-text search across every locally indexed note. The index is local
+    /// to this device and is updated as prefetched docs land or change.
     pub fn search_notes(&self, query: String) -> Vec<SearchHit> {
         let query = query.trim().to_string();
         if query.is_empty() {
             return Vec::new();
         }
-        let Some(root) = *self.folder.lock().unwrap() else {
-            return Vec::new();
-        };
-        let repo = self.repo.clone();
-        self.runtime.block_on(async move {
-            let mut hits = Vec::new();
-            let mut visited = std::collections::HashSet::new();
-            let mut folders = vec![root];
-            visited.insert(root);
-            while let Some(folder) = folders.pop() {
-                let Ok(entries) = repo.read_doc(folder, |doc| shapes::folder_entries(doc)).await
-                else {
-                    continue;
-                };
-                for entry in entries {
-                    let Ok(id) = DocId::from_url(&entry.url) else {
-                        continue;
-                    };
-                    if !visited.insert(id) {
-                        continue;
-                    }
-                    if entry.kind == "folder" {
-                        folders.push(id);
-                        continue;
-                    }
-                    if entry.kind != "rich" {
-                        continue;
-                    }
-                    let matched = repo
-                        .read_doc(id, |doc| {
-                            let title = shapes::doc_title(doc);
-                            let text = shapes::full_text(doc);
-                            if let Some(snippet) = shapes::search_snippet(&text, &query) {
-                                return Ok(Some(snippet));
-                            }
-                            if shapes::search_snippet(&title, &query).is_some() {
-                                return Ok(Some(shapes::note_preview(doc)));
-                            }
-                            Ok(None)
-                        })
-                        .await;
-                    if let Ok(Some(snippet)) = matched {
-                        hits.push(SearchHit {
-                            url: entry.url,
-                            name: entry.name,
-                            snippet,
-                        });
-                        continue;
-                    }
-                    // no body match: check attached files' names + vision text
-                    let embeds = repo
-                        .read_doc(id, |doc| Ok(shapes::embed_urls(doc)))
-                        .await
-                        .unwrap_or_default();
-                    for asset_url in embeds {
-                        let Ok(asset_id) = DocId::from_url(&asset_url) else {
-                            continue;
-                        };
-                        let found = repo
-                            .read_doc(asset_id, |doc| {
-                                Ok(shapes::search_snippet(
-                                    &shapes::asset_search_text(doc),
-                                    &query,
-                                ))
-                            })
-                            .await;
-                        if let Ok(Some(snippet)) = found {
-                            hits.push(SearchHit {
-                                url: entry.url.clone(),
-                                name: entry.name.clone(),
-                                snippet,
-                            });
-                            break;
-                        }
-                    }
-                }
-            }
-            hits
-        })
+        self.index.search(&query).unwrap_or_default()
     }
 
     pub fn note_preview(&self, url: String) -> String {
@@ -530,12 +545,11 @@ impl Core {
         let repo = self.repo.clone();
         let url = self.runtime.block_on(async move {
             let id = repo
-                .create_doc(|doc| {
-                    shapes::init_file_doc(doc, &name, &extension, &mime_type, data)
-                })
+                .create_doc(|doc| shapes::init_file_doc(doc, &name, &extension, &mime_type, data))
                 .await?;
             Ok::<_, anyhow::Error>(id.to_url())
         })?;
+        self.reindex_doc(DocId::from_url(&url)?);
         Ok(url)
     }
 
@@ -547,16 +561,20 @@ impl Core {
         ocr: String,
     ) -> Result<(), CoreError> {
         let repo = self.repo.clone();
+        let reindex_url = url.clone();
         self.runtime.block_on(async move {
             let id = DocId::from_url(&url)?;
             repo.ensure_doc(id).await?;
             if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
                 anyhow::bail!("asset not found");
             }
-            repo.change_doc(id, |doc| shapes::set_vision_metadata(doc, &description, &ocr))
-                .await?;
+            repo.change_doc(id, |doc| {
+                shapes::set_vision_metadata(doc, &description, &ocr)
+            })
+            .await?;
             Ok::<_, anyhow::Error>(())
         })?;
+        self.reindex_doc(DocId::from_url(&reindex_url)?);
         Ok(())
     }
 
@@ -617,9 +635,26 @@ impl Core {
         Ok(json)
     }
 
+    pub fn note_spans_snapshot(&self, url: String) -> Result<NoteSpansSnapshot, CoreError> {
+        let repo = self.repo.clone();
+        let snapshot = self.runtime.block_on(async move {
+            let id = DocId::from_url(&url)?;
+            repo.read_doc(id, |doc| {
+                let spans = shapes::spans_to_json(doc)?;
+                Ok::<_, anyhow::Error>(NoteSpansSnapshot {
+                    spans_json: serde_json::to_string(&spans)?,
+                    heads: encode_heads(doc.get_heads()),
+                })
+            })
+            .await
+        })?;
+        Ok(snapshot)
+    }
+
     pub fn update_note_spans(&self, url: String, spans_json: String) -> Result<(), CoreError> {
         guarded(|| {
             let repo = self.repo.clone();
+            let reindex_url = url.clone();
             self.runtime.block_on(async move {
                 let id = DocId::from_url(&url)?;
                 let spans: Vec<shapes::SpanJson> = serde_json::from_str(&spans_json)?;
@@ -630,7 +665,71 @@ impl Core {
                 .await?;
                 Ok::<_, anyhow::Error>(())
             })?;
+            self.reindex_doc(DocId::from_url(&reindex_url)?);
             Ok(())
+        })
+    }
+
+    pub fn splice_note_text(
+        &self,
+        url: String,
+        index: u64,
+        delete_count: i64,
+        insert: String,
+        title: String,
+        heads: Vec<String>,
+    ) -> Result<Vec<String>, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let heads = decode_heads(heads)?;
+            let current_heads = self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                repo.change_doc_at_deferred_save(id, heads, |doc| {
+                    shapes::splice_note_text(doc, index as usize, delete_count, &insert, &title)?;
+                    Ok(())
+                })
+                .await?;
+                repo.read_doc(id, |doc| Ok(encode_heads(doc.get_heads())))
+                    .await
+            })?;
+            Ok(current_heads)
+        })
+    }
+
+    pub fn apply_note_mark(
+        &self,
+        url: String,
+        start: u64,
+        end: u64,
+        name: String,
+        value_json: Option<String>,
+        title: String,
+        heads: Vec<String>,
+    ) -> Result<Vec<String>, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let heads = decode_heads(heads)?;
+            let current_heads = self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                let value = value_json
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?;
+                repo.change_doc_at_deferred_save(id, heads, |doc| {
+                    shapes::apply_note_mark(
+                        doc,
+                        start as usize,
+                        end as usize,
+                        &name,
+                        value,
+                        &title,
+                    )?;
+                    Ok(())
+                })
+                .await?;
+                repo.read_doc(id, |doc| Ok(encode_heads(doc.get_heads())))
+                    .await
+            })?;
+            Ok(current_heads)
         })
     }
 
@@ -644,6 +743,7 @@ impl Core {
     ) -> Result<(), CoreError> {
         guarded(|| {
             let repo = self.repo.clone();
+            let reindex_url = url.clone();
             self.runtime.block_on(async move {
                 let id = DocId::from_url(&url)?;
                 let spans: Vec<shapes::SpanJson> = serde_json::from_str(&spans_json)?;
@@ -654,6 +754,7 @@ impl Core {
                 .await?;
                 Ok::<_, anyhow::Error>(())
             })?;
+            self.reindex_doc(DocId::from_url(&reindex_url)?);
             Ok(())
         })
     }
@@ -661,7 +762,9 @@ impl Core {
     pub fn create_script_in(&self, folder_url: String, name: String) -> Result<String, CoreError> {
         let repo = self.repo.clone();
         let url = self.runtime.block_on(async move {
-            let script = repo.create_doc(|doc| shapes::init_script(doc, &name)).await?;
+            let script = repo
+                .create_doc(|doc| shapes::init_script(doc, &name))
+                .await?;
             let folder = DocId::from_url(&folder_url)?;
             repo.change_doc(folder, |doc| {
                 shapes::add_folder_entry(
@@ -689,6 +792,7 @@ impl Core {
             .block_on(self.repo.read_doc(id, |doc| {
                 Ok(doc
                     .get_changes(&[])
+                    .unwrap_or_default()
                     .iter()
                     .map(|c| c.timestamp())
                     .max()
@@ -720,6 +824,7 @@ impl Core {
                 .await?;
                 Ok::<_, anyhow::Error>(note.to_url())
             })?;
+            self.reindex_doc(DocId::from_url(&url)?);
             Ok(url)
         })
     }

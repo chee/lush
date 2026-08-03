@@ -89,7 +89,7 @@ enum PatchworkWeb {
     <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <!-- richweb_CONFIG -->
+    <!-- lushweb_CONFIG -->
     <script type="importmap">{
       "imports": {
         "@automerge/automerge": "/packages/@automerge/automerge.js",
@@ -127,18 +127,18 @@ enum PatchworkWeb {
     }</script>
     <link rel="stylesheet" href="/app.css" />
     <style>
-      html, body { margin: 0; height: 100%; }
+      html, body { margin: 0; height: 100%; background: var(--editor-fill); color: var(--editor-line); }
       body > repo-provider, body > repo-provider > patchwork-view {
         display: block; height: 100%; overflow: auto;
         background: var(--editor-fill); color: var(--editor-line);
       }
-      #status { font: 12px system-ui, sans-serif; color: #888; padding: 12px; }
+      #status { font: 12px system-ui, sans-serif; color: color-mix(in srgb, var(--editor-line) 55%, transparent); padding: 12px; }
       .picker { display: flex; flex-direction: column; gap: 6px; padding: 14px;
         font: 13px system-ui, sans-serif; }
       .picker-paste { display: flex; gap: 6px; }
       .picker-paste input { flex: 1; padding: 5px 8px; border-radius: 6px;
         border: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
-      .picker-heading { margin-top: 8px; color: #888; font-size: 11px;
+      .picker-heading { margin-top: 8px; color: color-mix(in srgb, var(--editor-line) 55%, transparent); font-size: 11px;
         text-transform: uppercase; letter-spacing: 0.04em; }
       .picker button { padding: 6px 10px; border-radius: 6px; cursor: pointer;
         border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -154,6 +154,10 @@ enum PatchworkWeb {
     """#
 
     static let shellJS = #"""
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/service-worker.js", { type: "module" }).catch(console.warn)
+    }
+
     import { initializeWasm, hasHeads } from "@automerge/automerge/slim"
     import {
       initSync as initSubductionSync,
@@ -228,8 +232,41 @@ enum PatchworkWeb {
       })
     }
 
+    function installHandoffListener() {
+      const HANDOFF_CHANNEL = "@patchwork/handoff"
+      const CACHEABLE = [200, 203, 204]
+      const ch = new BroadcastChannel(HANDOFF_CHANNEL)
+      ch.addEventListener("message", async (event) => {
+        const data = event.data
+        if (data?.type !== "request") return
+        const { id, cachename, request } = data
+        let handoffURL
+        try { handoffURL = new URL(request.handoffURL) } catch { return }
+        if (handoffURL.protocol !== "automerge:") return
+        const resolve = window.__patchworkResolve
+        if (!resolve) return
+        const raw = new URL(request.url).pathname.slice(1)
+        const result = await resolve(raw)
+        const bytes = Uint8Array.from(atob(result.base64), (c) => c.charCodeAt(0))
+        if (CACHEABLE.includes(result.status)) {
+          const cache = await caches.open(cachename)
+          await cache.put(
+            new Request(request.url, { method: request.method, headers: request.headers, referrer: request.referrer }),
+            new Response(bytes, { status: result.status, headers: { "content-type": result.mimeType } })
+          )
+          ch.postMessage({ id, type: "cached" })
+        } else {
+          ch.postMessage({
+            id, type: "response",
+            response: { status: result.status, body: new TextDecoder().decode(bytes), headers: { "content-type": result.mimeType } },
+          })
+        }
+      })
+      ch.postMessage({ type: "online" })
+    }
+
     // The JS half of RichWebSchemeHandler: serves file contents out of folder
-    // docs for richweb://app/automerge:…/path requests (tool modules, images).
+    // docs for lushweb://app/automerge:…/path requests (tool modules, images).
     function installResolver(repo) {
       window.__patchworkResolve = async (raw) => {
         try {
@@ -343,6 +380,7 @@ enum PatchworkWeb {
       })
       window.repo = repo
       installResolver(repo)
+      installHandoffListener()
 
       registerRepoProviderElement(repo)
       registerPatchworkViewElement({ repo })
@@ -531,7 +569,7 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
         switch path {
         case "", "embed.html":
             let html = PatchworkWeb.shellHTML.replacingOccurrences(
-                of: "<!-- richweb_CONFIG -->",
+                of: "<!-- lushweb_CONFIG -->",
                 with: PatchworkWeb.configScriptTag
             )
             return respond(url: url, data: Data(html.utf8), mime: "text/html; charset=utf-8")
@@ -687,7 +725,7 @@ func makePatchworkWebView(
 ) -> WKWebView {
     let handler = RichWebSchemeHandler()
     let configuration = WKWebViewConfiguration()
-    configuration.setURLSchemeHandler(handler, forURLScheme: "richweb")
+    configuration.setURLSchemeHandler(handler, forURLScheme: "lushweb")
     if let messageHandler {
         configuration.userContentController.add(messageHandler, name: "richtext")
     }
@@ -700,7 +738,7 @@ func makePatchworkWebView(
     webView.isOpaque = false
     webView.backgroundColor = .clear
     #endif
-    var components = URLComponents(string: "richweb://app/embed.html")!
+    var components = URLComponents(string: "lushweb://app/embed.html")!
     components.queryItems = query
     webView.load(URLRequest(url: components.url!))
     return webView
@@ -881,8 +919,7 @@ struct PatchworkBoxView: View {
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
-                .padding(.top, -10)
-                .padding(.trailing, -10)
+                .padding(8)
             }
         }
     }
