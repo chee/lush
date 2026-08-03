@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use richtext_core::{
+use lush_core::{
     repo::{DocId, Repo, RepoEvent, DEFAULT_SERVER},
     shapes,
 };

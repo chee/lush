@@ -26,7 +26,7 @@ use subduction_core::{
     peer::id::PeerId,
     policy::open::OpenPolicy,
     remote_heads::{RemoteHeads, RemoteHeadsObserver},
-    storage::powerbox::StoragePowerbox,
+    storage::{powerbox::StoragePowerbox, traits::Storage},
     subduction::Subduction,
     timeout::call::CallTimeout,
     transport::message::MessageTransport,
@@ -34,13 +34,17 @@ use subduction_core::{
 use subduction_crypto::signer::memory::MemorySigner;
 use subduction_websocket::tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn};
 use tokio::{
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, mpsc, Mutex, Semaphore},
     task::JoinHandle,
 };
 
 pub const DEFAULT_SERVER: &str = "wss://subduction.sync.inkandswitch.com";
 
-const SYNC_TIMEOUT: CallTimeout = CallTimeout::Uncapped;
+const SYNC_TIMEOUT: CallTimeout = CallTimeout::TimeoutMillis(60_000);
+const HEAL_INITIAL: Duration = Duration::from_secs(2);
+const HEAL_MAX_DELAY: Duration = Duration::from_secs(60);
+const HEAL_MAX_ATTEMPTS: u32 = 10;
+const COMPACTION_CONCURRENCY: usize = 10;
 
 type Conn = MessageTransport<TokioWebSocketClient<MemorySigner>>;
 type Handler = SyncHandler<
@@ -137,12 +141,26 @@ struct DocState {
     fragments_unavailable: bool,
 }
 
+struct SyncOutcome {
+    any_failed: bool,
+    data_received: bool,
+    peer_count: usize,
+}
+
+enum HealMsg {
+    Schedule(DocId),
+    Reset(DocId),
+}
+
 pub struct Repo {
     core: Arc<Core>,
+    storage: FsStorage,
     signer: MemorySigner,
     server_url: String,
     docs: Mutex<HashMap<DocId, DocState>>,
     pending_saves: Mutex<HashMap<DocId, JoinHandle<()>>>,
+    compact_tx: mpsc::UnboundedSender<DocId>,
+    heal_tx: mpsc::UnboundedSender<HealMsg>,
     events: broadcast::Sender<RepoEvent>,
     connected: std::sync::atomic::AtomicBool,
 }
@@ -205,6 +223,104 @@ fn known_hashes(doc: &Automerge, fragments_unavailable: bool) -> (HashSet<Change
     }
 }
 
+/// Background worker that serialises compaction so at most one compaction task
+/// runs per doc at a time. Mirrors JS `#scheduleCompaction` / `compactionInFlight`.
+async fn compact_worker(repo: Arc<Repo>, mut rx: mpsc::UnboundedReceiver<DocId>) {
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<DocId>();
+    let mut in_flight: HashSet<DocId> = HashSet::new();
+    loop {
+        tokio::select! {
+            Some(id) = rx.recv() => {
+                if in_flight.insert(id) {
+                    let repo2 = Arc::clone(&repo);
+                    let done_tx2 = done_tx.clone();
+                    tokio::spawn(async move {
+                        repo2.compact_absorbed(id).await;
+                        let _ = done_tx2.send(id);
+                    });
+                }
+            }
+            Some(id) = done_rx.recv() => {
+                in_flight.remove(&id);
+            }
+            else => break,
+        }
+    }
+}
+
+/// Background worker that manages per-doc exponential-backoff heal retries.
+/// Mirrors JS `SyncScheduler` (DEFAULT_HEAL_*).
+async fn heal_worker(
+    repo: Arc<Repo>,
+    heal_tx: mpsc::UnboundedSender<HealMsg>,
+    mut rx: mpsc::UnboundedReceiver<HealMsg>,
+) {
+    struct HealState {
+        attempts: u32,
+        backoff: Duration,
+        timer: Option<JoinHandle<()>>,
+    }
+    let mut states: HashMap<DocId, HealState> = HashMap::new();
+
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            HealMsg::Reset(id) => {
+                if let Some(state) = states.get_mut(&id) {
+                    if let Some(t) = state.timer.take() {
+                        t.abort();
+                    }
+                }
+                states.remove(&id);
+            }
+            HealMsg::Schedule(id) => {
+                let state = states.entry(id).or_insert(HealState {
+                    attempts: 0,
+                    backoff: HEAL_INITIAL,
+                    timer: None,
+                });
+                if state.attempts >= HEAL_MAX_ATTEMPTS {
+                    let short = id.to_url();
+                    let _ = repo.events.send(RepoEvent::SyncEvent(format!(
+                        "{}: sync heal exhausted after {} attempts",
+                        &short[11..23],
+                        state.attempts,
+                    )));
+                    states.remove(&id);
+                    continue;
+                }
+                if let Some(t) = state.timer.take() {
+                    t.abort();
+                }
+                let delay = state.backoff;
+                state.attempts += 1;
+                state.backoff = (state.backoff * 2).min(HEAL_MAX_DELAY);
+                let short = id.to_url();
+                let _ = repo.events.send(RepoEvent::SyncEvent(format!(
+                    "{}: heal scheduled in {delay:?} (attempt {}/{})",
+                    &short[11..23],
+                    state.attempts,
+                    HEAL_MAX_ATTEMPTS,
+                )));
+                let repo2 = Arc::clone(&repo);
+                let heal_tx2 = heal_tx.clone();
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let outcome = repo2.do_sync(id).await;
+                    if outcome.data_received {
+                        repo2.apply_from_storage(id).await;
+                    }
+                    if outcome.any_failed || outcome.peer_count == 0 {
+                        let _ = heal_tx2.send(HealMsg::Schedule(id));
+                    } else {
+                        let _ = heal_tx2.send(HealMsg::Reset(id));
+                    }
+                });
+                state.timer = Some(handle);
+            }
+        }
+    }
+}
+
 impl Repo {
     pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
@@ -213,11 +329,13 @@ impl Repo {
             FsStorage::new(data_dir.join("sedimentree")).context("opening sedimentree storage")?;
 
         let (heads_tx, mut heads_rx) = mpsc::unbounded_channel();
+        let (compact_tx, compact_rx) = mpsc::unbounded_channel();
+        let (heal_tx, heal_rx) = mpsc::unbounded_channel();
 
         let sedimentrees = Arc::new(BoundedShardedMap::new());
         let connections = Arc::new(async_lock::Mutex::new(Map::new()));
         let subscriptions = Arc::new(async_lock::Mutex::new(Map::new()));
-        let powerbox = StoragePowerbox::new(storage, Arc::new(OpenPolicy));
+        let powerbox = StoragePowerbox::new(storage.clone(), Arc::new(OpenPolicy));
         let handler = Arc::new(SyncHandler::with_remote_heads_observer(
             sedimentrees.clone(),
             connections.clone(),
@@ -258,10 +376,13 @@ impl Repo {
         let (events, _) = broadcast::channel(256);
         let repo = Arc::new(Repo {
             core,
+            storage,
             signer,
             server_url,
             docs: Mutex::new(HashMap::new()),
             pending_saves: Mutex::new(HashMap::new()),
+            compact_tx,
+            heal_tx: heal_tx.clone(),
             events,
             connected: std::sync::atomic::AtomicBool::new(false),
         });
@@ -273,6 +394,14 @@ impl Repo {
                     repo.on_remote_heads(sid, heads).await;
                 }
             });
+        }
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move { compact_worker(repo, compact_rx).await });
+        }
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move { heal_worker(repo, heal_tx, heal_rx).await });
         }
         {
             let repo = repo.clone();
@@ -355,18 +484,20 @@ impl Repo {
 
     async fn resync_all(self: Arc<Self>) {
         let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
-        let _ = self.events.send(RepoEvent::SyncEvent(format!("resync_all: syncing {} tracked docs", ids.len())));
+        let _ = self.events.send(RepoEvent::SyncEvent(format!(
+            "resync_all: syncing {} tracked docs",
+            ids.len()
+        )));
         for id in ids {
-            if let Err(e) = self
-                .core
-                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-                .await
-            {
-                tracing::warn!(error = %e, "resync failed");
-                let _ = self.events.send(RepoEvent::SyncEvent(format!("resync {}: sync_with_all_peers failed: {e}", &id.to_url()[11..23])));
-                continue;
+            let outcome = self.do_sync(id).await;
+            if outcome.data_received {
+                self.apply_from_storage(id).await;
             }
-            self.apply_from_storage(id).await;
+            if outcome.any_failed || outcome.peer_count == 0 {
+                self.schedule_heal(id);
+            } else {
+                self.reset_heal(id);
+            }
         }
     }
 
@@ -391,28 +522,30 @@ impl Repo {
         };
         if missing {
             let short = &id.to_url()[11..23];
-            let _ = self.events.send(RepoEvent::SyncEvent(format!("{short}: server has heads we're missing — pulling")));
-            let sync_ok = match self.core.sync_with_all_peers(sid, true, SYNC_TIMEOUT).await {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::warn!(error = %e, "sync after remote heads failed");
-                    let _ = self.events.send(RepoEvent::SyncEvent(format!("{short}: pull failed: {e}")));
-                    false
-                }
-            };
-            let advanced = self.apply_from_storage(id).await;
-            if sync_ok && !advanced {
-                // Sync succeeded but no new data arrived. This means those
-                // CommitIds are already in our sedimentree but under different
-                // automerge fragment boundaries (cross-client fragment mismatch).
-                // Add them directly to state.known so we don't loop forever.
-                let mut docs = self.docs.lock().await;
-                if let Some(state) = docs.get_mut(&id) {
-                    for h in &heads {
-                        state.known.insert(ChangeHash(*h.as_bytes()));
+            let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                "{short}: server has heads we're missing — pulling"
+            )));
+            let outcome = self.do_sync(id).await;
+            if outcome.data_received {
+                let advanced = self.apply_from_storage(id).await;
+                if !advanced {
+                    // Sync succeeded but no new data — heads already in sedimentree
+                    // under different fragment boundaries. Mark them known to stop looping.
+                    let mut docs = self.docs.lock().await;
+                    if let Some(state) = docs.get_mut(&id) {
+                        for h in &heads {
+                            state.known.insert(ChangeHash(*h.as_bytes()));
+                        }
                     }
+                    let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                        "{short}: heads already in sedimentree (fragment boundary mismatch) — marking known"
+                    )));
                 }
-                let _ = self.events.send(RepoEvent::SyncEvent(format!("{short}: heads already in sedimentree (fragment boundary mismatch) — marking known")));
+            }
+            if outcome.any_failed || outcome.peer_count == 0 {
+                self.schedule_heal(id);
+            } else {
+                self.reset_heal(id);
             }
         }
     }
@@ -588,6 +721,10 @@ impl Repo {
         if let Some(state) = docs.get_mut(&id) {
             state.known.extend(accepted_hashes);
         }
+        drop(docs);
+
+        // Compact superseded blobs in the background — don't block the write path.
+        let _ = self.compact_tx.send(id);
 
         Ok(())
     }
@@ -605,6 +742,133 @@ impl Repo {
             }
         });
         self.pending_saves.lock().await.insert(id, handle);
+    }
+
+    /// Delete on-disk commits and fragments that automerge has absorbed into
+    /// higher-level fragments. Mirrors JS `#compactAbsorbed`.
+    async fn compact_absorbed(&self, id: DocId) {
+        let sid = id.sedimentree_id();
+
+        let (live_commits, live_fragments) = {
+            let docs = self.docs.lock().await;
+            let Some(state) = docs.get(&id) else { return };
+            if state.doc.get_heads().is_empty() {
+                return;
+            }
+            let all = match safe_fragments(&state.doc, 0..) {
+                Some(f) => f,
+                None => return,
+            };
+            let mut commits: HashSet<ChangeHash> = HashSet::new();
+            let mut fragments: HashSet<ChangeHash> = HashSet::new();
+            for f in all {
+                if f.level == 0 {
+                    commits.insert(f.head);
+                } else {
+                    fragments.insert(f.head);
+                }
+            }
+            (commits, fragments)
+        };
+
+        let persisted_commits: Vec<LooseCommit> =
+            self.core.get_commits(sid).await.unwrap_or_default();
+        let persisted_fragments: Vec<Fragment> =
+            self.core.get_fragments(sid).await.unwrap_or_default();
+
+        let stale_commits: Vec<CommitId> = persisted_commits
+            .iter()
+            .filter(|c| !live_commits.contains(&ChangeHash(*c.head().as_bytes())))
+            .map(|c| c.head())
+            .collect();
+        let stale_fragments: Vec<CommitId> = persisted_fragments
+            .iter()
+            .filter(|f| !live_fragments.contains(&ChangeHash(*f.head().as_bytes())))
+            .map(|f| f.head())
+            .collect();
+
+        if stale_commits.is_empty() && stale_fragments.is_empty() {
+            return;
+        }
+
+        let short = id.to_url();
+        let short = &short[11..23];
+        let sem = Arc::new(Semaphore::new(COMPACTION_CONCURRENCY));
+        let mut tasks = Vec::new();
+
+        for commit_id in stale_commits {
+            let storage = self.storage.clone();
+            let sem = Arc::clone(&sem);
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                <FsStorage as Storage<Sendable>>::delete_loose_commit(&storage, sid, commit_id)
+                    .await
+            }));
+        }
+        for frag_id in stale_fragments {
+            let storage = self.storage.clone();
+            let sem = Arc::clone(&sem);
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                <FsStorage as Storage<Sendable>>::delete_fragment(&storage, sid, frag_id).await
+            }));
+        }
+
+        let mut errors = 0usize;
+        for task in tasks {
+            if matches!(task.await, Ok(Err(_))) {
+                errors += 1;
+            }
+        }
+        if errors > 0 {
+            tracing::debug!(doc = %short, "compaction: {errors} deletes failed (will retry next pass)");
+        } else {
+            tracing::debug!(doc = %short, "compaction complete");
+        }
+    }
+
+    /// Call `sync_with_all_peers` and summarise the outcome.
+    async fn do_sync(&self, id: DocId) -> SyncOutcome {
+        match self
+            .core
+            .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+            .await
+        {
+            Ok(result) => {
+                let peer_count = result.len();
+                let any_failed = result
+                    .values()
+                    .any(|(succeeded, _, errors)| !succeeded || !errors.is_empty());
+                let data_received = result
+                    .values()
+                    .any(|(_, stats, _)| stats.total_received() > 0);
+                if any_failed {
+                    let short = id.to_url();
+                    let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                        "{}: sync partially failed ({peer_count} peers)",
+                        &short[11..23],
+                    )));
+                }
+                SyncOutcome { any_failed, data_received, peer_count }
+            }
+            Err(e) => {
+                let short = id.to_url();
+                tracing::warn!(error = %e, doc = %&short[11..23], "sync failed");
+                let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                    "{}: sync failed: {e}",
+                    &short[11..23],
+                )));
+                SyncOutcome { any_failed: true, data_received: false, peer_count: 0 }
+            }
+        }
+    }
+
+    fn schedule_heal(&self, id: DocId) {
+        let _ = self.heal_tx.send(HealMsg::Schedule(id));
+    }
+
+    fn reset_heal(&self, id: DocId) {
+        let _ = self.heal_tx.send(HealMsg::Reset(id));
     }
 
     /// Load a doc from local storage into memory (if not already tracked) and
@@ -635,15 +899,15 @@ impl Repo {
             repo.wait_connected(Duration::from_secs(15)).await;
             let short = &id.to_url()[11..23];
             let _ = repo.events.send(RepoEvent::SyncEvent(format!("{short}: syncing with server")));
-            if let Err(e) = repo
-                .core
-                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-                .await
-            {
-                tracing::warn!(error = %e, "initial sync failed");
-                let _ = repo.events.send(RepoEvent::SyncEvent(format!("{short}: sync failed: {e}")));
+            let outcome = repo.do_sync(id).await;
+            if outcome.data_received {
+                repo.apply_from_storage(id).await;
             }
-            repo.apply_from_storage(id).await;
+            if outcome.any_failed || outcome.peer_count == 0 {
+                repo.schedule_heal(id);
+            } else {
+                repo.reset_heal(id);
+            }
         });
         Ok(())
     }
@@ -687,12 +951,11 @@ impl Repo {
         let repo = self.clone();
         tokio::spawn(async move {
             repo.wait_connected(Duration::from_secs(15)).await;
-            if let Err(e) = repo
-                .core
-                .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-                .await
-            {
-                tracing::warn!(error = %e, "sync of new doc failed");
+            let outcome = repo.do_sync(id).await;
+            if outcome.any_failed || outcome.peer_count == 0 {
+                repo.schedule_heal(id);
+            } else {
+                repo.reset_heal(id);
             }
         });
         Ok(id)

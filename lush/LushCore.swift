@@ -25,13 +25,13 @@ fileprivate extension RustBuffer {
     }
 
     static func from(_ ptr: UnsafeBufferPointer<UInt8>) -> RustBuffer {
-        try! rustCall { ffi_richtext_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
+        try! rustCall { ffi_lush_core_rustbuffer_from_bytes(ForeignBytes(bufferPointer: ptr), $0) }
     }
 
     // Frees the buffer in place.
     // The buffer must not be used after this is called.
     func deallocate() {
-        try! rustCall { ffi_richtext_core_rustbuffer_free(self, $0) }
+        try! rustCall { ffi_lush_core_rustbuffer_free(self, $0) }
     }
 }
 
@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureRichtextCoreInitialized()
+    uniffiEnsureLushCoreInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -700,12 +700,12 @@ open class Core: CoreProtocol, @unchecked Sendable {
     @_documentation(visibility: private)
 #endif
     public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_richtext_core_fn_clone_core(self.pointer, $0) }
+        return try! rustCall { uniffi_lush_core_fn_clone_core(self.pointer, $0) }
     }
 public convenience init(dataDir: String, serverUrl: String?)throws  {
     let pointer =
         try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_constructor_core_new(
+    uniffi_lush_core_fn_constructor_core_new(
         FfiConverterString.lower(dataDir),
         FfiConverterOptionString.lower(serverUrl),$0
     )
@@ -718,7 +718,7 @@ public convenience init(dataDir: String, serverUrl: String?)throws  {
             return
         }
 
-        try! rustCall { uniffi_richtext_core_fn_free_core(pointer, $0) }
+        try! rustCall { uniffi_lush_core_fn_free_core(pointer, $0) }
     }
 
     
@@ -726,7 +726,7 @@ public convenience init(dataDir: String, serverUrl: String?)throws  {
     
 open func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String])throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_apply_note_mark(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_apply_note_mark(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterUInt64.lower(start),
         FfiConverterUInt64.lower(end),
@@ -740,7 +740,7 @@ open func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, v
     
 open func assetBytes(url: String)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_asset_bytes(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_asset_bytes(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -748,7 +748,7 @@ open func assetBytes(url: String)throws  -> Data  {
     
 open func assetInfo(url: String) -> AssetInfo?  {
     return try!  FfiConverterOptionTypeAssetInfo.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_asset_info(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_asset_info(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -756,7 +756,7 @@ open func assetInfo(url: String) -> AssetInfo?  {
     
 open func assetVision(url: String) -> AssetVision?  {
     return try!  FfiConverterOptionTypeAssetVision.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_asset_vision(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_asset_vision(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -767,7 +767,7 @@ open func assetVision(url: String) -> AssetVision?  {
      */
 open func createAsset(name: String, `extension`: String, mimeType: String, data: Data)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_create_asset(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_create_asset(self.uniffiClonePointer(),
         FfiConverterString.lower(name),
         FfiConverterString.lower(`extension`),
         FfiConverterString.lower(mimeType),
@@ -778,7 +778,7 @@ open func createAsset(name: String, `extension`: String, mimeType: String, data:
     
 open func createNote(title: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_create_note(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_create_note(self.uniffiClonePointer(),
         FfiConverterString.lower(title),$0
     )
 })
@@ -789,7 +789,7 @@ open func createNote(title: String)throws  -> String  {
      */
 open func createNoteIn(folderUrl: String, title: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_create_note_in(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_create_note_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(title),$0
     )
@@ -798,7 +798,7 @@ open func createNoteIn(folderUrl: String, title: String)throws  -> String  {
     
 open func createScriptIn(folderUrl: String, name: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_create_script_in(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_create_script_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(name),$0
     )
@@ -810,7 +810,7 @@ open func createScriptIn(folderUrl: String, name: String)throws  -> String  {
      */
 open func createSubfolder(title: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_create_subfolder(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_create_subfolder(self.uniffiClonePointer(),
         FfiConverterString.lower(title),$0
     )
 })
@@ -821,7 +821,7 @@ open func createSubfolder(title: String)throws  -> String  {
      */
 open func createSubfolderIn(folderUrl: String, title: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_create_subfolder_in(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_create_subfolder_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(title),$0
     )
@@ -829,7 +829,7 @@ open func createSubfolderIn(folderUrl: String, title: String)throws  -> String  
 }
     
 open func deleteNote(url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_delete_note(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_delete_note(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 }
@@ -837,7 +837,7 @@ open func deleteNote(url: String)throws   {try rustCallWithError(FfiConverterTyp
     
 open func docChangeCount(url: String) -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_doc_change_count(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_doc_change_count(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -849,7 +849,7 @@ open func docChangeCount(url: String) -> UInt32  {
      */
 open func ensureFolder(existingUrl: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_ensure_folder(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_ensure_folder(self.uniffiClonePointer(),
         FfiConverterOptionString.lower(existingUrl),$0
     )
 })
@@ -860,7 +860,7 @@ open func ensureFolder(existingUrl: String?)throws  -> String  {
      */
 open func folderEntriesOf(url: String) -> [NoteInfo]  {
     return try!  FfiConverterSequenceTypeNoteInfo.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_folder_entries_of(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_folder_entries_of(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -868,28 +868,28 @@ open func folderEntriesOf(url: String) -> [NoteInfo]  {
     
 open func folderTitle() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_folder_title(self.uniffiClonePointer(),$0
+    uniffi_lush_core_fn_method_core_folder_title(self.uniffiClonePointer(),$0
     )
 })
 }
     
 open func folderUrl() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_folder_url(self.uniffiClonePointer(),$0
+    uniffi_lush_core_fn_method_core_folder_url(self.uniffiClonePointer(),$0
     )
 })
 }
     
 open func isConnected() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_is_connected(self.uniffiClonePointer(),$0
+    uniffi_lush_core_fn_method_core_is_connected(self.uniffiClonePointer(),$0
     )
 })
 }
     
 open func listNotes() -> [NoteInfo]  {
     return try!  FfiConverterSequenceTypeNoteInfo.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_list_notes(self.uniffiClonePointer(),$0
+    uniffi_lush_core_fn_method_core_list_notes(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -898,7 +898,7 @@ open func listNotes() -> [NoteInfo]  {
      * Move an entry from one folder doc to another, refusing cycles.
      */
 open func moveEntry(fromFolder: String, toFolder: String, url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_move_entry(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_move_entry(self.uniffiClonePointer(),
         FfiConverterString.lower(fromFolder),
         FfiConverterString.lower(toFolder),
         FfiConverterString.lower(url),$0
@@ -911,7 +911,7 @@ open func moveEntry(fromFolder: String, toFolder: String, url: String)throws   {
      */
 open func noteModified(url: String) -> Int64  {
     return try!  FfiConverterInt64.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_note_modified(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_note_modified(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -919,7 +919,7 @@ open func noteModified(url: String) -> Int64  {
     
 open func notePreview(url: String) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_note_preview(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_note_preview(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -927,7 +927,7 @@ open func notePreview(url: String) -> String  {
     
 open func noteSpansJson(url: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_note_spans_json(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_note_spans_json(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -935,7 +935,7 @@ open func noteSpansJson(url: String)throws  -> String  {
     
 open func noteSpansSnapshot(url: String)throws  -> NoteSpansSnapshot  {
     return try  FfiConverterTypeNoteSpansSnapshot_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_note_spans_snapshot(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_note_spans_snapshot(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -943,7 +943,7 @@ open func noteSpansSnapshot(url: String)throws  -> NoteSpansSnapshot  {
     
 open func noteTitle(url: String) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_note_title(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_note_title(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -954,7 +954,7 @@ open func noteTitle(url: String) -> String  {
      * locally (immediately for docs we already have).
      */
 open func openNote(url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_open_note(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_open_note(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 }
@@ -966,7 +966,7 @@ open func openNote(url: String)throws   {try rustCallWithError(FfiConverterTypeC
      * strings are normalized to Text.
      */
 open func prefetchNotes(urls: [String])  {try! rustCall() {
-    uniffi_richtext_core_fn_method_core_prefetch_notes(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_prefetch_notes(self.uniffiClonePointer(),
         FfiConverterSequenceString.lower(urls),$0
     )
 }
@@ -976,7 +976,7 @@ open func prefetchNotes(urls: [String])  {try! rustCall() {
      * Remove an entry from a specific folder doc.
      */
 open func removeEntry(folderUrl: String, url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_remove_entry(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_remove_entry(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(url),$0
     )
@@ -987,7 +987,7 @@ open func removeEntry(folderUrl: String, url: String)throws   {try rustCallWithE
      * Rename a doc and its entry inside a specific folder doc.
      */
 open func renameEntry(folderUrl: String, url: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_rename_entry(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_rename_entry(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(url),
         FfiConverterString.lower(title),$0
@@ -996,7 +996,7 @@ open func renameEntry(folderUrl: String, url: String, title: String)throws   {tr
 }
     
 open func renameNote(url: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_rename_note(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_rename_note(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterString.lower(title),$0
     )
@@ -1004,7 +1004,7 @@ open func renameNote(url: String, title: String)throws   {try rustCallWithError(
 }
     
 open func resyncDoc(url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_resync_doc(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_resync_doc(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 }
@@ -1016,14 +1016,14 @@ open func resyncDoc(url: String)throws   {try rustCallWithError(FfiConverterType
      */
 open func searchNotes(query: String) -> [SearchHit]  {
     return try!  FfiConverterSequenceTypeSearchHit.lift(try! rustCall() {
-    uniffi_richtext_core_fn_method_core_search_notes(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_search_notes(self.uniffiClonePointer(),
         FfiConverterString.lower(query),$0
     )
 })
 }
     
 open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
-    uniffi_richtext_core_fn_method_core_set_delegate(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_set_delegate(self.uniffiClonePointer(),
         FfiConverterCallbackInterfaceCoreDelegate_lower(delegate),$0
     )
 }
@@ -1031,7 +1031,7 @@ open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
     
 open func spliceNoteText(url: String, index: UInt64, deleteCount: Int64, insert: String, title: String, heads: [String])throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_splice_note_text(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_splice_note_text(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterUInt64.lower(index),
         FfiConverterInt64.lower(deleteCount),
@@ -1046,7 +1046,7 @@ open func spliceNoteText(url: String, index: UInt64, deleteCount: Int64, insert:
      * Write Vision OCR + description onto a UnixFileEntry doc.
      */
 open func updateAssetVision(url: String, description: String, ocr: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_update_asset_vision(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_update_asset_vision(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterString.lower(description),
         FfiConverterString.lower(ocr),$0
@@ -1055,7 +1055,7 @@ open func updateAssetVision(url: String, description: String, ocr: String)throws
 }
     
 open func updateNoteSpans(url: String, spansJson: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_update_note_spans(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_update_note_spans(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterString.lower(spansJson),$0
     )
@@ -1067,7 +1067,7 @@ open func updateNoteSpans(url: String, spansJson: String)throws   {try rustCallW
      * unix-seconds timestamp — used by importers to preserve edit dates.
      */
 open func updateNoteSpansAt(url: String, spansJson: String, timestamp: Int64)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_richtext_core_fn_method_core_update_note_spans_at(self.uniffiClonePointer(),
+    uniffi_lush_core_fn_method_core_update_note_spans_at(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterString.lower(spansJson),
         FfiConverterInt64.lower(timestamp),$0
@@ -1685,7 +1685,7 @@ fileprivate struct UniffiCallbackInterfaceCoreDelegate {
 }
 
 private func uniffiCallbackInitCoreDelegate() {
-    uniffi_richtext_core_fn_init_callback_vtable_coredelegate(UniffiCallbackInterfaceCoreDelegate.vtable)
+    uniffi_lush_core_fn_init_callback_vtable_coredelegate(UniffiCallbackInterfaceCoreDelegate.vtable)
 }
 
 // FfiConverter protocol for callback interfaces
@@ -1906,128 +1906,128 @@ private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
     let bindings_contract_version = 29
     // Get the scaffolding contract version by calling the into the dylib
-    let scaffolding_contract_version = ffi_richtext_core_uniffi_contract_version()
+    let scaffolding_contract_version = ffi_lush_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_apply_note_mark() != 43854) {
+    if (uniffi_lush_core_checksum_method_core_apply_note_mark() != 29508) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_asset_bytes() != 54619) {
+    if (uniffi_lush_core_checksum_method_core_asset_bytes() != 18011) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_asset_info() != 32924) {
+    if (uniffi_lush_core_checksum_method_core_asset_info() != 61101) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_asset_vision() != 9773) {
+    if (uniffi_lush_core_checksum_method_core_asset_vision() != 43383) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_create_asset() != 38052) {
+    if (uniffi_lush_core_checksum_method_core_create_asset() != 18937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_create_note() != 36103) {
+    if (uniffi_lush_core_checksum_method_core_create_note() != 43728) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_create_note_in() != 30365) {
+    if (uniffi_lush_core_checksum_method_core_create_note_in() != 47187) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_create_script_in() != 33463) {
+    if (uniffi_lush_core_checksum_method_core_create_script_in() != 25586) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_create_subfolder() != 34118) {
+    if (uniffi_lush_core_checksum_method_core_create_subfolder() != 47650) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_create_subfolder_in() != 30742) {
+    if (uniffi_lush_core_checksum_method_core_create_subfolder_in() != 43470) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_delete_note() != 23579) {
+    if (uniffi_lush_core_checksum_method_core_delete_note() != 536) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_doc_change_count() != 58043) {
+    if (uniffi_lush_core_checksum_method_core_doc_change_count() != 49864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_ensure_folder() != 35739) {
+    if (uniffi_lush_core_checksum_method_core_ensure_folder() != 6376) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_folder_entries_of() != 29382) {
+    if (uniffi_lush_core_checksum_method_core_folder_entries_of() != 63955) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_folder_title() != 18746) {
+    if (uniffi_lush_core_checksum_method_core_folder_title() != 65443) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_folder_url() != 20969) {
+    if (uniffi_lush_core_checksum_method_core_folder_url() != 41616) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_is_connected() != 60528) {
+    if (uniffi_lush_core_checksum_method_core_is_connected() != 16465) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_list_notes() != 24274) {
+    if (uniffi_lush_core_checksum_method_core_list_notes() != 43939) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_move_entry() != 59888) {
+    if (uniffi_lush_core_checksum_method_core_move_entry() != 40698) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_note_modified() != 43349) {
+    if (uniffi_lush_core_checksum_method_core_note_modified() != 42759) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_note_preview() != 50036) {
+    if (uniffi_lush_core_checksum_method_core_note_preview() != 9633) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_note_spans_json() != 16787) {
+    if (uniffi_lush_core_checksum_method_core_note_spans_json() != 37448) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_note_spans_snapshot() != 44179) {
+    if (uniffi_lush_core_checksum_method_core_note_spans_snapshot() != 8051) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_note_title() != 7059) {
+    if (uniffi_lush_core_checksum_method_core_note_title() != 56454) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_open_note() != 39670) {
+    if (uniffi_lush_core_checksum_method_core_open_note() != 42116) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_prefetch_notes() != 62152) {
+    if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 23856) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_remove_entry() != 6241) {
+    if (uniffi_lush_core_checksum_method_core_remove_entry() != 62609) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_rename_entry() != 59793) {
+    if (uniffi_lush_core_checksum_method_core_rename_entry() != 44827) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_rename_note() != 28758) {
+    if (uniffi_lush_core_checksum_method_core_rename_note() != 13351) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_resync_doc() != 16879) {
+    if (uniffi_lush_core_checksum_method_core_resync_doc() != 27414) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_search_notes() != 36813) {
+    if (uniffi_lush_core_checksum_method_core_search_notes() != 27844) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_set_delegate() != 6146) {
+    if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_splice_note_text() != 5956) {
+    if (uniffi_lush_core_checksum_method_core_splice_note_text() != 25441) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_update_asset_vision() != 10385) {
+    if (uniffi_lush_core_checksum_method_core_update_asset_vision() != 689) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_update_note_spans() != 16719) {
+    if (uniffi_lush_core_checksum_method_core_update_note_spans() != 5252) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_core_update_note_spans_at() != 24908) {
+    if (uniffi_lush_core_checksum_method_core_update_note_spans_at() != 42222) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_constructor_core_new() != 23653) {
+    if (uniffi_lush_core_checksum_constructor_core_new() != 29324) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_coredelegate_on_doc_changed() != 28329) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_doc_changed() != 53266) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_coredelegate_on_connection_changed() != 19367) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_connection_changed() != 65433) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_richtext_core_checksum_method_coredelegate_on_sync_event() != 23892) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_sync_event() != 24982) {
         return InitializationResult.apiChecksumMismatch
     }
 
@@ -2037,7 +2037,7 @@ private let initializationResult: InitializationResult = {
 
 // Make the ensure init function public so that other modules which have external type references to
 // our types can call it.
-public func uniffiEnsureRichtextCoreInitialized() {
+public func uniffiEnsureLushCoreInitialized() {
     switch initializationResult {
     case .ok:
         break

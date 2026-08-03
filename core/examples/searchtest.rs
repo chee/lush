@@ -1,4 +1,4 @@
-use richtext_core::api::Core;
+use lush_core::api::Core;
 
 fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all("/tmp/searchtest-data");

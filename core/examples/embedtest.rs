@@ -1,4 +1,4 @@
-use richtext_core::{repo::Repo, shapes};
+use lush_core::{repo::Repo, shapes};
 use std::time::Duration;
 
 #[tokio::main]
@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
     ];
     let repo = Repo::start(
         "/tmp/embedtest-data".into(),
-        richtext_core::repo::DEFAULT_SERVER.into(),
+        lush_core::repo::DEFAULT_SERVER.into(),
     )
     .await?;
     repo.wait_connected(Duration::from_secs(15)).await;
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     let fresh = Repo::start(
         "/tmp/embedtest-fresh".into(),
-        richtext_core::repo::DEFAULT_SERVER.into(),
+        lush_core::repo::DEFAULT_SERVER.into(),
     )
     .await?;
     fresh.ensure_doc(note).await?;
