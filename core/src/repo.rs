@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     future::IntoFuture,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -17,8 +20,8 @@ use sedimentree_core::{
     fragment::Fragment,
     id::SedimentreeId,
     loose_commit::{id::CommitId, LooseCommit},
+    sedimentree::{Sedimentree, SedimentreeItem},
 };
-use subduction_redb_storage::RedbStorage;
 use subduction_core::{
     collections::bounded_sharded_map::BoundedShardedMap,
     handler::sync::SyncHandler,
@@ -27,17 +30,20 @@ use subduction_core::{
     peer::id::PeerId,
     policy::open::OpenPolicy,
     remote_heads::{RemoteHeads, RemoteHeadsObserver},
-    storage::powerbox::StoragePowerbox,
+    storage::{powerbox::StoragePowerbox, traits::Storage},
     subduction::Subduction,
     timeout::call::CallTimeout,
     transport::message::MessageTransport,
 };
 use subduction_crypto::signer::memory::MemorySigner;
+use subduction_redb_storage::RedbStorage;
 use subduction_websocket::tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn};
 use tokio::{
     sync::{broadcast, mpsc, Mutex},
     task::JoinHandle,
 };
+
+use crate::observed_storage::{ObservedStorage, StoredBatch, StoredRecord};
 
 pub const DEFAULT_SERVER: &str = "wss://subduction.sync.inkandswitch.com";
 
@@ -50,7 +56,7 @@ const HEAL_MAX_ATTEMPTS: u32 = 12;
 type Conn = MessageTransport<TokioWebSocketClient<MemorySigner>>;
 type Handler = SyncHandler<
     Sendable,
-    RedbStorage,
+    ObservedStorage,
     Conn,
     OpenPolicy,
     CountLeadingZeroBytes,
@@ -61,7 +67,7 @@ type Handler = SyncHandler<
 type Core = Subduction<
     'static,
     Sendable,
-    RedbStorage,
+    ObservedStorage,
     Conn,
     Handler,
     OpenPolicy,
@@ -129,7 +135,7 @@ pub enum RepoEvent {
     SyncEvent(String),
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct HeadsObserver {
     tx: mpsc::UnboundedSender<(SedimentreeId, Vec<CommitId>)>,
 }
@@ -142,7 +148,8 @@ impl RemoteHeadsObserver for HeadsObserver {
 
 struct DocState {
     doc: Automerge,
-    known: HashSet<ChangeHash>,
+    stored_commits: HashSet<ChangeHash>,
+    stored_fragments: HashSet<ChangeHash>,
     applied: HashSet<Digest<Blob>>,
 }
 
@@ -150,7 +157,8 @@ impl DocState {
     fn new(doc: Automerge) -> Self {
         DocState {
             doc,
-            known: HashSet::new(),
+            stored_commits: HashSet::new(),
+            stored_fragments: HashSet::new(),
             applied: HashSet::new(),
         }
     }
@@ -164,13 +172,20 @@ struct SyncSlot {
     again: bool,
 }
 
+struct PendingSave {
+    generation: u64,
+    handle: JoinHandle<()>,
+}
+
 pub struct Repo {
     core: Arc<Core>,
+    storage: ObservedStorage,
     signer: MemorySigner,
     server_url: String,
     docs: Mutex<HashMap<DocId, DocState>>,
     syncs: Mutex<HashMap<DocId, SyncSlot>>,
-    pending_saves: Mutex<HashMap<DocId, JoinHandle<()>>>,
+    pending_saves: Mutex<HashMap<DocId, PendingSave>>,
+    next_save: AtomicU64,
     events: broadcast::Sender<RepoEvent>,
     connected: std::sync::atomic::AtomicBool,
 }
@@ -192,37 +207,44 @@ fn load_or_create_signer(path: &Path) -> Result<MemorySigner> {
 struct Ingested {
     commits: Vec<(LooseCommit, Blob)>,
     fragments: Vec<(Fragment, Blob)>,
-    heads: Vec<ChangeHash>,
+    commit_heads: Vec<ChangeHash>,
+    fragment_heads: Vec<ChangeHash>,
 }
 
 /// Decompose the doc's automerge fragments into sedimentree records, skipping
-/// anything already in `known`. Level 0 becomes loose commits, level 1+ become
+/// anything already stored. Level 0 becomes loose commits, level 1+ become
 /// fragments; filtering happens before bundling so a save only pays to encode
 /// what it is about to store.
 ///
 /// `Automerge::fragments` can panic on some change graphs (an upstream bug
 /// where a level-1 change escapes the cached fragment clock). A panic means no
 /// ingest this round; the next save retries.
-fn ingest(doc: &Automerge, sid: SedimentreeId, known: &HashSet<ChangeHash>) -> Option<Ingested> {
+fn ingest(
+    doc: &Automerge,
+    sid: SedimentreeId,
+    stored_commits: &HashSet<ChangeHash>,
+    stored_fragments: &HashSet<ChangeHash>,
+) -> Option<Ingested> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let fragments = doc.fragments(0..);
         let mut out = Ingested {
             commits: Vec::new(),
             fragments: Vec::new(),
-            heads: Vec::new(),
+            commit_heads: Vec::new(),
+            fragment_heads: Vec::new(),
         };
-        for f in doc.fragments(0..) {
-            if known.contains(&f.head) {
-                continue;
-            }
+        for f in fragments {
             let head = f.head;
             let level = f.level;
+            if (level == 0 && stored_commits.contains(&head))
+                || (level > 0 && stored_fragments.contains(&head))
+            {
+                continue;
+            }
             let boundary: BTreeSet<CommitId> =
                 f.boundary.iter().map(|h| CommitId::new(h.0)).collect();
             let checkpoints: Vec<CommitId> =
                 f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
-            // bundle_fragments silently drops what it cannot encode, so bundle
-            // one at a time: a batch call would shift bytes onto the wrong
-            // fragment.
             let Some(bytes) = doc.bundle_fragments([f]).into_iter().next() else {
                 tracing::warn!(?head, "fragment failed to bundle; retrying on next save");
                 continue;
@@ -233,15 +255,102 @@ fn ingest(doc: &Automerge, sid: SedimentreeId, known: &HashSet<ChangeHash>) -> O
             if level == 0 {
                 out.commits
                     .push((LooseCommit::new(sid, id, boundary, meta), blob));
+                out.commit_heads.push(head);
             } else {
                 out.fragments
                     .push((Fragment::new(sid, id, boundary, &checkpoints, meta), blob));
+                out.fragment_heads.push(head);
             }
-            out.heads.push(head);
         }
         out
     }))
     .ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncOutcome {
+    NoPeers,
+    Succeeded { data_received: bool },
+    Failed { data_received: bool },
+}
+
+impl SyncOutcome {
+    fn data_received(self) -> bool {
+        match self {
+            SyncOutcome::NoPeers => false,
+            SyncOutcome::Succeeded { data_received } | SyncOutcome::Failed { data_received } => {
+                data_received
+            }
+        }
+    }
+}
+
+fn classify_sync<I>(peers: I) -> SyncOutcome
+where
+    I: IntoIterator<Item = (bool, bool)>,
+{
+    let mut count = 0usize;
+    let mut succeeded = false;
+    let mut data_received = false;
+    for (peer_succeeded, peer_received) in peers {
+        count += 1;
+        succeeded |= peer_succeeded;
+        data_received |= peer_received;
+    }
+    if count == 0 {
+        SyncOutcome::NoPeers
+    } else if succeeded {
+        SyncOutcome::Succeeded { data_received }
+    } else {
+        SyncOutcome::Failed { data_received }
+    }
+}
+
+/// Apply stored blobs to `doc` in the dependency order guaranteed by their
+/// sedimentree fragment metadata.
+fn load_blob_batch(
+    doc: &mut Automerge,
+    commits: &[StoredRecord<LooseCommit>],
+    fragments: &[StoredRecord<Fragment>],
+) -> Result<Vec<Digest<Blob>>> {
+    if commits.is_empty() && fragments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sedimentree = Sedimentree::new(
+        fragments.iter().map(|record| record.meta.clone()).collect(),
+        commits.iter().map(|record| record.meta.clone()).collect(),
+    );
+    let fragment_metas: Vec<_> = sedimentree.fragments().collect();
+    let commit_metas: Vec<_> = sedimentree.loose_commits().collect();
+    let blobs: HashMap<_, _> = commits
+        .iter()
+        .map(|record| (BlobMeta::new(&record.blob).digest(), &record.blob))
+        .chain(
+            fragments
+                .iter()
+                .map(|record| (BlobMeta::new(&record.blob).digest(), &record.blob)),
+        )
+        .collect();
+    let mut digests = Vec::new();
+    let mut bytes = Vec::new();
+    for item in sedimentree.topsorted_blob_order()? {
+        let digest = match item {
+            SedimentreeItem::Fragment(index) => {
+                fragment_metas[index].summary().blob_meta().digest()
+            }
+            SedimentreeItem::LooseCommit(index) => commit_metas[index].blob_meta().digest(),
+        };
+        if digests.contains(&digest) {
+            continue;
+        }
+        let blob = blobs
+            .get(&digest)
+            .ok_or_else(|| anyhow!("stored metadata has no matching blob {digest}"))?;
+        bytes.extend_from_slice(blob.as_slice());
+        digests.push(digest);
+    }
+    doc.load_incremental(&bytes)?;
+    Ok(digests)
 }
 
 impl Repo {
@@ -254,13 +363,14 @@ impl Repo {
             64 * 1024 * 1024,
         )
         .context("opening sedimentree storage")?;
-
+        let (stored_tx, mut stored_rx) = mpsc::unbounded_channel();
         let (heads_tx, mut heads_rx) = mpsc::unbounded_channel();
+        let storage = ObservedStorage::new(storage, stored_tx);
 
         let sedimentrees = Arc::new(BoundedShardedMap::new());
         let connections = Arc::new(async_lock::Mutex::new(Map::new()));
         let subscriptions = Arc::new(async_lock::Mutex::new(Map::new()));
-        let powerbox = StoragePowerbox::new(storage, Arc::new(OpenPolicy));
+        let powerbox = StoragePowerbox::new(storage.clone(), Arc::new(OpenPolicy));
         let handler = Arc::new(SyncHandler::with_remote_heads_observer(
             sedimentrees.clone(),
             connections.clone(),
@@ -301,15 +411,31 @@ impl Repo {
         let (events, _) = broadcast::channel(256);
         let repo = Arc::new(Repo {
             core,
+            storage,
             signer,
             server_url,
             docs: Mutex::new(HashMap::new()),
             syncs: Mutex::new(HashMap::new()),
             pending_saves: Mutex::new(HashMap::new()),
+            next_save: AtomicU64::new(0),
             events,
             connected: std::sync::atomic::AtomicBool::new(false),
         });
 
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                while let Some(batch) = stored_rx.recv().await {
+                    let id = DocId::from_sedimentree_id(batch.sedimentree_id);
+                    if let Err(e) = repo.apply_stored_batch(batch).await {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "stored blobs failed to apply");
+                        if let Err(e) = repo.apply_new_blobs(id).await {
+                            tracing::warn!(doc = %id.to_url(), error = %e, "stored blob recovery failed");
+                        }
+                    }
+                }
+            });
+        }
         {
             let repo = repo.clone();
             tokio::spawn(async move {
@@ -404,43 +530,42 @@ impl Repo {
     }
 
     async fn on_remote_heads(self: &Arc<Self>, sid: SedimentreeId, heads: Vec<CommitId>) {
-        let id = DocId::from_sedimentree_id(sid);
-        let hashes: Vec<ChangeHash> = heads.iter().map(|h| ChangeHash(*h.as_bytes())).collect();
-        let missing = {
-            let docs = self.docs.lock().await;
-            let Some(state) = docs.get(&id) else { return };
-            !state.doc.get_missing_deps(&hashes).is_empty()
-        };
-        if !missing {
+        if sid.as_bytes()[16..].iter().any(|byte| *byte != 0) {
             return;
         }
-        let _ = self.events.send(RepoEvent::SyncEvent(format!(
-            "{}: server has heads we're missing — pulling",
-            short(id)
-        )));
-        self.request_sync(id).await;
+        let id = DocId::from_sedimentree_id(sid);
+        let hashes: Vec<ChangeHash> = heads
+            .iter()
+            .map(|head| ChangeHash(*head.as_bytes()))
+            .collect();
+        let missing = {
+            let docs = self.docs.lock().await;
+            let Some(state) = docs.get(&id) else {
+                return;
+            };
+            !state.doc.get_missing_deps(&hashes).is_empty()
+        };
+        if missing {
+            self.request_sync(id).await;
+        }
     }
 
     /// Run one sync round and apply whatever it landed in local storage.
-    async fn sync_once(&self, id: DocId) -> bool {
-        match self
+    async fn sync_once(&self, id: DocId, timeout: CallTimeout) -> Result<SyncOutcome> {
+        let peers = self
             .core
-            .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+            .sync_with_all_peers(id.sedimentree_id(), true, timeout)
             .await
-        {
-            Ok(_) => {
-                self.apply_new_blobs(id).await;
-                true
-            }
-            Err(e) => {
-                tracing::warn!(doc = %id.to_url(), error = %e, "sync failed");
-                let _ = self.events.send(RepoEvent::SyncEvent(format!(
-                    "{}: sync failed: {e}",
-                    short(id)
-                )));
-                false
-            }
+            .map_err(|e| anyhow!("sync failed: {e}"))?;
+        let outcome = classify_sync(
+            peers
+                .values()
+                .map(|(succeeded, stats, _)| (*succeeded, stats.total_received() > 0)),
+        );
+        if outcome.data_received() {
+            self.apply_new_blobs(id).await?;
         }
+        Ok(outcome)
     }
 
     /// Ask for a sync round without waiting for it. Every background path goes
@@ -460,8 +585,41 @@ impl Repo {
         }
         let repo = self.clone();
         tokio::spawn(async move {
+            let mut failures = 0u32;
             loop {
-                repo.sync_once(id).await;
+                let failed = match repo.sync_once(id, SYNC_TIMEOUT).await {
+                    Ok(SyncOutcome::Failed { .. }) => {
+                        let _ = repo.events.send(RepoEvent::SyncEvent(format!(
+                            "{}: all peers failed",
+                            short(id)
+                        )));
+                        true
+                    }
+                    Ok(SyncOutcome::NoPeers) => {
+                        let _ = repo.events.send(RepoEvent::SyncEvent(format!(
+                            "{}: no sync peers",
+                            short(id)
+                        )));
+                        true
+                    }
+                    Ok(SyncOutcome::Succeeded { .. }) => false,
+                    Err(e) => {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "sync failed");
+                        let _ = repo
+                            .events
+                            .send(RepoEvent::SyncEvent(format!("{}: {e}", short(id))));
+                        true
+                    }
+                };
+                if failed {
+                    failures += 1;
+                    if failures < HEAL_MAX_ATTEMPTS && repo.is_connected() {
+                        tokio::time::sleep(HEAL_DELAY).await;
+                        continue;
+                    }
+                } else {
+                    failures = 0;
+                }
                 let mut syncs = repo.syncs.lock().await;
                 let slot = syncs.entry(id).or_default();
                 if !slot.again {
@@ -473,129 +631,117 @@ impl Repo {
         });
     }
 
-    /// Bring the in-memory doc up to date with local storage. The first pass
-    /// for a doc reads every blob at once; later passes read only the blobs
-    /// whose digests have not been applied yet. Returns true (and emits
+    /// Bring the in-memory doc up to date with local storage, applying stored
+    /// blobs whose digests have not been applied yet. Returns true (and emits
     /// DocChanged) if the doc advanced.
-    async fn apply_new_blobs(&self, id: DocId) -> bool {
+    async fn apply_new_blobs(&self, id: DocId) -> Result<bool> {
         let sid = id.sedimentree_id();
-        let commits = self.core.get_commits(sid).await.unwrap_or_default();
-        let fragments = self.core.get_fragments(sid).await.unwrap_or_default();
-
-        let (cold, wanted, heads) = {
-            let docs = self.docs.lock().await;
-            let Some(state) = docs.get(&id) else { return false };
-            let heads: Vec<ChangeHash> = fragments
-                .iter()
-                .map(|f| ChangeHash(*f.head().as_bytes()))
-                .chain(commits.iter().map(|c| ChangeHash(*c.head().as_bytes())))
-                .collect();
-            let wanted: Vec<Digest<Blob>> = fragments
-                .iter()
-                .map(|f| f.summary().blob_meta().digest())
-                .chain(commits.iter().map(|c| c.blob_meta().digest()))
-                .filter(|d| !state.applied.contains(d))
-                .collect();
-            (state.applied.is_empty(), wanted, heads)
+        let (commits, fragments) = tokio::try_join!(
+            <ObservedStorage as Storage<Sendable>>::load_loose_commits(&self.storage, sid),
+            <ObservedStorage as Storage<Sendable>>::load_fragments(&self.storage, sid),
+        )
+        .map_err(|e| anyhow!("loading stored blobs failed: {e}"))?;
+        let batch = StoredBatch {
+            sedimentree_id: sid,
+            commits: commits
+                .into_iter()
+                .map(|verified| StoredRecord {
+                    meta: verified.payload().clone(),
+                    blob: verified.blob().clone(),
+                })
+                .collect(),
+            fragments: fragments
+                .into_iter()
+                .map(|verified| StoredRecord {
+                    meta: verified.payload().clone(),
+                    blob: verified.blob().clone(),
+                })
+                .collect(),
         };
+        self.apply_stored_batch(batch).await
+    }
 
-        let blobs = if wanted.is_empty() {
-            Vec::new()
-        } else if cold {
-            self.load_all_blobs(sid).await
-        } else {
-            let mut out = Vec::with_capacity(wanted.len());
-            for digest in wanted {
-                match self.core.get_blob(sid, digest).await {
-                    Ok(Some(blob)) => out.push((digest, blob)),
-                    Ok(None) => tracing::warn!(%digest, "no blob for known metadata"),
-                    Err(e) => tracing::warn!(error = %e, "get_blob failed"),
-                }
-            }
-            out
-        };
-
-        let count = blobs.len();
-        let (mut advanced, errors, dangling) = {
+    async fn apply_stored_batch(&self, batch: StoredBatch) -> Result<bool> {
+        if batch.sedimentree_id.as_bytes()[16..]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Ok(false);
+        }
+        let id = DocId::from_sedimentree_id(batch.sedimentree_id);
+        let count = batch.commits.len() + batch.fragments.len();
+        let (advanced, failed) = {
             let mut docs = self.docs.lock().await;
             let Some(state) = docs.get_mut(&id) else {
-                return false;
+                return Ok(false);
             };
-            state.known.extend(heads);
+            state.stored_commits.extend(
+                batch
+                    .commits
+                    .iter()
+                    .map(|record| ChangeHash(*record.meta.head().as_bytes())),
+            );
+            state.stored_fragments.extend(
+                batch
+                    .fragments
+                    .iter()
+                    .map(|record| ChangeHash(*record.meta.head().as_bytes())),
+            );
+            let commits: Vec<_> = batch
+                .commits
+                .into_iter()
+                .filter(|record| {
+                    !state
+                        .applied
+                        .contains(&BlobMeta::new(&record.blob).digest())
+                })
+                .collect();
+            let fragments: Vec<_> = batch
+                .fragments
+                .into_iter()
+                .filter(|record| {
+                    !state
+                        .applied
+                        .contains(&BlobMeta::new(&record.blob).digest())
+                })
+                .collect();
+            if commits.is_empty() && fragments.is_empty() {
+                return Ok(false);
+            }
             let before = state.doc.get_heads();
-            let mut errors = 0u32;
-            for (digest, blob) in blobs {
-                match state.doc.load_incremental(blob.as_slice()) {
-                    Ok(_) => {
-                        state.applied.insert(digest);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "load_incremental failed");
-                        errors += 1;
-                    }
+            match load_blob_batch(&mut state.doc, &commits, &fragments) {
+                Ok(applied) => {
+                    state.applied.extend(applied);
+                    (state.doc.get_heads() != before, false)
+                }
+                Err(e) => {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "stored blobs failed to apply");
+                    (false, true)
                 }
             }
-            (
-                state.doc.get_heads() != before,
-                errors,
-                !state.doc.get_missing_deps(&[]).is_empty(),
-            )
         };
-
-        // Changes are queued on deps we never applied. The minimized tree the
-        // metadata came from may be hiding a blob raw storage still holds, so
-        // fall back to reading everything. Only worth doing when this round
-        // brought in something new and did not already read the whole store.
-        if dangling && !cold && count > 0 {
-            let recovered = self.load_all_blobs(sid).await;
-            let mut docs = self.docs.lock().await;
-            if let Some(state) = docs.get_mut(&id) {
-                let before = state.doc.get_heads();
-                for (digest, blob) in recovered {
-                    if state.doc.load_incremental(blob.as_slice()).is_ok() {
-                        state.applied.insert(digest);
-                    }
-                }
-                advanced = advanced || state.doc.get_heads() != before;
-            }
-        }
-
-        if errors > 0 {
+        if failed {
             let _ = self.events.send(RepoEvent::SyncEvent(format!(
-                "{}: {errors}/{count} blobs failed to apply",
+                "{}: local storage incomplete; requesting repair",
                 short(id)
             )));
         }
         if !advanced {
-            return false;
+            return Ok(false);
         }
         let _ = self.events.send(RepoEvent::SyncEvent(format!(
-            "{}: doc advanced, {count} new blobs",
+            "{}: doc advanced, {count} stored blobs",
             short(id)
         )));
         let _ = self.events.send(RepoEvent::DocChanged(id));
-        true
-    }
-
-    async fn load_all_blobs(&self, sid: SedimentreeId) -> Vec<(Digest<Blob>, Blob)> {
-        match self.core.get_blobs(sid).await {
-            Ok(Some(blobs)) => blobs
-                .into_iter()
-                .map(|b| (BlobMeta::new(&b).digest(), b))
-                .collect(),
-            Ok(None) => Vec::new(),
-            Err(e) => {
-                tracing::warn!(error = %e, "get_blobs failed");
-                Vec::new()
-            }
-        }
+        Ok(true)
     }
 
     /// Push any automerge fragments not yet in the sedimentree. Returns true if
     /// anything was stored.
     async fn save_doc(&self, id: DocId) -> Result<bool> {
-        if let Some(handle) = self.pending_saves.lock().await.remove(&id) {
-            handle.abort();
+        if let Some(pending) = self.pending_saves.lock().await.remove(&id) {
+            pending.handle.abort();
         }
         self.save_doc_now(id).await
     }
@@ -607,7 +753,12 @@ impl Repo {
             let state = docs
                 .get(&id)
                 .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
-            ingest(&state.doc, sid, &state.known)
+            ingest(
+                &state.doc,
+                sid,
+                &state.stored_commits,
+                &state.stored_fragments,
+            )
         };
         let Some(ingested) = ingested else {
             tracing::warn!(doc = %id.to_url(), "fragment ingest failed; retrying on next save");
@@ -617,53 +768,75 @@ impl Repo {
             return Ok(false);
         }
 
+        let Ingested {
+            commits,
+            fragments,
+            commit_heads,
+            fragment_heads,
+        } = ingested;
         self.core
-            .store_built_batch(sid, ingested.commits, ingested.fragments)
+            .store_built_batch(sid, commits, fragments)
             .await
             .map_err(|e| anyhow!("store_built_batch failed: {e}"))?;
 
         let mut docs = self.docs.lock().await;
         if let Some(state) = docs.get_mut(&id) {
-            state.known.extend(ingested.heads);
+            state.stored_commits.extend(commit_heads);
+            state.stored_fragments.extend(fragment_heads);
         }
 
         Ok(true)
     }
 
     async fn schedule_save_doc(self: &Arc<Self>, id: DocId) {
-        if let Some(handle) = self.pending_saves.lock().await.remove(&id) {
-            handle.abort();
+        if let Some(pending) = self.pending_saves.lock().await.remove(&id) {
+            pending.handle.abort();
         }
+        let generation = self.next_save.fetch_add(1, Ordering::Relaxed);
         let repo = self.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(SAVE_DEBOUNCE).await;
-            repo.pending_saves.lock().await.remove(&id);
             match repo.save_doc_now(id).await {
                 Ok(true) => repo.request_sync(id).await,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(doc = %id.to_url(), error = %e, "deferred save failed"),
             }
+            let mut saves = repo.pending_saves.lock().await;
+            if saves.get(&id).map(|pending| pending.generation) == Some(generation) {
+                saves.remove(&id);
+            }
         });
-        self.pending_saves.lock().await.insert(id, handle);
+        self.pending_saves
+            .lock()
+            .await
+            .insert(id, PendingSave { generation, handle });
     }
 
     /// Load a doc from local storage into memory (if not already tracked) and
-    /// kick off a network sync + subscription in the background. A doc that is
-    /// still empty after a sync is retried until it has content.
+    /// kick off a network sync + subscription in the background. Unsuccessful
+    /// syncs are retried while a successful empty response is final.
     pub async fn ensure_doc(self: &Arc<Self>, id: DocId) -> Result<()> {
-        let fresh = {
-            let mut docs = self.docs.lock().await;
-            let fresh = !docs.contains_key(&id);
-            if fresh {
-                docs.insert(id, DocState::new(Automerge::new()));
-            }
-            fresh
-        };
+        let fresh = !self.docs.lock().await.contains_key(&id);
+        self.open_local(id).await;
         if fresh {
-            if !self.apply_new_blobs(id).await {
-                let _ = self
-                    .events
-                    .send(RepoEvent::SyncEvent(format!("{}: storage empty on open", short(id))));
+            if self.doc_has_heads(id).await {
+                match self.save_doc_now(id).await {
+                    Ok(true) => {
+                        let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                            "{}: repaired stored record layout",
+                            short(id)
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "storage repair failed");
+                    }
+                }
+            } else {
+                let _ = self.events.send(RepoEvent::SyncEvent(format!(
+                    "{}: storage empty on open",
+                    short(id)
+                )));
             }
             let _ = self.events.send(RepoEvent::DocChanged(id));
         }
@@ -683,8 +856,12 @@ impl Repo {
                         return;
                     }
                 }
-                if !repo.sync_once(id).await || repo.doc_has_heads(id).await {
-                    return;
+                match repo.sync_once(id, SYNC_TIMEOUT).await {
+                    Ok(SyncOutcome::NoPeers | SyncOutcome::Failed { .. }) => {}
+                    Ok(SyncOutcome::Succeeded { .. }) => return,
+                    Err(e) => {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "sync failed");
+                    }
                 }
             }
         });
@@ -829,15 +1006,36 @@ impl Repo {
         Ok(value)
     }
 
-    pub async fn read_doc<F, T>(&self, id: DocId, f: F) -> Result<T>
+    /// Read a doc, loading it from local storage first if it is not already
+    /// tracked. A read must never report an untracked doc as empty: its content
+    /// is on disk, and the sidebar walks nested folders through this path.
+    pub async fn read_doc<F, T>(self: &Arc<Self>, id: DocId, f: F) -> Result<T>
     where
         F: FnOnce(&Automerge) -> Result<T>,
     {
+        self.open_local(id).await;
         let docs = self.docs.lock().await;
         let state = docs
             .get(&id)
             .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
         f(&state.doc)
+    }
+
+    /// Track a doc and populate it from local storage. Does no network I/O, but
+    /// arms a background sync the first time a doc is opened so a doc reached
+    /// only by reading still receives remote updates.
+    async fn open_local(self: &Arc<Self>, id: DocId) {
+        {
+            let mut docs = self.docs.lock().await;
+            if docs.contains_key(&id) {
+                return;
+            }
+            docs.insert(id, DocState::new(Automerge::new()));
+        }
+        if let Err(e) = self.apply_new_blobs(id).await {
+            tracing::warn!(doc = %id.to_url(), error = %e, "local load failed");
+        }
+        self.request_sync(id).await;
     }
 
     /// Remove a doc from in-memory tracking so the next `ensure_doc` call
@@ -849,25 +1047,26 @@ impl Repo {
 
     /// One-shot: sync a doc and wait for the server to hold our heads.
     pub async fn flush(&self, id: DocId) -> Result<()> {
+        self.save_doc(id).await?;
         if !self.wait_connected(Duration::from_secs(15)).await {
             return Err(anyhow!("not connected to sync server"));
         }
-        self.core
-            .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-            .await
-            .map_err(|e| anyhow!("sync failed: {e}"))?;
-        Ok(())
+        match self.sync_once(id, SYNC_TIMEOUT).await? {
+            SyncOutcome::Succeeded { .. } => Ok(()),
+            SyncOutcome::NoPeers => Err(anyhow!("no sync peers connected")),
+            SyncOutcome::Failed { .. } => Err(anyhow!("all sync peers failed")),
+        }
     }
 
     /// Flush all pending saves and do a best-effort final sync before the app
     /// exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
     pub async fn shutdown(self: &Arc<Self>) {
-        let pending: Vec<(DocId, JoinHandle<()>)> = {
+        let pending: Vec<(DocId, PendingSave)> = {
             let mut saves = self.pending_saves.lock().await;
             saves.drain().collect()
         };
-        for (_, handle) in &pending {
-            handle.abort();
+        for (_, pending) in &pending {
+            pending.handle.abort();
         }
         let mut dirty: HashSet<DocId> = HashSet::new();
         for (id, _) in pending {
@@ -899,5 +1098,296 @@ impl Repo {
             }
         }))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    use automerge::{transaction::Transactable, ActorId, ROOT};
+    use tempfile::TempDir;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    fn put(doc: &mut Automerge, key: &str, value: impl Into<automerge::ScalarValue>) {
+        let mut tx = doc.transaction();
+        tx.put(ROOT, key, value).unwrap();
+        tx.commit();
+    }
+
+    async fn test_repo() -> (TempDir, Arc<Repo>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::start(dir.path().to_path_buf(), "http://[".to_string())
+            .await
+            .unwrap();
+        (dir, repo)
+    }
+
+    async fn wait_for_change(events: &mut broadcast::Receiver<RepoEvent>, id: DocId) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(events.recv().await.unwrap(), RepoEvent::DocChanged(changed) if changed == id)
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn sync_results_distinguish_no_peers_failure_and_success() {
+        assert_eq!(classify_sync([]), SyncOutcome::NoPeers);
+        assert_eq!(
+            classify_sync([(false, false), (false, true)]),
+            SyncOutcome::Failed {
+                data_received: true
+            }
+        );
+        assert_eq!(
+            classify_sync([(false, true), (true, false)]),
+            SyncOutcome::Succeeded {
+                data_received: true
+            }
+        );
+        assert_eq!(
+            classify_sync([(true, false)]),
+            SyncOutcome::Succeeded {
+                data_received: false
+            }
+        );
+    }
+
+    #[test]
+    fn stored_fragments_load_in_causal_order() {
+        let mut source = Automerge::new().with_actor(ActorId::from([7; 16].as_slice()));
+        for index in 0..1_000 {
+            put(
+                &mut source,
+                &format!("value-{index}"),
+                format!("value-{index:04}-{:08x}", index * 7919),
+            );
+        }
+        let ingested = ingest(
+            &source,
+            DocId([7; 16]).sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let mut commits: Vec<_> = ingested
+            .commits
+            .into_iter()
+            .map(|(meta, blob)| StoredRecord { meta, blob })
+            .collect();
+        let mut fragments: Vec<_> = ingested
+            .fragments
+            .into_iter()
+            .map(|(meta, blob)| StoredRecord { meta, blob })
+            .collect();
+        assert!(commits.len() + fragments.len() > 1);
+        commits.reverse();
+        fragments.reverse();
+
+        let mut loaded = Automerge::new();
+        let applied = load_blob_batch(&mut loaded, &commits, &fragments).unwrap();
+
+        assert_eq!(applied.len(), commits.len() + fragments.len());
+        assert_eq!(loaded.get_heads(), source.get_heads());
+    }
+
+    #[tokio::test]
+    async fn stored_fragments_survive_local_reopen() {
+        let (_dir, repo) = test_repo().await;
+        let id = DocId([8; 16]);
+        let mut source = Automerge::new().with_actor(ActorId::from([8; 16].as_slice()));
+        for index in 0..1_000 {
+            put(&mut source, &format!("value-{index}"), index as i64);
+        }
+        let ingested = ingest(
+            &source,
+            id.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(!ingested.fragments.is_empty());
+        repo.core
+            .store_built_batch(id.sedimentree_id(), ingested.commits, ingested.fragments)
+            .await
+            .unwrap();
+
+        repo.ensure_doc(id).await.unwrap();
+        assert_eq!(
+            repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap(),
+            source.get_heads()
+        );
+
+        repo.drop_doc(id).await;
+        repo.ensure_doc(id).await.unwrap();
+        assert_eq!(
+            repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap(),
+            source.get_heads()
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_batches_advance_tracked_docs_and_durable_ids() {
+        let (_dir, repo) = test_repo().await;
+        let id = DocId([3; 16]);
+        repo.docs
+            .lock()
+            .await
+            .insert(id, DocState::new(Automerge::new()));
+        let mut events = repo.subscribe();
+
+        let mut source = Automerge::new();
+        put(&mut source, "value", "stored");
+        let ingested = ingest(
+            &source,
+            id.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let commit_heads = ingested.commit_heads.clone();
+        let fragment_heads = ingested.fragment_heads.clone();
+
+        repo.core
+            .store_built_batch(id.sedimentree_id(), ingested.commits, ingested.fragments)
+            .await
+            .unwrap();
+        wait_for_change(&mut events, id).await;
+
+        let sid = id.sedimentree_id();
+        let (commit_ids, fragment_ids) = tokio::try_join!(
+            <ObservedStorage as Storage<Sendable>>::list_commit_ids(&repo.storage, sid),
+            <ObservedStorage as Storage<Sendable>>::list_fragment_ids(&repo.storage, sid),
+        )
+        .unwrap();
+        for head in &commit_heads {
+            assert!(commit_ids.contains(&CommitId::new(head.0)));
+        }
+        for head in &fragment_heads {
+            assert!(fragment_ids.contains(&CommitId::new(head.0)));
+        }
+
+        let docs = repo.docs.lock().await;
+        let state = docs.get(&id).unwrap();
+        assert_eq!(state.doc.get_heads(), source.get_heads());
+        assert_eq!(state.stored_commits.len(), commit_heads.len());
+        assert_eq!(state.stored_fragments.len(), fragment_heads.len());
+        let repeated = ingest(
+            &state.doc,
+            sid,
+            &state.stored_commits,
+            &state.stored_fragments,
+        )
+        .unwrap();
+        assert!(repeated.commits.is_empty());
+        assert!(repeated.fragments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_storage_adds_the_canonical_record_kind() {
+        let (_dir, repo) = test_repo().await;
+        let id = DocId([4; 16]);
+        let sid = id.sedimentree_id();
+        let mut source = Automerge::new().with_actor(ActorId::from([11; 16].as_slice()));
+        put(&mut source, "value", "legacy");
+        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+        assert_eq!(ingested.commits.len(), 1);
+        assert!(ingested.fragments.is_empty());
+        let (commit, blob) = ingested.commits.pop().unwrap();
+        let head = commit.head();
+        let legacy = Fragment::new(
+            sid,
+            head,
+            commit.parents().clone(),
+            &[],
+            BlobMeta::new(&blob),
+        );
+
+        repo.core
+            .store_built_batch(sid, Vec::new(), vec![(legacy, blob)])
+            .await
+            .unwrap();
+        repo.ensure_doc(id).await.unwrap();
+
+        let (commit_ids, fragment_ids) = tokio::try_join!(
+            <ObservedStorage as Storage<Sendable>>::list_commit_ids(&repo.storage, sid),
+            <ObservedStorage as Storage<Sendable>>::list_fragment_ids(&repo.storage, sid),
+        )
+        .unwrap();
+        assert!(commit_ids.contains(&head));
+        assert!(fragment_ids.contains(&head));
+        assert_eq!(
+            repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap(),
+            source.get_heads()
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_local_storage_continues_to_server_repair() {
+        let (_dir, repo) = test_repo().await;
+        let id = DocId([5; 16]);
+        let sid = id.sedimentree_id();
+        let blob = Blob::new(vec![1, 2, 3]);
+        let commit = LooseCommit::new(
+            sid,
+            CommitId::new([9; 32]),
+            BTreeSet::new(),
+            BlobMeta::new(&blob),
+        );
+        repo.core
+            .store_built_batch(sid, vec![(commit, blob)], Vec::new())
+            .await
+            .unwrap();
+        let mut events = repo.subscribe();
+
+        repo.ensure_doc(id).await.unwrap();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(events.recv().await.unwrap(), RepoEvent::SyncEvent(message) if message.contains("requesting repair"))
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_persists_a_deferred_change_before_syncing() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_save(id, heads, |doc| {
+            put(doc, "second", "deferred");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+
+        repo.connected.store(true, AtomicOrdering::Relaxed);
+        assert!(repo.flush(id).await.is_err());
+        repo.connected.store(false, AtomicOrdering::Relaxed);
+
+        repo.drop_doc(id).await;
+        repo.ensure_doc(id).await.unwrap();
+        let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
     }
 }

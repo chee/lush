@@ -1047,6 +1047,7 @@ dependencies = [
  "subduction_crypto",
  "subduction_redb_storage",
  "subduction_websocket",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
