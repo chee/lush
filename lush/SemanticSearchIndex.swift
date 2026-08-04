@@ -1,21 +1,25 @@
 import Foundation
+import CryptoKit
 import NaturalLanguage
 
-@MainActor
-final class SemanticSearchIndex {
+actor SemanticSearchIndex {
     private struct Chunk: Codable {
-        var url: String
-        var name: String
         var text: String
         var vector: [Double]
     }
 
-    private struct Store: Codable {
+    private struct Entry: Codable {
+        var name: String
+        var digest: String
         var chunks: [Chunk]
     }
 
-    private let embedding = NLEmbedding.sentenceEmbedding(for: .english)
-    private var chunks: [Chunk] = []
+    private struct Store: Codable {
+        var entries: [String: Entry]
+    }
+
+    private var embedding: NLEmbedding?
+    private var entries: [String: Entry] = [:]
     private var loaded = false
     private var saveTask: Task<Void, Never>?
 
@@ -29,86 +33,88 @@ final class SemanticSearchIndex {
         return dir.appendingPathComponent("semantic-search.json")
     }
 
-    var isAvailable: Bool {
-        embedding != nil
+    func indexedUrls() -> Set<String> {
+        loadIfNeeded()
+        return Set(entries.keys)
     }
 
     func index(url: String, name: String, spansJson: String) {
-        guard let embedding else { return }
         loadIfNeeded()
+        guard let embedding else { return }
         let spans = SpanNode.decodeList(spansJson)
         let title = RichText.title(from: spans)
         let displayName = title.isEmpty ? (name.isEmpty ? "Untitled" : name) : title
         let text = Self.plainText(from: spans)
-        let nextChunks = Self.chunks(for: text)
-            .compactMap { text -> Chunk? in
-                guard let vector = embedding.vector(for: text) else { return nil }
-                return Chunk(
-                    url: url,
-                    name: displayName,
-                    text: Self.snippet(from: text),
-                    vector: Self.normalized(vector)
-                )
-            }
-        chunks.removeAll { $0.url == url }
-        chunks.append(contentsOf: nextChunks)
+        let digest = Self.digest(of: text)
+        if let existing = entries[url], existing.digest == digest {
+            guard existing.name != displayName else { return }
+            entries[url]?.name = displayName
+            scheduleSave()
+            return
+        }
+        let chunks = Self.chunks(for: text).compactMap { text -> Chunk? in
+            guard let vector = embedding.vector(for: text) else { return nil }
+            return Chunk(text: Self.snippet(from: text), vector: Self.normalized(vector))
+        }
+        entries[url] = Entry(name: displayName, digest: digest, chunks: chunks)
         scheduleSave()
     }
 
     func remove(url: String) {
         loadIfNeeded()
-        chunks.removeAll { $0.url == url }
+        guard entries.removeValue(forKey: url) != nil else { return }
         scheduleSave()
     }
 
     func search(_ query: String, excluding excluded: Set<String> = []) -> [SearchHit] {
-        guard let embedding else { return [] }
         loadIfNeeded()
+        guard let embedding else { return [] }
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, let rawVector = embedding.vector(for: query) else { return [] }
         let vector = Self.normalized(rawVector)
-        var best: [String: (score: Double, chunk: Chunk)] = [:]
-        for chunk in chunks where !excluded.contains(chunk.url) {
-            let score = Self.dot(vector, chunk.vector)
-            guard score > 0.36 else { continue }
-            if best[chunk.url]?.score ?? -.infinity < score {
-                best[chunk.url] = (score, chunk)
+        var best: [String: (score: Double, name: String, text: String)] = [:]
+        for (url, entry) in entries where !excluded.contains(url) {
+            for chunk in entry.chunks {
+                let score = Self.dot(vector, chunk.vector)
+                guard score > 0.36 else { continue }
+                if best[url]?.score ?? -.infinity < score {
+                    best[url] = (score, entry.name, chunk.text)
+                }
             }
         }
-        return best.values
-            .sorted { $0.score > $1.score }
+        return best
+            .sorted { $0.value.score > $1.value.score }
             .prefix(12)
-            .map {
-                SearchHit(
-                    url: $0.chunk.url,
-                    name: $0.chunk.name,
-                    snippet: $0.chunk.text
-                )
-            }
+            .map { SearchHit(url: $0.key, name: $0.value.name, snippet: $0.value.text) }
     }
 
     private func loadIfNeeded() {
         guard !loaded else { return }
         loaded = true
+        embedding = NLEmbedding.sentenceEmbedding(for: .english)
         guard let data = try? Data(contentsOf: storeURL),
               let store = try? JSONDecoder().decode(Store.self, from: data)
         else { return }
-        chunks = store.chunks
+        entries = store.entries
     }
 
     private func scheduleSave() {
         saveTask?.cancel()
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }
-            self?.save()
+            await self?.save()
         }
     }
 
     private func save() {
-        let store = Store(chunks: chunks)
+        let store = Store(entries: entries)
         guard let data = try? JSONEncoder().encode(store) else { return }
         try? data.write(to: storeURL, options: [.atomic])
+    }
+
+    private static func digest(of text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func plainText(from spans: [SpanNode]) -> String {

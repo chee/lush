@@ -381,7 +381,7 @@ final class NotesModel {
                 }
                 let liveUrls = Set(visible.map(\.url))
                 self.contextMetas = self.contextMetas.filter { liveUrls.contains($0.key) }
-                self.scheduleSemanticIndex(for: visible.filter { $0.kind == "rich" }.map {
+                self.backfillSemanticIndex(for: visible.filter { $0.kind == "rich" }.map {
                     NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
                 })
             }
@@ -597,6 +597,9 @@ final class NotesModel {
         guard let core else { return }
         do {
             try core.deleteNote(url: url)
+            semanticIndexTasks[url]?.cancel()
+            semanticIndexTasks[url] = nil
+            Task { [semanticSearch] in await semanticSearch.remove(url: url) }
             refreshNotes()
         } catch {
             status = "Couldn't delete note: \(error.localizedDescription)"
@@ -694,7 +697,7 @@ final class NotesModel {
             return (core.notePreview(url: url), core.noteTitle(url: url))
         }.value
         previews[url] = preview
-        semanticSearch.index(url: url, name: title, spansJson: json)
+        scheduleSemanticIndex(url: url, name: title)
     }
 
     func updateDocument(
@@ -801,17 +804,22 @@ final class NotesModel {
         guard let core, !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
         let exact = await Task.detached { core.searchNotes(query: query) }.value
         let seen = Set(exact.map(\.url))
-        return exact + semanticSearch.search(query, excluding: seen)
+        return await exact + semanticSearch.search(query, excluding: seen)
     }
 
-    private func scheduleSemanticIndex(for notes: [NoteInfo]) {
-        for note in notes {
-            scheduleSemanticIndex(url: note.url, name: note.name)
+    /// Notes the index has never seen — everything else is kept current by
+    /// docChanged and the edit paths, so a refresh must not re-embed the world.
+    private func backfillSemanticIndex(for notes: [NoteInfo]) {
+        Task { [weak self, semanticSearch] in
+            let known = await semanticSearch.indexedUrls()
+            guard let self else { return }
+            for note in notes where !known.contains(note.url) {
+                self.scheduleSemanticIndex(url: note.url, name: note.name)
+            }
         }
     }
 
     private func scheduleSemanticIndex(url: String, name: String? = nil) {
-        guard semanticSearch.isAvailable else { return }
         semanticIndexTasks[url]?.cancel()
         semanticIndexTasks[url] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(900))
@@ -827,7 +835,7 @@ final class NotesModel {
             try? core.openNote(url: url)
             return (try? core.noteSpansJson(url: url)) ?? "[]"
         }.value
-        semanticSearch.index(url: url, name: resolvedName, spansJson: json)
+        await semanticSearch.index(url: url, name: resolvedName, spansJson: json)
         semanticIndexTasks[url] = nil
     }
 
@@ -1058,16 +1066,16 @@ final class NotesModel {
             return
         }
         let parent = node?.parentUrl ?? folderUrl
-        let (preview, spansJson) = await Task.detached {
+        let preview = await Task.detached {
             if let parent {
                 try? core.renameEntry(folderUrl: parent, url: url, title: name)
             } else {
                 try? core.renameNote(url: url, title: name)
             }
-            return (core.notePreview(url: url), (try? core.noteSpansJson(url: url)) ?? "[]")
+            return core.notePreview(url: url)
         }.value
         previews[url] = preview
-        semanticSearch.index(url: url, name: name, spansJson: spansJson)
+        scheduleSemanticIndex(url: url, name: name)
         refreshNotes()
     }
 
