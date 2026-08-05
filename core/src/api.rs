@@ -251,6 +251,12 @@ impl Core {
         self.repo.is_connected()
     }
 
+    /// Port of the loopback subduction listener the core hosts, if it bound.
+    /// Webviews connect here to sync against the core's own storage.
+    pub fn local_server_port(&self) -> Option<u16> {
+        self.repo.local_server_port()
+    }
+
     /// Open an existing folder doc (waiting for it to arrive if needed) or
     /// create a fresh one. Returns the folder's automerge URL.
     pub fn ensure_folder(&self, existing_url: Option<String>) -> Result<String, CoreError> {

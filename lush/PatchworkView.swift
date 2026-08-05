@@ -75,8 +75,14 @@ enum PatchworkWeb {
     }
 
     @MainActor
+    static var coreServerPort: UInt16?
+
+    @MainActor
     static var configScriptTag: String {
-        let localPort = LocalSyncServer.wsPort.map { ", \"localWsPort\": \($0)" } ?? ""
+        let ports = [coreServerPort, LocalSyncServer.wsPort].compactMap { $0 }
+        let localPort = ports.isEmpty
+            ? ""
+            : ", \"localWsPorts\": [\(ports.map(String.init).joined(separator: ", "))]"
         let modules = (try? JSONSerialization.data(withJSONObject: moduleUrls))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
         return """
@@ -135,6 +141,11 @@ enum PatchworkWeb {
         background: var(--editor-fill); color: var(--editor-line);
       }
       #status { font: 12px system-ui, sans-serif; color: color-mix(in srgb, var(--editor-line) 55%, transparent); padding: 12px; }
+      @keyframes lush-loading-pulse {
+        0%, 100% { background-color: color-mix(in srgb, #ffb35c 10%, var(--editor-fill)); }
+        50% { background-color: color-mix(in srgb, #ffb35c 26%, var(--editor-fill)); }
+      }
+      body.loading { animation: lush-loading-pulse 1.8s ease-in-out infinite; }
       .picker { display: flex; flex-direction: column; gap: 6px; padding: 14px;
         font: 13px system-ui, sans-serif; }
       .picker-paste { display: flex; gap: 6px; }
@@ -148,18 +159,15 @@ enum PatchworkWeb {
       .picker button:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
     </style>
     </head>
-    <body>
-    <div id="status">loading patchwork…</div>
+    <body class="loading">
+    <div id="status"></div>
     <script type="module" src="/embed.js"></script>
     </body>
     </html>
     """#
 
     static let shellJS = #"""
-    const isResolver =
-      new URLSearchParams(location.search).get("resolver") === "1"
-
-    if (isResolver && "serviceWorker" in navigator) {
+    if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("/service-worker.js", { type: "module" }).catch(console.warn)
     }
 
@@ -373,8 +381,8 @@ enum PatchworkWeb {
         ? MemorySigner.fromBytes(hexToBytes(config.signerSeedHex))
         : new MemorySigner()
       const endpoints = [config.publicEndpoint ?? "wss://subduction.sync.inkandswitch.com"]
-      if (config.localWsPort) {
-        endpoints.push(`ws://127.0.0.1:${config.localWsPort}`)
+      for (const port of config.localWsPorts ?? []) {
+        endpoints.push(`ws://127.0.0.1:${port}`)
       }
       const repo = new Repo({
         storage: new IndexedDBStorageAdapter(),
@@ -384,15 +392,12 @@ enum PatchworkWeb {
         subductionWebsocketEndpoints: endpoints,
       })
       window.repo = repo
-      if (isResolver) {
-        installResolver(repo)
-        installHandoffListener()
-      }
+      installResolver(repo)
+      installHandoffListener()
 
       registerRepoProviderElement(repo)
       registerPatchworkViewElement({ repo })
 
-      status("loading tools…")
       const sources = { system: "/modules.json" }
       for (const [index, moduleUrl] of (config.moduleUrls ?? []).entries()) {
         if (isValidAutomergeUrl(moduleUrl)) {
@@ -407,17 +412,14 @@ enum PatchworkWeb {
         },
         unregisterPlugins,
       )
-      await watcher.doneLoading
+      const toolsLoaded = watcher.doneLoading.catch((error) => {
+        console.warn("lush: module loading failed", error)
+      })
 
-      // Expose setDoc so native code can switch docs without reloading the page.
-      // The WASM and tools are already loaded; only the view element is replaced.
-      window.setDoc = async (docUrl, toolId) => {
-        if (!docUrl) {
-          document.body.replaceChildren()
-          status("")
-          return
-        }
-        status("finding document…")
+      // Tool selection and the tools menu catch up in the background once
+      // modules finish loading; the view element finds the doc on its own.
+      const finishSetDoc = async (docUrl, toolId, view) => {
+        await toolsLoaded
         let doc
         try {
           const handle = await Promise.race([
@@ -438,7 +440,6 @@ enum PatchworkWeb {
           const suggested = doc?.["@patchwork"]?.suggestedImportUrl
           if (!toolId && suggested && isValidAutomergeUrl(String(suggested))) {
             try {
-              status("importing tool…")
               const mod = await importToolPackage(repo, String(suggested))
               toolId =
                 firstToolFor(type) ??
@@ -449,13 +450,9 @@ enum PatchworkWeb {
               console.warn("lush: suggested tool import failed", error)
             }
           }
+          if (toolId && view.isConnected) view.setAttribute("tool-id", toolId)
         }
-        const view = document.createElement("patchwork-view")
-        if (toolId) view.setAttribute("tool-id", toolId)
-        view.setAttribute("doc-url", docUrl)
-        const provider = document.createElement("repo-provider")
-        provider.appendChild(view)
-        document.body.replaceChildren(provider)
+        if (!view.isConnected) return
         const tools = (getSupportedToolsForType(type) ?? [])
           .filter((tool) => !tool.unlisted)
           .map((tool) => ({ id: tool.id, name: tool.name ?? tool.id }))
@@ -466,9 +463,40 @@ enum PatchworkWeb {
         })
       }
 
+      // Expose setDoc so native code can switch docs without reloading the
+      // page. The view mounts immediately; nothing waits on module loading.
+      window.setDoc = async (docUrl, toolId) => {
+        document.body.classList.remove("loading")
+        if (!docUrl) {
+          document.body.replaceChildren()
+          status("")
+          return
+        }
+        const view = document.createElement("patchwork-view")
+        if (toolId) view.setAttribute("tool-id", toolId)
+        view.setAttribute("doc-url", docUrl)
+        const provider = document.createElement("repo-provider")
+        provider.appendChild(view)
+        document.body.replaceChildren(provider)
+        finishSetDoc(docUrl, toolId, view).catch((error) => {
+          console.warn("lush: tool setup failed", error)
+        })
+      }
+
       const params = new URLSearchParams(location.search)
       if (params.get("mode") === "picker") {
+        // Render with whatever has registered so far rather than waiting on
+        // stragglers; the paste field works regardless.
+        await Promise.race([
+          toolsLoaded,
+          new Promise((resolve) => setTimeout(resolve, 1000)),
+        ])
+        document.body.classList.remove("loading")
         renderPicker(repo)
+        toolsLoaded.then(() => {
+          const input = document.querySelector(".picker-paste input")
+          if (!input || input.value === "") renderPicker(repo)
+        })
         return repo
       }
       const docUrl = params.get("doc-url")
@@ -476,7 +504,8 @@ enum PatchworkWeb {
       if (docUrl) {
         await window.setDoc(docUrl, toolId || null)
       } else {
-        status("ready")
+        document.body.classList.remove("loading")
+        status("")
       }
       return repo
     }
@@ -544,6 +573,7 @@ enum PatchworkWeb {
     }
 
     window.patchworkReady = boot().catch((error) => {
+      document.body.classList.remove("loading")
       status(String(error))
       throw error
     })
@@ -551,6 +581,7 @@ enum PatchworkWeb {
 }
 
 final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
+    weak var webView: WKWebView?
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
 
     func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
@@ -607,16 +638,15 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
         return (data, response)
     }
 
-    /// All automerge-path fetches — from every pooled frame — resolve through
-    /// the single resolver webview, which booted at startup and already holds
-    /// the synced module docs. The wait loop covers fetches that land before
-    /// its boot has installed the resolver.
     private func resolveDocURL(path: String, url: URL) async throws -> (Data, URLResponse) {
-        let resolver = await SharedPatchworkWebView.shared.webView
-        let result = try await resolver.callAsyncJavaScript(
+        guard let webView else { throw URLError(.cannotConnectToHost) }
+        let result = try await webView.callAsyncJavaScript(
             """
+            let waited = 0
             while (!window.__patchworkResolve) {
+                if (waited >= 15000) throw new Error("resolver never became ready")
                 await new Promise(r => setTimeout(r, 50))
+                waited += 50
             }
             return await window.__patchworkResolve(path)
             """,
@@ -757,6 +787,7 @@ func makePatchworkWebView(
     }
     let webView = WKWebView(frame: .zero, configuration: configuration)
     webView.isInspectable = true
+    handler.webView = webView
     #if os(macOS)
     webView.setValue(false, forKey: "drawsBackground")
     #else
@@ -805,8 +836,10 @@ final class MutablePickerBridge: NSObject, WKScriptMessageHandler {
 @MainActor
 final class SharedPatchworkPickerView {
     static let shared = SharedPatchworkPickerView()
-    let webView: WKWebView
+    private let host: PatchworkWebViewHost
     private let bridge = MutablePickerBridge()
+
+    var webView: WKWebView { host.webView }
 
     var onPick: (@MainActor (String, String?) -> Void)? {
         get { bridge.onPick }
@@ -814,7 +847,7 @@ final class SharedPatchworkPickerView {
     }
 
     private init() {
-        webView = makePatchworkWebView(
+        host = PatchworkWebViewHost(
             query: [URLQueryItem(name: "mode", value: "picker")],
             messageHandler: bridge
         )
@@ -884,6 +917,7 @@ struct PatchworkCreateSheet: View {
         #endif
     }
 }
+
 
 struct NewPatchworkDocSheet: View {
     let onPick: @MainActor (String, String?) -> Void
@@ -977,8 +1011,12 @@ final class PatchworkViewPool {
         entry.host.setPatchworkDoc(url: docUrl, toolId: toolId)
     }
 
-    func release(docUrl: String) {
-        guard let entry = active.removeValue(forKey: docUrl) else { return }
+    /// A wrapper's dismantle can fire after a newer wrapper has re-acquired
+    /// the same doc (SwiftUI makes before it dismantles), so only the wrapper
+    /// whose webview is still the active one may release it.
+    func release(docUrl: String, webView: WKWebView) {
+        guard let entry = active[docUrl], entry.webView === webView else { return }
+        active[docUrl] = nil
         entry.bridge.onTools = nil
         guard idle.count < Self.warmTarget else { return }
         entry.host.setPatchworkDoc(url: nil, toolId: nil)
@@ -1017,7 +1055,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
-        PatchworkViewPool.shared.release(docUrl: coordinator.docUrl)
+        PatchworkViewPool.shared.release(docUrl: coordinator.docUrl, webView: nsView)
     }
 }
 #else
@@ -1051,7 +1089,7 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
-        PatchworkViewPool.shared.release(docUrl: coordinator.docUrl)
+        PatchworkViewPool.shared.release(docUrl: coordinator.docUrl, webView: uiView)
     }
 }
 #endif
@@ -1129,14 +1167,22 @@ struct PatchworkBoxView: View {
 }
 
 private extension WKWebView {
+    // Waits for boot to define window.setDoc rather than awaiting
+    // patchworkReady, which throws here if boot failed and would silently
+    // leave the previous doc on screen.
     func callSetDoc(url: String?, toolId: String?) {
         callAsyncJavaScript(
             """
-            while (!window.patchworkReady) {
+            let waited = 0
+            while (!window.setDoc) {
+                if (waited >= 30000) {
+                    console.warn("lush: setDoc never appeared; boot broken?")
+                    return
+                }
                 await new Promise(r => setTimeout(r, 50))
+                waited += 50
             }
-            await window.patchworkReady
-            if (window.setDoc) await window.setDoc(docUrl, toolId)
+            await window.setDoc(docUrl, toolId)
             """,
             arguments: ["docUrl": url as Any, "toolId": toolId as Any],
             in: nil,
@@ -1173,6 +1219,12 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
             webView.callSetDoc(url: p.url, toolId: p.toolId)
         }
     }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        NSLog("lush patchwork webview process died, reloading")
+        loaded = false
+        webView.reload()
+    }
 }
 
 @MainActor
@@ -1189,10 +1241,7 @@ final class SharedPatchworkWebView {
     }
 
     private init() {
-        host = PatchworkWebViewHost(
-            query: [URLQueryItem(name: "resolver", value: "1")],
-            messageHandler: bridge
-        )
+        host = PatchworkWebViewHost(query: [], messageHandler: bridge)
     }
 
     func setDoc(url: String, toolId: String?) {

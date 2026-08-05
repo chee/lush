@@ -22,10 +22,18 @@ use sedimentree_core::{
     loose_commit::{id::CommitId, LooseCommit},
     sedimentree::{Sedimentree, SedimentreeItem},
 };
+use async_tungstenite::{
+    tokio::TokioAdapter,
+    tungstenite::{handshake::server::NoCallback, protocol::WebSocketConfig},
+};
+use futures::future::BoxFuture;
 use subduction_core::{
     collections::bounded_sharded_map::BoundedShardedMap,
     handler::sync::SyncHandler,
-    handshake::audience::Audience,
+    handshake::{
+        self,
+        audience::{Audience, DiscoveryId},
+    },
     nonce_cache::NonceCache,
     peer::id::PeerId,
     policy::open::OpenPolicy,
@@ -33,12 +41,21 @@ use subduction_core::{
     storage::{powerbox::StoragePowerbox, traits::Storage},
     subduction::Subduction,
     timeout::call::CallTimeout,
-    transport::message::MessageTransport,
+    timestamp::TimestampSeconds,
+    transport::{message::MessageTransport, Transport},
 };
 use subduction_crypto::signer::memory::MemorySigner;
 use sedimentree_fs_storage::FsStorage;
-use subduction_websocket::tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn};
+use subduction_websocket::{
+    error::{DisconnectionError, RecvError, SendError},
+    handshake::WebSocketHandshake,
+    sleep::TokioSleeper,
+    tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn},
+    websocket::{KeepAlive, WebSocket},
+    DEFAULT_MAX_MESSAGE_SIZE,
+};
 use tokio::{
+    net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, Mutex},
     task::JoinHandle,
 };
@@ -52,8 +69,113 @@ const SHUTDOWN_SYNC_TIMEOUT: CallTimeout = CallTimeout::TimeoutMillis(5_000);
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(90);
 const HEAL_DELAY: Duration = Duration::from_secs(5);
 const HEAL_MAX_ATTEMPTS: u32 = 12;
+const LOCAL_SERVER_PORT: u16 = 43219;
+const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
 
-type Conn = MessageTransport<TokioWebSocketClient<MemorySigner>>;
+/// One Subduction node carries both the dialed connection to the public
+/// server and websocket peers accepted on the loopback listener (the
+/// patchwork webviews), so they all share the node's fs storage and sync
+/// through each other.
+#[derive(Debug, Clone)]
+pub enum WsTransport {
+    Dialed(TokioWebSocketClient<MemorySigner>),
+    Accepted(WebSocket<TokioAdapter<TcpStream>, Sendable>),
+}
+
+impl Transport<Sendable> for WsTransport {
+    type SendError = SendError;
+    type RecvError = RecvError;
+    type DisconnectionError = DisconnectionError;
+
+    fn send_bytes(&self, bytes: &[u8]) -> BoxFuture<'_, Result<(), Self::SendError>> {
+        match self {
+            Self::Dialed(ws) => Transport::<Sendable>::send_bytes(ws, bytes),
+            Self::Accepted(ws) => Transport::<Sendable>::send_bytes(ws, bytes),
+        }
+    }
+
+    fn recv_bytes(&self) -> BoxFuture<'_, Result<Vec<u8>, Self::RecvError>> {
+        match self {
+            Self::Dialed(ws) => Transport::<Sendable>::recv_bytes(ws),
+            Self::Accepted(ws) => Transport::<Sendable>::recv_bytes(ws),
+        }
+    }
+
+    fn disconnect(&self) -> BoxFuture<'_, Result<(), Self::DisconnectionError>> {
+        match self {
+            Self::Dialed(ws) => Transport::<Sendable>::disconnect(ws),
+            Self::Accepted(ws) => Transport::<Sendable>::disconnect(ws),
+        }
+    }
+}
+
+impl PartialEq for WsTransport {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dialed(a), Self::Dialed(b)) => a == b,
+            (Self::Accepted(a), Self::Accepted(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+type Conn = MessageTransport<WsTransport>;
+
+async fn accept_local_peer(
+    tcp: TcpStream,
+    node: Arc<Core>,
+    server_peer_id: PeerId,
+    discovery_audience: Option<Audience>,
+) {
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_message_size = Some(DEFAULT_MAX_MESSAGE_SIZE);
+
+    let ws_stream = match async_tungstenite::tokio::accept_hdr_async_with_config(
+        tcp,
+        NoCallback,
+        Some(ws_config),
+    )
+    .await
+    {
+        Ok(ws) => ws,
+        Err(_) => return,
+    };
+
+    let result = handshake::respond::<Sendable, _, _, _, _>(
+        WebSocketHandshake::new(ws_stream),
+        |ws_handshake, peer_id| {
+            let (ws, sender_fut, keepalive_task) = WebSocket::new_with_keepalive(
+                ws_handshake.into_inner(),
+                peer_id,
+                KeepAlive::balanced(),
+                TokioSleeper,
+            );
+            let listen_ws = ws.clone();
+            tokio::spawn(async move {
+                let _ = listen_ws.listen().await;
+            });
+            tokio::spawn(async move {
+                let _ = sender_fut.await;
+            });
+            tokio::spawn(async move {
+                let _ = keepalive_task.await;
+            });
+            (MessageTransport::new(WsTransport::Accepted(ws)), ())
+        },
+        node.signer(),
+        node.nonce_cache(),
+        server_peer_id,
+        discovery_audience,
+        TimestampSeconds::now(),
+        HANDSHAKE_MAX_DRIFT,
+    )
+    .await;
+
+    let Ok((authenticated, ())) = result else {
+        return;
+    };
+    let _ = node.add_connection(authenticated).await;
+}
 type Handler = SyncHandler<
     Sendable,
     ObservedStorage,
@@ -195,6 +317,7 @@ pub struct Repo {
     next_save: AtomicU64,
     events: broadcast::Sender<RepoEvent>,
     connected: std::sync::atomic::AtomicBool,
+    local_port: Option<u16>,
 }
 
 fn load_or_create_signer(path: &Path) -> Result<MemorySigner> {
@@ -361,6 +484,10 @@ fn load_blob_batch(
 }
 
 impl Repo {
+    pub fn local_server_port(&self) -> Option<u16> {
+        self.local_port
+    }
+
     pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
         let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
@@ -383,10 +510,21 @@ impl Repo {
             HeadsObserver { tx: heads_tx },
             TokioSpawn,
         ));
+        let listener = match TcpListener::bind(("127.0.0.1", LOCAL_SERVER_PORT)).await {
+            Ok(l) => Some(l),
+            Err(_) => TcpListener::bind(("127.0.0.1", 0)).await.ok(),
+        };
+        let local_port = listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|addr| addr.port());
+        let discovery_id =
+            local_port.map(|port| DiscoveryId::new(format!("127.0.0.1:{port}").as_bytes()));
+
         let send_counter = handler.send_counter().clone();
         let (core, listener_fut, manager_fut) = Subduction::new(
             handler,
-            None,
+            discovery_id,
             signer.clone(),
             sedimentrees,
             connections,
@@ -423,7 +561,22 @@ impl Repo {
             next_save: AtomicU64::new(0),
             events,
             connected: std::sync::atomic::AtomicBool::new(false),
+            local_port,
         });
+
+        if let Some(listener) = listener {
+            let node = repo.core.clone();
+            let peer_id = PeerId::from(repo.signer.verifying_key());
+            let audience = node.discovery_id().map(Audience::discover_id);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _addr)) = listener.accept().await else {
+                        continue;
+                    };
+                    tokio::spawn(accept_local_peer(tcp, node.clone(), peer_id, audience));
+                }
+            });
+        }
 
         {
             let repo = repo.clone();
@@ -513,7 +666,9 @@ impl Repo {
                     });
                     if let Err(e) = self
                         .core
-                        .add_connection(authenticated.map(MessageTransport::new))
+                        .add_connection(
+                            authenticated.map(|c| MessageTransport::new(WsTransport::Dialed(c))),
+                        )
                         .await
                     {
                         tracing::error!(error = %e, "failed to register connection");

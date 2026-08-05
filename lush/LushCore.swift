@@ -406,6 +406,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -633,6 +649,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func linkNoteToFolder(noteUrl: String, title: String) throws 
     
     func listNotes() async  -> [NoteInfo]
+    
+    /**
+     * Port of the loopback subduction listener the core hosts, if it bound.
+     * Webviews connect here to sync against the core's own storage.
+     */
+    func localServerPort()  -> UInt16?
     
     /**
      * Record that the analyzer has looked at this asset, so a fruitless one
@@ -1085,6 +1107,17 @@ open func listNotes()async  -> [NoteInfo]  {
             errorHandler: nil
             
         )
+}
+    
+    /**
+     * Port of the loopback subduction listener the core hosts, if it bound.
+     * Webviews connect here to sync against the core's own storage.
+     */
+open func localServerPort() -> UInt16?  {
+    return try!  FfiConverterOptionUInt16.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_local_server_port(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -2272,6 +2305,30 @@ public func FfiConverterCallbackInterfaceCoreDelegate_lower(_ v: CoreDelegate) -
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
+    typealias SwiftType = UInt16?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt16.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt16.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -2666,6 +2723,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_list_notes() != 11889) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_local_server_port() != 63802) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_mark_vision_attempted() != 8028) {

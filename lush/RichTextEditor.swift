@@ -477,6 +477,12 @@ final class EditorCore {
             guard let self else { return }
             let session = self.session
             if session.loaded {
+                // The session survives across visits but this editor's asset
+                // cache does not; reclassify embeds before reconciling or
+                // they all render as empty space.
+                let spans = SpanNode.decodeList(session.lastKnownJSON)
+                await self.fetchMissingAssets(in: spans)
+                guard self.noteUrl == url, self.session === session else { return }
                 self.syncFromSession()
                 return
             }
@@ -537,7 +543,8 @@ final class EditorCore {
         }
         for (url, data) in fetched {
             guard let data else {
-                if let info = await model.assetInfo(url), info.mimeType.isEmpty {
+                let info = await model.assetInfo(url)
+                if (info?.mimeType ?? "").isEmpty {
                     cache.patchworkDocs.insert(url)
                 }
                 continue

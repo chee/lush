@@ -103,12 +103,11 @@ final class NotesModel {
                let legacy = UserDefaults.standard.string(forKey: Self.folderDefaultsKey) {
                 saved = [legacy]
             }
-            await LocalSyncServer.startIfNeeded()
-            let serverUrl = LocalSyncServer.wsPort.map { "ws://127.0.0.1:\($0)" }
             let core = try await Task.detached {
-                try Core(dataDir: dataDir.path, serverUrl: serverUrl)
+                try Core(dataDir: dataDir.path, serverUrl: nil)
             }.value
             self.core = core
+            PatchworkWeb.coreServerPort = core.localServerPort()
             Task { [semanticSearch] in await semanticSearch.attach(core) }
             let delegateBridge = DelegateBridge(model: self)
             self.delegateBridge = delegateBridge

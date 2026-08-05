@@ -1030,6 +1030,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-lock",
+ "async-tungstenite",
  "automerge",
  "blake3",
  "bs58",
