@@ -8,7 +8,7 @@ use sedimentree_core::{
 };
 use subduction_core::storage::traits::Storage;
 use subduction_crypto::verified_meta::VerifiedMeta;
-use subduction_redb_storage::{RedbStorage, RedbStorageError};
+use sedimentree_fs_storage::{FsStorage, FsStorageError};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -32,44 +32,44 @@ impl StoredBatch {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObservedStorage {
-    inner: RedbStorage,
+    inner: FsStorage,
     stored: mpsc::UnboundedSender<StoredBatch>,
 }
 
 impl ObservedStorage {
-    pub(crate) fn new(inner: RedbStorage, stored: mpsc::UnboundedSender<StoredBatch>) -> Self {
+    pub(crate) fn new(inner: FsStorage, stored: mpsc::UnboundedSender<StoredBatch>) -> Self {
         Self { inner, stored }
     }
 }
 
 impl Storage<Sendable> for ObservedStorage {
-    type Error = RedbStorageError;
+    type Error = FsStorageError;
 
     fn save_sedimentree_id(
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::save_sedimentree_id(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::save_sedimentree_id(&self.inner, sedimentree_id)
     }
 
     fn delete_sedimentree_id(
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::delete_sedimentree_id(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::delete_sedimentree_id(&self.inner, sedimentree_id)
     }
 
     fn load_all_sedimentree_ids(
         &self,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Set<SedimentreeId>, Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::load_all_sedimentree_ids(&self.inner)
+        <FsStorage as Storage<Sendable>>::load_all_sedimentree_ids(&self.inner)
     }
 
     fn contains_sedimentree_id(
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<bool, Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::contains_sedimentree_id(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::contains_sedimentree_id(&self.inner, sedimentree_id)
     }
 
     fn save_loose_commit(
@@ -83,7 +83,7 @@ impl Storage<Sendable> for ObservedStorage {
             blob: verified.blob().clone(),
         };
         Sendable::from_future(async move {
-            <RedbStorage as Storage<Sendable>>::save_loose_commit(
+            <FsStorage as Storage<Sendable>>::save_loose_commit(
                 &self.inner,
                 sedimentree_id,
                 verified,
@@ -102,7 +102,7 @@ impl Storage<Sendable> for ObservedStorage {
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Set<CommitId>, Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::list_commit_ids(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::list_commit_ids(&self.inner, sedimentree_id)
     }
 
     fn load_loose_commits(
@@ -110,14 +110,14 @@ impl Storage<Sendable> for ObservedStorage {
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Vec<VerifiedMeta<LooseCommit>>, Self::Error>>
     {
-        <RedbStorage as Storage<Sendable>>::load_loose_commits(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::load_loose_commits(&self.inner, sedimentree_id)
     }
 
     fn load_loose_commit_metas(
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Vec<LooseCommit>, Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::load_loose_commit_metas(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::load_loose_commit_metas(&self.inner, sedimentree_id)
     }
 
     fn load_loose_commit(
@@ -126,7 +126,7 @@ impl Storage<Sendable> for ObservedStorage {
         commit_id: CommitId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Option<VerifiedMeta<LooseCommit>>, Self::Error>>
     {
-        <RedbStorage as Storage<Sendable>>::load_loose_commit(
+        <FsStorage as Storage<Sendable>>::load_loose_commit(
             &self.inner,
             sedimentree_id,
             commit_id,
@@ -138,7 +138,7 @@ impl Storage<Sendable> for ObservedStorage {
         sedimentree_id: SedimentreeId,
         commit_id: CommitId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::delete_loose_commit(
+        <FsStorage as Storage<Sendable>>::delete_loose_commit(
             &self.inner,
             sedimentree_id,
             commit_id,
@@ -149,7 +149,7 @@ impl Storage<Sendable> for ObservedStorage {
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::delete_loose_commits(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::delete_loose_commits(&self.inner, sedimentree_id)
     }
 
     fn save_fragment(
@@ -163,7 +163,7 @@ impl Storage<Sendable> for ObservedStorage {
             blob: verified.blob().clone(),
         };
         Sendable::from_future(async move {
-            <RedbStorage as Storage<Sendable>>::save_fragment(
+            <FsStorage as Storage<Sendable>>::save_fragment(
                 &self.inner,
                 sedimentree_id,
                 verified,
@@ -184,7 +184,7 @@ impl Storage<Sendable> for ObservedStorage {
         fragment_head: CommitId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Option<VerifiedMeta<Fragment>>, Self::Error>>
     {
-        <RedbStorage as Storage<Sendable>>::load_fragment(
+        <FsStorage as Storage<Sendable>>::load_fragment(
             &self.inner,
             sedimentree_id,
             fragment_head,
@@ -195,7 +195,7 @@ impl Storage<Sendable> for ObservedStorage {
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Set<CommitId>, Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::list_fragment_ids(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::list_fragment_ids(&self.inner, sedimentree_id)
     }
 
     fn load_fragments(
@@ -203,14 +203,14 @@ impl Storage<Sendable> for ObservedStorage {
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Vec<VerifiedMeta<Fragment>>, Self::Error>>
     {
-        <RedbStorage as Storage<Sendable>>::load_fragments(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::load_fragments(&self.inner, sedimentree_id)
     }
 
     fn load_fragment_metas(
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Vec<Fragment>, Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::load_fragment_metas(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::load_fragment_metas(&self.inner, sedimentree_id)
     }
 
     fn delete_fragment(
@@ -218,7 +218,7 @@ impl Storage<Sendable> for ObservedStorage {
         sedimentree_id: SedimentreeId,
         fragment_head: CommitId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::delete_fragment(
+        <FsStorage as Storage<Sendable>>::delete_fragment(
             &self.inner,
             sedimentree_id,
             fragment_head,
@@ -229,7 +229,7 @@ impl Storage<Sendable> for ObservedStorage {
         &self,
         sedimentree_id: SedimentreeId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<(), Self::Error>> {
-        <RedbStorage as Storage<Sendable>>::delete_fragments(&self.inner, sedimentree_id)
+        <FsStorage as Storage<Sendable>>::delete_fragments(&self.inner, sedimentree_id)
     }
 
     fn save_batch(
@@ -257,7 +257,7 @@ impl Storage<Sendable> for ObservedStorage {
                 .collect(),
         };
         Sendable::from_future(async move {
-            let count = <RedbStorage as Storage<Sendable>>::save_batch(
+            let count = <FsStorage as Storage<Sendable>>::save_batch(
                 &self.inner,
                 sedimentree_id,
                 commits,

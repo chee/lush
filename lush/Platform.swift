@@ -6,6 +6,7 @@ typealias PColor = NSColor
 typealias PImage = NSImage
 typealias PView = NSView
 typealias PFontDescriptor = NSFontDescriptor
+typealias PBezierPath = NSBezierPath
 #else
 import UIKit
 
@@ -14,6 +15,11 @@ typealias PColor = UIColor
 typealias PImage = UIImage
 typealias PView = UIView
 typealias PFontDescriptor = UIFontDescriptor
+typealias PBezierPath = UIBezierPath
+
+extension UIBezierPath {
+    func line(to point: CGPoint) { addLine(to: point) }
+}
 #endif
 
 enum Clipboard {
@@ -52,6 +58,23 @@ extension PColor {
         .secondaryLabelColor
         #else
         .secondaryLabel
+        #endif
+    }
+
+    /// The accent colour, and something that reads on top of it.
+    static var pTint: PColor {
+        #if os(macOS)
+        .controlAccentColor
+        #else
+        .tintColor
+        #endif
+    }
+
+    static var pOnTint: PColor {
+        #if os(macOS)
+        .textBackgroundColor
+        #else
+        .systemBackground
         #endif
     }
 }

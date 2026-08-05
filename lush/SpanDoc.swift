@@ -66,6 +66,11 @@ enum JSONValue: Codable, Equatable {
         if case .string(let s) = self { return s }
         return nil
     }
+
+    var boolValue: Bool? {
+        if case .bool(let b) = self { return b }
+        return nil
+    }
 }
 
 struct BlockValue: Codable, Equatable {
@@ -128,6 +133,15 @@ struct BlockValue: Codable, Equatable {
 
     var htmlSource: String? {
         attrs["html"]?.stringValue
+    }
+
+    /// A to-do item that has been ticked. Absent means unticked.
+    var isChecked: Bool {
+        type == "todo-list-item" && attrs["checked"]?.boolValue == true
+    }
+
+    static func todo(checked: Bool) -> BlockValue {
+        BlockValue(type: "todo-list-item", attrs: checked ? ["checked": .bool(true)] : [:])
     }
 
     /// Stable identifier for the format picker.
@@ -202,6 +216,8 @@ extension NSAttributedString.Key {
     /// round-trip into the document.
     static let amDisplayOnly = NSAttributedString.Key("io.lush.displayOnly")
     static let amHighlight = NSAttributedString.Key("io.lush.highlight")
+    /// "superscript" or "subscript" — the mark behind a shifted baseline.
+    static let amBaseline = NSAttributedString.Key("io.lush.baseline")
     static let amTableBox = NSAttributedString.Key("io.lush.tableBox")
     static let amColumnsBox = NSAttributedString.Key("io.lush.columnsBox")
 }
@@ -396,23 +412,47 @@ enum EditorSettings {
         #endif
     }
 
+    // Rendering a document asks for these once per attribute run, so they are
+    // read from UserDefaults once and dropped when a setter changes them.
+    private static var cachedBodySize: Double?
+    private static var cachedDesign: String?
+    private static var fontCache: [FontKey: PFont] = [:]
+
+    private struct FontKey: Hashable {
+        let size: CGFloat
+        let weight: CGFloat
+    }
+
+    private static func invalidateTypography() {
+        cachedBodySize = nil
+        cachedDesign = nil
+        fontCache = [:]
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
     static var bodySize: Double {
+        if let cachedBodySize { return cachedBodySize }
         let saved = UserDefaults.standard.double(forKey: sizeKey)
-        return saved > 0 ? saved : defaultBodySize
+        let size = saved > 0 ? saved : defaultBodySize
+        cachedBodySize = size
+        return size
     }
 
     static func setBodySize(_ size: Double) {
         UserDefaults.standard.set(size, forKey: sizeKey)
-        NotificationCenter.default.post(name: changed, object: nil)
+        invalidateTypography()
     }
 
     static var design: String {
-        UserDefaults.standard.string(forKey: designKey) ?? "system"
+        if let cachedDesign { return cachedDesign }
+        let design = UserDefaults.standard.string(forKey: designKey) ?? "system"
+        cachedDesign = design
+        return design
     }
 
     static func setDesign(_ design: String) {
         UserDefaults.standard.set(design, forKey: designKey)
-        NotificationCenter.default.post(name: changed, object: nil)
+        invalidateTypography()
     }
 
     static var autoInsertLogline: Bool {
@@ -425,6 +465,14 @@ enum EditorSettings {
     }
 
     static func font(ofSize size: CGFloat, weight: PFont.Weight = .regular) -> PFont {
+        let key = FontKey(size: size, weight: weight.rawValue)
+        if let hit = fontCache[key] { return hit }
+        let resolved = resolveFont(ofSize: size, weight: weight)
+        fontCache[key] = resolved
+        return resolved
+    }
+
+    private static func resolveFont(ofSize size: CGFloat, weight: PFont.Weight) -> PFont {
         let base = PFont.systemFont(ofSize: size, weight: weight)
         switch design {
         case "serif":
@@ -469,7 +517,22 @@ enum RichText {
         }
     }
 
+    private struct ParagraphKey: Hashable {
+        let type: String
+        let depth: Int
+    }
+
+    private static var paragraphStyleCache: [ParagraphKey: NSParagraphStyle] = [:]
+
     static func paragraphStyle(for block: BlockValue) -> NSParagraphStyle {
+        let key = ParagraphKey(type: block.type, depth: block.parents.count)
+        if let hit = paragraphStyleCache[key] { return hit }
+        let style = buildParagraphStyle(for: block)
+        paragraphStyleCache[key] = style
+        return style
+    }
+
+    private static func buildParagraphStyle(for block: BlockValue) -> NSParagraphStyle {
         let ps = NSMutableParagraphStyle()
         ps.paragraphSpacing = 6
         var indent: CGFloat = 0
@@ -478,7 +541,7 @@ enum RichText {
         switch block.type {
         case "heading":
             ps.paragraphSpacingBefore = 10
-        case "unordered-list-item", "ordered-list-item":
+        case "unordered-list-item", "ordered-list-item", "todo-list-item":
             indent += 32
         case "blockquote":
             indent += 16
@@ -525,6 +588,24 @@ enum RichText {
             out[.backgroundColor] = Highlight.background(name)
             out[.foregroundColor] = Highlight.ink(name)
         }
+        if case .bool(true)? = marks["underline"] {
+            out[.underlineStyle] = NSUnderlineStyle.single.rawValue
+        }
+        if case .bool(true)? = marks["strikethrough"] {
+            out[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+        }
+        // Sub- and superscript are a smaller font on a shifted baseline. The
+        // custom key is what reads back: the offset alone would also match
+        // text that merely sits on a different baseline.
+        if case .bool(true)? = marks["superscript"] {
+            out[.amBaseline] = "superscript"
+            out[.font] = font.withSize(font.pointSize * 0.72)
+            out[.baselineOffset] = font.pointSize * 0.38
+        } else if case .bool(true)? = marks["subscript"] {
+            out[.amBaseline] = "subscript"
+            out[.font] = font.withSize(font.pointSize * 0.72)
+            out[.baselineOffset] = -font.pointSize * 0.18
+        }
         if let link = marks["link"]?.stringValue, let url = URL(string: link) {
             out[.link] = url
             out[.underlineStyle] = NSUnderlineStyle.single.rawValue
@@ -554,6 +635,17 @@ enum RichText {
         }
         if let name = attrs[.amHighlight] as? String {
             marks["highlight"] = .string(name)
+        }
+        // A link draws itself underlined, so only text that isn't a link can
+        // claim the underline mark.
+        if attrs[.link] == nil, let style = attrs[.underlineStyle] as? Int, style != 0 {
+            marks["underline"] = .bool(true)
+        }
+        if let style = attrs[.strikethroughStyle] as? Int, style != 0 {
+            marks["strikethrough"] = .bool(true)
+        }
+        if let baseline = attrs[.amBaseline] as? String {
+            marks[baseline] = .bool(true)
         }
         return marks
     }

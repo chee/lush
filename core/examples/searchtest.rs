@@ -1,3 +1,4 @@
+use futures::executor::block_on;
 use lush_core::api::Core;
 
 fn main() -> anyhow::Result<()> {
@@ -34,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         println!("hit: {} | {} | {}", h.name, h.url, h.snippet);
     }
     assert_eq!(hits.len(), 2, "expected hits from root and subfolder");
-    let entries = core.list_notes();
+    let entries = block_on(core.list_notes());
     println!(
         "root entries: {:?}",
         entries

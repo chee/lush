@@ -1,5 +1,9 @@
+use futures::executor::block_on;
 use lush_core::api::Core;
 
+// Core's reads run on its own runtime and hand back a JoinHandle, so awaiting
+// one here needs no runtime of our own — and must not be inside one, since
+// the constructor blocks on Core's.
 fn main() {
     let _ = std::fs::remove_dir_all("/tmp/foldercrash-data");
     let core = Core::new("/tmp/foldercrash-data".into(), None).expect("core");
@@ -12,16 +16,16 @@ fn main() {
         }
         eprintln!("--- ensure_folder {url}");
         match core.ensure_folder(Some(url.clone())) {
-            Ok(_) => eprintln!("    ok: {}", core.folder_title()),
+            Ok(_) => eprintln!("    ok: {}", block_on(core.folder_title())),
             Err(e) => eprintln!("    ERROR: {e}"),
         }
-        for entry in core.folder_entries_of(url.clone()) {
+        for entry in block_on(core.folder_entries_of(url.clone())) {
             eprintln!("    entry: {} ({}) {}", entry.name, entry.kind, entry.url);
             if entry.kind == "folder" {
                 queue.push(entry.url);
             } else if entry.kind == "rich" {
                 eprintln!("    open_note {}", entry.url);
-                if let Err(e) = core.open_note(entry.url.clone()) {
+                if let Err(e) = block_on(core.open_note(entry.url.clone())) {
                     eprintln!("    note ERROR: {e}");
                 }
             }

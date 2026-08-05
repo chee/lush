@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use automerge::ChangeHash;
 use tokio::runtime::Runtime;
@@ -84,6 +84,22 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// One embedded passage of a note. `vector` must be unit length — the index
+/// compares with a plain dot product.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EmbeddingChunk {
+    pub text: String,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RecentNote {
+    pub url: String,
+    pub name: String,
+    /// Unix seconds; 0 when the note has not been indexed yet.
+    pub modified: i64,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AssetVision {
     pub description: String,
@@ -132,6 +148,23 @@ impl Core {
         let index = self.index.clone();
         self.runtime
             .block_on(async move { index_doc(repo, index, id).await });
+    }
+
+    /// Run work on the core's runtime and hand the caller a future instead of
+    /// blocking its thread. Awaiting a JoinHandle needs no ambient runtime, so
+    /// UniFFI can drive this from Swift's executor while the work stays here.
+    /// A fan-out of reads then costs futures rather than threads.
+    async fn run<F, T>(&self, fut: F) -> Result<T, CoreError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.runtime
+            .spawn(fut)
+            .await
+            .map_err(|e| CoreError::General {
+                msg: format!("core task failed: {e}"),
+            })
     }
 }
 
@@ -256,21 +289,27 @@ impl Core {
         self.folder.lock().unwrap().map(DocId::to_url)
     }
 
-    pub fn folder_title(&self) -> String {
+    pub async fn folder_title(&self) -> String {
         let Some(id) = *self.folder.lock().unwrap() else {
             return String::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::doc_title(doc))))
+        let repo = self.repo.clone();
+        self.run(async move { repo.read_doc(id, |doc| Ok(shapes::doc_title(doc))).await })
+            .await
+            .ok()
+            .and_then(Result::ok)
             .unwrap_or_default()
     }
 
-    pub fn list_notes(&self) -> Vec<NoteInfo> {
+    pub async fn list_notes(&self) -> Vec<NoteInfo> {
         let Some(id) = *self.folder.lock().unwrap() else {
             return Vec::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| shapes::folder_entries(doc)))
+        let repo = self.repo.clone();
+        self.run(async move { repo.read_doc(id, |doc| shapes::folder_entries(doc)).await })
+            .await
+            .ok()
+            .and_then(Result::ok)
             .map(|entries| {
                 entries
                     .into_iter()
@@ -292,12 +331,15 @@ impl Core {
     }
 
     /// Entries of any folder doc we hold locally (no waiting, no network).
-    pub fn folder_entries_of(&self, url: String) -> Vec<NoteInfo> {
+    pub async fn folder_entries_of(&self, url: String) -> Vec<NoteInfo> {
         let Ok(id) = DocId::from_url(&url) else {
             return Vec::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| shapes::folder_entries(doc)))
+        let repo = self.repo.clone();
+        self.run(async move { repo.read_doc(id, |doc| shapes::folder_entries(doc)).await })
+            .await
+            .ok()
+            .and_then(Result::ok)
             .map(|entries| {
                 entries
                     .into_iter()
@@ -316,30 +358,41 @@ impl Core {
 
     /// Bytes of the first embedded image in a note, if the asset is already
     /// held locally. Returns None without any network I/O.
-    pub fn note_thumbnail_bytes(&self, url: String) -> Option<Vec<u8>> {
+    pub async fn note_thumbnail_bytes(&self, url: String) -> Option<Vec<u8>> {
         let id = DocId::from_url(&url).ok()?;
-        let embed_urls = self
-            .runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::embed_urls(doc))))
-            .ok()?;
-        let first_url = embed_urls.into_iter().next()?;
-        let asset_id = DocId::from_url(&first_url).ok()?;
-        self.runtime
-            .block_on(self.repo.read_doc(asset_id, |doc| {
+        let repo = self.repo.clone();
+        self.run(async move {
+            let embed_urls = repo
+                .read_doc(id, |doc| Ok(shapes::embed_urls(doc)))
+                .await
+                .ok()?;
+            let asset_id = DocId::from_url(&embed_urls.into_iter().next()?).ok()?;
+            repo.read_doc(asset_id, |doc| {
                 shapes::file_bytes(doc).ok_or_else(|| anyhow::anyhow!("no bytes"))
-            }))
+            })
+            .await
             .ok()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Current automerge heads for any doc we hold locally. Returns an empty
     /// vec if the doc isn't tracked or has no changes.
-    pub fn doc_heads(&self, url: String) -> Vec<String> {
+    pub async fn doc_heads(&self, url: String) -> Vec<String> {
         let Ok(id) = DocId::from_url(&url) else {
             return Vec::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(encode_heads(doc.get_heads()))))
-            .unwrap_or_default()
+        let repo = self.repo.clone();
+        self.run(async move {
+            repo.read_doc(id, |doc| Ok(encode_heads(doc.get_heads())))
+                .await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
     }
 
     /// Move an entry from one folder doc to another, refusing cycles.
@@ -572,19 +625,20 @@ impl Core {
 
     /// Start tracking + syncing a note. Returns once the doc is available
     /// locally (immediately for docs we already have).
-    pub fn open_note(&self, url: String) -> Result<(), CoreError> {
+    pub async fn open_note(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
-        let reindex_url = url.clone();
-        self.runtime.block_on(async move {
-            let id = DocId::from_url(&url)?;
+        let index = self.index.clone();
+        let id = DocId::from_url(&url)?;
+        self.run(async move {
             repo.ensure_doc(id).await?;
             if repo.wait_for_doc(id, OPEN_TIMEOUT).await {
                 repo.change_doc(id, |doc| shapes::normalize_strings(doc))
                     .await?;
             }
+            index_doc(repo, index, id).await;
             Ok::<_, anyhow::Error>(())
-        })?;
-        self.reindex_doc(DocId::from_url(&reindex_url)?);
+        })
+        .await??;
         Ok(())
     }
 
@@ -636,12 +690,15 @@ impl Core {
         self.index.search(&query).unwrap_or_default()
     }
 
-    pub fn note_preview(&self, url: String) -> String {
+    pub async fn note_preview(&self, url: String) -> String {
         let Ok(id) = DocId::from_url(&url) else {
             return String::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::note_preview(doc))))
+        let repo = self.repo.clone();
+        self.run(async move { repo.read_doc(id, |doc| Ok(shapes::note_preview(doc))).await })
+            .await
+            .ok()
+            .and_then(Result::ok)
             .unwrap_or_default()
     }
 
@@ -711,54 +768,64 @@ impl Core {
             .map(|(description, ocr)| AssetVision { description, ocr })
     }
 
-    pub fn asset_bytes(&self, url: String) -> Result<Vec<u8>, CoreError> {
+    pub async fn asset_bytes(&self, url: String) -> Result<Vec<u8>, CoreError> {
         let repo = self.repo.clone();
-        let bytes = self.runtime.block_on(async move {
-            let id = DocId::from_url(&url)?;
-            repo.ensure_doc(id).await?;
-            if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
-                anyhow::bail!("asset not found locally or on the server");
-            }
-            repo.read_doc(id, |doc| {
-                shapes::file_bytes(doc).ok_or_else(|| anyhow::anyhow!("doc has no binary content"))
+        let bytes = self
+            .run(async move {
+                let id = DocId::from_url(&url)?;
+                repo.ensure_doc(id).await?;
+                if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
+                    anyhow::bail!("asset not found locally or on the server");
+                }
+                repo.read_doc(id, |doc| {
+                    shapes::file_bytes(doc)
+                        .ok_or_else(|| anyhow::anyhow!("doc has no binary content"))
+                })
+                .await
             })
-            .await
-        })?;
+            .await??;
         Ok(bytes)
     }
 
-    pub fn note_title(&self, url: String) -> String {
+    pub async fn note_title(&self, url: String) -> String {
         let Ok(id) = DocId::from_url(&url) else {
             return String::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::doc_title(doc))))
+        let repo = self.repo.clone();
+        self.run(async move { repo.read_doc(id, |doc| Ok(shapes::doc_title(doc))).await })
+            .await
+            .ok()
+            .and_then(Result::ok)
             .unwrap_or_default()
     }
 
-    pub fn note_spans_json(&self, url: String) -> Result<String, CoreError> {
+    pub async fn note_spans_json(&self, url: String) -> Result<String, CoreError> {
         let repo = self.repo.clone();
-        let json = self.runtime.block_on(async move {
-            let id = DocId::from_url(&url)?;
-            let spans = repo.read_doc(id, |doc| shapes::spans_to_json(doc)).await?;
-            Ok::<_, anyhow::Error>(serde_json::to_string(&spans)?)
-        })?;
+        let json = self
+            .run(async move {
+                let id = DocId::from_url(&url)?;
+                let spans = repo.read_doc(id, |doc| shapes::spans_to_json(doc)).await?;
+                Ok::<_, anyhow::Error>(serde_json::to_string(&spans)?)
+            })
+            .await??;
         Ok(json)
     }
 
-    pub fn note_spans_snapshot(&self, url: String) -> Result<NoteSpansSnapshot, CoreError> {
+    pub async fn note_spans_snapshot(&self, url: String) -> Result<NoteSpansSnapshot, CoreError> {
         let repo = self.repo.clone();
-        let snapshot = self.runtime.block_on(async move {
-            let id = DocId::from_url(&url)?;
-            repo.read_doc(id, |doc| {
-                let spans = shapes::spans_to_json(doc)?;
-                Ok::<_, anyhow::Error>(NoteSpansSnapshot {
-                    spans_json: serde_json::to_string(&spans)?,
-                    heads: encode_heads(doc.get_heads()),
+        let snapshot = self
+            .run(async move {
+                let id = DocId::from_url(&url)?;
+                repo.read_doc(id, |doc| {
+                    let spans = shapes::spans_to_json(doc)?;
+                    Ok::<_, anyhow::Error>(NoteSpansSnapshot {
+                        spans_json: serde_json::to_string(&spans)?,
+                        heads: encode_heads(doc.get_heads()),
+                    })
                 })
+                .await
             })
-            .await
-        })?;
+            .await??;
         Ok(snapshot)
     }
 
@@ -894,20 +961,75 @@ impl Core {
         Ok(url)
     }
 
+    /// Store a note's embedded passages, replacing any it already had.
+    pub fn set_note_embeddings(
+        &self,
+        url: String,
+        name: String,
+        digest: String,
+        chunks: Vec<EmbeddingChunk>,
+    ) -> Result<(), CoreError> {
+        self.index
+            .set_embeddings(&url, &name, &digest, &chunks)
+            .map_err(|e| CoreError::General { msg: e.to_string() })
+    }
+
+    pub fn remove_note_embeddings(&self, url: String) {
+        if let Err(e) = self.index.remove_embeddings(&url) {
+            tracing::warn!(error = %e, "embedding remove failed");
+        }
+    }
+
+    /// Indexed file docs with no `@computervision` metadata yet, for the
+    /// analyzer to backfill. Only images will actually yield anything.
+    pub fn assets_without_vision(&self, limit: u32) -> Vec<String> {
+        self.index.assets_without_vision(limit).unwrap_or_default()
+    }
+
+    /// Record that the analyzer has looked at this asset, so a fruitless one
+    /// (audio, a blank image) is not retried on every backfill.
+    pub fn mark_vision_attempted(&self, url: String) {
+        if let Err(e) = self.index.mark_vision_attempted(&url) {
+            tracing::warn!(error = %e, "vision attempt mark failed");
+        }
+    }
+
+    /// Digest of the text a note's stored embeddings were built from.
+    pub fn note_embedding_digest(&self, url: String) -> Option<String> {
+        self.index.embedding_digest(&url).unwrap_or_default()
+    }
+
+    /// url -> text digest for every embedded note. A backfill compares against
+    /// this instead of re-embedding notes that have not changed.
+    pub fn note_embedding_digests(&self) -> HashMap<String, String> {
+        self.index.embedding_digests().unwrap_or_default()
+    }
+
+    /// Notes whose closest passage is nearest `vector`, best first.
+    pub fn semantic_search(
+        &self,
+        vector: Vec<f32>,
+        limit: u32,
+        excluding: Vec<String>,
+    ) -> Vec<SearchHit> {
+        self.index
+            .semantic_search(&vector, limit, &excluding)
+            .unwrap_or_default()
+    }
+
+    /// Locally indexed notes, newest first. Served entirely from the search
+    /// index, so it costs one SQL query rather than a read per note.
+    pub fn recent_notes(&self, limit: u32) -> Vec<RecentNote> {
+        self.index.recent_notes(limit).unwrap_or_default()
+    }
+
     /// Unix seconds of the newest change in the doc (0 when unknown).
     pub fn note_modified(&self, url: String) -> i64 {
         let Ok(id) = DocId::from_url(&url) else {
             return 0;
         };
         self.runtime
-            .block_on(self.repo.read_doc(id, |doc| {
-                Ok(doc
-                    .get_changes(&[])
-                    .iter()
-                    .map(|c| c.timestamp())
-                    .max()
-                    .unwrap_or(0))
-            }))
+            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::doc_modified(doc))))
             .unwrap_or(0)
     }
 

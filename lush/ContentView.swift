@@ -440,10 +440,14 @@ struct ContentView: View {
             } else {
                 HStack(spacing: 8) {
                     if depth == 0 {
-                        Text(node.displayName)
-                            .font(.title3.weight(.medium))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
+                        if node.name.isEmpty {
+                            LoadingFolderLabel()
+                        } else {
+                            Text(node.displayName)
+                                .font(.title3.weight(.medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                        }
                     } else {
                         Label(node.displayName, systemImage: "folder")
                             .font(.body.weight(.medium))
@@ -613,13 +617,16 @@ struct ContentView: View {
 
     @ViewBuilder
     private func detailContent(for url: String) -> some View {
-        if model.node(for: url)?.kind == "lush:script" {
+        let node = model.node(for: url)
+        let isPatchwork = model.patchworkDocUrls.contains(url)
+        if node?.kind == "lush:script" {
             ScriptEditorView(url: url)
                 .environment(model)
                 .id(url)
-        } else if model.node(for: url)?.isNote == true || (!url.hasPrefix("automerge:") && model.node(for: url)?.isNote != false) {
+        } else if !isPatchwork && (node?.isNote == true || (!url.hasPrefix("automerge:") && node?.isNote != false)) {
+            // No .id here: the editor swaps documents through EditorCore.switchTo,
+            // which keeps the text view, its layout manager and the asset cache.
             NoteDetail(noteUrl: url)
-                .id(url)
         } else {
             PatchworkDetail(docUrl: url)
                 .id(url)
@@ -709,6 +716,17 @@ extension FolderNode {
             return kind == "folder" ? "Untitled Folder" : "Untitled"
         }
         return name
+    }
+}
+
+private struct LoadingFolderLabel: View {
+    @State private var dim = false
+    var body: some View {
+        RoundedRectangle(cornerRadius: 4)
+            .fill(Color.secondary.opacity(dim ? 0.15 : 0.35))
+            .frame(width: 72, height: 14)
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: dim)
+            .onAppear { dim = true }
     }
 }
 
@@ -814,6 +832,7 @@ struct FolderScreen: View {
     @Environment(ContextTracker.self) private var contextTracker
     @State private var searchText = ""
     @State private var searchHits: [SearchHit] = []
+    @State private var searchTask: Task<Void, Never>?
     @State private var showingSettings = false
     @State private var showingNewPatchwork = false
     @State private var renameTarget: FolderNode?
@@ -907,7 +926,8 @@ struct FolderScreen: View {
         .navigationTitle(title)
         .searchable(text: $searchText, prompt: "Search notes")
         .onChange(of: searchText) {
-            searchHits = model.search(searchText)
+            searchTask?.cancel()
+            searchTask = Task { searchHits = await model.search(searchText) }
         }
         .onAppear {
             if UserDefaults.standard.object(forKey: Self.pinnedExpandedKey) != nil {
@@ -1068,7 +1088,7 @@ struct RecentsScreen: View {
     @State private var renameText = ""
 
     var body: some View {
-        List(model.recentNotes(), id: \.node.url) { entry in
+        List(model.recents) { entry in
             NavigationLink(value: NavRoute.note(entry.node.url)) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.node.displayName)
@@ -1107,6 +1127,8 @@ struct RecentsScreen: View {
             }
         }
         .navigationTitle("Recents")
+        .task { await model.refreshRecents() }
+        .onChange(of: model.folderTree) { Task { await model.refreshRecents() } }
         .sheet(item: $moveTarget) { target in
             MoveSheet(urls: target.urls)
                 .environment(model)
@@ -1727,7 +1749,7 @@ struct PatchworkDetail: View {
     var body: some View {
         Group {
             if PatchworkWeb.available {
-                PatchworkWebView(
+                SharedPatchworkWebViewWrapper(
                     docUrl: docUrl,
                     toolId: appliedToolId,
                     onTools: { newTools, current in
@@ -1737,7 +1759,6 @@ struct PatchworkDetail: View {
                         }
                     }
                 )
-                .id(appliedToolId)
             } else {
                 ContentUnavailableView(
                     "Patchwork Unavailable",

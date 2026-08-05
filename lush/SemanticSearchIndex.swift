@@ -2,116 +2,121 @@ import Foundation
 import CryptoKit
 import NaturalLanguage
 
+/// Embeds note text with NLEmbedding and hands the vectors to the core, which
+/// stores them in search.sqlite3 beside the full-text index and does the
+/// similarity scan. This actor owns only the embedding model.
 actor SemanticSearchIndex {
-    private struct Chunk: Codable {
-        var text: String
-        var vector: [Double]
-    }
-
-    private struct Entry: Codable {
-        var name: String
-        var digest: String
-        var chunks: [Chunk]
-    }
-
-    private struct Store: Codable {
-        var entries: [String: Entry]
-    }
-
+    private var core: Core?
     private var embedding: NLEmbedding?
-    private var entries: [String: Entry] = [:]
-    private var loaded = false
-    private var saveTask: Task<Void, Never>?
+    private var loadedEmbedding = false
 
-    private var storeURL: URL {
-        let support = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        )[0]
-        let dir = support.appendingPathComponent("LushCore", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("semantic-search.json")
+    func attach(_ core: Core) {
+        self.core = core
+        migrateLegacyStore()
     }
 
     func indexedUrls() -> Set<String> {
-        loadIfNeeded()
-        return Set(entries.keys)
+        guard let core else { return [] }
+        return Set(core.noteEmbeddingDigests().keys)
     }
 
     func index(url: String, name: String, spansJson: String) {
-        loadIfNeeded()
-        guard let embedding else { return }
+        guard let core else { return }
         let spans = SpanNode.decodeList(spansJson)
         let title = RichText.title(from: spans)
         let displayName = title.isEmpty ? (name.isEmpty ? "Untitled" : name) : title
         let text = Self.plainText(from: spans)
         let digest = Self.digest(of: text)
-        if let existing = entries[url], existing.digest == digest {
-            guard existing.name != displayName else { return }
-            entries[url]?.name = displayName
-            scheduleSave()
+        // Unchanged text still needs the row rewritten if the note was renamed,
+        // but not re-embedded — inference is the expensive half.
+        if core.noteEmbeddingDigest(url: url) == digest {
             return
         }
-        let chunks = Self.chunks(for: text).compactMap { text -> Chunk? in
-            guard let vector = embedding.vector(for: text) else { return nil }
-            return Chunk(text: Self.snippet(from: text), vector: Self.normalized(vector))
+        guard let embedding = embeddingModel() else { return }
+        let chunks = Self.chunks(for: text).compactMap { chunk -> EmbeddingChunk? in
+            guard let vector = embedding.vector(for: chunk) else { return nil }
+            return EmbeddingChunk(text: Self.snippet(from: chunk), vector: Self.unit(vector))
         }
-        entries[url] = Entry(name: displayName, digest: digest, chunks: chunks)
-        scheduleSave()
+        try? core.setNoteEmbeddings(url: url, name: displayName, digest: digest, chunks: chunks)
     }
 
     func remove(url: String) {
-        loadIfNeeded()
-        guard entries.removeValue(forKey: url) != nil else { return }
-        scheduleSave()
+        core?.removeNoteEmbeddings(url: url)
     }
 
     func search(_ query: String, excluding excluded: Set<String> = []) -> [SearchHit] {
-        loadIfNeeded()
-        guard let embedding else { return [] }
+        guard let core else { return [] }
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty, let rawVector = embedding.vector(for: query) else { return [] }
-        let vector = Self.normalized(rawVector)
-        var best: [String: (score: Double, name: String, text: String)] = [:]
-        for (url, entry) in entries where !excluded.contains(url) {
-            for chunk in entry.chunks {
-                let score = Self.dot(vector, chunk.vector)
-                guard score > 0.36 else { continue }
-                if best[url]?.score ?? -.infinity < score {
-                    best[url] = (score, entry.name, chunk.text)
-                }
-            }
-        }
-        return best
-            .sorted { $0.value.score > $1.value.score }
-            .prefix(12)
-            .map { SearchHit(url: $0.key, name: $0.value.name, snippet: $0.value.text) }
+        guard !query.isEmpty,
+              let embedding = embeddingModel(),
+              let raw = embedding.vector(for: query)
+        else { return [] }
+        return core.semanticSearch(
+            vector: Self.unit(raw),
+            limit: 12,
+            excluding: Array(excluded)
+        )
     }
 
-    private func loadIfNeeded() {
-        guard !loaded else { return }
-        loaded = true
-        embedding = NLEmbedding.sentenceEmbedding(for: .english)
-        guard let data = try? Data(contentsOf: storeURL),
-              let store = try? JSONDecoder().decode(Store.self, from: data)
+    private func embeddingModel() -> NLEmbedding? {
+        if !loadedEmbedding {
+            loadedEmbedding = true
+            embedding = NLEmbedding.sentenceEmbedding(for: .english)
+        }
+        return embedding
+    }
+
+    // MARK: legacy store
+
+    private struct LegacyChunk: Codable {
+        var text: String
+        var vector: [Double]
+    }
+
+    private struct LegacyEntry: Codable {
+        var name: String
+        var digest: String
+        var chunks: [LegacyChunk]
+    }
+
+    private struct LegacyStore: Codable {
+        var entries: [String: LegacyEntry]
+    }
+
+    private var legacyStoreURL: URL {
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+        return support
+            .appendingPathComponent("LushCore", isDirectory: true)
+            .appendingPathComponent("semantic-search.json")
+    }
+
+    /// Move the old JSON store into the core once, so an upgrade doesn't have to
+    /// re-run inference over every note. The file is removed on success.
+    private func migrateLegacyStore() {
+        guard let core else { return }
+        let url = legacyStoreURL
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let store = try? JSONDecoder().decode(LegacyStore.self, from: data)
         else { return }
-        entries = store.entries
-    }
-
-    private func scheduleSave() {
-        saveTask?.cancel()
-        saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled else { return }
-            await self?.save()
+        for (noteUrl, entry) in store.entries {
+            let chunks = entry.chunks.map {
+                EmbeddingChunk(text: $0.text, vector: $0.vector.map(Float.init))
+            }
+            try? core.setNoteEmbeddings(
+                url: noteUrl,
+                name: entry.name,
+                digest: entry.digest,
+                chunks: chunks
+            )
         }
+        try? FileManager.default.removeItem(at: url)
     }
 
-    private func save() {
-        let store = Store(entries: entries)
-        guard let data = try? JSONEncoder().encode(store) else { return }
-        try? data.write(to: storeURL, options: [.atomic])
-    }
+    // MARK: text
 
     private static func digest(of text: String) -> String {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -163,13 +168,9 @@ actor SemanticSearchIndex {
         return snippet
     }
 
-    private static func normalized(_ vector: [Double]) -> [Double] {
+    private static func unit(_ vector: [Double]) -> [Float] {
         let magnitude = sqrt(vector.reduce(0) { $0 + $1 * $1 })
-        guard magnitude > 0 else { return vector }
-        return vector.map { $0 / magnitude }
-    }
-
-    private static func dot(_ a: [Double], _ b: [Double]) -> Double {
-        zip(a, b).reduce(0) { $0 + $1.0 * $1.1 }
+        guard magnitude > 0 else { return vector.map(Float.init) }
+        return vector.map { Float($0 / magnitude) }
     }
 }

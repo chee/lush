@@ -36,7 +36,7 @@ use subduction_core::{
     transport::message::MessageTransport,
 };
 use subduction_crypto::signer::memory::MemorySigner;
-use subduction_redb_storage::RedbStorage;
+use sedimentree_fs_storage::FsStorage;
 use subduction_websocket::tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn};
 use tokio::{
     sync::{broadcast, mpsc, Mutex},
@@ -154,6 +154,10 @@ struct DocState {
 }
 
 impl DocState {
+    fn shared(doc: Automerge) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self::new(doc)))
+    }
+
     fn new(doc: Automerge) -> Self {
         DocState {
             doc,
@@ -182,7 +186,10 @@ pub struct Repo {
     storage: ObservedStorage,
     signer: MemorySigner,
     server_url: String,
-    docs: Mutex<HashMap<DocId, DocState>>,
+    /// The outer lock only guards the map. Each doc carries its own lock, so
+    /// decoding blobs into one doc or building fragments for it does not stall
+    /// reads of every other doc — which is what the UI does on every keystroke.
+    docs: Mutex<HashMap<DocId, Arc<Mutex<DocState>>>>,
     syncs: Mutex<HashMap<DocId, SyncSlot>>,
     pending_saves: Mutex<HashMap<DocId, PendingSave>>,
     next_save: AtomicU64,
@@ -357,12 +364,8 @@ impl Repo {
     pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
         let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
-        let storage = RedbStorage::with_settings(
-            data_dir.join("sedimentree"),
-            subduction_redb_storage::DEFAULT_INLINE_THRESHOLD,
-            64 * 1024 * 1024,
-        )
-        .context("opening sedimentree storage")?;
+        let storage = FsStorage::new(data_dir.join("sedimentree"))
+            .context("opening sedimentree storage")?;
         let (stored_tx, mut stored_rx) = mpsc::unbounded_channel();
         let (heads_tx, mut heads_rx) = mpsc::unbounded_channel();
         let storage = ObservedStorage::new(storage, stored_tx);
@@ -471,6 +474,23 @@ impl Repo {
         true
     }
 
+    /// The discovery id a subduction websocket server registers itself under:
+    /// whatever `new URL(url).host` gives automerge-repo, which keeps the port
+    /// unless it's the scheme's default. Dropping it misses a local server,
+    /// which listens as `127.0.0.1:<its port>`.
+    fn service_name(uri: &tungstenite::http::Uri) -> String {
+        let host = uri.host().unwrap_or("localhost");
+        let default_port = match uri.scheme_str() {
+            Some("wss" | "https") => Some(443),
+            Some("ws" | "http") => Some(80),
+            _ => None,
+        };
+        match uri.port_u16() {
+            Some(port) if Some(port) != default_port => format!("{host}:{port}"),
+            _ => host.to_string(),
+        }
+    }
+
     async fn connect_loop(self: Arc<Self>) {
         let uri: tungstenite::http::Uri = match self.server_url.parse() {
             Ok(u) => u,
@@ -479,7 +499,7 @@ impl Repo {
                 return;
             }
         };
-        let host = uri.host().unwrap_or("localhost").to_string();
+        let host = Self::service_name(&uri);
         let mut backoff = Duration::from_millis(500);
         loop {
             let audience = Audience::discover(host.as_bytes());
@@ -539,10 +559,10 @@ impl Repo {
             .map(|head| ChangeHash(*head.as_bytes()))
             .collect();
         let missing = {
-            let docs = self.docs.lock().await;
-            let Some(state) = docs.get(&id) else {
+            let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 return;
             };
+            let state = state.lock().await;
             !state.doc.get_missing_deps(&hashes).is_empty()
         };
         if missing {
@@ -671,10 +691,10 @@ impl Repo {
         let id = DocId::from_sedimentree_id(batch.sedimentree_id);
         let count = batch.commits.len() + batch.fragments.len();
         let (advanced, failed) = {
-            let mut docs = self.docs.lock().await;
-            let Some(state) = docs.get_mut(&id) else {
+            let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 return Ok(false);
             };
+            let mut state = state.lock().await;
             state.stored_commits.extend(
                 batch
                     .commits
@@ -748,11 +768,9 @@ impl Repo {
 
     async fn save_doc_now(&self, id: DocId) -> Result<bool> {
         let sid = id.sedimentree_id();
+        let shared = self.doc_state(id).await?;
         let ingested = {
-            let docs = self.docs.lock().await;
-            let state = docs
-                .get(&id)
-                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            let state = shared.lock().await;
             ingest(
                 &state.doc,
                 sid,
@@ -779,11 +797,9 @@ impl Repo {
             .await
             .map_err(|e| anyhow!("store_built_batch failed: {e}"))?;
 
-        let mut docs = self.docs.lock().await;
-        if let Some(state) = docs.get_mut(&id) {
-            state.stored_commits.extend(commit_heads);
-            state.stored_fragments.extend(fragment_heads);
-        }
+        let mut state = shared.lock().await;
+        state.stored_commits.extend(commit_heads);
+        state.stored_fragments.extend(fragment_heads);
 
         Ok(true)
     }
@@ -869,12 +885,11 @@ impl Repo {
     }
 
     async fn doc_has_heads(&self, id: DocId) -> bool {
-        self.docs
-            .lock()
-            .await
-            .get(&id)
-            .map(|s| !s.doc.get_heads().is_empty())
-            .unwrap_or(false)
+        let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+            return false;
+        };
+        let has = !state.lock().await.doc.get_heads().is_empty();
+        has
     }
 
     /// Block until a doc has content (or the timeout passes). Used when
@@ -882,13 +897,8 @@ impl Repo {
     pub async fn wait_for_doc(self: &Arc<Self>, id: DocId, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            {
-                let docs = self.docs.lock().await;
-                if let Some(state) = docs.get(&id) {
-                    if !state.doc.get_heads().is_empty() {
-                        return true;
-                    }
-                }
+            if self.doc_has_heads(id).await {
+                return true;
             }
             if tokio::time::Instant::now() >= deadline {
                 return false;
@@ -904,7 +914,7 @@ impl Repo {
         let id = DocId::random();
         let mut doc = Automerge::new();
         init(&mut doc)?;
-        self.docs.lock().await.insert(id, DocState::new(doc));
+        self.docs.lock().await.insert(id, DocState::shared(doc));
         self.save_doc(id).await?;
         let repo = self.clone();
         tokio::spawn(async move {
@@ -925,10 +935,8 @@ impl Repo {
             self.ensure_doc(id).await?;
         }
         let value = {
-            let mut docs = self.docs.lock().await;
-            let state = docs
-                .get_mut(&id)
-                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            let state = self.doc_state(id).await?;
+            let mut state = state.lock().await;
             f(&mut state.doc)?
         };
         if self.save_doc(id).await? {
@@ -951,10 +959,8 @@ impl Repo {
         F: FnOnce(&mut Automerge) -> Result<T>,
     {
         let value = {
-            let mut docs = self.docs.lock().await;
-            let state = docs
-                .get_mut(&id)
-                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            let state = self.doc_state(id).await?;
+            let mut state = state.lock().await;
             if state.doc.get_heads() == heads {
                 f(&mut state.doc)?
             } else {
@@ -986,10 +992,8 @@ impl Repo {
         F: FnOnce(&mut Automerge) -> Result<T>,
     {
         let value = {
-            let mut docs = self.docs.lock().await;
-            let state = docs
-                .get_mut(&id)
-                .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+            let state = self.doc_state(id).await?;
+            let mut state = state.lock().await;
             if heads.is_empty() || state.doc.get_heads() == heads {
                 f(&mut state.doc)?
             } else {
@@ -1014,11 +1018,19 @@ impl Repo {
         F: FnOnce(&Automerge) -> Result<T>,
     {
         self.open_local(id).await;
-        let docs = self.docs.lock().await;
-        let state = docs
-            .get(&id)
-            .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+        let state = self.doc_state(id).await?;
+        let state = state.lock().await;
         f(&state.doc)
+    }
+
+    /// The lock for one doc, without holding the map lock while it is used.
+    async fn doc_state(&self, id: DocId) -> Result<Arc<Mutex<DocState>>> {
+        self.docs
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))
     }
 
     /// Track a doc and populate it from local storage. Does no network I/O, but
@@ -1030,7 +1042,7 @@ impl Repo {
             if docs.contains_key(&id) {
                 return;
             }
-            docs.insert(id, DocState::new(Automerge::new()));
+            docs.insert(id, DocState::shared(Automerge::new()));
         }
         if let Err(e) = self.apply_new_blobs(id).await {
             tracing::warn!(doc = %id.to_url(), error = %e, "local load failed");
@@ -1110,6 +1122,18 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    #[test]
+    fn service_name_matches_the_url_host() {
+        let name = |url: &str| Repo::service_name(&url.parse().unwrap());
+        assert_eq!(name("ws://127.0.0.1:43217"), "127.0.0.1:43217");
+        assert_eq!(
+            name("wss://subduction.sync.inkandswitch.com"),
+            "subduction.sync.inkandswitch.com"
+        );
+        assert_eq!(name("wss://example.com:443"), "example.com");
+        assert_eq!(name("ws://example.com:80/sync"), "example.com");
+    }
 
     fn put(doc: &mut Automerge, key: &str, value: impl Into<automerge::ScalarValue>) {
         let mut tx = doc.transaction();
@@ -1241,7 +1265,7 @@ mod tests {
         repo.docs
             .lock()
             .await
-            .insert(id, DocState::new(Automerge::new()));
+            .insert(id, DocState::shared(Automerge::new()));
         let mut events = repo.subscribe();
 
         let mut source = Automerge::new();
@@ -1275,8 +1299,8 @@ mod tests {
             assert!(fragment_ids.contains(&CommitId::new(head.0)));
         }
 
-        let docs = repo.docs.lock().await;
-        let state = docs.get(&id).unwrap();
+        let state = repo.docs.lock().await.get(&id).cloned().unwrap();
+        let state = state.lock().await;
         assert_eq!(state.doc.get_heads(), source.get_heads());
         assert_eq!(state.stored_commits.len(), commit_heads.len());
         assert_eq!(state.stored_fragments.len(), fragment_heads.len());

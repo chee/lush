@@ -358,9 +358,12 @@ struct EditorSheetView: View {
         case .html(let handle):
             HtmlEditorSheet(html: handle.html) { controller.saveHtml(handle, html: $0) }
         case .info(let assetUrl, let name, let image):
-            AssetInfoSheet(name: name, image: image) {
-                await controller.assetVision(assetUrl)
-            }
+            AssetInfoSheet(
+                name: name,
+                image: image,
+                fetch: { await controller.assetVision(assetUrl) },
+                analyze: { await controller.analyzeAssetVision(assetUrl) }
+            )
         case .patchworkCreate:
             PatchworkCreateSheet(controller: controller)
         }
@@ -371,9 +374,11 @@ struct AssetInfoSheet: View {
     let name: String
     let image: PImage?
     let fetch: () async -> AssetVision?
+    let analyze: () async -> AssetVision?
     @Environment(\.dismiss) private var dismiss
     @State private var vision: AssetVision?
     @State private var loaded = false
+    @State private var analyzing = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -402,8 +407,15 @@ struct AssetInfoSheet: View {
                         if !vision.ocr.isEmpty {
                             CopyableText(title: "Text", text: vision.ocr)
                         }
+                    } else if analyzing {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Looking at the image…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     } else if loaded {
-                        Text("No description or recognized text yet.")
+                        Text("Nothing recognized in this image.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -419,6 +431,14 @@ struct AssetInfoSheet: View {
         #endif
         .task {
             vision = await fetch()
+            // Assets inserted on another device, or before there was an
+            // analyzer, arrive with nothing — so look now rather than show an
+            // empty sheet.
+            if vision == nil {
+                analyzing = true
+                vision = await analyze()
+                analyzing = false
+            }
             loaded = true
         }
     }

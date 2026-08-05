@@ -510,6 +510,17 @@ pub fn doc_kind(doc: &Automerge) -> String {
     }
 }
 
+/// Unix seconds of the newest change. The newest change is always one of the
+/// heads, so this reads a handful of changes rather than the whole history.
+pub fn doc_modified(doc: &Automerge) -> i64 {
+    doc.get_heads()
+        .iter()
+        .filter_map(|hash| doc.get_change_by_hash(hash))
+        .map(|change| change.timestamp())
+        .max()
+        .unwrap_or(0)
+}
+
 pub fn doc_title(doc: &Automerge) -> String {
     if let Some(t) = read_str(doc, &ROOT, "title") {
         return t;

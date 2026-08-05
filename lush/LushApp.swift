@@ -45,6 +45,14 @@ struct FormatCommands: Commands {
                 .keyboardShortcut("i")
             Button("Inline Code") { editor?.toggleCode() }
                 .keyboardShortcut("e")
+            Button("Underline") { editor?.toggleUnderline() }
+                .keyboardShortcut("u")
+            Button("Strikethrough") { editor?.toggleStrikethrough() }
+                .keyboardShortcut("/")
+            Button("Superscript") { editor?.toggleSuperscript() }
+                .keyboardShortcut("+", modifiers: [.command, .control])
+            Button("Subscript") { editor?.toggleSubscript() }
+                .keyboardShortcut("-", modifiers: [.command, .control])
             Menu("Highlight") {
                 ForEach(Highlight.names, id: \.self) { name in
                     Button(name.capitalized) { editor?.applyHighlight(name) }
@@ -66,6 +74,8 @@ struct FormatCommands: Commands {
                 .keyboardShortcut("8", modifiers: [.command, .shift])
             Button("Numbered List") { editor?.applyStyle("ordered-list-item") }
                 .keyboardShortcut("7", modifiers: [.command, .shift])
+            Button("To-do List") { editor?.applyStyle("todo-list-item") }
+                .keyboardShortcut("0", modifiers: [.command, .shift])
             Button("Block Quote") { editor?.applyStyle("blockquote") }
                 .keyboardShortcut("9", modifiers: [.command, .shift])
             Button("Code Block") { editor?.applyStyle("code-block") }
@@ -119,6 +129,10 @@ struct LushApp: App {
                     await model.start()
                     await server
                     contextTracker.start()
+                    if PatchworkWeb.available {
+                        _ = SharedPatchworkWebView.shared
+                        PatchworkViewPool.shared.warm()
+                    }
                 }
         }
         .windowToolbarStyle(.unified(showsTitle: false))
@@ -157,6 +171,10 @@ struct LushApp: App {
                     await model.start()
                     await server
                     contextTracker.start()
+                    if PatchworkWeb.available {
+                        _ = SharedPatchworkWebView.shared
+                        PatchworkViewPool.shared.warm()
+                    }
                 }
         }
         .commands {

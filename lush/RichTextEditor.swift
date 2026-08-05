@@ -41,6 +41,7 @@ final class EditorController {
         ("heading3", "Subheading"),
         ("unordered-list-item", "Bulleted List"),
         ("ordered-list-item", "Numbered List"),
+        ("todo-list-item", "To-do List"),
         ("blockquote", "Quote"),
         ("code-block", "Code"),
     ]
@@ -49,6 +50,10 @@ final class EditorController {
     var strongActive = false
     var emActive = false
     var codeActive = false
+    var underlineActive = false
+    var strikethroughActive = false
+    var superscriptActive = false
+    var subscriptActive = false
     var highlightActive: String?
     var recorderVisible = false
     var sheet: EditorSheet?
@@ -66,6 +71,11 @@ final class EditorController {
     func toggleStrong() { core?.toggleMark("strong") }
     func toggleEm() { core?.toggleMark("em") }
     func toggleCode() { core?.toggleMark("code") }
+    func toggleUnderline() { core?.toggleMark("underline") }
+    func toggleStrikethrough() { core?.toggleMark("strikethrough") }
+    // The two are exclusive: a run of text sits on one baseline.
+    func toggleSuperscript() { core?.toggleBaseline("superscript") }
+    func toggleSubscript() { core?.toggleBaseline("subscript") }
     func applyHighlight(_ name: String?) { core?.setHighlight(name) }
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
@@ -129,6 +139,11 @@ final class EditorController {
         return await core.model.assetVision(url)
     }
 
+    func analyzeAssetVision(_ url: String) async -> AssetVision? {
+        guard let core else { return nil }
+        return await core.model.analyzeAssetVision(url)
+    }
+
     func saveTranscript(assetUrl: String, transcript: String) {
         core?.cache.transcripts[assetUrl] = transcript
         Task { [weak self] in
@@ -156,8 +171,15 @@ protocol EditorTextViewLike: AnyObject {
 /// are pure decoration — they never exist in the text, so the automerge
 /// round-trip can't be corrupted by them.
 final class ListMarkerLayoutManager: NSLayoutManager {
+    /// Paragraph location -> its 1-based ordinal, for the duration of one draw
+    /// pass. Without it every item in a numbered list rescans the whole run
+    /// above it, which is quadratic in the length of the list.
+    private var ordinals: [Int: Int] = [:]
+
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+        ordinals = [:]
+        defer { ordinals = [:] }
         guard let storage = textStorage else { return }
         let str = storage.string as NSString
         let charRange = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
@@ -171,7 +193,8 @@ final class ListMarkerLayoutManager: NSLayoutManager {
             let block = box.value
             let isBullet = block.type == "unordered-list-item"
             let isNumber = block.type == "ordered-list-item"
-            guard isBullet || isNumber else { continue }
+            let isTodo = block.type == "todo-list-item"
+            guard isBullet || isNumber || isTodo else { continue }
 
             let itemFont = storage.attribute(.font, at: paragraph.location, effectiveRange: nil)
                 as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
@@ -190,7 +213,16 @@ final class ListMarkerLayoutManager: NSLayoutManager {
             // for paragraph-separator null glyphs on empty lines.
             let baseline = origin.y + lineRect.minY + itemFont.ascender
             let diameter: CGFloat = 6.5
-            if isBullet {
+            if isTodo {
+                let side = itemFont.pointSize * 0.82
+                let rect = CGRect(
+                    x: origin.x + indent - side - 6,
+                    y: baseline - itemFont.xHeight / 2 - side / 2,
+                    width: side,
+                    height: side
+                )
+                Self.drawCheckbox(in: rect, checked: block.isChecked)
+            } else if isBullet {
                 let rect = CGRect(
                     x: origin.x + indent - diameter - 5,
                     y: baseline - itemFont.xHeight / 2 - diameter / 2,
@@ -222,6 +254,7 @@ final class ListMarkerLayoutManager: NSLayoutManager {
     /// 1-based position among the contiguous run of ordered items with the
     /// same nesting.
     private func ordinal(of location: Int, in storage: NSTextStorage, str: NSString) -> Int {
+        if let hit = ordinals[location] { return hit }
         guard let box = storage.attribute(.amBlock, at: location, effectiveRange: nil) as? BlockBox
         else { return 1 }
         let parents = box.value.parents
@@ -234,10 +267,41 @@ final class ListMarkerLayoutManager: NSLayoutManager {
                   prevBox.value.type == "ordered-list-item",
                   prevBox.value.parents == parents
             else { break }
+            if let hit = ordinals[previous.location] {
+                count += hit
+                break
+            }
             count += 1
             cursor = previous.location
         }
+        ordinals[location] = count
         return count
+    }
+
+    /// The to-do box: an empty rounded square, or a filled one with a tick.
+    /// Clicking it is handled by the text view (`toggleTodo(at:)`).
+    static func drawCheckbox(in rect: CGRect, checked: Bool) {
+        let square = rect.insetBy(dx: 0.75, dy: 0.75)
+        #if os(macOS)
+        let box = NSBezierPath(roundedRect: square, xRadius: 3, yRadius: 3)
+        #else
+        let box = UIBezierPath(roundedRect: square, cornerRadius: 3)
+        #endif
+        guard checked else {
+            box.lineWidth = 1.5
+            PColor.pSecondaryLabel.setStroke()
+            box.stroke()
+            return
+        }
+        PColor.pTint.setFill()
+        box.fill()
+        let tick = PBezierPath()
+        tick.move(to: CGPoint(x: rect.minX + rect.width * 0.24, y: rect.midY + rect.height * 0.02))
+        tick.line(to: CGPoint(x: rect.minX + rect.width * 0.43, y: rect.maxY - rect.height * 0.24))
+        tick.line(to: CGPoint(x: rect.minX + rect.width * 0.76, y: rect.minY + rect.height * 0.24))
+        tick.lineWidth = max(1.5, rect.width * 0.14)
+        PColor.pOnTint.setStroke()
+        tick.stroke()
     }
 }
 
@@ -591,9 +655,8 @@ final class EditorCore {
             // Notes-style: an empty note starts with a Title line.
             view.pTypingAttributes = RichText.attributes(block: .heading(level: 1), marks: [:])
         }
-        let currentSpans = RichText.spans(from: attributed)
-        session.lastKnownJSON = SpanNode.encodeList(currentSpans)
-        session.title = RichText.title(from: currentSpans)
+        session.lastKnownJSON = SpanNode.encodeList(spans)
+        session.title = RichText.title(from: spans)
         refreshFormattingState()
         inline.setNeedsReconcile()
         if location == attributed.length, location > 0,
@@ -1066,6 +1129,10 @@ final class EditorCore {
         controller.strongActive = marks["strong"] != nil
         controller.emActive = marks["em"] != nil
         controller.codeActive = marks["code"] != nil
+        controller.underlineActive = marks["underline"] != nil
+        controller.strikethroughActive = marks["strikethrough"] != nil
+        controller.superscriptActive = marks["superscript"] != nil
+        controller.subscriptActive = marks["subscript"] != nil
         controller.highlightActive = marks["highlight"]?.stringValue
     }
 
@@ -1107,6 +1174,62 @@ final class EditorCore {
         return box.value
     }
 
+    /// The character in a to-do item whose box sits under this point in the
+    /// text container — the marker gutter is the indent the item's own
+    /// paragraph style asks for.
+    func todoBoxHit(
+        at point: CGPoint,
+        layoutManager: NSLayoutManager,
+        container: NSTextContainer
+    ) -> Int? {
+        guard let storage = view?.pStorage, storage.length > 0 else { return nil }
+        let index = min(
+            layoutManager.characterIndex(
+                for: point,
+                in: container,
+                fractionOfDistanceBetweenInsertionPoints: nil
+            ),
+            storage.length - 1
+        )
+        guard let style = storage.attribute(.paragraphStyle, at: index, effectiveRange: nil)
+                as? NSParagraphStyle,
+              point.x >= 0, point.x < style.firstLineHeadIndent,
+              let box = storage.attribute(.amBlock, at: index, effectiveRange: nil) as? BlockBox,
+              box.value.type == "todo-list-item"
+        else { return nil }
+        return index
+    }
+
+    /// Tick or untick the to-do item containing a character. Returns false
+    /// when that character isn't in one, so a click can fall through.
+    @discardableResult
+    func toggleTodo(at character: Int) -> Bool {
+        guard let view, let storage = view.pStorage, character < storage.length else { return false }
+        let str = storage.string as NSString
+        let paragraph = str.paragraphRange(for: NSRange(location: character, length: 0))
+        guard paragraph.length > 0,
+              let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
+              box.value.type == "todo-list-item"
+        else { return false }
+        var block = box.value
+        if block.isChecked {
+            block.attrs.removeValue(forKey: "checked")
+        } else {
+            block.attrs["checked"] = .bool(true)
+        }
+        let selection = view.pSelectedRange
+        storage.beginEditing()
+        storage.enumerateAttributes(in: paragraph) { runAttrs, runRange, _ in
+            let marks = RichText.marks(from: runAttrs, block: box.value)
+            storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
+        }
+        storage.endEditing()
+        view.pSelectedRange = selection
+        refreshFormattingState()
+        scheduleSave()
+        return true
+    }
+
     func applyBlockStyle(_ block: BlockValue) {
         guard let view, let storage = view.pStorage else { return }
         let str = storage.string as NSString
@@ -1145,6 +1268,17 @@ final class EditorCore {
 
     func setHighlight(_ name: String?) {
         applyMark("highlight", value: name.map { .string($0) })
+    }
+
+    /// Superscript and subscript are one axis: turning one on turns the other
+    /// off, since text can only sit on one baseline.
+    func toggleBaseline(_ mark: String) {
+        let other = mark == "superscript" ? "subscript" : "superscript"
+        let turningOn = marksAtSelection()[mark] == nil
+        if turningOn, marksAtSelection()[other] != nil {
+            applyMark(other, value: nil)
+        }
+        applyMark(mark, value: turningOn ? .bool(true) : nil)
     }
 
     private func applyMark(_ mark: String, value: JSONValue?) {
@@ -1225,11 +1359,19 @@ final class EditorCore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let continuing = block.type == "unordered-list-item"
             || block.type == "ordered-list-item"
+            || block.type == "todo-list-item"
             || block.type == "blockquote"
             || block.type == "code-block"
         if continuing, paragraphText.isEmpty {
             // Return on an empty continuing block leaves it, like Notes.
             applyBlockStyle(.paragraph)
+            return true
+        }
+        // A new to-do starts unticked, however the one above it stands.
+        if block.type == "todo-list-item" {
+            view.pInsertText("\n")
+            view.pTypingAttributes = RichText.attributes(block: .todo(checked: false), marks: [:])
+            refreshFormattingState()
             return true
         }
         if block.type == "heading" || block.isAtomic {
@@ -1272,6 +1414,8 @@ final class EditorCore {
         let newBlock: BlockValue
         switch prefix {
         case "-", "*": newBlock = BlockValue(type: "unordered-list-item")
+        case "[]", "[ ]": newBlock = .todo(checked: false)
+        case "[x]", "[X]": newBlock = .todo(checked: true)
         case ">": newBlock = BlockValue(type: "blockquote")
         case "#": newBlock = .heading(level: 1)
         case "##": newBlock = .heading(level: 2)
@@ -1319,6 +1463,15 @@ final class EditorCore {
     }
 
     // MARK: attachment interaction
+
+    func isImageAttachment(at charIndex: Int) -> Bool {
+        guard let storage = view?.pStorage, charIndex < storage.length,
+              let box = storage.attributes(at: charIndex, effectiveRange: nil)[.amBlock] as? BlockBox,
+              box.value.isEmbedBlock,
+              let url = box.value.embedUrl
+        else { return false }
+        return cache.images[url] != nil
+    }
 
     @discardableResult
     func openAttachment(at charIndex: Int, includeImages: Bool = true) -> Bool {
@@ -1656,28 +1809,75 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
     /// Media/table/html attachments open on click; images open their info
     /// sheet on double-click so a single click still places the selection.
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount <= 2, let core,
-           let layoutManager, let textContainer, let storage = textStorage {
+        if event.clickCount <= 2, let core, let layoutManager, let textContainer {
             let point = convert(event.locationInWindow, from: nil)
             let containerPoint = CGPoint(
                 x: point.x - textContainerOrigin.x,
                 y: point.y - textContainerOrigin.y
             )
-            let glyphIndex = layoutManager.glyphIndex(for: containerPoint, in: textContainer)
-            let rect = layoutManager.boundingRect(
-                forGlyphRange: NSRange(location: glyphIndex, length: 1),
-                in: textContainer
-            )
-            if rect.contains(containerPoint) {
-                let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
-                if charIndex < storage.length,
-                   storage.attribute(.attachment, at: charIndex, effectiveRange: nil) != nil,
-                   core.openAttachment(at: charIndex, includeImages: event.clickCount == 2) {
-                    return
-                }
+            if event.clickCount == 1,
+               let todo = core.todoBoxHit(
+                   at: containerPoint,
+                   layoutManager: layoutManager,
+                   container: textContainer
+               ),
+               core.toggleTodo(at: todo) {
+                return
+            }
+            if let charIndex = attachmentIndex(at: containerPoint),
+               core.openAttachment(at: charIndex, includeImages: event.clickCount == 2) {
+                return
             }
         }
         super.mouseDown(with: event)
+    }
+
+    private func attachmentIndex(at containerPoint: CGPoint) -> Int? {
+        guard let layoutManager, let textContainer, let storage = textStorage else { return nil }
+        let glyphIndex = layoutManager.glyphIndex(for: containerPoint, in: textContainer)
+        let rect = layoutManager.boundingRect(
+            forGlyphRange: NSRange(location: glyphIndex, length: 1),
+            in: textContainer
+        )
+        guard rect.contains(containerPoint) else { return nil }
+        let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+        guard charIndex < storage.length,
+              storage.attribute(.attachment, at: charIndex, effectiveRange: nil) != nil
+        else { return nil }
+        return charIndex
+    }
+
+    /// Double-clicking an image opens its info, but nothing advertises that.
+    /// Right-click is where a mac user looks for it.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let standard = super.menu(for: event)
+        let point = convert(event.locationInWindow, from: nil)
+        let containerPoint = CGPoint(
+            x: point.x - textContainerOrigin.x,
+            y: point.y - textContainerOrigin.y
+        )
+        guard let core,
+              let charIndex = attachmentIndex(at: containerPoint),
+              core.isImageAttachment(at: charIndex)
+        else { return standard }
+        let menu = standard ?? NSMenu()
+        let item = NSMenuItem(
+            title: "Get Info",
+            action: #selector(showAttachmentInfo(_:)),
+            keyEquivalent: ""
+        )
+        item.target = self
+        item.representedObject = charIndex
+        menu.insertItem(item, at: 0)
+        if standard != nil {
+            menu.insertItem(.separator(), at: 1)
+        }
+        return menu
+    }
+
+    @objc private func showAttachmentInfo(_ sender: NSMenuItem) {
+        guard let charIndex = sender.representedObject as? Int else { return }
+        core?.openAttachment(at: charIndex)
     }
 
     /// Files and images win over the stray strings browsers put alongside
@@ -2022,6 +2222,13 @@ struct RichTextEditor: UIViewRepresentable {
                 y: point.y - textView.textContainerInset.top
             )
             let layoutManager = textView.layoutManager
+            if let todo = core.todoBoxHit(
+                at: containerPoint,
+                layoutManager: layoutManager,
+                container: textView.textContainer
+            ), core.toggleTodo(at: todo) {
+                return
+            }
             let glyphIndex = layoutManager.glyphIndex(
                 for: containerPoint,
                 in: textView.textContainer
@@ -2071,8 +2278,20 @@ struct FormatAccessoryBar: View {
             barButton("italic", active: controller.emActive) {
                 controller.toggleEm()
             }
+            barButton("underline", active: controller.underlineActive) {
+                controller.toggleUnderline()
+            }
+            barButton("strikethrough", active: controller.strikethroughActive) {
+                controller.toggleStrikethrough()
+            }
             barButton("chevron.left.forwardslash.chevron.right", active: controller.codeActive) {
                 controller.toggleCode()
+            }
+            barButton("textformat.superscript", active: controller.superscriptActive) {
+                controller.toggleSuperscript()
+            }
+            barButton("textformat.subscript", active: controller.subscriptActive) {
+                controller.toggleSubscript()
             }
             Menu {
                 ForEach(Highlight.names, id: \.self) { name in

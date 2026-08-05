@@ -1041,11 +1041,11 @@ dependencies = [
  "rand 0.9.5",
  "rusqlite",
  "sedimentree_core",
+ "sedimentree_fs_storage",
  "serde",
  "serde_json",
  "subduction_core",
  "subduction_crypto",
- "subduction_redb_storage",
  "subduction_websocket",
  "tempfile",
  "thiserror",
@@ -1402,15 +1402,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
-name = "redb"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1553,6 +1544,22 @@ dependencies = [
  "serde",
  "siphasher 1.0.3",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "sedimentree_fs_storage"
+version = "0.11.0"
+source = "git+https://github.com/inkandswitch/subduction?rev=9c0fbfd06bd499d4a8b53548788119d33af0d1ec#9c0fbfd06bd499d4a8b53548788119d33af0d1ec"
+dependencies = [
+ "async-lock",
+ "future_form",
+ "hex",
+ "sedimentree_core",
+ "subduction_core",
+ "subduction_crypto",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 
@@ -1787,22 +1794,6 @@ dependencies = [
  "sedimentree_core",
  "serde",
  "thiserror",
-]
-
-[[package]]
-name = "subduction_redb_storage"
-version = "0.1.0"
-source = "git+https://github.com/inkandswitch/subduction?rev=9c0fbfd06bd499d4a8b53548788119d33af0d1ec#9c0fbfd06bd499d4a8b53548788119d33af0d1ec"
-dependencies = [
- "future_form",
- "futures",
- "redb",
- "sedimentree_core",
- "subduction_core",
- "subduction_crypto",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]

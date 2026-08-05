@@ -211,9 +211,7 @@ struct SyncSettingsPane: View {
     }
 
     private func folderName(_ url: String) -> String {
-        guard let core = model.core else { return "Folder" }
-        let name = core.noteTitle(url: url)
-        return name.isEmpty ? "Notes" : name
+        model.node(for: url)?.displayName ?? "Notes"
     }
 }
 

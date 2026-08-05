@@ -194,8 +194,14 @@ enum NoteExporter {
                 }
                 let content = runs.map { applyMarks(escape($0.0), marks: $0.1) }.joined()
                 let isList = b.type == "unordered-list-item" || b.type == "ordered-list-item"
+                    || b.type == "todo-list-item"
                 let depth = b.parents.count
                 let listTag = b.type == "ordered-list-item" ? "ol" : "ul"
+                // A to-do exports as a disabled checkbox, so the list reads
+                // the same in a browser as it does in the app.
+                let item = b.type == "todo-list-item"
+                    ? "<input type=\"checkbox\" disabled\(b.isChecked ? " checked" : "")> " + content
+                    : content
                 if isList {
                     while let last = openLists.last, last.depth > depth {
                         out += "</li></\(last.tag)>\n"
@@ -206,9 +212,9 @@ enum NoteExporter {
                         openLists.removeLast()
                     }
                     if let last = openLists.last, last.depth == depth {
-                        out += "</li>\n<li>\(content)"
+                        out += "</li>\n<li>\(item)"
                     } else {
-                        out += "<\(listTag)>\n<li>\(content)"
+                        out += "<\(listTag)>\n<li>\(item)"
                         openLists.append((tag: listTag, depth: depth))
                     }
                 } else {
@@ -249,6 +255,10 @@ enum NoteExporter {
         if case .bool(true)? = marks["code"] { out = "<code>\(out)</code>" }
         if case .bool(true)? = marks["strong"] { out = "<strong>\(out)</strong>" }
         if case .bool(true)? = marks["em"] { out = "<em>\(out)</em>" }
+        if case .bool(true)? = marks["underline"] { out = "<u>\(out)</u>" }
+        if case .bool(true)? = marks["strikethrough"] { out = "<s>\(out)</s>" }
+        if case .bool(true)? = marks["superscript"] { out = "<sup>\(out)</sup>" }
+        if case .bool(true)? = marks["subscript"] { out = "<sub>\(out)</sub>" }
         if let name = marks["highlight"]?.stringValue {
             out = "<mark data-color=\"\(escape(name))\">\(out)</mark>"
         }
