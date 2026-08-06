@@ -4,4 +4,17 @@
    <FileRef
       location = "self:">
    </FileRef>
+   <Group
+      location = "group:LushShareExtension"
+      name = "LushShareExtension">
+      <FileRef
+         location = "group:Info.plist">
+      </FileRef>
+      <FileRef
+         location = "group:LushShareExtension.entitlements">
+      </FileRef>
+      <FileRef
+         location = "group:ShareViewController.swift">
+      </FileRef>
+   </Group>
 </Workspace>

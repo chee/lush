@@ -1,11 +1,14 @@
 import Foundation
 import Observation
+import WidgetKit
 #if os(macOS)
 import AppKit
 #endif
 
 @Observable @MainActor
 final class NotesModel {
+    static let shared = NotesModel()
+
     private(set) var core: Core?
     var notes: [NoteInfo] = []
     var folderUrl: String?
@@ -30,6 +33,7 @@ final class NotesModel {
         syncLog.append(entry)
     }
     private let semanticSearch = SemanticSearchIndex()
+    private let spotlightIndex = SpotlightIndex()
     private var semanticIndexTasks: [String: Task<Void, Never>] = [:]
     private var previewUpdateTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var startTask: Task<Void, Never>?
@@ -37,6 +41,9 @@ final class NotesModel {
     @ObservationIgnored private var noteObservers: [UUID: @MainActor (String) -> Void] = [:]
     @ObservationIgnored private var delegateBridge: DelegateBridge?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var documentHistoryCache: [String: DocumentHistorySummary] = [:]
+    @ObservationIgnored private var snapshotCache: [HistorySnapshotKey: NoteSpansSnapshot] = [:]
+    @ObservationIgnored private var renderedSnapshotCache: [HistorySnapshotKey: NSAttributedString] = [:]
     private(set) var thumbnails: [String: Data] = [:]
     @ObservationIgnored private var pendingRefreshTask: Task<Void, Never>?
     private var lastKnownCounts: [String: Int] = [:]
@@ -70,6 +77,103 @@ final class NotesModel {
     private static let folderDefaultsKey = "folderURL"
     private static let foldersDefaultsKey = "folderURLs"
     private static let lastOpenNoteKey = "lastOpenNoteUrl"
+    private static let accountUrlKey = "patchworkAccountUrl"
+    private static let appGroupIdentifier = "group.party.chee.patchwork.lush"
+    private static let widgetSnapshotFileName = "LushWidgetSnapshot.json"
+    private static let folderContentWidgetKind = "FolderContentWidget"
+
+    private(set) var accountUrl: String? = UserDefaults.standard.string(forKey: accountUrlKey)
+    private(set) var accountConfigUrl: String?
+    private(set) var inboxUrl: String?
+    private(set) var contactName: String?
+    private(set) var contactAvatarData: Data?
+
+    var loggedIn: Bool { accountUrl != nil }
+
+    static func normalizedAccountUrl(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("automerge:") { return trimmed }
+        if trimmed.hasPrefix("account:") {
+            return "automerge:" + String(trimmed.dropFirst("account:".count))
+        }
+        return nil
+    }
+
+    func logIn(accountUrl url: String) async -> Bool {
+        guard let core else { return false }
+        guard let normalized = Self.normalizedAccountUrl(url) else {
+            status = "Login failed: expected an automerge: or account: URL"
+            return false
+        }
+        status = "Logging in…"
+        do {
+            let state = try await Task.detached {
+                try core.loginAccount(accountUrl: normalized)
+            }.value
+            accountUrl = state.accountUrl
+            UserDefaults.standard.set(state.accountUrl, forKey: Self.accountUrlKey)
+            await applyAccount(state)
+            status = ""
+            appendSyncEvent("Logged in: \(state.accountUrl)")
+            return true
+        } catch {
+            status = "Login failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func logOut() {
+        accountUrl = nil
+        accountConfigUrl = nil
+        inboxUrl = nil
+        contactName = nil
+        contactAvatarData = nil
+        UserDefaults.standard.removeObject(forKey: Self.accountUrlKey)
+        appendSyncEvent("Logged out")
+    }
+
+    private func applyAccount(_ state: AccountState) async {
+        accountConfigUrl = state.configUrl
+        inboxUrl = state.inbox
+        if !state.folders.isEmpty, state.folders != rootFolderUrls {
+            rootFolderUrls = state.folders
+            persistRoots()
+            if folderUrl == nil || node(for: folderUrl ?? "") == nil {
+                let first = state.folders[0]
+                folderUrl = first
+                try? core?.startFolderUrl(url: first)
+            }
+            refreshNotes()
+        }
+        guard let contactUrl = state.contactUrl, let core else { return }
+        let info = await Task.detached { core.contactInfo(url: contactUrl) }.value
+        contactName = info?.name
+        if let avatarUrl = info?.avatarUrl {
+            contactAvatarData = await assetBytes(avatarUrl)
+        }
+    }
+
+    /// Root-folder edits mirror into the synced config doc when logged in.
+    private func syncConfigFolders() {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let urls = rootFolderUrls
+        Task.detached { try? core.setConfigFolders(configUrl: configUrl, urls: urls) }
+    }
+
+    func setInbox(_ url: String) {
+        inboxUrl = url
+        guard let core, let configUrl = accountConfigUrl else { return }
+        Task.detached { try? core.setConfigInbox(configUrl: configUrl, url: url) }
+    }
+
+    /// Widget/shortcut note creation lands in the configured inbox folder.
+    func createNoteInInbox(snap: ContextSnapshot? = nil) {
+        if let inboxUrl {
+            createNote(inFolder: inboxUrl)
+        } else {
+            createNote(snap: snap)
+        }
+    }
 
     private func persistRoots() {
         UserDefaults.standard.set(rootFolderUrls, forKey: Self.foldersDefaultsKey)
@@ -108,11 +212,19 @@ final class NotesModel {
             }.value
             self.core = core
             PatchworkWeb.coreServerPort = core.localServerPort()
+            NativeWebStorage.shared.core = core
             Task { [semanticSearch] in await semanticSearch.attach(core) }
             let delegateBridge = DelegateBridge(model: self)
             self.delegateBridge = delegateBridge
             core.setDelegate(delegate: delegateBridge)
             connected = core.isConnected()
+
+            // The last-open doc needs only its url, not the folder tree —
+            // open it before any folder work so the editor loads immediately.
+            if saved.first != nil,
+               let last = UserDefaults.standard.string(forKey: Self.lastOpenNoteKey) {
+                selectedNoteUrl = last
+            }
 
             if let first = saved.first {
                 // Returning user: set folder immediately and return to the UI.
@@ -126,10 +238,10 @@ final class NotesModel {
                 core.prefetchNotes(urls: Array(saved.dropFirst()))
                 refreshNotes()
                 startPolling()
-                if let last = UserDefaults.standard.string(forKey: Self.lastOpenNoteKey) {
-                    selectedNoteUrl = last
-                }
                 appendSyncEvent("Started: \(saved.count) root folder(s)")
+                if let account = accountUrl {
+                    Task { await self.logIn(accountUrl: account) }
+                }
             } else {
                 // Fresh install: create the folder doc (one-time wait, acceptable).
                 status = "Creating folder…"
@@ -310,6 +422,9 @@ final class NotesModel {
             await MainActor.run {
                 self.folderTree = tree
                 self.folderNodeCache = newCache
+                #if os(macOS)
+                self.writeWidgetSnapshot()
+                #endif
             }
         }
     }
@@ -345,9 +460,12 @@ final class NotesModel {
         } else {
             // open instantly; folder retargeting happens behind the scenes
             selectedNoteUrl = url
-            if let parent = node.parentUrl, parent != folderUrl {
-                await selectFolder(parent)
-                selectedNoteUrl = url
+            if let parent = node.parentUrl {
+                core?.refreshFolderEntry(folderUrl: parent, url: url)
+                if parent != folderUrl {
+                    await selectFolder(parent)
+                    selectedNoteUrl = url
+                }
             }
         }
     }
@@ -362,6 +480,7 @@ final class NotesModel {
             }.value
             rootFolderUrls.append(opened)
             persistRoots()
+            syncConfigFolders()
             folderUrl = opened
             refreshNotes()
             status = ""
@@ -376,6 +495,7 @@ final class NotesModel {
         else { return }
         rootFolderUrls.remove(at: index)
         persistRoots()
+        syncConfigFolders()
         if folderUrl == url || node(for: folderUrl ?? "") == nil {
             selectedNoteUrl = nil
             let fallback = rootFolderUrls[0]
@@ -397,6 +517,7 @@ final class NotesModel {
             : adjustedTargetIndex
         rootFolderUrls.insert(url, at: insertionIndex)
         persistRoots()
+        syncConfigFolders()
         buildTree()
     }
 
@@ -432,10 +553,15 @@ final class NotesModel {
                 self.metaFetched.formUnion(newPreviews.keys)
                 self.metaFetched.formIntersection(liveUrls)
                 self.contextMetas = self.contextMetas.filter { liveUrls.contains($0.key) }
-                self.backfillSemanticIndex(for: visible.filter { $0.kind == "rich" }.map {
+                let richNotes = visible.filter { $0.kind == "rich" }.map {
                     NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
-                })
+                }
+                self.backfillSemanticIndex(for: richNotes)
+                self.backfillSpotlightIndex(for: richNotes)
                 self.backfillAssetVision()
+                #if os(macOS)
+                self.writeWidgetSnapshot()
+                #endif
             }
         }
     }
@@ -495,6 +621,69 @@ final class NotesModel {
         }
     }
 
+    private func writeWidgetSnapshot() {
+        guard let root = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: Self.appGroupIdentifier
+        ) else { return }
+
+        let folders = widgetFolders(from: folderTree)
+        let defaultFolderUrl = folderUrl ?? rootFolderUrls.first ?? folders.first?.url
+        let url = root.appendingPathComponent(Self.widgetSnapshotFileName)
+        let oldData = try? Data(contentsOf: url)
+        let oldSnapshot = oldData.flatMap { try? JSONDecoder().decode(LushWidgetSnapshot.self, from: $0) }
+        let updatedAt = oldSnapshot?.defaultFolderUrl == defaultFolderUrl && oldSnapshot?.folders == folders
+            ? oldSnapshot?.updatedAt ?? Date()
+            : Date()
+        let snapshot = LushWidgetSnapshot(
+            updatedAt: updatedAt,
+            defaultFolderUrl: defaultFolderUrl,
+            folders: folders
+        )
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        guard oldData != data else { return }
+
+        do {
+            try data.write(to: url, options: .atomic)
+            WidgetCenter.shared.reloadTimelines(ofKind: Self.folderContentWidgetKind)
+        } catch {
+            appendSyncEvent("Widget snapshot failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func widgetFolders(from nodes: [FolderNode]) -> [LushWidgetFolderSnapshot] {
+        var folders: [LushWidgetFolderSnapshot] = []
+
+        func walk(_ nodes: [FolderNode], prefix: String) {
+            for node in nodes where node.kind == "folder" {
+                let title = node.displayName
+                let path = prefix.isEmpty ? title : "\(prefix) / \(title)"
+                let children = node.children ?? []
+                let items = children
+                    .filter { $0.kind != "folder" }
+                    .prefix(6)
+                    .map {
+                        LushWidgetItemSnapshot(
+                            url: $0.url,
+                            title: $0.displayName,
+                            preview: previews[$0.url] ?? "",
+                            kind: $0.kind
+                        )
+                    }
+                folders.append(LushWidgetFolderSnapshot(
+                    url: node.url,
+                    title: title,
+                    path: path,
+                    totalItemCount: children.filter { $0.kind != "folder" }.count,
+                    items: Array(items)
+                ))
+                walk(children, prefix: path)
+            }
+        }
+
+        walk(nodes, prefix: "")
+        return folders
+    }
+
     func clearStorage() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dataDir = support.appendingPathComponent("LushCore", isDirectory: true)
@@ -537,15 +726,53 @@ final class NotesModel {
         contextMetas[url] = meta
     }
 
+    func documentHistorySummary(url: String) async -> DocumentHistorySummary {
+        guard let core else {
+            return DocumentHistorySummary(changeCount: 0, heads: [], modified: nil, entries: [])
+        }
+        let currentHeads = await core.docHeads(url: url)
+        if let cached = documentHistoryCache[url], cached.heads == currentHeads {
+            return cached
+        }
+        async let entries = Task.detached { core.docHistory(url: url) }.value
+        let modifiedSeconds = await Task.detached { core.noteModified(url: url) }.value
+        let modified = modifiedSeconds > 0
+            ? Date(timeIntervalSince1970: TimeInterval(modifiedSeconds))
+            : nil
+        let historyEntries = await entries
+        let summary = DocumentHistorySummary(
+            changeCount: historyEntries.count,
+            heads: currentHeads,
+            modified: modified,
+            entries: historyEntries
+        )
+        documentHistoryCache[url] = summary
+        return summary
+    }
+
     private var pendingRefreshUrls: Set<String> = []
 
     func docChanged(url: String) {
         folderNodeCache.removeValue(forKey: url)
+        documentHistoryCache.removeValue(forKey: url)
         thumbnails.removeValue(forKey: url)
         metaFetched.remove(url)
         notifyNoteObservers(url)
+        if url == accountConfigUrl, let core, let configUrl = accountConfigUrl {
+            Task { @MainActor [weak self] in
+                let state = await Task.detached { core.configState(configUrl: configUrl) }.value
+                guard let self, let state else { return }
+                self.inboxUrl = state.inbox
+                if !state.folders.isEmpty, state.folders != self.rootFolderUrls {
+                    self.rootFolderUrls = state.folders
+                    self.persistRoots()
+                    self.refreshNotes()
+                }
+            }
+        }
         if node(for: url)?.isNote == true || notes.contains(where: { $0.url == url && $0.kind == "rich" }) {
             scheduleSemanticIndex(url: url)
+            scheduleSpotlightIndex(url: url)
         }
         pendingRefreshUrls.insert(url)
         pendingRefreshTask?.cancel()
@@ -564,7 +791,12 @@ final class NotesModel {
                 if treeChanged { self.buildTree() }
                 let known = Set(self.notes.map(\.url))
                 let stale = urls.filter { known.contains($0) }
-                guard !stale.isEmpty, let core = self.core else { return }
+                guard !stale.isEmpty, let core = self.core else {
+                    #if os(macOS)
+                self.writeWidgetSnapshot()
+                #endif
+                    return
+                }
                 var fresh: [String: String] = [:]
                 await withTaskGroup(of: (String, String).self) { group in
                     for url in stale {
@@ -573,6 +805,9 @@ final class NotesModel {
                     for await (url, preview) in group { fresh[url] = preview }
                 }
                 self.previews.merge(fresh) { _, new in new }
+                #if os(macOS)
+                self.writeWidgetSnapshot()
+                #endif
             }
         }
     }
@@ -629,6 +864,30 @@ final class NotesModel {
         }
     }
 
+    func createNoteForShortcut(inFolder folderUrl: String?) async -> String? {
+        if core == nil {
+            await start()
+        }
+        guard let core else { return nil }
+        let target = folderUrl ?? inboxUrl ?? self.folderUrl
+        guard let target else { return nil }
+        do {
+            let url = try await Task.detached {
+                let url = try core.createNoteIn(folderUrl: target, title: "")
+                let initial: [SpanNode] = [.block(.creationBlock(snap: nil)), .block(.heading(level: 1))]
+                try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial))
+                return url
+            }.value
+            pendingFocusUrl = url
+            selectedNoteUrl = url
+            refreshNotes()
+            return url
+        } catch {
+            status = "Couldn't create note: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     func createScript() {
         guard let core, let folderUrl else { return }
         do {
@@ -640,6 +899,36 @@ final class NotesModel {
         }
     }
 
+    func createFileForShortcut(inFolder folderUrl: String?) async -> String? {
+        if core == nil {
+            await start()
+        }
+        guard let core else { return nil }
+        let target = folderUrl ?? inboxUrl ?? self.folderUrl
+        guard let target else { return nil }
+        do {
+            let url = try await Task.detached {
+                try core.createScriptIn(folderUrl: target, name: "")
+            }.value
+            refreshNotes()
+            selectedNoteUrl = url
+            return url
+        } catch {
+            status = "Couldn't create file: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    func addDocToFolder(url: String, folderUrl: String?) async {
+        if core == nil {
+            await start()
+        }
+        if let folderUrl {
+            await selectFolder(folderUrl)
+        }
+        addDocToCurrentFolder(url: url)
+    }
+
     func deleteNote(_ url: String) {
         guard let core else { return }
         do {
@@ -647,6 +936,7 @@ final class NotesModel {
             semanticIndexTasks[url]?.cancel()
             semanticIndexTasks[url] = nil
             Task { [semanticSearch] in await semanticSearch.remove(url: url) }
+            Task { [spotlightIndex] in await spotlightIndex.remove(url: url) }
             refreshNotes()
         } catch {
             status = "Couldn't delete note: \(error.localizedDescription)"
@@ -725,6 +1015,65 @@ final class NotesModel {
         try? await core.openNote(url: url)
         return (try? await core.noteSpansSnapshot(url: url))
             ?? NoteSpansSnapshot(spansJson: "[]", heads: [])
+    }
+
+    func spansSnapshot(for url: String, heads: [String]) async -> NoteSpansSnapshot {
+        if core == nil {
+            await start()
+        }
+        if !heads.isEmpty {
+            let key = HistorySnapshotKey(url: url, heads: heads)
+            if let cached = snapshotCache[key] {
+                return cached
+            }
+        }
+        guard let core else { return NoteSpansSnapshot(spansJson: "[]", heads: heads) }
+        try? await core.openNote(url: url)
+        let snapshot: NoteSpansSnapshot
+        if heads.isEmpty {
+            snapshot = (try? await core.noteSpansSnapshot(url: url))
+                ?? NoteSpansSnapshot(spansJson: "[]", heads: [])
+        } else {
+            snapshot = await Task.detached {
+                (try? await core.noteSpansSnapshotAt(url: url, heads: heads))
+                    ?? NoteSpansSnapshot(spansJson: "[]", heads: heads)
+            }.value
+        }
+        if !snapshot.heads.isEmpty {
+            snapshotCache[HistorySnapshotKey(url: url, heads: snapshot.heads)] = snapshot
+        }
+        return snapshot
+    }
+
+    #if os(macOS)
+    func renderedSnapshot(for url: String, heads: [String]) async -> NSAttributedString {
+        if !heads.isEmpty {
+            let key = HistorySnapshotKey(url: url, heads: heads)
+            if let cached = renderedSnapshotCache[key] {
+                return cached
+            }
+        }
+        let snapshot = await spansSnapshot(for: url, heads: heads)
+        let key = HistorySnapshotKey(url: url, heads: snapshot.heads)
+        if let cached = renderedSnapshotCache[key] {
+            return cached
+        }
+        let spans = await Task.detached {
+            SpanNode.decodeList(snapshot.spansJson)
+        }.value
+        let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        if !snapshot.heads.isEmpty {
+            renderedSnapshotCache[key] = attributed
+        }
+        return attributed
+    }
+    #endif
+
+    func revertNote(_ url: String, to heads: [String]) async {
+        let snapshot = await spansSnapshot(for: url, heads: heads)
+        let spans = await Task.detached { SpanNode.decodeList(snapshot.spansJson) }.value
+        let title = RichText.title(from: spans)
+        await updateDocument(url, json: snapshot.spansJson, title: title)
     }
 
     private func latestNoteHeads(for url: String) async -> [String]? {
@@ -863,6 +1212,12 @@ final class NotesModel {
         }
     }
 
+    private func backfillSpotlightIndex(for notes: [NoteInfo]) {
+        for note in notes {
+            scheduleSpotlightIndex(url: note.url, name: note.name)
+        }
+    }
+
     private func scheduleSemanticIndex(url: String, name: String? = nil) {
         semanticIndexTasks[url]?.cancel()
         semanticIndexTasks[url] = Task { [weak self] in
@@ -880,6 +1235,23 @@ final class NotesModel {
         let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
         await semanticSearch.index(url: url, name: resolvedName ?? "", spansJson: json)
         semanticIndexTasks[url] = nil
+    }
+
+    private func scheduleSpotlightIndex(url: String, name: String? = nil) {
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard !Task.isCancelled else { return }
+            await self?.indexForSpotlight(url: url, name: name)
+        }
+    }
+
+    private func indexForSpotlight(url: String, name: String?) async {
+        guard let core else { return }
+        var resolvedName = name ?? node(for: url)?.displayName
+        if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
+        try? await core.openNote(url: url)
+        let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
+        await spotlightIndex.index(url: url, title: resolvedName ?? "", spansJson: json)
     }
 
     private func schedulePreviewUpdate(url: String) {
@@ -1063,6 +1435,57 @@ final class NotesModel {
         UserDefaults.standard.set(url, forKey: Self.quickNoteKey)
     }
 
+    func appendToQuickNote(_ snippet: String) async -> String? {
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return quickNoteUrl }
+        if core == nil {
+            await start()
+        }
+        guard let core else { return nil }
+        let url: String
+        if let quickNoteUrl {
+            url = quickNoteUrl
+        } else {
+            let target = inboxUrl ?? folderUrl
+            do {
+                url = try await Task.detached {
+                    if let target {
+                        return try core.createNoteIn(folderUrl: target, title: "Quick Note")
+                    }
+                    let noteUrl = try core.createNoteDoc(title: "Quick Note")
+                    try? core.linkNoteToFolder(noteUrl: noteUrl, title: "Quick Note")
+                    return noteUrl
+                }.value
+                setQuickNote(url)
+            } catch {
+                status = "Couldn't create Quick Note: \(error.localizedDescription)"
+                return nil
+            }
+        }
+        do {
+            try? await core.openNote(url: url)
+            let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
+            var spans = SpanNode.decodeList(json)
+            if !spans.isEmpty {
+                spans.append(.text("\n", [:]))
+            }
+            spans.append(.text(trimmed, [:]))
+            try await Task.detached {
+                try core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(spans))
+            }.value
+            previews[url] = await core.notePreview(url: url)
+            pendingFocusUrl = url
+            selectedNoteUrl = url
+            scheduleSemanticIndex(url: url)
+            scheduleSpotlightIndex(url: url)
+            refreshNotes()
+            return url
+        } catch {
+            status = "Couldn't update Quick Note: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     /// Every folder in the tree as (url, "parent / child") choices, skipping
     /// the moving items' own subtrees.
     func folderChoices(excluding excluded: Set<String> = []) -> [(url: String, path: String)] {
@@ -1125,7 +1548,31 @@ final class NotesModel {
             if seconds > 4_000_000_000 { seconds /= 1000 }
             return RecentEntry(node: node, modified: Date(timeIntervalSince1970: seconds))
         }
+        #if os(macOS)
+        writeDockMenuSnapshot()
+        #endif
     }
+
+    #if os(macOS)
+    private func writeDockMenuSnapshot() {
+        guard let root = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.party.chee.patchwork.lush"
+        ) else { return }
+        let snapshot = DockMenuSnapshot(
+            recents: recents.prefix(8).map {
+                DockMenuRecent(
+                    title: $0.node.displayName.isEmpty ? "Untitled" : $0.node.displayName,
+                    url: $0.node.url,
+                    modified: $0.modified.timeIntervalSince1970
+                )
+            }
+        )
+        let url = root.appendingPathComponent("DockMenuSnapshot.json")
+        if let data = try? JSONEncoder().encode(snapshot) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+    #endif
 
     func updateTitleIfNeeded(_ url: String, title: String) async {
         guard let core else { return }
@@ -1154,37 +1601,83 @@ final class NotesModel {
     func importAsNewNote(_ content: IncomingContent) {
         guard let core else { return }
         do {
-            let title: String
-            let spansJson: String
-            switch content.payload {
-            case .text(let text):
-                title = String(text.prefix(60)).components(separatedBy: .newlines).first ?? ""
-                let spans = [SpanNode.text(text, [:])]
-                spansJson = SpanNode.encodeList(spans)
-            case .file(let url):
-                title = url.deletingPathExtension().lastPathComponent
-                spansJson = "[]"
+            let title = content.displayTitle
+            var spans: [SpanNode] = []
+            for payload in content.flattenedPayloads {
+                switch payload {
+                case .text(let text):
+                    appendText(text, to: &spans)
+                case .file(let url):
+                    try appendFile(url, to: &spans, core: core)
+                case .batch:
+                    break
+                }
             }
+            let spansJson = SpanNode.encodeList(spans)
             let noteUrl = try core.createNote(title: title)
             if !spansJson.isEmpty && spansJson != "[]" {
                 try? core.updateNoteSpans(url: noteUrl, spansJson: spansJson)
             }
-            if case .file(let url) = content.payload,
-               let data = try? Data(contentsOf: url) {
-                let ext = url.pathExtension.lowercased()
-                let mime = mimeType(for: ext)
-                _ = try? core.createAsset(
-                    name: url.lastPathComponent,
-                    extension: ext.isEmpty ? "bin" : ext,
-                    mimeType: mime,
-                    data: data
-                )
-            }
             refreshNotes()
             selectedNoteUrl = noteUrl
+            content.cleanupHandoff()
         } catch {
             status = "Couldn't import: \(error.localizedDescription)"
         }
+    }
+
+    private func appendText(_ text: String, to spans: inout [SpanNode]) {
+        if !spans.isEmpty {
+            spans.append(.text("\n\n", [:]))
+        }
+        spans.append(.text(text, [:]))
+    }
+
+    private func appendFile(_ url: URL, to spans: inout [SpanNode], core: Core) throws {
+        var isDirectory: ObjCBool = false
+        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+        if isDirectory.boolValue {
+            let files = FileManager.default.enumerator(
+                at: url,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )?.compactMap { $0 as? URL } ?? []
+            for file in files {
+                let values = try? file.resourceValues(forKeys: [.isRegularFileKey])
+                guard values?.isRegularFile == true else { continue }
+                try appendSingleFile(file, displayName: relativeDisplayName(for: file, under: url), to: &spans, core: core)
+            }
+        } else {
+            try appendSingleFile(url, displayName: url.lastPathComponent, to: &spans, core: core)
+        }
+    }
+
+    private func appendSingleFile(
+        _ url: URL,
+        displayName: String,
+        to spans: inout [SpanNode],
+        core: Core
+    ) throws {
+        let data = try Data(contentsOf: url)
+        let ext = url.pathExtension.lowercased()
+        let assetUrl = try core.createAsset(
+            name: displayName.isEmpty ? url.lastPathComponent : displayName,
+            extension: ext.isEmpty ? "bin" : ext,
+            mimeType: mimeType(for: ext),
+            data: data
+        )
+        if !spans.isEmpty {
+            spans.append(.text("\n\n", [:]))
+        }
+        spans.append(.text(displayName.isEmpty ? url.lastPathComponent : displayName, [:]))
+        spans.append(.block(.embed(url: assetUrl)))
+    }
+
+    private func relativeDisplayName(for file: URL, under folder: URL) -> String {
+        let folderPath = folder.standardizedFileURL.path
+        let filePath = file.standardizedFileURL.path
+        guard filePath.hasPrefix(folderPath) else { return file.lastPathComponent }
+        return String(filePath.dropFirst(folderPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     private func mimeType(for ext: String) -> String {
@@ -1240,11 +1733,40 @@ struct RecentEntry: Identifiable {
     var id: String { node.url }
 }
 
+#if os(macOS)
+struct DockMenuSnapshot: Codable {
+    let recents: [DockMenuRecent]
+}
+
+struct DockMenuRecent: Codable {
+    let title: String
+    let url: String
+    let modified: TimeInterval
+}
+#endif
+
 struct NoteContextMeta {
     var created: Date?
     var location: String?
     var weather: String?
     var nowPlaying: String?
+}
+
+struct DocumentHistorySummary: Equatable {
+    var changeCount: Int
+    var heads: [String]
+    var modified: Date?
+    var entries: [DocHistoryEntry]
+}
+
+struct HistorySnapshotKey: Hashable {
+    let url: String
+    let heads: [String]
+
+    init(url: String, heads: [String]) {
+        self.url = url
+        self.heads = heads.sorted()
+    }
 }
 
 struct FolderNode: Identifiable, Hashable {
@@ -1258,11 +1780,138 @@ struct FolderNode: Identifiable, Hashable {
     var isNote: Bool { kind == "lush" || kind == "rich" }
 }
 
+private struct LushWidgetSnapshot: Codable, Equatable {
+    let updatedAt: Date
+    let defaultFolderUrl: String?
+    let folders: [LushWidgetFolderSnapshot]
+}
+
+private struct LushWidgetFolderSnapshot: Codable, Equatable {
+    let url: String
+    let title: String
+    let path: String
+    let totalItemCount: Int
+    let items: [LushWidgetItemSnapshot]
+}
+
+private struct LushWidgetItemSnapshot: Codable, Equatable {
+    let url: String
+    let title: String
+    let preview: String
+    let kind: String
+}
+
 struct IncomingContent: Identifiable {
     let id = UUID()
     enum Payload {
         case text(String)
         case file(URL)
+        case batch([Payload])
     }
     let payload: Payload
+    let handoffDirectory: URL?
+
+    init(payload: Payload, handoffDirectory: URL? = nil) {
+        self.payload = payload
+        self.handoffDirectory = handoffDirectory
+    }
+
+    var flattenedPayloads: [Payload] {
+        switch payload {
+        case .text, .file:
+            return [payload]
+        case .batch(let payloads):
+            return payloads.flatMap { IncomingContent(payload: $0).flattenedPayloads }
+        }
+    }
+
+    var displayTitle: String {
+        switch payload {
+        case .text(let text):
+            let title = String(text.prefix(60)).components(separatedBy: .newlines).first ?? ""
+            return title.isEmpty ? "Shared Text" : title
+        case .file(let url):
+            return url.lastPathComponent.isEmpty ? "Shared File" : url.lastPathComponent
+        case .batch(let payloads):
+            if payloads.count == 1 {
+                return IncomingContent(payload: payloads[0]).displayTitle
+            }
+            return "\(payloads.count) Shared Items"
+        }
+    }
+
+    func cleanupHandoff() {
+        guard let handoffDirectory else { return }
+        try? FileManager.default.removeItem(at: handoffDirectory)
+    }
+
+    static func sharedHandoff(id: String) -> IncomingContent? {
+        guard let root = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: SharedHandoff.appGroupIdentifier
+        ) else { return nil }
+        let directory = root
+            .appendingPathComponent("SharedIntake", isDirectory: true)
+            .appendingPathComponent(id, isDirectory: true)
+        let payloadUrl = directory.appendingPathComponent("payload.json")
+        guard let data = try? Data(contentsOf: payloadUrl),
+              let handoff = try? JSONDecoder().decode(SharedHandoff.self, from: data) else {
+            return nil
+        }
+        let payloads = handoff.items.compactMap { item -> Payload? in
+            switch item {
+            case .text(let text):
+                return .text(text)
+            case .file(let relativePath, _):
+                return .file(directory.appendingPathComponent(relativePath))
+            }
+        }
+        guard !payloads.isEmpty else { return nil }
+        return IncomingContent(payload: .batch(payloads), handoffDirectory: directory)
+    }
+}
+
+private struct SharedHandoff: Codable {
+    static let appGroupIdentifier = "group.party.chee.patchwork.lush"
+
+    let createdAt: Date
+    let items: [SharedHandoffItem]
+}
+
+private enum SharedHandoffItem: Codable {
+    case text(String)
+    case file(relativePath: String, suggestedName: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, text, relativePath, suggestedName
+    }
+
+    private enum Kind: String, Codable {
+        case text, file
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .text:
+            self = .text(try container.decode(String.self, forKey: .text))
+        case .file:
+            self = .file(
+                relativePath: try container.decode(String.self, forKey: .relativePath),
+                suggestedName: try container.decode(String.self, forKey: .suggestedName)
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .text(let text):
+            try container.encode(Kind.text, forKey: .kind)
+            try container.encode(text, forKey: .text)
+        case .file(let relativePath, let suggestedName):
+            try container.encode(Kind.file, forKey: .kind)
+            try container.encode(relativePath, forKey: .relativePath)
+            try container.encode(suggestedName, forKey: .suggestedName)
+        }
+    }
 }

@@ -105,6 +105,10 @@ enum NoteExporter {
 
     // MARK: - HTML builder
 
+    static func htmlFragment(from spans: [SpanNode]) -> String {
+        htmlBody(from: spans, assetResolver: .none)
+    }
+
     private enum AssetResolver {
         case none
         case relativePaths([String: String])

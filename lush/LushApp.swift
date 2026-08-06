@@ -1,9 +1,92 @@
 import SwiftUI
+import AppIntents
 #if os(macOS)
 import AppKit
+#if canImport(CoreSpotlight)
+import CoreSpotlight
+#endif
 
 private extension NSResponder {
     @objc(pasteAsPlainText:) func pasteAsPlainTextCommand(_ sender: Any?) {}
+}
+
+@MainActor
+final class LushAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.servicesProvider = LushServicesProvider.shared
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(
+            title: "New Note",
+            action: #selector(newDockNote(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Open Quick Note",
+            action: #selector(openDockQuickNote(_:)),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Quick Capture",
+            action: #selector(openDockQuickCapture(_:)),
+            keyEquivalent: ""
+        ))
+
+        let recents = Array(NotesModel.shared.recents.prefix(8))
+        if !recents.isEmpty {
+            menu.addItem(.separator())
+            for recent in recents {
+                let item = NSMenuItem(
+                    title: recent.node.displayName.isEmpty ? "Untitled" : recent.node.displayName,
+                    action: #selector(openDockRecent(_:)),
+                    keyEquivalent: ""
+                )
+                item.representedObject = recent.node.url
+                menu.addItem(item)
+            }
+        }
+        return menu
+    }
+
+    @objc private func newDockNote(_ sender: Any?) {
+        AppRouter.shared.pending = .newNote
+        NSApp.activate()
+    }
+
+    @objc private func openDockQuickNote(_ sender: Any?) {
+        AppRouter.shared.pending = .quickNote
+        NSApp.activate()
+    }
+
+    @objc private func openDockQuickCapture(_ sender: Any?) {
+        AppRouter.shared.pending = .capture
+        NSApp.activate()
+    }
+
+    @objc private func openDockRecent(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? String else { return }
+        AppRouter.shared.pending = .note(url)
+        NSApp.activate()
+    }
+
+    func application(
+        _ application: NSApplication,
+        continue userActivity: NSUserActivity,
+        restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
+    ) -> Bool {
+        #if canImport(CoreSpotlight)
+        guard userActivity.activityType == CSSearchableItemActionType,
+              let url = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String
+        else { return false }
+        AppRouter.shared.pending = .note(url)
+        application.activate()
+        return true
+        #else
+        return false
+        #endif
+    }
 }
 #endif
 
@@ -11,10 +94,24 @@ struct EditorControllerFocusKey: FocusedValueKey {
     typealias Value = EditorController
 }
 
+struct NoteSearchActions {
+    let focusNoteSearch: () -> Void
+    let focusNotesSearch: () -> Void
+}
+
+struct NoteSearchActionsFocusKey: FocusedValueKey {
+    typealias Value = NoteSearchActions
+}
+
 extension FocusedValues {
     var editorController: EditorController? {
         get { self[EditorControllerFocusKey.self] }
         set { self[EditorControllerFocusKey.self] = newValue }
+    }
+
+    var noteSearchActions: NoteSearchActions? {
+        get { self[NoteSearchActionsFocusKey.self] }
+        set { self[NoteSearchActionsFocusKey.self] = newValue }
     }
 }
 
@@ -101,6 +198,24 @@ struct FormatCommands: Commands {
 }
 
 #if os(macOS)
+struct SearchCommands: Commands {
+    @FocusedValue(\.noteSearchActions) private var searchActions
+
+    var body: some Commands {
+        CommandGroup(after: .textEditing) {
+            Button("Find") {
+                searchActions?.focusNoteSearch()
+            }
+            .keyboardShortcut("f")
+
+            Button("Search Notes") {
+                searchActions?.focusNotesSearch()
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+        }
+    }
+}
+
 struct EditCommands: Commands {
     var body: some Commands {
         CommandGroup(after: .pasteboard) {
@@ -115,8 +230,15 @@ struct EditCommands: Commands {
 
 @main
 struct LushApp: App {
-    @State private var model = NotesModel()
+    @State private var model = NotesModel.shared
     @State private var contextTracker = ContextTracker()
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(LushAppDelegate.self) private var appDelegate
+    #endif
+
+    init() {
+        LushShortcuts.updateAppShortcutParameters()
+    }
 
     var body: some Scene {
         #if os(macOS)
@@ -129,15 +251,12 @@ struct LushApp: App {
                     await model.start()
                     await server
                     contextTracker.start()
-                    if PatchworkWeb.available {
-                        _ = SharedPatchworkWebView.shared
-                        PatchworkViewPool.shared.warm()
-                    }
                 }
         }
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
             EditCommands()
+            SearchCommands()
             FormatCommands()
             FolderCommands(model: model)
         }
@@ -160,7 +279,21 @@ struct LushApp: App {
         Settings {
             SettingsView()
                 .environment(model)
+                .environment(contextTracker)
         }
+
+        WindowGroup("Quick Capture", id: "quick-capture") {
+            QuickCaptureView()
+                .environment(model)
+        }
+        .defaultSize(width: 340, height: 190)
+        .windowResizability(.contentSize)
+
+        MenuBarExtra("Lush", systemImage: "text.badge.plus") {
+            QuickCaptureView()
+                .environment(model)
+        }
+        .menuBarExtraStyle(.window)
         #else
         WindowGroup {
             ContentView()
@@ -171,10 +304,6 @@ struct LushApp: App {
                     await model.start()
                     await server
                     contextTracker.start()
-                    if PatchworkWeb.available {
-                        _ = SharedPatchworkWebView.shared
-                        PatchworkViewPool.shared.warm()
-                    }
                 }
         }
         .commands {

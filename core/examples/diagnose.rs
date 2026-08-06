@@ -13,22 +13,27 @@ use subduction_core::storage::traits::Storage;
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let url = args.next().expect("usage: diagnose <automerge:url> [data-dir]");
-    let data_dir = args.next().map(std::path::PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var("HOME").expect("HOME");
-        std::path::PathBuf::from(home).join(
-            "Library/Containers/party.chee.patchwork.lush/Data/\
+    let url = args
+        .next()
+        .expect("usage: diagnose <automerge:url> [data-dir]");
+    let data_dir = args
+        .next()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").expect("HOME");
+            std::path::PathBuf::from(home).join(
+                "Library/Containers/party.chee.patchwork.lush/Data/\
              Library/Application Support/LushCore",
-        )
-    });
+            )
+        });
 
     let id = DocId::from_url(&url).expect("bad doc url");
     let sid = id.sedimentree_id();
     println!("doc  {url}");
     println!("dir  {}", data_dir.display());
 
-    let storage = FsStorage::new(data_dir.join("sedimentree"))
-        .expect("opening sedimentree storage");
+    let storage =
+        FsStorage::new(data_dir.join("sedimentree")).expect("opening sedimentree storage");
 
     let commits = <FsStorage as Storage<future_form::Sendable>>::load_loose_commits(&storage, sid)
         .await
@@ -82,7 +87,10 @@ async fn main() {
             Err(e) => println!("cumulative load stopped after {applied} blob(s): {e}"),
         }
     }
-    println!("cumulative: {applied} blob(s) applied, heads {:?}", doc.get_heads());
+    println!(
+        "cumulative: {applied} blob(s) applied, heads {:?}",
+        doc.get_heads()
+    );
     if bad.is_empty() {
         println!("\nevery blob parses on its own");
     } else {

@@ -10,8 +10,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use async_tungstenite::{
+    tokio::TokioAdapter,
+    tungstenite::{handshake::server::NoCallback, protocol::WebSocketConfig},
+};
 use automerge::{Automerge, ChangeHash, ReadDoc};
 use future_form::Sendable;
+use futures::{future::BoxFuture, FutureExt};
 use sedimentree_core::{
     blob::{Blob, BlobMeta},
     collections::Map,
@@ -22,13 +27,10 @@ use sedimentree_core::{
     loose_commit::{id::CommitId, LooseCommit},
     sedimentree::{Sedimentree, SedimentreeItem},
 };
-use async_tungstenite::{
-    tokio::TokioAdapter,
-    tungstenite::{handshake::server::NoCallback, protocol::WebSocketConfig},
-};
-use futures::future::BoxFuture;
+use sedimentree_fs_storage::FsStorage;
 use subduction_core::{
     collections::bounded_sharded_map::BoundedShardedMap,
+    connection::message::SyncMessage,
     handler::sync::SyncHandler,
     handshake::{
         self,
@@ -45,9 +47,10 @@ use subduction_core::{
     transport::{message::MessageTransport, Transport},
 };
 use subduction_crypto::signer::memory::MemorySigner;
-use sedimentree_fs_storage::FsStorage;
+use subduction_http_longpoll::{server::LongPollHandler, transport::HttpLongPollTransport};
+use subduction_iroh::transport::IrohTransport;
+use subduction_websocket::timeout::FuturesTimerTimeout;
 use subduction_websocket::{
-    error::{DisconnectionError, RecvError, SendError},
     handshake::WebSocketHandshake,
     sleep::TokioSleeper,
     tokio::{client::TokioWebSocketClient, TimeoutTokio, TokioSpawn},
@@ -72,39 +75,155 @@ const HEAL_MAX_ATTEMPTS: u32 = 12;
 const LOCAL_SERVER_PORT: u16 = 43219;
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
 
-/// One Subduction node carries both the dialed connection to the public
-/// server and websocket peers accepted on the loopback listener (the
-/// patchwork webviews), so they all share the node's fs storage and sync
-/// through each other.
+/// A local-peer WebSocket transport that intercepts incoming BatchSyncRequests
+/// and pre-fetches unknown docs from the remote server before letting the
+/// SyncHandler process the message. This prevents automerge-repo from seeing
+/// an empty sync response and immediately marking the doc "unavailable".
+///
+/// The repo reference is held outside this type (in a spawned task) to avoid
+/// a recursive type-parameter cycle that would make the Sync bound overflow.
+#[derive(Debug, Clone)]
+pub struct PrefetchTransport {
+    inner: WebSocket<TokioAdapter<TcpStream>, Sendable>,
+    prefetch_tx: mpsc::UnboundedSender<(SedimentreeId, tokio::sync::oneshot::Sender<()>)>,
+}
+
+impl PartialEq for PrefetchTransport {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+/// One Subduction node carries the dialed connection to the public server,
+/// websocket peers accepted on the loopback listener (patchwork webviews),
+/// iroh QUIC peers for direct device-to-device sync,
+/// and HTTP long-poll peers for Pushwork compatibility.
 #[derive(Debug, Clone)]
 pub enum WsTransport {
     Dialed(TokioWebSocketClient<MemorySigner>),
     Accepted(WebSocket<TokioAdapter<TcpStream>, Sendable>),
+    Iroh(IrohTransport),
+    HttpLongPoll(HttpLongPollTransport),
+    Prefetch(PrefetchTransport),
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum TransportSendError {
+    #[error("{0}")]
+    Ws(subduction_websocket::error::SendError),
+    #[error("{0}")]
+    Iroh(subduction_iroh::error::SendError),
+    #[error("{0}")]
+    Http(subduction_http_longpoll::error::SendError),
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum TransportRecvError {
+    #[error("{0}")]
+    Ws(subduction_websocket::error::RecvError),
+    #[error("{0}")]
+    Iroh(subduction_iroh::error::RecvError),
+    #[error("{0}")]
+    Http(subduction_http_longpoll::error::RecvError),
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub enum TransportDisconnectError {
+    #[error("{0}")]
+    Ws(subduction_websocket::error::DisconnectionError),
+    #[error("{0}")]
+    Iroh(subduction_iroh::error::DisconnectionError),
+    #[error("{0}")]
+    Http(subduction_http_longpoll::error::DisconnectionError),
 }
 
 impl Transport<Sendable> for WsTransport {
-    type SendError = SendError;
-    type RecvError = RecvError;
-    type DisconnectionError = DisconnectionError;
+    type SendError = TransportSendError;
+    type RecvError = TransportRecvError;
+    type DisconnectionError = TransportDisconnectError;
 
     fn send_bytes(&self, bytes: &[u8]) -> BoxFuture<'_, Result<(), Self::SendError>> {
         match self {
-            Self::Dialed(ws) => Transport::<Sendable>::send_bytes(ws, bytes),
-            Self::Accepted(ws) => Transport::<Sendable>::send_bytes(ws, bytes),
+            Self::Dialed(ws) => {
+                let fut = Transport::<Sendable>::send_bytes(ws, bytes);
+                Box::pin(async move { fut.await.map_err(TransportSendError::Ws) })
+            }
+            Self::Accepted(ws) => {
+                let fut = Transport::<Sendable>::send_bytes(ws, bytes);
+                Box::pin(async move { fut.await.map_err(TransportSendError::Ws) })
+            }
+            Self::Prefetch(pt) => {
+                let fut = Transport::<Sendable>::send_bytes(&pt.inner, bytes);
+                Box::pin(async move { fut.await.map_err(TransportSendError::Ws) })
+            }
+            Self::Iroh(iroh) => {
+                let fut = Transport::<Sendable>::send_bytes(iroh, bytes);
+                Box::pin(async move { fut.await.map_err(TransportSendError::Iroh) })
+            }
+            Self::HttpLongPoll(lp) => {
+                let fut = Transport::<Sendable>::send_bytes(lp, bytes);
+                Box::pin(async move { fut.await.map_err(TransportSendError::Http) })
+            }
         }
     }
 
     fn recv_bytes(&self) -> BoxFuture<'_, Result<Vec<u8>, Self::RecvError>> {
         match self {
-            Self::Dialed(ws) => Transport::<Sendable>::recv_bytes(ws),
-            Self::Accepted(ws) => Transport::<Sendable>::recv_bytes(ws),
+            Self::Dialed(ws) => Transport::<Sendable>::recv_bytes(ws)
+                .map(|r| r.map_err(TransportRecvError::Ws))
+                .boxed(),
+            Self::Accepted(ws) => Transport::<Sendable>::recv_bytes(ws)
+                .map(|r| r.map_err(TransportRecvError::Ws))
+                .boxed(),
+            Self::Prefetch(pt) => {
+                let inner = pt.inner.clone();
+                let prefetch_tx = pt.prefetch_tx.clone();
+                async move {
+                    let bytes = Transport::<Sendable>::recv_bytes(&inner)
+                        .await
+                        .map_err(TransportRecvError::Ws)?;
+                    if let Ok(SyncMessage::BatchSyncRequest(req)) =
+                        SyncMessage::try_decode(&bytes)
+                    {
+                        if req.subscribe
+                            && req.id.as_bytes()[16..].iter().all(|b| *b == 0)
+                        {
+                            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                            if prefetch_tx.send((req.id, done_tx)).is_ok() {
+                                let _ = done_rx.await;
+                            }
+                        }
+                    }
+                    Ok(bytes)
+                }
+                .boxed()
+            }
+            Self::Iroh(iroh) => Transport::<Sendable>::recv_bytes(iroh)
+                .map(|r| r.map_err(TransportRecvError::Iroh))
+                .boxed(),
+            Self::HttpLongPoll(lp) => Transport::<Sendable>::recv_bytes(lp)
+                .map(|r| r.map_err(TransportRecvError::Http))
+                .boxed(),
         }
     }
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), Self::DisconnectionError>> {
         match self {
-            Self::Dialed(ws) => Transport::<Sendable>::disconnect(ws),
-            Self::Accepted(ws) => Transport::<Sendable>::disconnect(ws),
+            Self::Dialed(ws) => Transport::<Sendable>::disconnect(ws)
+                .map(|r| r.map_err(TransportDisconnectError::Ws))
+                .boxed(),
+            Self::Accepted(ws) => Transport::<Sendable>::disconnect(ws)
+                .map(|r| r.map_err(TransportDisconnectError::Ws))
+                .boxed(),
+            Self::Prefetch(pt) => Transport::<Sendable>::disconnect(&pt.inner)
+                .map(|r| r.map_err(TransportDisconnectError::Ws))
+                .boxed(),
+            Self::Iroh(iroh) => Transport::<Sendable>::disconnect(iroh)
+                .map(|r| r.map_err(TransportDisconnectError::Iroh))
+                .boxed(),
+            Self::HttpLongPoll(lp) => Transport::<Sendable>::disconnect(lp)
+                .map(|r| r.map_err(TransportDisconnectError::Http))
+                .boxed(),
         }
     }
 }
@@ -114,16 +233,150 @@ impl PartialEq for WsTransport {
         match (self, other) {
             (Self::Dialed(a), Self::Dialed(b)) => a == b,
             (Self::Accepted(a), Self::Accepted(b)) => a == b,
+            (Self::Prefetch(a), Self::Prefetch(b)) => a == b,
+            (Self::Iroh(a), Self::Iroh(b)) => a == b,
+            (Self::HttpLongPoll(a), Self::HttpLongPoll(b)) => a == b,
             _ => false,
+        }
+    }
+}
+
+async fn accept_iroh_peer(
+    endpoint: Arc<iroh::Endpoint>,
+    node: Arc<Core>,
+    signer: MemorySigner,
+    peer_id: PeerId,
+) {
+    let nonce_cache = NonceCache::default();
+    loop {
+        match subduction_iroh::server::accept_one(
+            &endpoint,
+            &signer,
+            &nonce_cache,
+            peer_id,
+            None,
+            HANDSHAKE_MAX_DRIFT,
+        )
+        .await
+        {
+            Ok(result) => {
+                tokio::spawn(result.listener_task);
+                tokio::spawn(result.sender_task);
+                let mapped = result
+                    .authenticated
+                    .map(|c| MessageTransport::new(WsTransport::Iroh(c)));
+                if let Err(e) = node.add_connection(mapped).await {
+                    tracing::warn!(error = %e, "iroh: add_connection failed");
+                }
+            }
+            Err(subduction_iroh::error::AcceptError::NoIncoming) => break,
+            Err(e) => tracing::warn!(error = %e, "iroh: accept failed"),
         }
     }
 }
 
 type Conn = MessageTransport<WsTransport>;
 
+async fn accept_local_http_peer(
+    tcp: TcpStream,
+    node: Arc<Core>,
+    lp_handler: LongPollHandler<MemorySigner, FuturesTimerTimeout>,
+) {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::header::{
+        HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+        ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE,
+    };
+    use hyper_util::rt::TokioIo;
+
+    let io = TokioIo::new(tcp);
+    let service = hyper::service::service_fn(move |req| {
+        let handler = lp_handler.clone();
+        let node = node.clone();
+        async move {
+            if req.method() == hyper::Method::OPTIONS {
+                let mut resp = hyper::Response::new(Full::new(Bytes::new()));
+                *resp.status_mut() = hyper::StatusCode::NO_CONTENT;
+                resp.headers_mut()
+                    .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+                resp.headers_mut().insert(
+                    ACCESS_CONTROL_ALLOW_METHODS,
+                    HeaderValue::from_static("POST, OPTIONS"),
+                );
+                resp.headers_mut().insert(
+                    ACCESS_CONTROL_ALLOW_HEADERS,
+                    HeaderValue::from_static("Content-Type, X-Session-Id"),
+                );
+                resp.headers_mut().insert(
+                    ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static("X-Session-Id"),
+                );
+                resp.headers_mut()
+                    .insert(ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+                return Ok::<_, hyper::Error>(resp);
+            }
+
+            let resp = match handler.handle(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(error = %e, "http longpoll handler error");
+                    hyper::Response::new(Full::new(Bytes::from(e.to_string())))
+                }
+            };
+
+            if resp.status() == hyper::StatusCode::OK {
+                if let Some(sid_hdr) = resp
+                    .headers()
+                    .get(subduction_http_longpoll::SESSION_ID_HEADER)
+                {
+                    if let Ok(sid_str) = sid_hdr.to_str() {
+                        if let Some(sid) =
+                            subduction_http_longpoll::session::SessionId::from_hex(sid_str)
+                        {
+                            if let Some(auth) = handler.take_authenticated(&sid).await {
+                                let mapped = auth
+                                    .map(|lp| MessageTransport::new(WsTransport::HttpLongPoll(lp)));
+                                if let Err(e) = node.add_connection(mapped).await {
+                                    tracing::warn!(error = %e, "http longpoll: add_connection failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (mut parts, body) = resp.into_parts();
+            parts
+                .headers
+                .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            parts.headers.insert(
+                ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("POST, OPTIONS"),
+            );
+            parts.headers.insert(
+                ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("Content-Type, X-Session-Id"),
+            );
+            parts.headers.insert(
+                ACCESS_CONTROL_EXPOSE_HEADERS,
+                HeaderValue::from_static("X-Session-Id"),
+            );
+            Ok::<_, hyper::Error>(hyper::Response::from_parts(parts, body))
+        }
+    });
+
+    let builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    if let Err(e) = builder.serve_connection(io, service).await {
+        tracing::debug!(error = %e, "http longpoll connection ended");
+    }
+}
+
 async fn accept_local_peer(
     tcp: TcpStream,
     node: Arc<Core>,
+    repo: Arc<Repo>,
     server_peer_id: PeerId,
     discovery_audience: Option<Audience>,
 ) {
@@ -140,6 +393,9 @@ async fn accept_local_peer(
         Ok(ws) => ws,
         Err(_) => return,
     };
+
+    let (prefetch_tx, mut prefetch_rx) =
+        mpsc::unbounded_channel::<(SedimentreeId, tokio::sync::oneshot::Sender<()>)>();
 
     let result = handshake::respond::<Sendable, _, _, _, _>(
         WebSocketHandshake::new(ws_stream),
@@ -160,7 +416,11 @@ async fn accept_local_peer(
             tokio::spawn(async move {
                 let _ = keepalive_task.await;
             });
-            (MessageTransport::new(WsTransport::Accepted(ws)), ())
+            let transport = PrefetchTransport {
+                inner: ws,
+                prefetch_tx: prefetch_tx.clone(),
+            };
+            (MessageTransport::new(WsTransport::Prefetch(transport)), ())
         },
         node.signer(),
         node.nonce_cache(),
@@ -175,6 +435,14 @@ async fn accept_local_peer(
         return;
     };
     let _ = node.add_connection(authenticated).await;
+
+    tokio::spawn(async move {
+        while let Some((sid, done_tx)) = prefetch_rx.recv().await {
+            let id = DocId::from_sedimentree_id(sid);
+            repo.prefetch_doc(id, Duration::from_secs(30)).await;
+            let _ = done_tx.send(());
+        }
+    });
 }
 type Handler = SyncHandler<
     Sendable,
@@ -318,6 +586,18 @@ pub struct Repo {
     events: broadcast::Sender<RepoEvent>,
     connected: std::sync::atomic::AtomicBool,
     local_port: Option<u16>,
+    iroh_endpoint: Option<Arc<iroh::Endpoint>>,
+}
+
+fn load_or_create_iroh_key(path: &Path) -> Result<iroh::SecretKey> {
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            return Ok(iroh::SecretKey::from(arr));
+        }
+    }
+    let key = iroh::SecretKey::generate();
+    std::fs::write(path, key.to_bytes()).context("writing iroh key")?;
+    Ok(key)
 }
 
 fn load_or_create_signer(path: &Path) -> Result<MemorySigner> {
@@ -488,11 +768,75 @@ impl Repo {
         self.local_port
     }
 
+    pub fn local_http_url(&self) -> Option<String> {
+        self.local_port
+            .map(|port| format!("http://127.0.0.1:{port}"))
+    }
+
+    pub fn iroh_node_id(&self) -> Option<String> {
+        self.iroh_endpoint.as_ref().map(|ep| ep.id().to_string())
+    }
+
+    pub async fn add_iroh_peer(self: &Arc<Self>, node_id_str: String) -> Result<()> {
+        let ep = self
+            .iroh_endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow!("iroh endpoint not running"))?;
+        let node_id: iroh::EndpointId = node_id_str
+            .parse()
+            .map_err(|e| anyhow!("invalid iroh node id: {e}"))?;
+        let addr = iroh::EndpointAddr::from(node_id);
+        let audience = Audience::discover(node_id_str.as_bytes());
+        let result = subduction_iroh::client::connect(ep, addr, &self.signer, audience).await?;
+        let node = self.core.clone();
+        tokio::spawn(result.listener_task);
+        tokio::spawn(result.sender_task);
+        let mapped = result
+            .authenticated
+            .map(|c| MessageTransport::new(WsTransport::Iroh(c)));
+        node.add_connection(mapped)
+            .await
+            .map_err(|e| anyhow!("add_connection failed: {e}"))?;
+        tracing::info!(peer = %node_id_str, "iroh: dialed peer");
+        Ok(())
+    }
+
+    /// Raw stored blobs for a doc, each a loadable automerge chunk. Serves the
+    /// webviews' storage read-through; order is irrelevant because automerge
+    /// backlogs changes whose dependencies haven't been applied yet.
+    pub async fn doc_chunks(&self, id: DocId) -> Vec<(String, Vec<u8>)> {
+        let sid = id.sedimentree_id();
+        let fragments = <ObservedStorage as Storage<Sendable>>::load_fragments(&self.storage, sid)
+            .await
+            .unwrap_or_default();
+        let commits =
+            <ObservedStorage as Storage<Sendable>>::load_loose_commits(&self.storage, sid)
+                .await
+                .unwrap_or_default();
+        let mut chunks = Vec::new();
+        for record in &fragments {
+            let blob = record.blob();
+            chunks.push((
+                BlobMeta::new(blob).digest().to_string(),
+                blob.as_slice().to_vec(),
+            ));
+        }
+        for record in &commits {
+            let blob = record.blob();
+            chunks.push((
+                BlobMeta::new(blob).digest().to_string(),
+                blob.as_slice().to_vec(),
+            ));
+        }
+        chunks
+    }
+
     pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
+        let iroh_key = load_or_create_iroh_key(&data_dir.join("iroh.key"))?;
         let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
-        let storage = FsStorage::new(data_dir.join("sedimentree"))
-            .context("opening sedimentree storage")?;
+        let storage =
+            FsStorage::new(data_dir.join("sedimentree")).context("opening sedimentree storage")?;
         let (stored_tx, mut stored_rx) = mpsc::unbounded_channel();
         let (heads_tx, mut heads_rx) = mpsc::unbounded_channel();
         let storage = ObservedStorage::new(storage, stored_tx);
@@ -549,6 +893,22 @@ impl Repo {
             }
         });
 
+        let iroh_endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh_key)
+            .alpns(vec![subduction_iroh::ALPN.to_vec()])
+            .bind()
+            .await
+        {
+            Ok(ep) => {
+                tracing::info!(node_id = %ep.id(), "iroh endpoint bound");
+                Some(Arc::new(ep))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "iroh endpoint failed to bind; peer-to-peer sync unavailable");
+                None
+            }
+        };
+
         let (events, _) = broadcast::channel(256);
         let repo = Arc::new(Repo {
             core,
@@ -562,20 +922,59 @@ impl Repo {
             events,
             connected: std::sync::atomic::AtomicBool::new(false),
             local_port,
+            iroh_endpoint,
         });
 
         if let Some(listener) = listener {
             let node = repo.core.clone();
             let peer_id = PeerId::from(repo.signer.verifying_key());
             let audience = node.discovery_id().map(Audience::discover_id);
+            let lp_signer = repo.signer.clone();
+            let lp_peer_id = peer_id;
+            let lp_discovery = audience;
+            let lp_handler = LongPollHandler::new(
+                lp_signer,
+                std::sync::Arc::new(NonceCache::default()),
+                lp_peer_id,
+                lp_discovery,
+                HANDSHAKE_MAX_DRIFT,
+                FuturesTimerTimeout,
+            );
+            let relay_repo = repo.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((tcp, _addr)) = listener.accept().await else {
                         continue;
                     };
-                    tokio::spawn(accept_local_peer(tcp, node.clone(), peer_id, audience));
+                    let mut peek = [0u8; 4];
+                    match tcp.peek(&mut peek).await {
+                        Ok(n) if n >= 3 => {}
+                        _ => continue,
+                    }
+                    if peek.starts_with(b"POST") || peek.starts_with(b"OPTI") {
+                        tokio::spawn(accept_local_http_peer(
+                            tcp,
+                            node.clone(),
+                            lp_handler.clone(),
+                        ));
+                    } else {
+                        tokio::spawn(accept_local_peer(
+                            tcp,
+                            node.clone(),
+                            relay_repo.clone(),
+                            peer_id,
+                            audience,
+                        ));
+                    }
                 }
             });
+        }
+
+        if let Some(iroh_ep) = repo.iroh_endpoint.clone() {
+            let node = repo.core.clone();
+            let signer = repo.signer.clone();
+            let peer_id = PeerId::from(repo.signer.verifying_key());
+            tokio::spawn(accept_iroh_peer(iroh_ep, node, signer, peer_id));
         }
 
         {
@@ -1060,6 +1459,14 @@ impl Repo {
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
+    }
+
+    pub async fn prefetch_doc(self: &Arc<Self>, id: DocId, timeout: Duration) {
+        if self.docs.lock().await.contains_key(&id) {
+            return;
+        }
+        let _ = self.ensure_doc(id).await;
+        self.wait_for_doc(id, timeout).await;
     }
 
     pub async fn create_doc<F>(self: &Arc<Self>, init: F) -> Result<DocId>

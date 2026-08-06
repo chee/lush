@@ -10,6 +10,8 @@
 		F07316B33022831200FFA544 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F07316B23022831200FFA544 /* WidgetKit.framework */; };
 		F07316B53022831200FFA544 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F07316B43022831200FFA544 /* SwiftUI.framework */; };
 		F07316C03022831400FFA544 /* LushWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F07316B03022831200FFA544 /* LushWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		F073171B30241ABC00FFA544 /* LushShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F073170F30241ABC00FFA544 /* LushShareExtension.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		F073173330241AD500FFA544 /* LushFinderAction.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F073172530241AD500FFA544 /* LushFinderAction.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		F0872FA4301F62AD003F9B3B /* PatchworkWeb.bundle in Resources */ = {isa = PBXBuildFile; fileRef = F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */; };
 		F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA6301F718C003F9B3B /* PatchworkServerKit */; };
 		F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA9301F756A003F9B3B /* PatchworkServerKit */; };
@@ -23,6 +25,20 @@
 			remoteGlobalIDString = F07316AF3022831200FFA544;
 			remoteInfo = LushWidgetExtension;
 		};
+		F073171930241ABC00FFA544 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F001D300301E8AA900E154BD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F073170E30241ABC00FFA544;
+			remoteInfo = LushShareExtension;
+		};
+		F073173130241AD500FFA544 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F001D300301E8AA900E154BD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F073172430241AD500FFA544;
+			remoteInfo = LushFinderAction;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -32,7 +48,9 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
+				F073171B30241ABC00FFA544 /* LushShareExtension.appex in Embed Foundation Extensions */,
 				F07316C03022831400FFA544 /* LushWidgetExtension.appex in Embed Foundation Extensions */,
+				F073173330241AD500FFA544 /* LushFinderAction.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -44,6 +62,8 @@
 		F07316B03022831200FFA544 /* LushWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F07316B23022831200FFA544 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = /System/Library/Frameworks/WidgetKit.framework; sourceTree = "<absolute>"; };
 		F07316B43022831200FFA544 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = /System/Library/Frameworks/SwiftUI.framework; sourceTree = "<absolute>"; };
+		F073170F30241ABC00FFA544 /* LushShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		F073172530241AD500FFA544 /* LushFinderAction.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushFinderAction.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -54,6 +74,20 @@
 				Info.plist,
 			);
 			target = F07316AF3022831200FFA544 /* LushWidgetExtension */;
+		};
+		F073171C30241ABC00FFA544 /* Exceptions for "LushShareExtension" folder in "LushShareExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = F073170E30241ABC00FFA544 /* LushShareExtension */;
+		};
+		F073173430241AD500FFA544 /* Exceptions for "LushFinderAction" folder in "LushFinderAction" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = F073172430241AD500FFA544 /* LushFinderAction */;
 		};
 		F09B1ABE3020EA4300417560 /* Exceptions for "lush" folder in "Lush" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
@@ -71,6 +105,22 @@
 				F07316C13022831400FFA544 /* Exceptions for "LushWidget" folder in "LushWidgetExtension" target */,
 			);
 			path = LushWidget;
+			sourceTree = "<group>";
+		};
+		F073171030241ABC00FFA544 /* LushShareExtension */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F073171C30241ABC00FFA544 /* Exceptions for "LushShareExtension" folder in "LushShareExtension" target */,
+			);
+			path = LushShareExtension;
+			sourceTree = "<group>";
+		};
+		F073172630241AD500FFA544 /* LushFinderAction */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F073173430241AD500FFA544 /* Exceptions for "LushFinderAction" folder in "LushFinderAction" target */,
+			);
+			path = LushFinderAction;
 			sourceTree = "<group>";
 		};
 		F09B1AA13020DCF500417560 /* lush */ = {
@@ -102,6 +152,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F073170C30241ABC00FFA544 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F073172230241AD500FFA544 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -109,6 +173,8 @@
 			isa = PBXGroup;
 			children = (
 				F07316B63022831200FFA544 /* LushWidget */,
+				F073171030241ABC00FFA544 /* LushShareExtension */,
+				F073172630241AD500FFA544 /* LushFinderAction */,
 				F07316B13022831200FFA544 /* Frameworks */,
 				F001D309301E8AA900E154BD /* Products */,
 				F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */,
@@ -121,6 +187,8 @@
 			children = (
 				F001D308301E8AA900E154BD /* Lush.app */,
 				F07316B03022831200FFA544 /* LushWidgetExtension.appex */,
+				F073170F30241ABC00FFA544 /* LushShareExtension.appex */,
+				F073172530241AD500FFA544 /* LushFinderAction.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -150,6 +218,8 @@
 			);
 			dependencies = (
 				F07316BF3022831400FFA544 /* PBXTargetDependency */,
+				F073171A30241ABC00FFA544 /* PBXTargetDependency */,
+				F073173230241AD500FFA544 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				F09B1AA13020DCF500417560 /* lush */,
@@ -185,6 +255,50 @@
 			productReference = F07316B03022831200FFA544 /* LushWidgetExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		F073170E30241ABC00FFA544 /* LushShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F073171D30241ABC00FFA544 /* Build configuration list for PBXNativeTarget "LushShareExtension" */;
+			buildPhases = (
+				F073170B30241ABC00FFA544 /* Sources */,
+				F073170C30241ABC00FFA544 /* Frameworks */,
+				F073170D30241ABC00FFA544 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				F073171030241ABC00FFA544 /* LushShareExtension */,
+			);
+			name = LushShareExtension;
+			packageProductDependencies = (
+			);
+			productName = LushShareExtension;
+			productReference = F073170F30241ABC00FFA544 /* LushShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		F073172430241AD500FFA544 /* LushFinderAction */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F073173530241AD500FFA544 /* Build configuration list for PBXNativeTarget "LushFinderAction" */;
+			buildPhases = (
+				F073172130241AD500FFA544 /* Sources */,
+				F073172230241AD500FFA544 /* Frameworks */,
+				F073172330241AD500FFA544 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				F073172630241AD500FFA544 /* LushFinderAction */,
+			);
+			name = LushFinderAction;
+			packageProductDependencies = (
+			);
+			productName = LushFinderAction;
+			productReference = F073172530241AD500FFA544 /* LushFinderAction.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -199,6 +313,12 @@
 						CreatedOnToolsVersion = 26.6;
 					};
 					F07316AF3022831200FFA544 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					F073170E30241ABC00FFA544 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					F073172430241AD500FFA544 = {
 						CreatedOnToolsVersion = 26.6;
 					};
 				};
@@ -224,6 +344,8 @@
 			targets = (
 				F001D307301E8AA900E154BD /* Lush */,
 				F07316AF3022831200FFA544 /* LushWidgetExtension */,
+				F073170E30241ABC00FFA544 /* LushShareExtension */,
+				F073172430241AD500FFA544 /* LushFinderAction */,
 			);
 		};
 /* End PBXProject section */
@@ -238,6 +360,20 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		F07316AE3022831200FFA544 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F073170D30241ABC00FFA544 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F073172330241AD500FFA544 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -261,6 +397,20 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F073170B30241ABC00FFA544 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F073172130241AD500FFA544 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -268,6 +418,16 @@
 			isa = PBXTargetDependency;
 			target = F07316AF3022831200FFA544 /* LushWidgetExtension */;
 			targetProxy = F07316BE3022831400FFA544 /* PBXContainerItemProxy */;
+		};
+		F073171A30241ABC00FFA544 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F073170E30241ABC00FFA544 /* LushShareExtension */;
+			targetProxy = F073171930241ABC00FFA544 /* PBXContainerItemProxy */;
+		};
+		F073173230241AD500FFA544 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F073172430241AD500FFA544 /* LushFinderAction */;
+			targetProxy = F073173130241AD500FFA544 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -303,6 +463,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Lush;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Lush reads your Apple Notes to import them.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Lush takes photos to attach them to your notes.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Lush records audio to attach voice memos to your notes. hehe";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -380,6 +541,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Lush;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Lush reads your Apple Notes to import them.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Lush takes photos to attach them to your notes.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Lush records audio to attach voice memos to your notes. hehe";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -552,6 +714,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_ENTITLEMENTS = LushWidget/LushWidget.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R2MP6EU7T3;
@@ -594,6 +757,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_ENTITLEMENTS = LushWidget/LushWidget.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = R2MP6EU7T3;
@@ -631,6 +795,138 @@
 			};
 			name = Release;
 		};
+		F073171E30241ABC00FFA544 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LushShareExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LushShareExtension;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F073171F30241ABC00FFA544 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LushShareExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LushShareExtension;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushShareExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		F073173630241AD500FFA544 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LushFinderAction/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LushFinderAction;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushFinderAction;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F073173730241AD500FFA544 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SELECTED_FILES = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LushFinderAction/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = LushFinderAction;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushFinderAction;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -657,6 +953,24 @@
 			buildConfigurations = (
 				F07316C33022831400FFA544 /* Debug */,
 				F07316C43022831400FFA544 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F073171D30241ABC00FFA544 /* Build configuration list for PBXNativeTarget "LushShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F073171E30241ABC00FFA544 /* Debug */,
+				F073171F30241ABC00FFA544 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F073173530241AD500FFA544 /* Build configuration list for PBXNativeTarget "LushFinderAction" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F073173630241AD500FFA544 /* Debug */,
+				F073173730241AD500FFA544 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

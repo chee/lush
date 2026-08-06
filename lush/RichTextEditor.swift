@@ -47,6 +47,8 @@ final class EditorController {
     ]
 
     var currentStyleKey: String = "paragraph"
+    var currentCodeLanguage: String = CodeLanguage.plain.id
+    var isCodeBlockActive: Bool { currentStyleKey == "code-block" }
     var strongActive = false
     var emActive = false
     var codeActive = false
@@ -68,6 +70,10 @@ final class EditorController {
         core?.applyBlockStyle(BlockValue.fromStyleKey(key))
     }
 
+    func applyCodeLanguage(_ language: CodeLanguage) {
+        core?.setCodeLanguage(language.id)
+    }
+
     func toggleStrong() { core?.toggleMark("strong") }
     func toggleEm() { core?.toggleMark("em") }
     func toggleCode() { core?.toggleMark("code") }
@@ -77,6 +83,8 @@ final class EditorController {
     func toggleSuperscript() { core?.toggleBaseline("superscript") }
     func toggleSubscript() { core?.toggleBaseline("subscript") }
     func applyHighlight(_ name: String?) { core?.setHighlight(name) }
+    func indent() { _ = core?.nestListItem() }
+    func outdent() { _ = core?.unnestListItem() }
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
@@ -167,14 +175,18 @@ protocol EditorTextViewLike: AnyObject {
     func pReplace(_ range: NSRange, with attributed: NSAttributedString)
 }
 
-/// Draws bullet / number markers in the margin for list items. The markers
-/// are pure decoration — they never exist in the text, so the automerge
-/// round-trip can't be corrupted by them.
+/// Draws list markers and quote accents in the margin. They are pure
+/// decoration — they never exist in the text, so the automerge round-trip
+/// can't be corrupted by them.
 final class ListMarkerLayoutManager: NSLayoutManager {
     /// Paragraph location -> its 1-based ordinal, for the duration of one draw
     /// pass. Without it every item in a numbered list rescans the whole run
     /// above it, which is quadratic in the length of the list.
     private var ordinals: [Int: Int] = [:]
+
+    /// The empty final paragraph has no characters to hang attributes on, so
+    /// its marker comes from the view's typing attributes via this hook.
+    var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
 
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
@@ -191,6 +203,11 @@ final class ListMarkerLayoutManager: NSLayoutManager {
             guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox
             else { continue }
             let block = box.value
+            if block.type == "blockquote" {
+                drawQuoteAccent(for: paragraph, origin: origin)
+                continue
+            }
+
             let isBullet = block.type == "unordered-list-item"
             let isNumber = block.type == "ordered-list-item"
             let isTodo = block.type == "todo-list-item"
@@ -211,44 +228,146 @@ final class ListMarkerLayoutManager: NSLayoutManager {
             guard lineRect != .zero else { continue }
             // Use font ascender for the baseline — glyph location y is 0
             // for paragraph-separator null glyphs on empty lines.
-            let baseline = origin.y + lineRect.minY + itemFont.ascender
-            let diameter: CGFloat = 6.5
-            if isTodo {
-                let side = itemFont.pointSize * 0.82
-                let rect = CGRect(
-                    x: origin.x + indent - side - 6,
-                    y: baseline - itemFont.xHeight / 2 - side / 2,
-                    width: side,
-                    height: side
-                )
-                Self.drawCheckbox(in: rect, checked: block.isChecked)
-            } else if isBullet {
-                let rect = CGRect(
-                    x: origin.x + indent - diameter - 5,
-                    y: baseline - itemFont.xHeight / 2 - diameter / 2,
-                    width: diameter,
-                    height: diameter
-                )
-                PColor.pLabel.setFill()
-                #if os(macOS)
-                NSBezierPath(ovalIn: rect).fill()
-                #else
-                UIBezierPath(ovalIn: rect).fill()
-                #endif
-            } else {
-                let marker = "\(ordinal(of: paragraph.location, in: storage, str: str))."
-                let font = PFont.monospacedDigitSystemFont(ofSize: RichText.bodySize, weight: .regular)
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: font,
-                    .foregroundColor: PColor.pLabel,
-                ]
-                let point = CGPoint(
-                    x: origin.x + indent - diameter - 5,
-                    y: baseline - font.ascender
-                )
-                marker.draw(at: point, withAttributes: attrs)
+            drawMarker(
+                block: block,
+                ordinal: block.type == "ordered-list-item"
+                    ? ordinal(of: paragraph.location, in: storage, str: str)
+                    : 1,
+                font: itemFont,
+                indent: indent,
+                lineRect: lineRect,
+                origin: origin
+            )
+        }
+        drawTrailingParagraphMarker(storage: storage, str: str, origin: origin)
+    }
+
+    /// The empty final paragraph (doc ends in a newline) carries no
+    /// characters; its marker is what typing attributes promise the next
+    /// character will be.
+    private func drawTrailingParagraphMarker(storage: NSTextStorage, str: NSString, origin: CGPoint) {
+        guard extraLineFragmentRect != .zero,
+              storage.length > 0,
+              str.hasSuffix("\n"),
+              let typing = typingAttributesProvider?(),
+              let box = typing[.amBlock] as? BlockBox
+        else { return }
+        let block = box.value
+        if block.type == "blockquote" {
+            drawQuoteAccent(lineRect: extraLineFragmentRect, origin: origin)
+            return
+        }
+
+        guard block.type == "unordered-list-item"
+            || block.type == "ordered-list-item"
+            || block.type == "todo-list-item"
+        else { return }
+        let font = typing[.font] as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
+        let indent = (typing[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
+        var number = 1
+        if block.type == "ordered-list-item", storage.length > 0 {
+            let previous = str.paragraphRange(for: NSRange(location: storage.length - 1, length: 0))
+            if let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
+               prevBox.value.type == "ordered-list-item",
+               prevBox.value.parents == block.parents {
+                number = ordinal(of: previous.location, in: storage, str: str) + 1
             }
         }
+        drawMarker(
+            block: block,
+            ordinal: number,
+            font: font,
+            indent: indent,
+            lineRect: extraLineFragmentRect,
+            origin: origin
+        )
+    }
+
+    private func drawMarker(
+        block: BlockValue,
+        ordinal: Int,
+        font itemFont: PFont,
+        indent: CGFloat,
+        lineRect: CGRect,
+        origin: CGPoint
+    ) {
+        let baseline = origin.y + lineRect.minY + itemFont.ascender
+        let diameter: CGFloat = 6.5
+        switch block.type {
+        case "todo-list-item":
+            let side = itemFont.pointSize * 0.82
+            let rect = CGRect(
+                x: origin.x + indent - side - 6,
+                y: baseline - itemFont.xHeight / 2 - side / 2,
+                width: side,
+                height: side
+            )
+            Self.drawCheckbox(in: rect, checked: block.isChecked)
+        case "unordered-list-item":
+            let rect = CGRect(
+                x: origin.x + indent - diameter - 5,
+                y: baseline - itemFont.xHeight / 2 - diameter / 2,
+                width: diameter,
+                height: diameter
+            )
+            PColor.pLabel.setFill()
+            #if os(macOS)
+            NSBezierPath(ovalIn: rect).fill()
+            #else
+            UIBezierPath(ovalIn: rect).fill()
+            #endif
+        default:
+            let marker = "\(ordinal)."
+            let font = PFont.monospacedDigitSystemFont(ofSize: RichText.bodySize, weight: .regular)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: PColor.pLabel,
+            ]
+            let markerWidth = (marker as NSString).size(withAttributes: attrs).width
+            let point = CGPoint(
+                x: origin.x + indent - markerWidth - 6,
+                y: baseline - font.ascender
+            )
+            marker.draw(at: point, withAttributes: attrs)
+        }
+    }
+
+    private func drawQuoteAccent(for paragraph: NSRange, origin: CGPoint) {
+        ensureLayout(forCharacterRange: paragraph)
+
+        var quoteRect = CGRect.null
+        let glyphRange = glyphRange(forCharacterRange: paragraph, actualCharacterRange: nil)
+        enumerateLineFragments(forGlyphRange: glyphRange) { lineRect, _, _, _, _ in
+            quoteRect = quoteRect.union(lineRect)
+        }
+
+        if quoteRect.isNull {
+            let glyphIndex = glyphIndexForCharacter(at: paragraph.location)
+            quoteRect = glyphIndex < numberOfGlyphs
+                ? lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+                : extraLineFragmentRect
+        }
+
+        guard !quoteRect.isNull, quoteRect != .zero else { return }
+        drawQuoteAccent(lineRect: quoteRect, origin: origin)
+    }
+
+    private func drawQuoteAccent(lineRect: CGRect, origin: CGPoint) {
+        let width: CGFloat = 3
+        let height = max(0, lineRect.height - 2)
+        let rect = CGRect(
+            x: origin.x + 1,
+            y: origin.y + lineRect.minY + 1,
+            width: width,
+            height: height
+        )
+
+        PColor.pTint.setFill()
+        #if os(macOS)
+        NSBezierPath(roundedRect: rect, xRadius: width / 2, yRadius: width / 2).fill()
+        #else
+        UIBezierPath(roundedRect: rect, cornerRadius: width / 2).fill()
+        #endif
     }
 
     /// 1-based position among the contiguous run of ordered items with the
@@ -666,10 +785,12 @@ final class EditorCore {
         session.title = RichText.title(from: spans)
         refreshFormattingState()
         inline.setNeedsReconcile()
+        highlightCodeBlocks()
         if location == attributed.length, location > 0,
            let lastNonEmbed = spans.reversed().compactMap({ (s: SpanNode) -> BlockValue? in guard case .block(let b) = s, !b.isEmbedBlock else { return nil }; return b }).first {
             view.pTypingAttributes = RichText.attributes(block: lastNonEmbed, marks: [:])
             controller.currentStyleKey = lastNonEmbed.styleKey
+            controller.currentCodeLanguage = lastNonEmbed.codeLanguage
         }
         if focus {
             #if os(macOS)
@@ -949,6 +1070,12 @@ final class EditorCore {
         let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
         let json = SpanNode.encodeList(spans)
         guard json != session.lastKnownJSON else { return }
+        let embedCount = spans.filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
+        let previousEmbeds = SpanNode.decodeList(session.lastKnownJSON)
+            .filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
+        if embedCount < previousEmbeds {
+            NSLog("lush save: embed count dropped %d -> %d in %@", previousEmbeds, embedCount, noteUrl)
+        }
         session.lastKnownJSON = json
         let url = noteUrl
         let title = RichText.title(from: spans)
@@ -1130,9 +1257,26 @@ final class EditorCore {
             typing.removeValue(forKey: .amDisplayOnly)
             view.pTypingAttributes = typing
         }
+        #if os(iOS)
+        // iOS strips custom typing attributes on selection changes; text
+        // typed without .amBlock breaks its paragraph's list rendering.
+        // AppKit preserves them, and rebuilding attributes mid-edit on macOS
+        // interferes with block conversions (bullets vanishing on indent).
+        if view.pTypingAttributes[.amBlock] == nil, view.pStorage?.length ?? 0 > 0 {
+            view.pTypingAttributes = RichText.attributes(
+                block: blockAtSelection(),
+                marks: marksAtSelection()
+            )
+        }
+        #endif
         let block = blockAtSelection()
         controller.currentStyleKey = block.styleKey
-        let marks = marksAtSelection()
+        controller.currentCodeLanguage = block.codeLanguage
+        // With a caret, the buttons must show what the next typed character
+        // will be — that's the typing attributes, not the character behind it.
+        let marks = view.pSelectedRange.length > 0
+            ? marksAtSelection()
+            : RichText.marks(from: view.pTypingAttributes, block: block)
         controller.strongActive = marks["strong"] != nil
         controller.emActive = marks["em"] != nil
         controller.codeActive = marks["code"] != nil
@@ -1164,7 +1308,18 @@ final class EditorCore {
     func blockAtSelection() -> BlockValue {
         guard let view, let storage = view.pStorage else { return .paragraph }
         let selection = view.pSelectedRange
-        if storage.length == 0 || selection.location >= storage.length {
+        if storage.length == 0 { return typingBlock() }
+        if selection.location >= storage.length {
+            // Caret at the very end. Unless the doc ends with a newline (an
+            // empty final paragraph, where only typing attributes exist), the
+            // caret is inside the last paragraph — read its block from the
+            // text, not from typing attributes, which iOS likes to strip.
+            if (storage.string as NSString).hasSuffix("\n") {
+                return typingBlock()
+            }
+            if let box = storage.attribute(.amBlock, at: storage.length - 1, effectiveRange: nil) as? BlockBox {
+                return box.value
+            }
             return typingBlock()
         }
         let index = min(selection.location, storage.length - 1)
@@ -1266,6 +1421,9 @@ final class EditorCore {
         view.pSelectedRange = selection
         refreshFormattingState()
         scheduleSave()
+        if block.type == "code-block" {
+            highlightCodeBlocks(around: selection.location)
+        }
     }
 
     func toggleMark(_ mark: String) {
@@ -1275,6 +1433,43 @@ final class EditorCore {
 
     func setHighlight(_ name: String?) {
         applyMark("highlight", value: name.map { .string($0) })
+    }
+
+    func setCodeLanguage(_ language: String) {
+        guard let view, let storage = view.pStorage else { return }
+        let normalized = CodeLanguage.named(language).id
+        let selection = view.pSelectedRange
+        var block = blockAtSelection()
+        guard block.type == "code-block" else { return }
+        if normalized == CodeLanguage.plain.id {
+            block.attrs.removeValue(forKey: "language")
+        } else {
+            block.attrs["language"] = .string(normalized)
+        }
+        let newTypingAttributes = RichText.attributes(block: block, marks: [:])
+        if storage.length == 0 {
+            view.pTypingAttributes = newTypingAttributes
+            controller.currentCodeLanguage = normalized
+            refreshFormattingState()
+            return
+        }
+        let str = storage.string as NSString
+        let paragraphRange = str.paragraphRange(for: selection)
+        storage.beginEditing()
+        storage.enumerateAttributes(in: paragraphRange) { runAttrs, runRange, _ in
+            guard let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value,
+                  oldBlock.type == "code-block"
+            else { return }
+            let marks = RichText.marks(from: runAttrs, block: oldBlock)
+            storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
+        }
+        storage.endEditing()
+        view.pTypingAttributes = newTypingAttributes
+        view.pSelectedRange = selection
+        controller.currentCodeLanguage = normalized
+        refreshFormattingState()
+        scheduleSave()
+        highlightCodeBlocks(around: selection.location)
     }
 
     /// Superscript and subscript are one axis: turning one on turns the other
@@ -1378,12 +1573,14 @@ final class EditorCore {
         if block.type == "todo-list-item" {
             view.pInsertText("\n")
             view.pTypingAttributes = RichText.attributes(block: .todo(checked: false), marks: [:])
+            restyleCaretParagraph(as: .todo(checked: false))
             refreshFormattingState()
             return true
         }
         if block.type == "heading" || block.isAtomic {
             view.pInsertText("\n")
             view.pTypingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+            restyleCaretParagraph(as: .paragraph)
             refreshFormattingState()
             return true
         }
@@ -1402,16 +1599,33 @@ final class EditorCore {
         return false
     }
 
+    /// After return splits a paragraph, the caret's new paragraph starts with
+    /// the old one's terminator newline — which still carries the finished
+    /// block's attributes (a ticked checkbox, a heading). Rebadge it.
+    private func restyleCaretParagraph(as block: BlockValue) {
+        guard let view, let storage = view.pStorage else { return }
+        let caret = view.pSelectedRange.location
+        guard caret <= storage.length else { return }
+        let str = storage.string as NSString
+        let paragraph = str.paragraphRange(for: NSRange(location: caret, length: 0))
+        guard paragraph.length > 0 else { return }
+        storage.addAttribute(.amBlock, value: BlockBox(block), range: paragraph)
+    }
+
     /// Markdown-style prefixes: typing a space after `-`, `1.`, `#`…`###`
     /// or `>` at the start of a paragraph converts the block.
     func handleMarkdownTrigger(at location: Int) -> Bool {
         guard let view, let storage = view.pStorage else { return false }
-        guard view.pSelectedRange.length == 0 else { return false }
-        let block = blockAtSelection()
-        guard block.type == "paragraph" else { return false }
+        guard view.pSelectedRange.length == 0 else {
+            NSLog("lush md-trigger: skipped, selection not empty")
+            return false
+        }
         let str = storage.string as NSString
         let paragraph = str.paragraphRange(for: NSRange(location: location, length: 0))
-        guard location > paragraph.location else { return false }
+        guard location > paragraph.location else {
+            NSLog("lush md-trigger: skipped, caret at paragraph start")
+            return false
+        }
         let prefixRange = NSRange(
             location: paragraph.location,
             length: location - paragraph.location
@@ -1529,19 +1743,67 @@ final class EditorCore {
     func removeEmbed(_ box: BlockBox) {
         guard let storage = view?.pStorage else { return }
         guard let range = range(whereBlockBox: box, in: storage) else { return }
+        NSLog("lush embed removed by user: %@", box.value.embedUrl ?? "?")
         storage.replaceCharacters(in: range, with: NSAttributedString())
         scheduleSave()
         inline.setNeedsReconcile()
     }
 
     func updateEmbedTool(_ box: BlockBox, tool: String?) {
-        guard let storage = view?.pStorage else { return }
-        guard let range = range(whereBlockBox: box, in: storage) else { return }
-        guard let url = box.value.embedUrl else { return }
-        var newBlock = BlockValue.embed(url: url)
+        var newBlock = box.value
         if let tool, !tool.isEmpty {
             newBlock.attrs["tool"] = .string(tool)
+        } else {
+            newBlock.attrs["tool"] = nil
         }
+        replaceEmbedBlock(box, with: newBlock)
+    }
+
+    /// Mutates the box in place and re-measures so the hosted webview resizes
+    /// live, exactly like a window resize — replacing the attachment would
+    /// tear the webview down and boot a new one. The doc write happens once,
+    /// when the drag ends.
+    func updateEmbedSize(_ box: BlockBox, width: Double, height: Double, commit: Bool) {
+        box.value.attrs["width"] = .number(width)
+        box.value.attrs["height"] = .number(height)
+        inline.setNeedsReconcile()
+        if commit { scheduleSave() }
+    }
+
+    /// Repaint syntax colors on code-block paragraphs; scoped to the
+    /// paragraph at `location` when given, the whole doc otherwise. Colors
+    /// are display-only — the span encoder never reads them.
+    func highlightCodeBlocks(around location: Int? = nil) {
+        guard let storage = view?.pStorage, storage.length > 0 else { return }
+        let str = storage.string as NSString
+        let scope = location.map {
+            str.paragraphRange(for: NSRange(location: min($0, storage.length), length: 0))
+        } ?? NSRange(location: 0, length: storage.length)
+        var cursor = scope.location
+        storage.beginEditing()
+        while cursor < NSMaxRange(scope) {
+            let paragraph = str.paragraphRange(for: NSRange(location: cursor, length: 0))
+            if paragraph.length == 0 { break }
+            cursor = NSMaxRange(paragraph)
+            guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
+                  box.value.type == "code-block"
+            else { continue }
+            storage.addAttribute(.foregroundColor, value: PColor.pLabel, range: paragraph)
+            let text = str.substring(with: paragraph)
+            for token in CodeHighlight.tokens(in: text, language: box.value.codeLanguage) {
+                storage.addAttribute(
+                    .foregroundColor,
+                    value: CodeHighlight.color(for: token.kind),
+                    range: NSRange(location: paragraph.location + token.range.location, length: token.range.length)
+                )
+            }
+        }
+        storage.endEditing()
+    }
+
+    private func replaceEmbedBlock(_ box: BlockBox, with newBlock: BlockValue) {
+        guard let storage = view?.pStorage else { return }
+        guard let range = range(whereBlockBox: box, in: storage) else { return }
         storage.replaceCharacters(
             in: range,
             with: RichText.embedAttachment(for: newBlock, cache: cache)
@@ -1795,8 +2057,84 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         }
     }
 
+    /// Automerge rich-text spans as JSON — the same shape automerge's spans
+    /// API speaks, so other automerge apps can interchange with it. Consumers
+    /// should skip block types they don't know.
+    static let spansPasteboardType = NSPasteboard.PasteboardType(RichTextClipboard.spansTypeIdentifier)
+    static let htmlPasteboardType = NSPasteboard.PasteboardType(RichTextClipboard.htmlTypeIdentifier)
+    static let markdownPasteboardType = NSPasteboard.PasteboardType(RichTextClipboard.markdownTypeIdentifier)
+
+    /// Copy rich selections in every interchange format we can produce.
+    /// The app-specific span JSON is lossless; HTML and Markdown are for
+    /// moving content through other editors.
+    private func copySelectionAsSpans(cut: Bool) -> Bool {
+        guard let storage = textStorage else { return false }
+        let range = selectedRange()
+        guard range.length > 0 else { return false }
+        let slice = storage.attributedSubstring(from: range)
+        let spans = RichText.spans(from: slice)
+        let json = SpanNode.encodeList(spans)
+        let plain = slice.string.replacingOccurrences(of: "\u{FFFC}", with: "")
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(json, forType: Self.spansPasteboardType)
+        pasteboard.setString(RichTextClipboard.html(from: spans), forType: Self.htmlPasteboardType)
+        pasteboard.setString(RichTextClipboard.markdown(from: spans), forType: Self.markdownPasteboardType)
+        for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
+            pasteboard.setData(data, forType: .init(type))
+        }
+        pasteboard.setString(plain, forType: .string)
+        if cut {
+            pReplace(range, with: NSAttributedString())
+        }
+        return true
+    }
+
+    override func copy(_ sender: Any?) {
+        if copySelectionAsSpans(cut: false) { return }
+        super.copy(sender)
+    }
+
+    override func cut(_ sender: Any?) {
+        if copySelectionAsSpans(cut: true) { return }
+        super.cut(sender)
+    }
+
     override func paste(_ sender: Any?) {
-        if consumeAttachment(from: NSPasteboard.general) { return }
+        let pasteboard = NSPasteboard.general
+        if let core,
+           let json = pasteboard.string(forType: Self.spansPasteboardType),
+           let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
+            pReplace(selectedRange(), with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
+        if let core,
+           let mapData = pasteboard.data(forType: .init(RichTextClipboard.webCustomMapIdentifier)),
+           let json = RichTextClipboard.spansJSON(webCustomMap: mapData, payload: {
+               pasteboard.data(forType: .init($0))
+           }),
+           let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
+            pReplace(selectedRange(), with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
+        if consumeAttachment(from: pasteboard) { return }
+        if let core,
+           let html = pasteboard.string(forType: Self.htmlPasteboardType),
+           let attributed = RichTextClipboard.attributed(fromHTML: html, cache: core.cache) {
+            pReplace(selectedRange(), with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
+        if let core,
+           let markdown = pasteboard.string(forType: Self.markdownPasteboardType)
+                ?? pasteboard.string(forType: .string),
+           let attributed = RichTextClipboard.attributed(fromMarkdown: markdown, cache: core.cache) {
+            pReplace(selectedRange(), with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
         super.paste(sender)
     }
 
@@ -1808,8 +2146,85 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         insertText(text, replacementRange: selectedRange())
     }
 
+    /// Sidebar drags carry automerge urls as strings inside SwiftUI's private
+    /// pasteboard items. AppKit's legacy-filenames shim sends `path` to those
+    /// items and dies, so anything that might consult it — NSTextView's own
+    /// drag validation, NSURL reading — is kept away from text-only drags.
+    private func isTextOnlyDrag(_ sender: NSDraggingInfo) -> Bool {
+        guard (sender.draggingSource as AnyObject?) !== self else { return false }
+        let types = sender.draggingPasteboard.types ?? []
+        let hasText = types.contains { $0 == .string || $0.rawValue.contains("utf8-plain-text") }
+        let hasFiles = types.contains {
+            $0 == .fileURL || $0.rawValue == "NSFilenamesPboardType"
+        }
+        return hasText && !hasFiles
+    }
+
+    /// `string(forType:)` can come back nil for lazily-promised SwiftUI items;
+    /// asking each item for its own text types resolves them directly.
+    private func dragString(_ pasteboard: NSPasteboard) -> String? {
+        if let text = pasteboard.string(forType: .string) { return text }
+        for item in pasteboard.pasteboardItems ?? [] {
+            for type in item.types
+            where type.rawValue.contains("utf8-plain-text") || type.rawValue.contains("public.text") {
+                if let text = item.string(forType: type) { return text }
+            }
+        }
+        return nil
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if isTextOnlyDrag(sender) { return .copy }
+        return super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if isTextOnlyDrag(sender) { return .copy }
+        return super.draggingUpdated(sender)
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        if isTextOnlyDrag(sender) { return true }
+        return super.prepareForDragOperation(sender)
+    }
+
+    /// NSTextView refreshes drag previews on a timer by enumerating the items
+    /// as image URLs, which sends `path` to SwiftUI's pasteboard items and
+    /// crashes — the one AppKit entry point the other overrides don't cover.
+    override func updateDraggingItemsForDrag(_ sender: NSDraggingInfo?) {
+        if let sender, isTextOnlyDrag(sender) { return }
+        super.updateDraggingItemsForDrag(sender)
+    }
+
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        if consumeAttachment(from: sender.draggingPasteboard) { return true }
+        let pasteboard = sender.draggingPasteboard
+        if let core,
+           let text = dragString(pasteboard),
+           text.contains("automerge:") {
+            let urls = text.split(whereSeparator: \.isNewline)
+                .map(String.init)
+                .filter { $0.hasPrefix("automerge:") }
+            if !urls.isEmpty {
+                if let layoutManager, let textContainer {
+                    let point = convert(sender.draggingLocation, from: nil)
+                    let containerPoint = CGPoint(
+                        x: point.x - textContainerOrigin.x,
+                        y: point.y - textContainerOrigin.y
+                    )
+                    let index = layoutManager.characterIndex(
+                        for: containerPoint,
+                        in: textContainer,
+                        fractionOfDistanceBetweenInsertionPoints: nil
+                    )
+                    setSelectedRange(NSRange(location: min(index, textStorage?.length ?? 0), length: 0))
+                }
+                for url in urls {
+                    core.insertPatchworkEmbed(url: url, tool: nil)
+                }
+                return true
+            }
+        }
+        if consumeAttachment(from: pasteboard) { return true }
         return super.performDragOperation(sender)
     }
 
@@ -1891,8 +2306,9 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
     /// copied images; plain text still pastes as text.
     private func consumeAttachment(from pasteboard: NSPasteboard) -> Bool {
         guard let core else { return false }
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL],
-           let url = urls.first, url.isFileURL,
+        if let urlData = pasteboard.data(forType: .fileURL),
+           let url = URL(dataRepresentation: urlData, relativeTo: nil),
+           url.isFileURL,
            let data = try? Data(contentsOf: url) {
             let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
             return core.incomingData(data, fileExtension: ext, suggestedName: url.lastPathComponent)
@@ -1954,6 +2370,12 @@ struct RichTextEditor: NSViewRepresentable {
         )
         textView.core = context.coordinator.core
         layoutManager.delegate = context.coordinator
+        layoutManager.typingAttributesProvider = { [weak textView] in
+            guard let textView,
+                  textView.selectedRange().location >= (textView.textStorage?.length ?? 0)
+            else { return nil }
+            return textView.typingAttributes
+        }
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -1995,6 +2417,9 @@ struct RichTextEditor: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             core.textDidChange()
+            if core.blockAtSelection().type == "code-block" {
+                core.highlightCodeBlocks(around: core.view?.pSelectedRange.location)
+            }
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -2076,14 +2501,73 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     @objc private func handleShiftTabKey() { core?.unnestListItem() }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        if action == #selector(paste(_:)), UIPasteboard.general.hasImages {
-            return true
+        if action == #selector(paste(_:)) {
+            let pasteboard = UIPasteboard.general
+            if pasteboard.hasImages
+                || pasteboard.value(forPasteboardType: Self.spansPasteboardType) != nil
+                || pasteboard.value(forPasteboardType: RichTextClipboard.webCustomMapIdentifier) != nil
+                || pasteboard.value(forPasteboardType: RichTextClipboard.htmlTypeIdentifier) != nil
+                || pasteboard.value(forPasteboardType: RichTextClipboard.markdownTypeIdentifier) != nil {
+                return true
+            }
         }
         return super.canPerformAction(action, withSender: sender)
     }
 
+    static let spansPasteboardType = RichTextClipboard.spansTypeIdentifier
+
+    private func copySelectionAsSpans(cut: Bool) -> Bool {
+        let range = selectedRange
+        guard range.length > 0 else { return false }
+        let slice = textStorage.attributedSubstring(from: range)
+        let spans = RichText.spans(from: slice)
+        let json = SpanNode.encodeList(spans)
+        var item: [String: Any] = [
+            Self.spansPasteboardType: json,
+            RichTextClipboard.htmlTypeIdentifier: RichTextClipboard.html(from: spans),
+            RichTextClipboard.markdownTypeIdentifier: RichTextClipboard.markdown(from: spans),
+            UTType.utf8PlainText.identifier: slice.string.replacingOccurrences(of: "\u{FFFC}", with: ""),
+        ]
+        for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
+            item[type] = data
+        }
+        UIPasteboard.general.items = [item]
+        if cut {
+            pReplace(range, with: NSAttributedString())
+        }
+        return true
+    }
+
+    override func copy(_ sender: Any?) {
+        if copySelectionAsSpans(cut: false) { return }
+        super.copy(sender)
+    }
+
+    override func cut(_ sender: Any?) {
+        if copySelectionAsSpans(cut: true) { return }
+        super.cut(sender)
+    }
+
     override func paste(_ sender: Any?) {
         let pasteboard = UIPasteboard.general
+        if let value = pasteboard.value(forPasteboardType: Self.spansPasteboardType),
+           let json = (value as? String) ?? (value as? Data).flatMap({ String(data: $0, encoding: .utf8) }),
+           let core,
+           let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
+            pReplace(selectedRange, with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
+        if let mapData = pasteboard.data(forPasteboardType: RichTextClipboard.webCustomMapIdentifier),
+           let json = RichTextClipboard.spansJSON(webCustomMap: mapData, payload: {
+               pasteboard.data(forPasteboardType: $0)
+           }),
+           let core,
+           let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
+            pReplace(selectedRange, with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
         if pasteboard.hasImages, let core {
             if let data = pasteboard.data(forPasteboardType: UTType.png.identifier) {
                 if core.incomingData(data, fileExtension: "png", suggestedName: nil) { return }
@@ -2094,6 +2578,23 @@ final class EditorTextView: UITextView, EditorTextViewLike {
             if let image = pasteboard.image, let data = image.pngData() {
                 if core.incomingData(data, fileExtension: "png", suggestedName: nil) { return }
             }
+        }
+        if let value = pasteboard.value(forPasteboardType: RichTextClipboard.htmlTypeIdentifier),
+           let html = (value as? String) ?? (value as? Data).flatMap({ String(data: $0, encoding: .utf8) }),
+           let core,
+           let attributed = RichTextClipboard.attributed(fromHTML: html, cache: core.cache) {
+            pReplace(selectedRange, with: attributed)
+            core.inline.setNeedsReconcile()
+            return
+        }
+        if let markdown = pasteboard.value(forPasteboardType: RichTextClipboard.markdownTypeIdentifier)
+            .flatMap({ ($0 as? String) ?? ($0 as? Data).flatMap { String(data: $0, encoding: .utf8) } })
+            ?? pasteboard.string,
+           let core,
+           let attributed = RichTextClipboard.attributed(fromMarkdown: markdown, cache: core.cache) {
+            pReplace(selectedRange, with: attributed)
+            core.inline.setNeedsReconcile()
+            return
         }
         super.paste(sender)
     }
@@ -2135,6 +2636,12 @@ struct RichTextEditor: UIViewRepresentable {
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
         layoutManager.delegate = context.coordinator
+        layoutManager.typingAttributesProvider = { [weak textView] in
+            guard let textView,
+                  textView.selectedRange.location >= textView.textStorage.length
+            else { return nil }
+            return textView.typingAttributes
+        }
 
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -2189,6 +2696,9 @@ struct RichTextEditor: UIViewRepresentable {
 
         func textViewDidChange(_ textView: UITextView) {
             core.textDidChange()
+            if core.blockAtSelection().type == "code-block" {
+                core.highlightCodeBlocks(around: core.view?.pSelectedRange.location)
+            }
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -2224,6 +2734,8 @@ struct RichTextEditor: UIViewRepresentable {
             // If the tap landed on a live inline view (audio, table, etc.),
             // let that view handle the interaction instead of opening a sheet.
             guard !core.inline.hasLiveView(at: point) else { return }
+            // A tap in the text is a click outside every embed.
+            NotificationCenter.default.post(name: .lushDeactivateEmbeds, object: nil)
             let containerPoint = CGPoint(
                 x: point.x - textView.textContainerInset.left,
                 y: point.y - textView.textContainerInset.top
@@ -2261,74 +2773,106 @@ struct FormatAccessoryBar: View {
     let controller: EditorController
 
     var body: some View {
-        HStack(spacing: 18) {
-            Menu {
-                ForEach(EditorController.styles, id: \.key) { style in
-                    Button {
-                        controller.applyStyle(style.key)
+        HStack(spacing: 0) {
+            // Scrollable controls, like Notes: the bar holds more than fits.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 18) {
+                    Menu {
+                        ForEach(EditorController.styles, id: \.key) { style in
+                            Button {
+                                controller.applyStyle(style.key)
+                            } label: {
+                                if controller.currentStyleKey == style.key {
+                                    Label(style.label, systemImage: "checkmark")
+                                } else {
+                                    Text(style.label)
+                                }
+                            }
+                        }
                     } label: {
-                        if controller.currentStyleKey == style.key {
-                            Label(style.label, systemImage: "checkmark")
-                        } else {
-                            Text(style.label)
+                        Image(systemName: "textformat")
+                    }
+                    if controller.isCodeBlockActive {
+                        Menu {
+                            ForEach(CodeLanguage.all) { language in
+                                Button {
+                                    controller.applyCodeLanguage(language)
+                                } label: {
+                                    if controller.currentCodeLanguage == language.id {
+                                        Label(language.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(language.name)
+                                    }
+                                }
+                            }
+                        } label: {
+                            Text(CodeLanguage.named(controller.currentCodeLanguage).name)
+                                .font(.system(size: 13, weight: .medium))
                         }
                     }
-                }
-            } label: {
-                Image(systemName: "textformat")
-            }
-            Divider()
-                .frame(height: 22)
-            barButton("bold", active: controller.strongActive) {
-                controller.toggleStrong()
-            }
-            barButton("italic", active: controller.emActive) {
-                controller.toggleEm()
-            }
-            barButton("underline", active: controller.underlineActive) {
-                controller.toggleUnderline()
-            }
-            barButton("strikethrough", active: controller.strikethroughActive) {
-                controller.toggleStrikethrough()
-            }
-            barButton("chevron.left.forwardslash.chevron.right", active: controller.codeActive) {
-                controller.toggleCode()
-            }
-            barButton("textformat.superscript", active: controller.superscriptActive) {
-                controller.toggleSuperscript()
-            }
-            barButton("textformat.subscript", active: controller.subscriptActive) {
-                controller.toggleSubscript()
-            }
-            Menu {
-                ForEach(Highlight.names, id: \.self) { name in
-                    Button {
-                        controller.applyHighlight(name)
-                    } label: {
-                        if controller.highlightActive == name {
-                            Label(name.capitalized, systemImage: "checkmark")
-                        } else {
-                            Text(name.capitalized)
+                    Divider()
+                        .frame(height: 22)
+                    barButton("bold", active: controller.strongActive) {
+                        controller.toggleStrong()
+                    }
+                    barButton("italic", active: controller.emActive) {
+                        controller.toggleEm()
+                    }
+                    barButton("underline", active: controller.underlineActive) {
+                        controller.toggleUnderline()
+                    }
+                    barButton("strikethrough", active: controller.strikethroughActive) {
+                        controller.toggleStrikethrough()
+                    }
+                    barButton("chevron.left.forwardslash.chevron.right", active: controller.codeActive) {
+                        controller.toggleCode()
+                    }
+                    barButton("textformat.superscript", active: controller.superscriptActive) {
+                        controller.toggleSuperscript()
+                    }
+                    barButton("textformat.subscript", active: controller.subscriptActive) {
+                        controller.toggleSubscript()
+                    }
+                    Menu {
+                        ForEach(Highlight.names, id: \.self) { name in
+                            Button {
+                                controller.applyHighlight(name)
+                            } label: {
+                                if controller.highlightActive == name {
+                                    Label(name.capitalized, systemImage: "checkmark")
+                                } else {
+                                    Text(name.capitalized)
+                                }
+                            }
                         }
+                        Divider()
+                        Button("None") { controller.applyHighlight(nil) }
+                    } label: {
+                        Image(systemName: "highlighter")
+                            .foregroundStyle(
+                                controller.highlightActive != nil ? Color.accentColor : Color.primary
+                            )
+                    }
+                    Divider()
+                        .frame(height: 22)
+                    barButton("decrease.indent", active: false) {
+                        controller.outdent()
+                    }
+                    barButton("increase.indent", active: false) {
+                        controller.indent()
                     }
                 }
-                Divider()
-                Button("None") { controller.applyHighlight(nil) }
-            } label: {
-                Image(systemName: "highlighter")
-                    .foregroundStyle(
-                        controller.highlightActive != nil ? Color.accentColor : Color.primary
-                    )
+                .padding(.horizontal, 16)
+                .frame(maxHeight: .infinity)
             }
-            Spacer()
             Button {
                 controller.dismissKeyboard()
             } label: {
                 Image(systemName: "keyboard.chevron.compact.down")
             }
+            .padding(.horizontal, 16)
         }
         .font(.system(size: 17))
-        .padding(.horizontal, 16)
         .frame(maxHeight: .infinity)
         .background(.bar)
     }

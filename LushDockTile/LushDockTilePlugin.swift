@@ -1,0 +1,67 @@
+import AppKit
+import Foundation
+
+final class LushDockTilePlugin: NSObject, NSDockTilePlugIn {
+    private var dockTile: NSDockTile?
+
+    func setDockTile(_ dockTile: NSDockTile?) {
+        self.dockTile = dockTile
+    }
+
+    func dockMenu() -> NSMenu? {
+        let menu = NSMenu()
+        addRoute("New Note", url: "lush://new", to: menu)
+        addRoute("Open Quick Note", url: "lush://show?doc=quick", to: menu)
+        addRoute("Quick Capture", url: "lush://capture", to: menu)
+
+        let recents = loadSnapshot().recents.prefix(8)
+        if !recents.isEmpty {
+            menu.addItem(.separator())
+            for recent in recents {
+                addRoute(
+                    recent.title.isEmpty ? "Untitled" : recent.title,
+                    url: "lush://show?doc=\(recent.url.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? recent.url)",
+                    to: menu
+                )
+            }
+        }
+        return menu
+    }
+
+    private func addRoute(_ title: String, url: String, to menu: NSMenu) {
+        let item = NSMenuItem(title: title, action: #selector(openRoute(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = url
+        menu.addItem(item)
+    }
+
+    @objc private func openRoute(_ sender: NSMenuItem) {
+        guard let route = sender.representedObject as? String,
+              let url = URL(string: route) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func loadSnapshot() -> DockMenuSnapshot {
+        guard let root = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.party.chee.patchwork.lush"
+        ) else {
+            return DockMenuSnapshot(recents: [])
+        }
+        let url = root.appendingPathComponent("DockMenuSnapshot.json")
+        guard let data = try? Data(contentsOf: url),
+              let snapshot = try? JSONDecoder().decode(DockMenuSnapshot.self, from: data) else {
+            return DockMenuSnapshot(recents: [])
+        }
+        return snapshot
+    }
+}
+
+private struct DockMenuSnapshot: Codable {
+    let recents: [DockMenuRecent]
+}
+
+private struct DockMenuRecent: Codable {
+    let title: String
+    let url: String
+    let modified: TimeInterval
+}

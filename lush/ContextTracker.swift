@@ -3,6 +3,38 @@ import CoreLocation
 import MapKit
 import MediaPlayer
 
+struct SavedPlace: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var latitude: Double
+    var longitude: Double
+    var radius: Double = 150
+}
+
+enum SavedPlaces {
+    static let changed = Notification.Name("io.lush.savedPlacesChanged")
+    private static let key = "loglinePlaces"
+
+    static var all: [SavedPlace] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([SavedPlace].self, from: data)) ?? []
+    }
+
+    static func save(_ places: [SavedPlace]) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(places), forKey: key)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static func name(near loc: CLLocation) -> String? {
+        all.compactMap { place -> (name: String, distance: Double)? in
+            let center = CLLocation(latitude: place.latitude, longitude: place.longitude)
+            let distance = loc.distance(from: center)
+            return distance <= place.radius ? (place.name, distance) : nil
+        }
+        .min { $0.distance < $1.distance }?.name
+    }
+}
+
 struct ContextSnapshot: Equatable {
     var timestamp: Date = .distantPast
     var locationName: String?
@@ -10,6 +42,8 @@ struct ContextSnapshot: Equatable {
     var longitude: Double?
     var weatherDescription: String?
     var nowPlaying: String?
+    /// Values from registered providers, keyed by attribute name.
+    var extras: [String: String] = [:]
 
     func hasSubstantialChange(from previous: Self) -> Bool {
         if timestamp.timeIntervalSince(previous.timestamp) > 600 { return true }
@@ -20,8 +54,10 @@ struct ContextSnapshot: Equatable {
         } else if latitude != nil && previous.latitude == nil {
             return true
         }
+        if locationName != previous.locationName { return true }
         if weatherDescription != previous.weatherDescription { return true }
         if nowPlaying != previous.nowPlaying { return true }
+        if extras != previous.extras { return true }
         return false
     }
 }
@@ -36,6 +72,7 @@ extension BlockValue {
         if let lon = snap.longitude { attrs["lon"] = .number(lon) }
         if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
         if let s = snap.nowPlaying { attrs["now_playing"] = .string(s) }
+        for (key, value) in snap.extras { attrs[key] = .string(value) }
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
 
@@ -49,6 +86,7 @@ extension BlockValue {
             if let lon = snap.longitude { attrs["lon"] = .number(lon) }
             if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
             if let s = snap.nowPlaying { attrs["now_playing"] = .string(s) }
+            for (key, value) in snap.extras { attrs[key] = .string(value) }
         }
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
@@ -114,11 +152,16 @@ struct ContextInlineView: View {
 final class ContextTracker {
     private(set) var snapshot = ContextSnapshot()
 
+    /// Extra logline sources. Each tick asks every provider for a value; the
+    /// key becomes the context block's attribute name.
+    var providers: [String: @MainActor () -> String?] = [:]
+
     private let locationDelegate = _LocationDelegate()
     private var locationManager: CLLocationManager?
     private var monitorTask: Task<Void, Never>?
     private var lastWeatherFetch: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
+    private var lastLocation: CLLocation?
 
     init() {
         locationDelegate.owner = self
@@ -127,11 +170,12 @@ final class ContextTracker {
     func start() {
         let mgr = CLLocationManager()
         mgr.delegate = locationDelegate
-        mgr.desiredAccuracy = kCLLocationAccuracyHundredMeters
-        mgr.distanceFilter = 300
+        mgr.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+        mgr.distanceFilter = 100
         locationManager = mgr
         requestLocation()
 
+        tick()
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(60))
@@ -155,9 +199,46 @@ final class ContextTracker {
 
     private func tick() {
         updateNowPlaying()
+        var extras: [String: String] = [:]
+        for (key, provide) in providers {
+            if let value = provide() { extras[key] = value }
+        }
+        snapshot.extras = extras
         snapshot.timestamp = Date()
     }
 
+    #if os(macOS)
+    /// MPNowPlayingInfoCenter only reports this app's own playback, so ask
+    /// the players themselves. `is running` doesn't launch them.
+    private static let nowPlayingScript = NSAppleScript(source: """
+        tell application "System Events"
+            set musicRunning to (name of processes) contains "Music"
+            set spotifyRunning to (name of processes) contains "Spotify"
+        end tell
+        if musicRunning then
+            tell application "Music"
+                if player state is playing then
+                    return (get name of current track) & " – " & (get artist of current track)
+                end if
+            end tell
+        end if
+        if spotifyRunning then
+            tell application "Spotify"
+                if player state is playing then
+                    return (get name of current track) & " – " & (get artist of current track)
+                end if
+            end tell
+        end if
+        return ""
+        """)
+
+    private func updateNowPlaying() {
+        var error: NSDictionary?
+        let result = Self.nowPlayingScript?.executeAndReturnError(&error)
+        let playing = result?.stringValue ?? ""
+        snapshot.nowPlaying = playing.isEmpty ? nil : playing
+    }
+    #else
     private func updateNowPlaying() {
         let info = MPNowPlayingInfoCenter.default().nowPlayingInfo
         if let title = info?[MPMediaItemPropertyTitle] as? String, !title.isEmpty {
@@ -167,19 +248,58 @@ final class ContextTracker {
             snapshot.nowPlaying = nil
         }
     }
+    #endif
 
     func didUpdateLocation(_ loc: CLLocation) {
+        lastLocation = loc
         snapshot.latitude = loc.coordinate.latitude
         snapshot.longitude = loc.coordinate.longitude
         snapshot.timestamp = Date()
         Task {
-            if let request = MKReverseGeocodingRequest(location: loc),
-               let mapItem = try? await request.mapItems.first,
-               let addr = mapItem.addressRepresentations {
-                snapshot.locationName = addr.cityWithContext ?? addr.cityName
-            }
+            if let name = await placeName(at: loc) { snapshot.locationName = name }
             await fetchWeather(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
         }
+    }
+
+    func refreshPlaceName() {
+        guard let loc = lastLocation else { return }
+        Task {
+            if let name = await placeName(at: loc) { snapshot.locationName = name }
+        }
+    }
+
+    /// The most specific name for the spot — a saved place, a nearby business
+    /// or park, else the street — followed by the city and its region.
+    private func placeName(at loc: CLLocation) async -> String? {
+        guard let request = MKReverseGeocodingRequest(location: loc),
+              let mapItem = try? await request.mapItems.first
+        else { return nil }
+        let addr = mapItem.addressRepresentations
+        let city = addr?.cityWithContext ?? addr?.cityName
+        let street = addr?.fullAddress(includingRegion: false, singleLine: false)?
+            .split(separator: "\n").first.map(String.init)
+        let poi = mapItem.pointOfInterestCategory != nil ? mapItem.name : nil
+        var specific = SavedPlaces.name(near: loc) ?? poi
+        if specific == nil { specific = await nearbyPointOfInterest(at: loc) ?? street }
+        if let found = specific, let city, city.hasPrefix(found) { specific = nil }
+        let parts = [specific, city].compactMap { $0 }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
+    }
+
+    private func nearbyPointOfInterest(at loc: CLLocation) async -> String? {
+        guard loc.horizontalAccuracy <= 150 else { return nil }
+        let radius: CLLocationDistance = 60
+        let poi = MKLocalPointsOfInterestRequest(center: loc.coordinate, radius: radius)
+        let search = MKLocalSearch(request: poi)
+        guard let response = try? await search.start() else { return nil }
+        var nearest: (name: String, distance: CLLocationDistance)?
+        for item in response.mapItems {
+            guard let name = item.name else { continue }
+            let distance = item.location.distance(from: loc)
+            guard distance <= radius else { continue }
+            if nearest == nil || distance < nearest!.distance { nearest = (name, distance) }
+        }
+        return nearest?.name
     }
 
     func didChangeAuthorization() {

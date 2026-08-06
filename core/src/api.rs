@@ -1,4 +1,10 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use automerge::ChangeHash;
 use tokio::runtime::Runtime;
@@ -55,6 +61,17 @@ pub struct NoteSpansSnapshot {
     pub heads: Vec<String>,
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DocHistoryEntry {
+    pub hash: String,
+    pub heads: Vec<String>,
+    pub time: i64,
+    pub actor: String,
+    pub seq: u64,
+    pub message: Option<String>,
+    pub deps: Vec<String>,
+}
+
 fn encode_heads(heads: Vec<ChangeHash>) -> Vec<String> {
     heads.into_iter().map(|h| h.to_string()).collect()
 }
@@ -75,6 +92,34 @@ pub struct AssetInfo {
     pub name: String,
     pub mime_type: String,
     pub extension: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StorageChunk {
+    pub digest: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AccountState {
+    pub account_url: String,
+    pub contact_url: Option<String>,
+    pub root_folder_url: Option<String>,
+    pub config_url: Option<String>,
+    pub folders: Vec<String>,
+    pub inbox: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ContactInfo {
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ConfigState {
+    pub folders: Vec<String>,
+    pub inbox: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -122,6 +167,7 @@ pub struct Core {
 }
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+const LINK_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Core {
     fn start_index_updates(self: &Arc<Self>) {
@@ -220,7 +266,9 @@ impl Core {
                     Ok(RepoEvent::SyncEvent(msg)) => delegate.on_sync_event(msg),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("delegate missed {n} events");
-                        delegate.on_sync_event(format!("[warn] delegate missed {n} events — some updates may be delayed"));
+                        delegate.on_sync_event(format!(
+                            "[warn] delegate missed {n} events — some updates may be delayed"
+                        ));
                     }
                     Err(_) => break,
                 }
@@ -239,12 +287,49 @@ impl Core {
     }
 
     pub fn doc_change_count(&self, url: String) -> u32 {
-        let Ok(id) = DocId::from_url(&url) else { return 0 };
+        let Ok(id) = DocId::from_url(&url) else {
+            return 0;
+        };
+        self.runtime
+            .block_on(
+                self.repo
+                    .read_doc(id, |doc| Ok(doc.get_changes(&[]).len() as u32)),
+            )
+            .unwrap_or(0)
+    }
+
+    pub fn doc_history(&self, url: String) -> Vec<DocHistoryEntry> {
+        let Ok(id) = DocId::from_url(&url) else {
+            return Vec::new();
+        };
         self.runtime
             .block_on(self.repo.read_doc(id, |doc| {
-                Ok(doc.get_changes(&[]).len() as u32)
+                let mut frontier = HashSet::<ChangeHash>::new();
+                let entries = doc
+                    .get_changes_meta(&[])
+                    .into_iter()
+                    .map(|change| {
+                        for dep in &change.deps {
+                            frontier.remove(dep);
+                        }
+                        frontier.insert(change.hash);
+                        let mut heads: Vec<String> =
+                            frontier.iter().map(ToString::to_string).collect();
+                        heads.sort();
+                        DocHistoryEntry {
+                            hash: change.hash.to_string(),
+                            heads,
+                            time: change.timestamp,
+                            actor: change.actor.to_string(),
+                            seq: change.seq,
+                            message: change.message.map(|message| message.into_owned()),
+                            deps: change.deps.into_iter().map(|dep| dep.to_string()).collect(),
+                        }
+                    })
+                    .collect();
+                Ok(entries)
             }))
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -255,6 +340,32 @@ impl Core {
     /// Webviews connect here to sync against the core's own storage.
     pub fn local_server_port(&self) -> Option<u16> {
         self.repo.local_server_port()
+    }
+
+    pub fn iroh_node_id(&self) -> Option<String> {
+        self.repo.iroh_node_id()
+    }
+
+    pub fn local_http_url(&self) -> Option<String> {
+        self.repo.local_http_url()
+    }
+
+    pub fn add_iroh_peer(&self, node_id: String) -> Result<(), CoreError> {
+        let repo = self.repo.clone();
+        self.runtime
+            .block_on(async move { repo.add_iroh_peer(node_id).await })?;
+        Ok(())
+    }
+
+    pub fn doc_storage_chunks(&self, url: String) -> Vec<StorageChunk> {
+        let Ok(id) = DocId::from_url(&url) else {
+            return Vec::new();
+        };
+        self.runtime
+            .block_on(self.repo.doc_chunks(id))
+            .into_iter()
+            .map(|(digest, bytes)| StorageChunk { digest, bytes })
+            .collect()
     }
 
     /// Open an existing folder doc (waiting for it to arrive if needed) or
@@ -464,6 +575,192 @@ impl Core {
     }
 
     /// Rename a doc and its entry inside a specific folder doc.
+    /// Log in with a patchwork account doc: syncs it, ensures the lush config
+    /// doc exists at `.tools.lush`, and on first login creates the
+    /// "🍡 Lush notes" folder inside the account's root folder, seeding
+    /// `.folders` and `.inbox` with it.
+    pub fn login_account(&self, account_url: String) -> Result<AccountState, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let state = self.runtime.block_on(async move {
+                let account = DocId::from_url(&account_url)?;
+                repo.ensure_doc(account).await?;
+                if !repo.wait_for_doc(account, OPEN_TIMEOUT).await {
+                    anyhow::bail!("account doc not found locally or on the server");
+                }
+                let (contact_url, root_folder_url, mut config_url) = repo
+                    .read_doc(account, |doc| {
+                        Ok((
+                            shapes::account_field(doc, "contactUrl"),
+                            shapes::account_field(doc, "rootFolderUrl"),
+                            shapes::account_tools_lush(doc),
+                        ))
+                    })
+                    .await?;
+                if config_url.is_none() {
+                    let created = repo.create_doc(shapes::init_lush_config).await?;
+                    let url = created.to_url();
+                    repo.change_doc(account, |doc| shapes::set_account_tools_lush(doc, &url))
+                        .await?;
+                    config_url = Some(url);
+                }
+                let config_url = config_url.expect("config url ensured above");
+                let config = DocId::from_url(&config_url)?;
+                repo.ensure_doc(config).await?;
+                let _ = repo.wait_for_doc(config, LINK_TIMEOUT).await;
+                let (mut folders, mut inbox) = repo
+                    .read_doc(config, |doc| {
+                        Ok((shapes::config_folders(doc), shapes::config_inbox(doc)))
+                    })
+                    .await?;
+                if folders.is_empty() {
+                    if let Some(root_url) = &root_folder_url {
+                        let root = DocId::from_url(root_url)?;
+                        repo.ensure_doc(root).await?;
+                        if repo.wait_for_doc(root, OPEN_TIMEOUT).await {
+                            let title = "🍡 Lush notes".to_string();
+                            let sub = repo
+                                .create_doc(|doc| shapes::init_folder(doc, &title))
+                                .await?;
+                            repo.change_doc(root, |doc| {
+                                shapes::add_folder_entry(
+                                    doc,
+                                    &shapes::DocLink {
+                                        name: title.clone(),
+                                        kind: "folder".into(),
+                                        url: sub.to_url(),
+                                        lush: None,
+                                    },
+                                )
+                            })
+                            .await?;
+                            folders = vec![sub.to_url()];
+                            inbox = Some(sub.to_url());
+                            let urls = folders.clone();
+                            let inbox_url = sub.to_url();
+                            repo.change_doc(config, move |doc| {
+                                shapes::config_set_folders(doc, &urls)?;
+                                shapes::config_set_inbox(doc, &inbox_url)
+                            })
+                            .await?;
+                        }
+                    }
+                } else if inbox.is_none() {
+                    inbox = folders.first().cloned();
+                    if let Some(inbox_url) = inbox.clone() {
+                        repo.change_doc(config, move |doc| {
+                            shapes::config_set_inbox(doc, &inbox_url)
+                        })
+                        .await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(AccountState {
+                    account_url: account_url.clone(),
+                    contact_url,
+                    root_folder_url,
+                    config_url: Some(config_url),
+                    folders,
+                    inbox,
+                })
+            })?;
+            Ok(state)
+        })
+    }
+
+    pub fn contact_info(&self, url: String) -> Option<ContactInfo> {
+        let id = DocId::from_url(&url).ok()?;
+        let repo = self.repo.clone();
+        self.runtime.block_on(async move {
+            let _ = repo.ensure_doc(id).await;
+            if !repo.wait_for_doc(id, LINK_TIMEOUT).await {
+                return None;
+            }
+            repo.read_doc(id, |doc| {
+                Ok(ContactInfo {
+                    name: shapes::doc_field(doc, "name"),
+                    avatar_url: shapes::account_field(doc, "avatarUrl"),
+                })
+            })
+            .await
+            .ok()
+        })
+    }
+
+    pub fn config_state(&self, config_url: String) -> Option<ConfigState> {
+        let id = DocId::from_url(&config_url).ok()?;
+        let repo = self.repo.clone();
+        self.runtime.block_on(async move {
+            repo.read_doc(id, |doc| {
+                Ok(ConfigState {
+                    folders: shapes::config_folders(doc),
+                    inbox: shapes::config_inbox(doc),
+                })
+            })
+            .await
+            .ok()
+        })
+    }
+
+    pub fn set_config_folders(
+        &self,
+        config_url: String,
+        urls: Vec<String>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| shapes::config_set_folders(doc, &urls))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_config_inbox(&self, config_url: String, url: String) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| shapes::config_set_inbox(doc, &url))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Fix a folder entry whose name or type drifted from the doc it points
+    /// at — runs when the doc is opened, so stale entries heal over time.
+    pub fn refresh_folder_entry(&self, folder_url: String, url: String) {
+        let repo = self.repo.clone();
+        self.runtime.spawn(async move {
+            let (Ok(folder), Ok(id)) = (DocId::from_url(&folder_url), DocId::from_url(&url)) else {
+                return;
+            };
+            if !repo.wait_for_doc(id, LINK_TIMEOUT).await {
+                return;
+            }
+            let Ok((name, kind)) = repo
+                .read_doc(id, |doc| {
+                    Ok((
+                        shapes::doc_title(doc),
+                        shapes::doc_patchwork_type(doc).unwrap_or_default(),
+                    ))
+                })
+                .await
+            else {
+                return;
+            };
+            let _ = repo
+                .change_doc(folder, |doc| {
+                    shapes::refresh_folder_entry(doc, &url, &name, &kind)
+                })
+                .await;
+        });
+    }
+
     pub fn rename_entry(
         &self,
         folder_url: String,
@@ -563,6 +860,9 @@ impl Core {
 
     /// Link a note into the current folder. The folder doc is loaded from
     /// local storage on demand if not already in memory.
+    /// The folder entry's name and type come from the doc itself when the
+    /// caller has none — picker-created patchwork docs arrive here with no
+    /// title, and their type is whatever their datatype says, not "rich".
     pub fn link_note_to_folder(&self, note_url: String, title: String) -> Result<(), CoreError> {
         let folder = self
             .folder
@@ -573,12 +873,32 @@ impl Core {
             })?;
         let repo = self.repo.clone();
         self.runtime.block_on(async move {
+            let mut name = title;
+            let mut kind = "rich".to_string();
+            if let Ok(id) = DocId::from_url(&note_url) {
+                let _ = repo.ensure_doc(id).await;
+                if repo.wait_for_doc(id, LINK_TIMEOUT).await {
+                    if let Ok((doc_name, doc_kind)) = repo
+                        .read_doc(id, |doc| {
+                            Ok((shapes::doc_title(doc), shapes::doc_patchwork_type(doc)))
+                        })
+                        .await
+                    {
+                        if name.is_empty() {
+                            name = doc_name;
+                        }
+                        if let Some(doc_kind) = doc_kind {
+                            kind = doc_kind;
+                        }
+                    }
+                }
+            }
             repo.change_doc(folder, |doc| {
                 shapes::add_folder_entry(
                     doc,
                     &shapes::DocLink {
-                        name: title,
-                        kind: "rich".into(),
+                        name,
+                        kind,
                         url: note_url,
                         lush: None,
                     },
@@ -823,6 +1143,37 @@ impl Core {
             .run(async move {
                 let id = DocId::from_url(&url)?;
                 repo.read_doc(id, |doc| {
+                    let spans = shapes::spans_to_json(doc)?;
+                    Ok::<_, anyhow::Error>(NoteSpansSnapshot {
+                        spans_json: serde_json::to_string(&spans)?,
+                        heads: encode_heads(doc.get_heads()),
+                    })
+                })
+                .await
+            })
+            .await??;
+        Ok(snapshot)
+    }
+
+    pub async fn note_spans_snapshot_at(
+        &self,
+        url: String,
+        heads: Vec<String>,
+    ) -> Result<NoteSpansSnapshot, CoreError> {
+        let repo = self.repo.clone();
+        let heads = decode_heads(heads)?;
+        let snapshot = self
+            .run(async move {
+                let id = DocId::from_url(&url)?;
+                repo.read_doc(id, |doc| {
+                    let current_heads = doc.get_heads();
+                    let view;
+                    let doc = if heads.is_empty() || current_heads == heads {
+                        doc
+                    } else {
+                        view = doc.fork_at(&heads)?;
+                        &view
+                    };
                     let spans = shapes::spans_to_json(doc)?;
                     Ok::<_, anyhow::Error>(NoteSpansSnapshot {
                         spans_json: serde_json::to_string(&spans)?,

@@ -571,6 +571,8 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol CoreProtocol: AnyObject, Sendable {
     
+    func addIrohPeer(nodeId: String) throws 
+    
     func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String]) throws  -> [String]
     
     func assetBytes(url: String) async throws  -> Data
@@ -584,6 +586,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * analyzer to backfill. Only images will actually yield anything.
      */
     func assetsWithoutVision(limit: UInt32)  -> [String]
+    
+    func configState(configUrl: String)  -> ConfigState?
+    
+    func contactInfo(url: String)  -> ContactInfo?
     
     /**
      * Store binary data as a patchwork UnixFileEntry doc; returns its URL.
@@ -625,6 +631,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func docHeads(url: String) async  -> [String]
     
+    func docHistory(url: String)  -> [DocHistoryEntry]
+    
+    func docStorageChunks(url: String)  -> [StorageChunk]
+    
     /**
      * Open an existing folder doc (waiting for it to arrive if needed) or
      * create a fresh one. Returns the folder's automerge URL.
@@ -640,21 +650,37 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func folderUrl()  -> String?
     
+    func irohNodeId()  -> String?
+    
     func isConnected()  -> Bool
     
     /**
      * Link a note into the current folder. The folder doc is loaded from
      * local storage on demand if not already in memory.
+     * The folder entry's name and type come from the doc itself when the
+     * caller has none — picker-created patchwork docs arrive here with no
+     * title, and their type is whatever their datatype says, not "rich".
      */
     func linkNoteToFolder(noteUrl: String, title: String) throws 
     
     func listNotes() async  -> [NoteInfo]
+    
+    func localHttpUrl()  -> String?
     
     /**
      * Port of the loopback subduction listener the core hosts, if it bound.
      * Webviews connect here to sync against the core's own storage.
      */
     func localServerPort()  -> UInt16?
+    
+    /**
+     * Rename a doc and its entry inside a specific folder doc.
+     * Log in with a patchwork account doc: syncs it, ensures the lush config
+     * doc exists at `.tools.lush`, and on first login creates the
+     * "🍡 Lush notes" folder inside the account's root folder, seeding
+     * `.folders` and `.inbox` with it.
+     */
+    func loginAccount(accountUrl: String) throws  -> AccountState
     
     /**
      * Record that the analyzer has looked at this asset, so a fruitless one
@@ -689,6 +715,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func noteSpansSnapshot(url: String) async throws  -> NoteSpansSnapshot
     
+    func noteSpansSnapshotAt(url: String, heads: [String]) async throws  -> NoteSpansSnapshot
+    
     /**
      * Bytes of the first embedded image in a note, if the asset is already
      * held locally. Returns None without any network I/O.
@@ -717,15 +745,18 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func recentNotes(limit: UInt32)  -> [RecentNote]
     
     /**
+     * Fix a folder entry whose name or type drifted from the doc it points
+     * at — runs when the doc is opened, so stale entries heal over time.
+     */
+    func refreshFolderEntry(folderUrl: String, url: String) 
+    
+    /**
      * Remove an entry from a specific folder doc.
      */
     func removeEntry(folderUrl: String, url: String) throws 
     
     func removeNoteEmbeddings(url: String) 
     
-    /**
-     * Rename a doc and its entry inside a specific folder doc.
-     */
     func renameEntry(folderUrl: String, url: String, title: String) throws 
     
     func renameNote(url: String, title: String) throws 
@@ -742,6 +773,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Notes whose closest passage is nearest `vector`, best first.
      */
     func semanticSearch(vector: [Float], limit: UInt32, excluding: [String])  -> [SearchHit]
+    
+    func setConfigFolders(configUrl: String, urls: [String]) throws 
+    
+    func setConfigInbox(configUrl: String, url: String) throws 
     
     func setDelegate(delegate: CoreDelegate) 
     
@@ -840,6 +875,13 @@ public convenience init(dataDir: String, serverUrl: String?)throws  {
     
 
     
+open func addIrohPeer(nodeId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_add_iroh_peer(self.uniffiClonePointer(),
+        FfiConverterString.lower(nodeId),$0
+    )
+}
+}
+    
 open func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String])throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_apply_note_mark(self.uniffiClonePointer(),
@@ -895,6 +937,22 @@ open func assetsWithoutVision(limit: UInt32) -> [String]  {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_assets_without_vision(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+open func configState(configUrl: String) -> ConfigState?  {
+    return try!  FfiConverterOptionTypeConfigState.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_config_state(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),$0
+    )
+})
+}
+    
+open func contactInfo(url: String) -> ContactInfo?  {
+    return try!  FfiConverterOptionTypeContactInfo.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_contact_info(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
     )
 })
 }
@@ -1014,6 +1072,22 @@ open func docHeads(url: String)async  -> [String]  {
         )
 }
     
+open func docHistory(url: String) -> [DocHistoryEntry]  {
+    return try!  FfiConverterSequenceTypeDocHistoryEntry.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_doc_history(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+open func docStorageChunks(url: String) -> [StorageChunk]  {
+    return try!  FfiConverterSequenceTypeStorageChunk.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_doc_storage_chunks(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
     /**
      * Open an existing folder doc (waiting for it to arrive if needed) or
      * create a fresh one. Returns the folder's automerge URL.
@@ -1072,6 +1146,13 @@ open func folderUrl() -> String?  {
 })
 }
     
+open func irohNodeId() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_iroh_node_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func isConnected() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_is_connected(self.uniffiClonePointer(),$0
@@ -1082,6 +1163,9 @@ open func isConnected() -> Bool  {
     /**
      * Link a note into the current folder. The folder doc is loaded from
      * local storage on demand if not already in memory.
+     * The folder entry's name and type come from the doc itself when the
+     * caller has none — picker-created patchwork docs arrive here with no
+     * title, and their type is whatever their datatype says, not "rich".
      */
 open func linkNoteToFolder(noteUrl: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_link_note_to_folder(self.uniffiClonePointer(),
@@ -1109,6 +1193,13 @@ open func listNotes()async  -> [NoteInfo]  {
         )
 }
     
+open func localHttpUrl() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_local_http_url(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
     /**
      * Port of the loopback subduction listener the core hosts, if it bound.
      * Webviews connect here to sync against the core's own storage.
@@ -1116,6 +1207,21 @@ open func listNotes()async  -> [NoteInfo]  {
 open func localServerPort() -> UInt16?  {
     return try!  FfiConverterOptionUInt16.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_local_server_port(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Rename a doc and its entry inside a specific folder doc.
+     * Log in with a patchwork account doc: syncs it, ensures the lush config
+     * doc exists at `.tools.lush`, and on first login creates the
+     * "🍡 Lush notes" folder inside the account's root folder, seeding
+     * `.folders` and `.inbox` with it.
+     */
+open func loginAccount(accountUrl: String)throws  -> AccountState  {
+    return try  FfiConverterTypeAccountState_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_login_account(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountUrl),$0
     )
 })
 }
@@ -1228,6 +1334,23 @@ open func noteSpansSnapshot(url: String)async throws  -> NoteSpansSnapshot  {
         )
 }
     
+open func noteSpansSnapshotAt(url: String, heads: [String])async throws  -> NoteSpansSnapshot  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_note_spans_snapshot_at(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url),FfiConverterSequenceString.lower(heads)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeNoteSpansSnapshot_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
     /**
      * Bytes of the first embedded image in a note, if the asset is already
      * held locally. Returns None without any network I/O.
@@ -1314,6 +1437,18 @@ open func recentNotes(limit: UInt32) -> [RecentNote]  {
 }
     
     /**
+     * Fix a folder entry whose name or type drifted from the doc it points
+     * at — runs when the doc is opened, so stale entries heal over time.
+     */
+open func refreshFolderEntry(folderUrl: String, url: String)  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_refresh_folder_entry(self.uniffiClonePointer(),
+        FfiConverterString.lower(folderUrl),
+        FfiConverterString.lower(url),$0
+    )
+}
+}
+    
+    /**
      * Remove an entry from a specific folder doc.
      */
 open func removeEntry(folderUrl: String, url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -1331,9 +1466,6 @@ open func removeNoteEmbeddings(url: String)  {try! rustCall() {
 }
 }
     
-    /**
-     * Rename a doc and its entry inside a specific folder doc.
-     */
 open func renameEntry(folderUrl: String, url: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_rename_entry(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
@@ -1381,6 +1513,22 @@ open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String]) ->
         FfiConverterSequenceString.lower(excluding),$0
     )
 })
+}
+    
+open func setConfigFolders(configUrl: String, urls: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_folders(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterSequenceString.lower(urls),$0
+    )
+}
+}
+    
+open func setConfigInbox(configUrl: String, url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_inbox(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterString.lower(url),$0
+    )
+}
 }
     
 open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
@@ -1525,6 +1673,108 @@ public func FfiConverterTypeCore_lower(_ value: Core) -> UnsafeMutableRawPointer
 }
 
 
+
+
+public struct AccountState {
+    public var accountUrl: String
+    public var contactUrl: String?
+    public var rootFolderUrl: String?
+    public var configUrl: String?
+    public var folders: [String]
+    public var inbox: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(accountUrl: String, contactUrl: String?, rootFolderUrl: String?, configUrl: String?, folders: [String], inbox: String?) {
+        self.accountUrl = accountUrl
+        self.contactUrl = contactUrl
+        self.rootFolderUrl = rootFolderUrl
+        self.configUrl = configUrl
+        self.folders = folders
+        self.inbox = inbox
+    }
+}
+
+#if compiler(>=6)
+extension AccountState: Sendable {}
+#endif
+
+
+extension AccountState: Equatable, Hashable {
+    public static func ==(lhs: AccountState, rhs: AccountState) -> Bool {
+        if lhs.accountUrl != rhs.accountUrl {
+            return false
+        }
+        if lhs.contactUrl != rhs.contactUrl {
+            return false
+        }
+        if lhs.rootFolderUrl != rhs.rootFolderUrl {
+            return false
+        }
+        if lhs.configUrl != rhs.configUrl {
+            return false
+        }
+        if lhs.folders != rhs.folders {
+            return false
+        }
+        if lhs.inbox != rhs.inbox {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(accountUrl)
+        hasher.combine(contactUrl)
+        hasher.combine(rootFolderUrl)
+        hasher.combine(configUrl)
+        hasher.combine(folders)
+        hasher.combine(inbox)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountState {
+        return
+            try AccountState(
+                accountUrl: FfiConverterString.read(from: &buf), 
+                contactUrl: FfiConverterOptionString.read(from: &buf), 
+                rootFolderUrl: FfiConverterOptionString.read(from: &buf), 
+                configUrl: FfiConverterOptionString.read(from: &buf), 
+                folders: FfiConverterSequenceString.read(from: &buf), 
+                inbox: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AccountState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.accountUrl, into: &buf)
+        FfiConverterOptionString.write(value.contactUrl, into: &buf)
+        FfiConverterOptionString.write(value.rootFolderUrl, into: &buf)
+        FfiConverterOptionString.write(value.configUrl, into: &buf)
+        FfiConverterSequenceString.write(value.folders, into: &buf)
+        FfiConverterOptionString.write(value.inbox, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountState_lift(_ buf: RustBuffer) throws -> AccountState {
+    return try FfiConverterTypeAccountState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountState_lower(_ value: AccountState) -> RustBuffer {
+    return FfiConverterTypeAccountState.lower(value)
+}
 
 
 public struct AssetInfo {
@@ -1672,6 +1922,256 @@ public func FfiConverterTypeAssetVision_lift(_ buf: RustBuffer) throws -> AssetV
 #endif
 public func FfiConverterTypeAssetVision_lower(_ value: AssetVision) -> RustBuffer {
     return FfiConverterTypeAssetVision.lower(value)
+}
+
+
+public struct ConfigState {
+    public var folders: [String]
+    public var inbox: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(folders: [String], inbox: String?) {
+        self.folders = folders
+        self.inbox = inbox
+    }
+}
+
+#if compiler(>=6)
+extension ConfigState: Sendable {}
+#endif
+
+
+extension ConfigState: Equatable, Hashable {
+    public static func ==(lhs: ConfigState, rhs: ConfigState) -> Bool {
+        if lhs.folders != rhs.folders {
+            return false
+        }
+        if lhs.inbox != rhs.inbox {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(folders)
+        hasher.combine(inbox)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConfigState {
+        return
+            try ConfigState(
+                folders: FfiConverterSequenceString.read(from: &buf), 
+                inbox: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConfigState, into buf: inout [UInt8]) {
+        FfiConverterSequenceString.write(value.folders, into: &buf)
+        FfiConverterOptionString.write(value.inbox, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConfigState_lift(_ buf: RustBuffer) throws -> ConfigState {
+    return try FfiConverterTypeConfigState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConfigState_lower(_ value: ConfigState) -> RustBuffer {
+    return FfiConverterTypeConfigState.lower(value)
+}
+
+
+public struct ContactInfo {
+    public var name: String
+    public var avatarUrl: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, avatarUrl: String?) {
+        self.name = name
+        self.avatarUrl = avatarUrl
+    }
+}
+
+#if compiler(>=6)
+extension ContactInfo: Sendable {}
+#endif
+
+
+extension ContactInfo: Equatable, Hashable {
+    public static func ==(lhs: ContactInfo, rhs: ContactInfo) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.avatarUrl != rhs.avatarUrl {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(avatarUrl)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactInfo {
+        return
+            try ContactInfo(
+                name: FfiConverterString.read(from: &buf), 
+                avatarUrl: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.avatarUrl, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactInfo_lift(_ buf: RustBuffer) throws -> ContactInfo {
+    return try FfiConverterTypeContactInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactInfo_lower(_ value: ContactInfo) -> RustBuffer {
+    return FfiConverterTypeContactInfo.lower(value)
+}
+
+
+public struct DocHistoryEntry {
+    public var hash: String
+    public var heads: [String]
+    public var time: Int64
+    public var actor: String
+    public var seq: UInt64
+    public var message: String?
+    public var deps: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hash: String, heads: [String], time: Int64, actor: String, seq: UInt64, message: String?, deps: [String]) {
+        self.hash = hash
+        self.heads = heads
+        self.time = time
+        self.actor = actor
+        self.seq = seq
+        self.message = message
+        self.deps = deps
+    }
+}
+
+#if compiler(>=6)
+extension DocHistoryEntry: Sendable {}
+#endif
+
+
+extension DocHistoryEntry: Equatable, Hashable {
+    public static func ==(lhs: DocHistoryEntry, rhs: DocHistoryEntry) -> Bool {
+        if lhs.hash != rhs.hash {
+            return false
+        }
+        if lhs.heads != rhs.heads {
+            return false
+        }
+        if lhs.time != rhs.time {
+            return false
+        }
+        if lhs.actor != rhs.actor {
+            return false
+        }
+        if lhs.seq != rhs.seq {
+            return false
+        }
+        if lhs.message != rhs.message {
+            return false
+        }
+        if lhs.deps != rhs.deps {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(hash)
+        hasher.combine(heads)
+        hasher.combine(time)
+        hasher.combine(actor)
+        hasher.combine(seq)
+        hasher.combine(message)
+        hasher.combine(deps)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDocHistoryEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DocHistoryEntry {
+        return
+            try DocHistoryEntry(
+                hash: FfiConverterString.read(from: &buf), 
+                heads: FfiConverterSequenceString.read(from: &buf), 
+                time: FfiConverterInt64.read(from: &buf), 
+                actor: FfiConverterString.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf), 
+                message: FfiConverterOptionString.read(from: &buf), 
+                deps: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DocHistoryEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterSequenceString.write(value.heads, into: &buf)
+        FfiConverterInt64.write(value.time, into: &buf)
+        FfiConverterString.write(value.actor, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+        FfiConverterOptionString.write(value.message, into: &buf)
+        FfiConverterSequenceString.write(value.deps, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDocHistoryEntry_lift(_ buf: RustBuffer) throws -> DocHistoryEntry {
+    return try FfiConverterTypeDocHistoryEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDocHistoryEntry_lower(_ value: DocHistoryEntry) -> RustBuffer {
+    return FfiConverterTypeDocHistoryEntry.lower(value)
 }
 
 
@@ -2059,6 +2559,76 @@ public func FfiConverterTypeSearchHit_lower(_ value: SearchHit) -> RustBuffer {
 }
 
 
+public struct StorageChunk {
+    public var digest: String
+    public var bytes: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(digest: String, bytes: Data) {
+        self.digest = digest
+        self.bytes = bytes
+    }
+}
+
+#if compiler(>=6)
+extension StorageChunk: Sendable {}
+#endif
+
+
+extension StorageChunk: Equatable, Hashable {
+    public static func ==(lhs: StorageChunk, rhs: StorageChunk) -> Bool {
+        if lhs.digest != rhs.digest {
+            return false
+        }
+        if lhs.bytes != rhs.bytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(digest)
+        hasher.combine(bytes)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStorageChunk: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StorageChunk {
+        return
+            try StorageChunk(
+                digest: FfiConverterString.read(from: &buf), 
+                bytes: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StorageChunk, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.digest, into: &buf)
+        FfiConverterData.write(value.bytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStorageChunk_lift(_ buf: RustBuffer) throws -> StorageChunk {
+    return try FfiConverterTypeStorageChunk.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStorageChunk_lower(_ value: StorageChunk) -> RustBuffer {
+    return FfiConverterTypeStorageChunk.lower(value)
+}
+
+
 public enum CoreError: Swift.Error {
 
     
@@ -2425,6 +2995,54 @@ fileprivate struct FfiConverterOptionTypeAssetVision: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeConfigState: FfiConverterRustBuffer {
+    typealias SwiftType = ConfigState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeConfigState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeConfigState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeContactInfo: FfiConverterRustBuffer {
+    typealias SwiftType = ContactInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeContactInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeContactInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
     typealias SwiftType = [Float]
 
@@ -2467,6 +3085,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeDocHistoryEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [DocHistoryEntry]
+
+    public static func write(_ value: [DocHistoryEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDocHistoryEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DocHistoryEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DocHistoryEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDocHistoryEntry.read(from: &buf))
         }
         return seq
     }
@@ -2575,6 +3218,31 @@ fileprivate struct FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeStorageChunk: FfiConverterRustBuffer {
+    typealias SwiftType = [StorageChunk]
+
+    public static func write(_ value: [StorageChunk], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeStorageChunk.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StorageChunk] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [StorageChunk]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeStorageChunk.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
     public static func write(_ value: [String: String], into buf: inout [UInt8]) {
         let len = Int32(value.count)
@@ -2659,6 +3327,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_add_iroh_peer() != 53581) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_apply_note_mark() != 29508) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2672,6 +3343,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_assets_without_vision() != 63793) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_config_state() != 45575) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_contact_info() != 36844) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_asset() != 18937) {
@@ -2704,6 +3381,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_doc_heads() != 15047) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_doc_history() != 37101) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_doc_storage_chunks() != 51003) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_ensure_folder() != 6376) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2716,16 +3399,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_folder_url() != 41616) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_iroh_node_id() != 63944) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_is_connected() != 16465) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 10426) {
+    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 60899) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_list_notes() != 11889) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_local_http_url() != 6170) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_local_server_port() != 63802) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_login_account() != 1192) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_mark_vision_attempted() != 8028) {
@@ -2752,6 +3444,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_note_spans_snapshot() != 29041) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_note_spans_snapshot_at() != 16836) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_note_thumbnail_bytes() != 51892) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2767,13 +3462,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_recent_notes() != 1475) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_refresh_folder_entry() != 57229) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_remove_entry() != 62609) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_remove_note_embeddings() != 44705) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_rename_entry() != 44827) {
+    if (uniffi_lush_core_checksum_method_core_rename_entry() != 36269) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_rename_note() != 13351) {
@@ -2786,6 +3484,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_semantic_search() != 9002) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_folders() != 33231) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_inbox() != 3370) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {

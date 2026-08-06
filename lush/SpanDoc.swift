@@ -140,6 +140,11 @@ struct BlockValue: Codable, Equatable {
         type == "todo-list-item" && attrs["checked"]?.boolValue == true
     }
 
+    var codeLanguage: String {
+        guard type == "code-block" else { return CodeLanguage.plain.id }
+        return CodeLanguage.named(attrs["language"]?.stringValue).id
+    }
+
     static func todo(checked: Bool) -> BlockValue {
         BlockValue(type: "todo-list-item", attrs: checked ? ["checked": .bool(true)] : [:])
     }
@@ -332,7 +337,7 @@ final class FittingImageAttachment: NSTextAttachment {
 }
 
 final class BlockBox: NSObject {
-    let value: BlockValue
+    var value: BlockValue
     init(_ value: BlockValue) { self.value = value }
 
     override func isEqual(_ object: Any?) -> Bool {

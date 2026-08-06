@@ -224,6 +224,17 @@ final class InlineViewManager {
                 retained: retained
             )
         }
+        // A block type this app doesn't know (pasted from another automerge
+        // app, or from a newer lush) still renders as a chip — never as
+        // invisible space — and round-trips untouched.
+        if block.type != "embed" {
+            let (view, _, retained) = makeHosting(UnknownBlockView(block: block))
+            return Host(
+                view: view,
+                preferredSize: { width in CGSize(width: min(320, width), height: 44) },
+                retained: retained
+            )
+        }
         guard let url = block.embedUrl else { return nil }
         if core.isPatchworkDoc(url) {
             let (view, _, retained) = makeHosting(PatchworkBoxView(
@@ -234,11 +245,19 @@ final class InlineViewManager {
                 },
                 onRemove: { [weak core] in
                     core?.removeEmbed(box)
+                },
+                onResize: { [weak core] width, height, commit in
+                    core?.updateEmbedSize(box, width: width, height: height, commit: commit)
                 }
             ))
             return Host(
                 view: view,
-                preferredSize: { width in CGSize(width: min(460, width), height: 300) },
+                preferredSize: { width in
+                    CGSize(
+                        width: min(box.value.attrs["width"]?.doubleValue ?? 460, width),
+                        height: box.value.attrs["height"]?.doubleValue ?? 300
+                    )
+                },
                 retained: retained
             )
         }
@@ -395,5 +414,32 @@ struct TableInlineView: View {
         box.grid = grid
         box.raw = nil
         onEdit()
+    }
+}
+
+struct UnknownBlockView: View {
+    let block: BlockValue
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "questionmark.square.dashed")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(block.type)
+                    .font(.caption)
+                if let url = block.embedUrl {
+                    Text(url)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .background(.background)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator))
     }
 }

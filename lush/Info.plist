@@ -14,6 +14,8 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleDisplayName</key>
 	<string>Lush Notes</string>
+	<key>NSDockTilePlugIn</key>
+	<string>LushDockTile</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Attaches your location to notes as context.</string>
 	<key>CFBundleURLTypes</key>
@@ -26,8 +28,45 @@
 				<string>lush</string>
 			</array>
 		</dict>
-	</array>
-	<key>UILaunchScreen</key>
-	<dict/>
+		</array>
+		<key>NSUserActivityTypes</key>
+		<array>
+			<string>com.apple.corespotlightitem</string>
+		</array>
+		<key>NSServices</key>
+		<array>
+			<dict>
+				<key>NSMenuItem</key>
+				<dict>
+					<key>default</key>
+					<string>Add to Lush Quick Note</string>
+				</dict>
+				<key>NSMessage</key>
+				<string>addSelectionToQuickNote</string>
+				<key>NSSendTypes</key>
+				<array>
+					<string>NSStringPboardType</string>
+					<string>public.utf8-plain-text</string>
+				</array>
+			</dict>
+			<dict>
+				<key>NSMenuItem</key>
+				<dict>
+					<key>default</key>
+					<string>Import into Lush</string>
+				</dict>
+				<key>NSMessage</key>
+				<string>importSelectionIntoLush</string>
+				<key>NSSendTypes</key>
+				<array>
+					<string>NSStringPboardType</string>
+					<string>NSFilenamesPboardType</string>
+					<string>public.file-url</string>
+					<string>public.utf8-plain-text</string>
+				</array>
+			</dict>
+		</array>
+		<key>UILaunchScreen</key>
+		<dict/>
 </dict>
 </plist>

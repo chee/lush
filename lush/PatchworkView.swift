@@ -71,11 +71,38 @@ enum PatchworkWeb {
     @MainActor
     static func setModuleUrls(_ urls: [String]) {
         UserDefaults.standard.set(urls, forKey: moduleUrlsKey)
-        PatchworkViewPool.shared.invalidateIdle()
     }
 
     @MainActor
     static var coreServerPort: UInt16?
+
+    private static let lastToolsKey = "patchworkLastTools"
+
+    @MainActor
+    static func lastTool(for url: String) -> String? {
+        (UserDefaults.standard.dictionary(forKey: lastToolsKey) as? [String: String])?[url]
+    }
+
+    @MainActor
+    static func setLastTool(_ tool: String?, for url: String) {
+        var tools = UserDefaults.standard.dictionary(forKey: lastToolsKey) as? [String: String] ?? [:]
+        tools[url] = tool
+        UserDefaults.standard.set(tools, forKey: lastToolsKey)
+    }
+
+    private static let lastToolsByTypeKey = "patchworkLastToolsByType"
+
+    @MainActor
+    static func lastTool(forType kind: String) -> String? {
+        (UserDefaults.standard.dictionary(forKey: lastToolsByTypeKey) as? [String: String])?[kind]
+    }
+
+    @MainActor
+    static func setLastTool(_ tool: String?, forType kind: String) {
+        var tools = UserDefaults.standard.dictionary(forKey: lastToolsByTypeKey) as? [String: String] ?? [:]
+        tools[kind] = tool
+        UserDefaults.standard.set(tools, forKey: lastToolsByTypeKey)
+    }
 
     @MainActor
     static var configScriptTag: String {
@@ -167,10 +194,6 @@ enum PatchworkWeb {
     """#
 
     static let shellJS = #"""
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/service-worker.js", { type: "module" }).catch(console.warn)
-    }
-
     import { initializeWasm, hasHeads } from "@automerge/automerge/slim"
     import {
       initSync as initSubductionSync,
@@ -182,7 +205,48 @@ enum PatchworkWeb {
       parseAutomergeUrl,
       stringifyAutomergeUrl,
     } from "@automerge/automerge-repo/slim"
-    import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb"
+    // Storage lives in the app: reads and writes go over IPC to native files,
+    // and the first load of any doc falls through to the Rust core's own
+    // storage, so docs the app already has open with no network sync.
+    class NativeStorageAdapter {
+      async #call(message) {
+        try {
+          return await window.webkit.messageHandlers.lushstorage.postMessage(message)
+        } catch (error) {
+          reportError(`storage ${message.op} failed: ${error}`)
+          throw error
+        }
+      }
+      #bytes(base64) {
+        return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0))
+      }
+      async load(key) {
+        const result = await this.#call({ op: "load", key })
+        return result?.binary ? this.#bytes(result.binary) : undefined
+      }
+      async save(key, binary) {
+        await this.#call({ op: "save", key, binary: toBase64(binary) })
+      }
+      async saveBatch(entries) {
+        await this.#call({
+          op: "saveBatch",
+          entries: entries.map(([key, binary]) => ({ key, binary: toBase64(binary) })),
+        })
+      }
+      async remove(key) {
+        await this.#call({ op: "remove", key })
+      }
+      async loadRange(keyPrefix) {
+        const result = await this.#call({ op: "loadRange", key: keyPrefix })
+        return (result?.chunks ?? []).map((chunk) => ({
+          key: chunk.key,
+          data: this.#bytes(chunk.binary),
+        }))
+      }
+      async removeRange(keyPrefix) {
+        await this.#call({ op: "removeRange", key: keyPrefix })
+      }
+    }
     import { registerRepoProviderElement } from "@inkandswitch/patchwork-providers"
     import { registerPatchworkViewElement } from "@inkandswitch/patchwork-elements"
     import { ModuleWatcher, resolvePath } from "@inkandswitch/patchwork-filesystem"
@@ -198,6 +262,34 @@ enum PatchworkWeb {
       const el = document.getElementById("status")
       if (el) el.textContent = text
     }
+
+    // The one bit the host's activation machine needs: does anything in
+    // this embed actually scroll? If nothing does, wheel belongs to the tool.
+    const hasScrollableContent = (root) => {
+      const walk = (el, depth) => {
+        if (!el || depth > 10) return false
+        if (el.scrollHeight > el.clientHeight + 4 || el.scrollWidth > el.clientWidth + 4) {
+          const style = getComputedStyle(el)
+          if (/(auto|scroll)/.test(style.overflowY + style.overflowX)) return true
+        }
+        const kids = [...el.children, ...(el.shadowRoot ? el.shadowRoot.children : [])]
+        for (const child of kids) {
+          if (walk(child, depth + 1)) return true
+        }
+        return false
+      }
+      return walk(root, 0)
+    }
+
+    const reportError = (text) => {
+      window.webkit?.messageHandlers?.lusherror?.postMessage(String(text))
+    }
+    window.addEventListener("error", (event) => {
+      reportError(`${event.message} @ ${event.filename}:${event.lineno}`)
+    })
+    window.addEventListener("unhandledrejection", (event) => {
+      reportError(`unhandled rejection: ${event.reason?.stack ?? event.reason}`)
+    })
 
     function hexToBytes(hex) {
       const bytes = new Uint8Array(hex.length / 2)
@@ -243,39 +335,6 @@ enum PatchworkWeb {
         handle.on("heads-changed", check)
         check()
       })
-    }
-
-    function installHandoffListener() {
-      const HANDOFF_CHANNEL = "@patchwork/handoff"
-      const CACHEABLE = [200, 203, 204]
-      const ch = new BroadcastChannel(HANDOFF_CHANNEL)
-      ch.addEventListener("message", async (event) => {
-        const data = event.data
-        if (data?.type !== "request") return
-        const { id, cachename, request } = data
-        let handoffURL
-        try { handoffURL = new URL(request.handoffURL) } catch { return }
-        if (handoffURL.protocol !== "automerge:") return
-        const resolve = window.__patchworkResolve
-        if (!resolve) return
-        const raw = new URL(request.url).pathname.slice(1)
-        const result = await resolve(raw)
-        const bytes = Uint8Array.from(atob(result.base64), (c) => c.charCodeAt(0))
-        if (CACHEABLE.includes(result.status)) {
-          const cache = await caches.open(cachename)
-          await cache.put(
-            new Request(request.url, { method: request.method, headers: request.headers, referrer: request.referrer }),
-            new Response(bytes, { status: result.status, headers: { "content-type": result.mimeType } })
-          )
-          ch.postMessage({ id, type: "cached" })
-        } else {
-          ch.postMessage({
-            id, type: "response",
-            response: { status: result.status, body: new TextDecoder().decode(bytes), headers: { "content-type": result.mimeType } },
-          })
-        }
-      })
-      ch.postMessage({ type: "online" })
     }
 
     // The JS half of RichWebSchemeHandler: serves file contents out of folder
@@ -385,7 +444,7 @@ enum PatchworkWeb {
         endpoints.push(`ws://127.0.0.1:${port}`)
       }
       const repo = new Repo({
-        storage: new IndexedDBStorageAdapter(),
+        storage: new NativeStorageAdapter(),
         signer,
         peerId: `lush-${Math.random().toString(36).slice(2, 10)}`,
         enableRemoteHeadsGossiping: true,
@@ -393,7 +452,6 @@ enum PatchworkWeb {
       })
       window.repo = repo
       installResolver(repo)
-      installHandoffListener()
 
       registerRepoProviderElement(repo)
       registerPatchworkViewElement({ repo })
@@ -453,7 +511,8 @@ enum PatchworkWeb {
           if (toolId && view.isConnected) view.setAttribute("tool-id", toolId)
         }
         if (!view.isConnected) return
-        const tools = (getSupportedToolsForType(type) ?? [])
+        const descriptors = getSupportedToolsForType(type) ?? []
+        const tools = descriptors
           .filter((tool) => !tool.unlisted)
           .map((tool) => ({ id: tool.id, name: tool.name ?? tool.id }))
         window.webkit?.messageHandlers?.lush?.postMessage({
@@ -461,23 +520,56 @@ enum PatchworkWeb {
           tools,
           current: toolId ?? null,
         })
+        const descriptor = descriptors.find((tool) => tool.id === toolId)
+        if (typeof descriptor?.capturesPointer === "boolean") {
+          window.webkit?.messageHandlers?.lush?.postMessage({
+            kind: "traits",
+            capturesPointer: descriptor.capturesPointer,
+          })
+        }
       }
 
       // Expose setDoc so native code can switch docs without reloading the
       // page. The view mounts immediately; nothing waits on module loading.
       window.setDoc = async (docUrl, toolId) => {
-        document.body.classList.remove("loading")
         if (!docUrl) {
+          document.body.classList.remove("loading")
           document.body.replaceChildren()
           status("")
           return
         }
+        document.body.classList.add("loading")
         const view = document.createElement("patchwork-view")
         if (toolId) view.setAttribute("tool-id", toolId)
         view.setAttribute("doc-url", docUrl)
         const provider = document.createElement("repo-provider")
         provider.appendChild(view)
         document.body.replaceChildren(provider)
+        // Pulse until the tool actually renders something (content may live in
+        // a shadow root, so poll rather than observe). A superseded view stops
+        // its timers without touching the class — the newer setDoc owns it.
+        const stop = () => {
+          clearInterval(watcher)
+          clearTimeout(cap)
+        }
+        const watcher = setInterval(() => {
+          if (!view.isConnected) return stop()
+          if (view.childElementCount || view.shadowRoot?.childElementCount) {
+            stop()
+            document.body.classList.remove("loading")
+            setTimeout(() => {
+              if (!view.isConnected) return
+              window.webkit?.messageHandlers?.lush?.postMessage({
+                kind: "traits",
+                capturesPointer: !hasScrollableContent(view),
+              })
+            }, 400)
+          }
+        }, 100)
+        const cap = setTimeout(() => {
+          stop()
+          if (view.isConnected) document.body.classList.remove("loading")
+        }, 15000)
         finishSetDoc(docUrl, toolId, view).catch((error) => {
           console.warn("lush: tool setup failed", error)
         })
@@ -514,11 +606,28 @@ enum PatchworkWeb {
     // chosen one (or take a pasted automerge: url), and hand the result to the
     // native side through the "lush" message handler.
     function renderPicker(repo) {
+      const preferredType = params.get("type")
+      const preferredTool = params.get("tool-id")
       const post = (url, tool) => {
         window.webkit?.messageHandlers?.lush?.postMessage({
           url,
           tool: tool ?? null,
         })
+      }
+      const createDatatype = async (datatype, button) => {
+        if (button) button.disabled = true
+        try {
+          const loaded = await getRegistry("patchwork:datatype").load(datatype.id)
+          const handle = await createDocOfDatatype2(loaded, repo, undefined, undefined)
+          const url = handle?.url ?? String(handle)
+          const tool = preferredTool || (getSupportedToolsForType(datatype.id) ?? []).filter(
+            (tool) => !tool.unlisted,
+          )[0]?.id
+          post(url, tool)
+        } catch (error) {
+          status(String(error))
+          if (button) button.disabled = false
+        }
       }
       const datatypes = (getRegistry("patchwork:datatype").all() ?? []).filter(
         (datatype) => !datatype.unlisted,
@@ -552,24 +661,18 @@ enum PatchworkWeb {
         const button = document.createElement("button")
         button.className = "picker-type"
         button.textContent = datatype.name ?? datatype.id
-        button.onclick = async () => {
-          button.disabled = true
-          try {
-            const loaded = await getRegistry("patchwork:datatype").load(datatype.id)
-            const handle = await createDocOfDatatype2(loaded, repo, undefined, undefined)
-            const url = handle?.url ?? String(handle)
-            const tool = (getSupportedToolsForType(datatype.id) ?? []).filter(
-              (tool) => !tool.unlisted,
-            )[0]?.id
-            post(url, tool)
-          } catch (error) {
-            status(String(error))
-            button.disabled = false
-          }
-        }
+        button.onclick = () => createDatatype(datatype, button)
         root.append(button)
       }
       document.body.replaceChildren(root)
+      if (preferredType) {
+        const wanted = preferredType.toLowerCase()
+        const datatype = datatypes.find((datatype) =>
+          datatype.id?.toLowerCase() === wanted ||
+          datatype.name?.toLowerCase() === wanted
+        )
+        if (datatype) createDatatype(datatype, null)
+      }
     }
 
     window.patchworkReady = boot().catch((error) => {
@@ -774,6 +877,185 @@ struct PatchworkWebView: UIViewRepresentable {
 }
 #endif
 
+/// The webviews' automerge-repo storage adapter, backed by app-local files
+/// plus a read-through into the Rust core's own storage: the first load of a
+/// doc the webview has never stored answers with the core's blobs, so docs
+/// the app already holds (module settings, modules, embeds) open instantly
+/// with no network sync.
+final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
+    static let shared = NativeWebStorage()
+    nonisolated(unsafe) var core: Core?
+
+    private let root = FileManager.default.urls(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask
+    )[0].appendingPathComponent("LushWebStorage", isDirectory: true)
+
+    private nonisolated static let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+
+    private nonisolated func path(for key: [String]) -> URL {
+        key.reduce(root) {
+            $0.appendingPathComponent($1.addingPercentEncoding(withAllowedCharacters: Self.safe) ?? $1)
+        }
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+        guard let body = message.body as? [String: Any],
+              let op = body["op"] as? String else {
+            replyHandler(nil, "bad storage message")
+            return
+        }
+        let key = body["key"] as? [String] ?? []
+        let core = self.core
+        Task.detached { [self] in
+            let reply = handle(op: op, key: key, body: body, core: core)
+            await MainActor.run { replyHandler(reply, nil) }
+        }
+    }
+
+    private nonisolated func handle(
+        op: String,
+        key: [String],
+        body: [String: Any],
+        core: Core?
+    ) -> [String: Any] {
+        let fm = FileManager.default
+        switch op {
+        case "load":
+            guard let data = try? Data(contentsOf: path(for: key)) else { return [:] }
+            return ["binary": data.base64EncodedString()]
+        case "save":
+            guard let base64 = body["binary"] as? String,
+                  let data = Data(base64Encoded: base64) else { return [:] }
+            let url = path(for: key)
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url)
+            return [:]
+        case "saveBatch":
+            for entry in body["entries"] as? [[String: Any]] ?? [] {
+                guard let entryKey = entry["key"] as? [String],
+                      let base64 = entry["binary"] as? String,
+                      let data = Data(base64Encoded: base64) else { continue }
+                let url = path(for: entryKey)
+                try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? data.write(to: url)
+            }
+            return [:]
+        case "remove":
+            try? fm.removeItem(at: path(for: key))
+            return [:]
+        case "removeRange":
+            try? fm.removeItem(at: path(for: key))
+            return [:]
+        case "loadRange":
+            var chunks = loadRange(prefix: key)
+            if chunks.isEmpty, key.count == 1, let core {
+                chunks = core.docStorageChunks(url: "automerge:\(key[0])").map { chunk in
+                    ["key": [key[0], "incremental", "core-\(chunk.digest)"],
+                     "binary": Data(chunk.bytes).base64EncodedString()]
+                }
+            }
+            return ["chunks": chunks]
+        default:
+            return [:]
+        }
+    }
+
+    private nonisolated func loadRange(prefix: [String]) -> [[String: Any]] {
+        let base = path(for: prefix)
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: base, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            return []
+        }
+        var chunks: [[String: Any]] = []
+        for case let file as URL in enumerator {
+            guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
+                  let data = try? Data(contentsOf: file) else { continue }
+            let relative = file.path.dropFirst(base.path.count).split(separator: "/")
+                .map { String($0).removingPercentEncoding ?? String($0) }
+            chunks.append(["key": prefix + relative, "binary": data.base64EncodedString()])
+        }
+        return chunks
+    }
+}
+
+final class LushErrorBridge: NSObject, WKScriptMessageHandler {
+    static let shared = LushErrorBridge()
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        NSLog("lush webview error: %@", message.body as? String ?? "?")
+    }
+}
+
+extension Notification.Name {
+    static let lushDeactivateEmbeds = Notification.Name("io.lush.deactivateEmbeds")
+}
+
+/// Embeds are inert until the reader clicks in: wheel and keys pass to the
+/// page, so a canvas can't trap scrolling. A click activates (Maps/Figma
+/// rule); Escape or focus loss drops back to inert. Full-viewport detail
+/// views skip the machine and are always active.
+final class EmbedWebView: WKWebView {
+    var activatable = false
+    var toolCapturesPointer = false
+    var onActiveChanged: ((Bool) -> Void)?
+
+    private(set) var isActive = false {
+        didSet { if isActive != oldValue { onActiveChanged?(isActive) } }
+    }
+
+    func deactivate() {
+        isActive = false
+    }
+
+    func activate() {
+        isActive = true
+    }
+
+    #if os(macOS)
+    override func mouseDown(with event: NSEvent) {
+        if activatable, !isActive {
+            isActive = true
+            window?.makeFirstResponder(self)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if activatable, !isActive, toolCapturesPointer {
+            nextResponder?.scrollWheel(with: event)
+            return
+        }
+        super.scrollWheel(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if activatable, isActive, event.keyCode == 53 {
+            isActive = false
+            window?.makeFirstResponder(nil)
+            return
+        }
+        if activatable, !isActive {
+            nextResponder?.keyDown(with: event)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        if activatable { isActive = false }
+        return super.resignFirstResponder()
+    }
+    #endif
+}
+
 @MainActor
 func makePatchworkWebView(
     query: [URLQueryItem],
@@ -782,10 +1064,17 @@ func makePatchworkWebView(
     let handler = RichWebSchemeHandler()
     let configuration = WKWebViewConfiguration()
     configuration.setURLSchemeHandler(handler, forURLScheme: "lushweb")
+    configuration.userContentController.addScriptMessageHandler(
+        NativeWebStorage.shared,
+        contentWorld: .page,
+        name: "lushstorage"
+    )
+    configuration.userContentController.add(LushErrorBridge.shared, name: "lusherror")
     if let messageHandler {
         configuration.userContentController.add(messageHandler, name: "lush")
     }
-    let webView = WKWebView(frame: .zero, configuration: configuration)
+    configuration.preferences.setValue(true, forKey: "developerExtrasEnabled")
+    let webView = EmbedWebView(frame: .zero, configuration: configuration)
     webView.isInspectable = true
     handler.webView = webView
     #if os(macOS)
@@ -817,6 +1106,11 @@ extension PatchworkWebView {
 
 final class MutablePickerBridge: NSObject, WKScriptMessageHandler {
     @MainActor var onPick: (@MainActor (String, String?) -> Void)?
+
+    init(onPick: (@MainActor (String, String?) -> Void)? = nil) {
+        self.onPick = onPick
+        super.init()
+    }
 
     func userContentController(
         _ userContentController: WKUserContentController,
@@ -857,27 +1151,67 @@ final class SharedPatchworkPickerView {
 #if os(macOS)
 struct PatchworkPickerView: NSViewRepresentable {
     let onPick: @MainActor (String, String?) -> Void
+    var preferredType: String?
+    var preferredToolId: String?
+
+    func makeCoordinator() -> MutablePickerBridge {
+        MutablePickerBridge(onPick: onPick)
+    }
 
     func makeNSView(context: Context) -> WKWebView {
+        if let preferredType {
+            return makePatchworkWebView(
+                query: [
+                    URLQueryItem(name: "mode", value: "picker"),
+                    URLQueryItem(name: "type", value: preferredType),
+                    URLQueryItem(name: "tool-id", value: preferredToolId),
+                ],
+                messageHandler: context.coordinator
+            )
+        }
         SharedPatchworkPickerView.shared.onPick = onPick
         return SharedPatchworkPickerView.shared.webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        SharedPatchworkPickerView.shared.onPick = onPick
+        if preferredType == nil {
+            SharedPatchworkPickerView.shared.onPick = onPick
+        } else {
+            context.coordinator.onPick = onPick
+        }
     }
 }
 #else
 struct PatchworkPickerView: UIViewRepresentable {
     let onPick: @MainActor (String, String?) -> Void
+    var preferredType: String?
+    var preferredToolId: String?
+
+    func makeCoordinator() -> MutablePickerBridge {
+        MutablePickerBridge(onPick: onPick)
+    }
 
     func makeUIView(context: Context) -> WKWebView {
+        if let preferredType {
+            return makePatchworkWebView(
+                query: [
+                    URLQueryItem(name: "mode", value: "picker"),
+                    URLQueryItem(name: "type", value: preferredType),
+                    URLQueryItem(name: "tool-id", value: preferredToolId),
+                ],
+                messageHandler: context.coordinator
+            )
+        }
         SharedPatchworkPickerView.shared.onPick = onPick
         return SharedPatchworkPickerView.shared.webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        SharedPatchworkPickerView.shared.onPick = onPick
+        if preferredType == nil {
+            SharedPatchworkPickerView.shared.onPick = onPick
+        } else {
+            context.coordinator.onPick = onPick
+        }
     }
 }
 #endif
@@ -920,8 +1254,20 @@ struct PatchworkCreateSheet: View {
 
 
 struct NewPatchworkDocSheet: View {
+    var preferredType: String?
+    var preferredToolId: String?
     let onPick: @MainActor (String, String?) -> Void
     @Environment(\.dismiss) private var dismiss
+
+    init(
+        preferredType: String? = nil,
+        preferredToolId: String? = nil,
+        onPick: @escaping @MainActor (String, String?) -> Void
+    ) {
+        self.preferredType = preferredType
+        self.preferredToolId = preferredToolId
+        self.onPick = onPick
+    }
 
     var body: some View {
         VStack(spacing: 12) {
@@ -932,10 +1278,10 @@ struct NewPatchworkDocSheet: View {
                 Button("Cancel") { dismiss() }
             }
             if PatchworkWeb.available {
-                PatchworkPickerView { url, tool in
-                    onPick(url, tool)
+                PatchworkPickerView(onPick: { url, tool in
+                    onPick(url, tool ?? preferredToolId)
                     dismiss()
-                }
+                }, preferredType: preferredType, preferredToolId: preferredToolId)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
@@ -955,141 +1301,119 @@ struct NewPatchworkDocSheet: View {
     }
 }
 
+/// Each embed and detail view owns its webview: storage reads come from the
+/// app over IPC, so boot has no network wait, and nothing shared means no
+/// stale-doc races when the selection changes.
 @MainActor
-final class PatchworkViewPool {
-    static let shared = PatchworkViewPool()
-
-    struct Entry {
-        let host: PatchworkWebViewHost
-        let bridge: MutablePatchworkBridge
-        var webView: WKWebView { host.webView }
-    }
-
-    #if os(macOS)
-    static let warmTarget = 4
-    #else
-    static let warmTarget = 2
-    #endif
-
-    private var idle: [Entry] = []
-    var active: [String: Entry] = [:]
-
-    private init() {}
-
-    private func makeEntry() -> Entry {
-        let bridge = MutablePatchworkBridge()
-        return Entry(host: PatchworkWebViewHost(messageHandler: bridge), bridge: bridge)
-    }
-
-    /// Boots idle webviews ahead of time so embeds don't pay the wasm + tools
-    /// load when they first appear.
-    func warm() {
-        guard PatchworkWeb.available else { return }
-        while idle.count < Self.warmTarget {
-            idle.append(makeEntry())
-        }
-    }
-
-    /// Idle views loaded their tool modules at creation; drop them when the
-    /// module list changes so fresh ones pick up the new config.
-    func invalidateIdle() {
-        idle.removeAll()
-        warm()
-    }
-
-    func acquire(docUrl: String, toolId: String?) -> Entry {
-        if let existing = active[docUrl] { return existing }
-        let entry = idle.isEmpty ? makeEntry() : idle.removeLast()
-        entry.host.setPatchworkDoc(url: docUrl, toolId: toolId)
-        active[docUrl] = entry
-        Task { self.warm() }
-        return entry
-    }
-
-    func updateToolId(_ toolId: String?, for docUrl: String) {
-        guard let entry = active[docUrl] else { return }
-        entry.host.setPatchworkDoc(url: docUrl, toolId: toolId)
-    }
-
-    /// A wrapper's dismantle can fire after a newer wrapper has re-acquired
-    /// the same doc (SwiftUI makes before it dismantles), so only the wrapper
-    /// whose webview is still the active one may release it.
-    func release(docUrl: String, webView: WKWebView) {
-        guard let entry = active[docUrl], entry.webView === webView else { return }
-        active[docUrl] = nil
-        entry.bridge.onTools = nil
-        guard idle.count < Self.warmTarget else { return }
-        entry.host.setPatchworkDoc(url: nil, toolId: nil)
-        idle.append(entry)
-    }
+final class PatchworkBoxCoordinator {
+    let bridge = MutablePatchworkBridge()
+    var host: PatchworkWebViewHost?
+    var lastDocUrl: String?
+    var lastToolId: String? = "__unset__"
 }
 
 #if os(macOS)
 struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
     let docUrl: String
     let toolId: String?
+    var activatable = false
+    var toolCapturesPointer = false
+    var active: Binding<Bool>? = nil
+    var onTraits: (@MainActor (Bool) -> Void)? = nil
     var onTools: @MainActor ([ToolChoice], String?) -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(docUrl: docUrl) }
-
-    final class Coordinator {
-        let docUrl: String
-        var lastToolId: String? = "__unset__"
-        init(docUrl: String) { self.docUrl = docUrl }
-    }
+    func makeCoordinator() -> PatchworkBoxCoordinator { PatchworkBoxCoordinator() }
 
     func makeNSView(context: Context) -> WKWebView {
-        let entry = PatchworkViewPool.shared.acquire(docUrl: docUrl, toolId: toolId)
-        entry.bridge.onTools = onTools
-        context.coordinator.lastToolId = toolId
-        return entry.webView
+        let coord = context.coordinator
+        let host = PatchworkWebViewHost(messageHandler: coord.bridge)
+        coord.host = host
+        coord.bridge.onTools = onTools
+        coord.bridge.onTraits = onTraits
+        coord.lastDocUrl = docUrl
+        coord.lastToolId = toolId
+        host.setPatchworkDoc(url: docUrl, toolId: toolId)
+        configureActivation(host.webView)
+        return host.webView
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        PatchworkViewPool.shared.active[docUrl]?.bridge.onTools = onTools
         let coord = context.coordinator
-        if coord.lastToolId != toolId {
-            PatchworkViewPool.shared.updateToolId(toolId, for: docUrl)
+        coord.bridge.onTools = onTools
+        coord.bridge.onTraits = onTraits
+        configureActivation(nsView)
+        if coord.lastDocUrl != docUrl || coord.lastToolId != toolId {
+            coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId)
+            coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
         }
     }
 
-    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
-        PatchworkViewPool.shared.release(docUrl: coordinator.docUrl, webView: nsView)
+    private func configureActivation(_ webView: WKWebView) {
+        guard let embed = webView as? EmbedWebView else { return }
+        embed.activatable = activatable
+        embed.toolCapturesPointer = toolCapturesPointer
+        guard let active else { return }
+        if active.wrappedValue != embed.isActive {
+            active.wrappedValue ? embed.activate() : embed.deactivate()
+        }
+        embed.onActiveChanged = { value in
+            Task { @MainActor in active.wrappedValue = value }
+        }
     }
 }
 #else
 struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
     let docUrl: String
     let toolId: String?
+    var activatable = false
+    var toolCapturesPointer = false
+    var active: Binding<Bool>? = nil
+    var onTraits: (@MainActor (Bool) -> Void)? = nil
     var onTools: @MainActor ([ToolChoice], String?) -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(docUrl: docUrl) }
-
-    final class Coordinator {
-        let docUrl: String
-        var lastToolId: String? = "__unset__"
-        init(docUrl: String) { self.docUrl = docUrl }
-    }
+    func makeCoordinator() -> PatchworkBoxCoordinator { PatchworkBoxCoordinator() }
 
     func makeUIView(context: Context) -> WKWebView {
-        let entry = PatchworkViewPool.shared.acquire(docUrl: docUrl, toolId: toolId)
-        entry.bridge.onTools = onTools
-        context.coordinator.lastToolId = toolId
-        return entry.webView
+        let coord = context.coordinator
+        let host = PatchworkWebViewHost(messageHandler: coord.bridge)
+        coord.host = host
+        coord.bridge.onTools = onTools
+        coord.bridge.onTraits = onTraits
+        coord.lastDocUrl = docUrl
+        coord.lastToolId = toolId
+        host.setPatchworkDoc(url: docUrl, toolId: toolId)
+        configureActivation(host.webView)
+        return host.webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        PatchworkViewPool.shared.active[docUrl]?.bridge.onTools = onTools
         let coord = context.coordinator
-        if coord.lastToolId != toolId {
-            PatchworkViewPool.shared.updateToolId(toolId, for: docUrl)
+        coord.bridge.onTools = onTools
+        coord.bridge.onTraits = onTraits
+        configureActivation(uiView)
+        if coord.lastDocUrl != docUrl || coord.lastToolId != toolId {
+            coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId)
+            coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
         }
     }
 
-    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
-        PatchworkViewPool.shared.release(docUrl: coordinator.docUrl, webView: uiView)
+    /// Inert on touch means the reader's one-finger pan belongs to the page:
+    /// touches skip the webview entirely until a tap activates it.
+    private func configureActivation(_ webView: WKWebView) {
+        guard let embed = webView as? EmbedWebView else { return }
+        embed.activatable = activatable
+        embed.toolCapturesPointer = toolCapturesPointer
+        if let active {
+            if active.wrappedValue != embed.isActive {
+                active.wrappedValue ? embed.activate() : embed.deactivate()
+            }
+            embed.onActiveChanged = { value in
+                Task { @MainActor in active.wrappedValue = value }
+            }
+        }
+        embed.isUserInteractionEnabled = !activatable || embed.isActive
     }
 }
 #endif
@@ -1099,16 +1423,37 @@ struct PatchworkBoxView: View {
     let toolId: String?
     var onSelectTool: ((String?) -> Void)?
     var onRemove: (() -> Void)?
+    var onResize: ((Double, Double, Bool) -> Void)?
     @State private var tools: [ToolChoice] = []
     @State private var currentTool: String?
+    @State private var boxSize: CGSize = .zero
+    @State private var dragBase: CGSize?
+    @State private var embedActive = false
+    @State private var toolCapturesPointer = false
 
     var body: some View {
         Group {
             if PatchworkWeb.available {
-                PatchworkBoxWebViewWrapper(docUrl: docUrl, toolId: toolId) { tools, current in
+                PatchworkBoxWebViewWrapper(
+                    docUrl: docUrl,
+                    toolId: toolId,
+                    activatable: true,
+                    toolCapturesPointer: toolCapturesPointer,
+                    active: $embedActive,
+                    onTraits: { self.toolCapturesPointer = $0 }
+                ) { tools, current in
                     self.tools = tools
                     self.currentTool = current
                 }
+                #if os(iOS)
+                .overlay {
+                    if !embedActive {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture { embedActive = true }
+                    }
+                }
+                #endif
             } else {
                 VStack(spacing: 6) {
                     Image(systemName: "shippingbox")
@@ -1130,6 +1475,16 @@ struct PatchworkBoxView: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(.separator)
         )
+        .overlay {
+            if embedActive {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.accentColor.opacity(0.8), lineWidth: 2)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .lushDeactivateEmbeds)) { _ in
+            embedActive = false
+        }
         .overlay(alignment: .topTrailing) {
             if onSelectTool != nil || onRemove != nil {
                 Menu {
@@ -1163,18 +1518,68 @@ struct PatchworkBoxView: View {
                 .padding(8)
             }
         }
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { boxSize = proxy.size }
+                    .onChange(of: proxy.size) { _, size in boxSize = size }
+            }
+        )
+        .overlay(alignment: .bottomTrailing) {
+            if onResize != nil {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(5)
+                    .background(Circle().fill(.background))
+                    .padding(6)
+                    .gesture(resizeGesture)
+                    #if os(macOS)
+                    .onHover { inside in
+                        if inside { NSCursor.crosshair.push() } else { NSCursor.pop() }
+                    }
+                    #endif
+            }
+        }
+    }
+
+    private var resizeGesture: some Gesture {
+        DragGesture(minimumDistance: 2)
+            .onChanged { value in
+                let base = dragBase ?? boxSize
+                dragBase = base
+                onResize?(
+                    max(120, base.width + value.translation.width),
+                    max(80, base.height + value.translation.height),
+                    false
+                )
+            }
+            .onEnded { value in
+                let base = dragBase ?? boxSize
+                dragBase = nil
+                onResize?(
+                    max(120, base.width + value.translation.width),
+                    max(80, base.height + value.translation.height),
+                    true
+                )
+            }
     }
 }
 
 private extension WKWebView {
     // Waits for boot to define window.setDoc rather than awaiting
     // patchworkReady, which throws here if boot failed and would silently
-    // leave the previous doc on screen.
+    // leave the previous doc on screen. Concurrent calls race on their poll
+    // timers, so each takes a generation and only the newest may mount —
+    // otherwise a stale call can win and show the previous doc.
     func callSetDoc(url: String?, toolId: String?) {
         callAsyncJavaScript(
             """
+            window.__lushSetDocGen = (window.__lushSetDocGen ?? 0) + 1
+            const gen = window.__lushSetDocGen
             let waited = 0
             while (!window.setDoc) {
+                if (gen !== window.__lushSetDocGen) return
                 if (waited >= 30000) {
                     console.warn("lush: setDoc never appeared; boot broken?")
                     return
@@ -1182,6 +1587,7 @@ private extension WKWebView {
                 await new Promise(r => setTimeout(r, 50))
                 waited += 50
             }
+            if (gen !== window.__lushSetDocGen) return
             await window.setDoc(docUrl, toolId)
             """,
             arguments: ["docUrl": url as Any, "toolId": toolId as Any],
@@ -1227,38 +1633,24 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     }
 }
 
-@MainActor
-final class SharedPatchworkWebView {
-    static let shared = SharedPatchworkWebView()
-    private let host: PatchworkWebViewHost
-    private let bridge = MutablePatchworkBridge()
-
-    var webView: WKWebView { host.webView }
-
-    var onTools: (@MainActor ([ToolChoice], String?) -> Void)? {
-        get { bridge.onTools }
-        set { bridge.onTools = newValue }
-    }
-
-    private init() {
-        host = PatchworkWebViewHost(query: [], messageHandler: bridge)
-    }
-
-    func setDoc(url: String, toolId: String?) {
-        host.setPatchworkDoc(url: url, toolId: toolId)
-    }
-}
-
 final class MutablePatchworkBridge: NSObject, WKScriptMessageHandler {
     @MainActor var onTools: (@MainActor ([ToolChoice], String?) -> Void)?
+    @MainActor var onTraits: (@MainActor (Bool) -> Void)?
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
         guard message.name == "lush",
-              let body = message.body as? [String: Any],
-              body["kind"] as? String == "tools",
+              let body = message.body as? [String: Any] else { return }
+        if body["kind"] as? String == "traits",
+           let capturesPointer = body["capturesPointer"] as? Bool {
+            Task { @MainActor in
+                self.onTraits?(capturesPointer)
+            }
+            return
+        }
+        guard body["kind"] as? String == "tools",
               let rawTools = body["tools"] as? [[String: Any]]
         else { return }
         let tools = rawTools.compactMap { raw -> ToolChoice? in
@@ -1271,63 +1663,3 @@ final class MutablePatchworkBridge: NSObject, WKScriptMessageHandler {
         }
     }
 }
-
-#if os(macOS)
-struct SharedPatchworkWebViewWrapper: NSViewRepresentable {
-    let docUrl: String
-    let toolId: String?
-    var onTools: @MainActor ([ToolChoice], String?) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    class Coordinator {
-        var lastState: (docUrl: String, toolId: String?)?
-    }
-
-    func makeNSView(context: Context) -> WKWebView {
-        let shared = SharedPatchworkWebView.shared
-        shared.onTools = onTools
-        shared.setDoc(url: docUrl, toolId: toolId)
-        context.coordinator.lastState = (docUrl, toolId)
-        return shared.webView
-    }
-
-    func updateNSView(_ nsView: WKWebView, context: Context) {
-        SharedPatchworkWebView.shared.onTools = onTools
-        let coord = context.coordinator
-        if coord.lastState?.docUrl != docUrl || coord.lastState?.toolId != toolId {
-            SharedPatchworkWebView.shared.setDoc(url: docUrl, toolId: toolId)
-            coord.lastState = (docUrl, toolId)
-        }
-    }
-}
-#else
-struct SharedPatchworkWebViewWrapper: UIViewRepresentable {
-    let docUrl: String
-    let toolId: String?
-    var onTools: @MainActor ([ToolChoice], String?) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    class Coordinator {
-        var lastState: (docUrl: String, toolId: String?)?
-    }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let shared = SharedPatchworkWebView.shared
-        shared.onTools = onTools
-        shared.setDoc(url: docUrl, toolId: toolId)
-        context.coordinator.lastState = (docUrl, toolId)
-        return shared.webView
-    }
-
-    func updateUIView(_ uiView: WKWebView, context: Context) {
-        SharedPatchworkWebView.shared.onTools = onTools
-        let coord = context.coordinator
-        if coord.lastState?.docUrl != docUrl || coord.lastState?.toolId != toolId {
-            SharedPatchworkWebView.shared.setDoc(url: docUrl, toolId: toolId)
-            coord.lastState = (docUrl, toolId)
-        }
-    }
-}
-#endif

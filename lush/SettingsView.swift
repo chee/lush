@@ -48,6 +48,7 @@ struct SyncSettingsPane: View {
     @State private var peerText = ""
     @State private var peerError: String?
     @State private var copiedNodeId = false
+    @State private var copiedLocalPort = false
     @State private var showingClearConfirm = false
 
     var body: some View {
@@ -62,56 +63,27 @@ struct SyncSettingsPane: View {
                         Text(model.connected ? "Connected" : "Offline")
                     }
                 }
-            }
-            Section {
-                ForEach(model.rootFolderUrls, id: \.self) { url in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(folderName(url))
-                            Text(url)
+                if let httpUrl = model.core?.localHttpUrl() {
+                    LabeledContent("Local (HTTP)") {
+                        HStack(spacing: 8) {
+                            Text(httpUrl)
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
-                        }
-                        Spacer()
-                        Button(copiedUrl == url ? "Copied" : "Copy") {
-                            Clipboard.copy(url)
-                            copiedUrl = url
-                            Task {
-                                try? await Task.sleep(for: .seconds(2))
-                                if copiedUrl == url { copiedUrl = nil }
+                            Button(copiedLocalPort ? "Copied" : "Copy") {
+                                Clipboard.copy(httpUrl)
+                                copiedLocalPort = true
+                                Task {
+                                    try? await Task.sleep(for: .seconds(2))
+                                    copiedLocalPort = false
+                                }
                             }
                         }
-                        Button("Remove") {
-                            model.removeRootFolder(url)
-                        }
-                        .disabled(model.rootFolderUrls.count == 1)
                     }
                 }
-            } header: {
-                Text("Folders")
-            } footer: {
-                Text("Copy a folder URL to add it to Patchwork. Removing a folder only takes it out of the sidebar — it stays on the sync server.")
             }
             Section {
-                TextField("automerge:…", text: $folderText)
-                    .font(.body.monospaced())
-                Button("Add Folder") {
-                    let url = folderText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !url.isEmpty else { return }
-                    folderText = ""
-                    Task { await model.addRootFolder(url) }
-                }
-                .disabled(
-                    folderText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
-            } header: {
-                Text("Add a folder")
-            } footer: {
-                Text("Paste a Patchwork folder URL to show it in the sidebar alongside your other folders.")
-            }
-            Section {
-                if let nodeId = LocalSyncServer.irohNodeId {
+                if let nodeId = model.core?.irohNodeId() {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("This device")
@@ -130,18 +102,13 @@ struct SyncSettingsPane: View {
                             }
                         }
                     }
-                    ForEach(LocalSyncServer.friends, id: \.self) { friend in
-                        Text(friend)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
                     TextField("friend's node id", text: $peerText)
                         .font(.body.monospaced())
                     Button("Add Peer") {
                         let nodeId = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !nodeId.isEmpty else { return }
                         do {
-                            try LocalSyncServer.addFriend(nodeId)
+                            try model.core?.addIrohPeer(nodeId: nodeId)
                             peerText = ""
                             peerError = nil
                         } catch {
@@ -157,13 +124,13 @@ struct SyncSettingsPane: View {
                             .foregroundStyle(.red)
                     }
                 } else {
-                    Text("The local sync server isn't running.")
+                    Text("iroh endpoint not running.")
                         .foregroundStyle(.secondary)
                 }
             } header: {
                 Text("Peers (iroh)")
             } footer: {
-                Text("Share this device's node id and add a friend's; their patchwork embeds then sync device-to-device.")
+                Text("Share this device's node id and add a friend's; the rust subduction cores then sync directly via iroh.")
             }
             Section {
                 Button("Force Resync") {
@@ -217,9 +184,12 @@ struct SyncSettingsPane: View {
 
 struct EditorSettingsPane: View {
     @Environment(NotesModel.self) private var model
+    @Environment(ContextTracker.self) private var contextTracker
     @State private var fontDesign = EditorSettings.design
     @State private var fontSize = EditorSettings.bodySize
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var places = SavedPlaces.all
+    @State private var placeName = ""
 
     var body: some View {
         Form {
@@ -268,18 +238,140 @@ struct EditorSettingsPane: View {
                         EditorSettings.setAutoInsertLogline(autoInsertLogline)
                     }
             }
+            Section {
+                ForEach(places) { place in
+                    HStack {
+                        Label(place.name, systemImage: "mappin.and.ellipse")
+                        Spacer()
+                        Button("Remove") {
+                            places.removeAll { $0.id == place.id }
+                            SavedPlaces.save(places)
+                            contextTracker.refreshPlaceName()
+                        }
+                    }
+                }
+                HStack {
+                    TextField("Name", text: $placeName)
+                    Button("Add Here") { addPlace() }
+                        .disabled(placeName.trimmingCharacters(in: .whitespaces).isEmpty
+                            || contextTracker.snapshot.latitude == nil)
+                }
+            } header: {
+                Text("Places")
+            } footer: {
+                Text("A logline within 150m of a saved place uses its name — \"Home, London, England\" instead of the street.")
+            }
         }
         .formStyle(.grouped)
         .navigationTitle("Editor")
     }
+
+    private func addPlace() {
+        let snap = contextTracker.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude else { return }
+        places.append(SavedPlace(
+            name: placeName.trimmingCharacters(in: .whitespaces),
+            latitude: lat,
+            longitude: lon
+        ))
+        SavedPlaces.save(places)
+        placeName = ""
+        contextTracker.refreshPlaceName()
+    }
 }
 
 struct PatchworkSettingsPane: View {
+    @Environment(NotesModel.self) private var model
     @State private var moduleText = ""
     @State private var moduleUrls = PatchworkWeb.moduleUrls
+    @State private var accountText = ""
+    @State private var folderText = ""
+    @State private var loggingIn = false
 
     var body: some View {
         Form {
+            Section {
+                if model.loggedIn {
+                    HStack(spacing: 8) {
+                        if let data = model.contactAvatarData, let image = PImage(data: data) {
+                            Image(pImage: image)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 28, height: 28)
+                                .clipShape(Circle())
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.contactName ?? "Logged in")
+                            Text(model.accountUrl ?? "")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer()
+                        Button("Log Out") { model.logOut() }
+                    }
+                } else {
+                    TextField("account:… or automerge:… account url", text: $accountText)
+                        .font(.body.monospaced())
+                    Button(loggingIn ? "Logging in…" : "Log In") {
+                        let url = accountText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard NotesModel.normalizedAccountUrl(url) != nil else { return }
+                        loggingIn = true
+                        Task {
+                            if await model.logIn(accountUrl: url) {
+                                accountText = ""
+                            }
+                            loggingIn = false
+                        }
+                    }
+                    .disabled(
+                        loggingIn
+                            || NotesModel.normalizedAccountUrl(accountText) == nil
+                    )
+                }
+            } header: {
+                Text("Account")
+            } footer: {
+                Text("Log in with a Patchwork account doc. Your folders and inbox sync across devices through the account's lush config doc.")
+            }
+            Section {
+                ForEach(model.rootFolderUrls, id: \.self) { url in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.node(for: url)?.displayName ?? "Folder")
+                            Text(url)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
+                        if model.loggedIn {
+                            Button(model.inboxUrl == url ? "Inbox ✓" : "Make Inbox") {
+                                model.setInbox(url)
+                            }
+                            .disabled(model.inboxUrl == url)
+                        }
+                        Button("Remove") {
+                            model.removeRootFolder(url)
+                        }
+                        .disabled(model.rootFolderUrls.count == 1)
+                    }
+                }
+                TextField("automerge:… folder url", text: $folderText)
+                    .font(.body.monospaced())
+                Button("Add Folder") {
+                    let url = folderText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !url.isEmpty else { return }
+                    folderText = ""
+                    Task { await model.addRootFolder(url) }
+                }
+                .disabled(folderText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            } header: {
+                Text("Folders")
+            } footer: {
+                Text("The folders shown in the sidebar. New notes from the widget or shortcuts land in the inbox folder. When logged in this list lives in your account's lush config and syncs across devices.")
+            }
             Section {
                 ForEach(moduleUrls, id: \.self) { url in
                     HStack {

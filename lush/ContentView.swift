@@ -1,5 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(CoreSpotlight)
+import CoreSpotlight
+#endif
 #if os(iOS)
 import PhotosUI
 #endif
@@ -17,24 +20,36 @@ struct MoveTarget: Identifiable {
     let urls: [String]
 }
 
+struct PatchworkCreateRequest: Identifiable {
+    let id = UUID()
+    let preferredType: String?
+    let toolId: String?
+    let folderUrl: String?
+}
+
 struct ContentView: View {
     @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
     @State private var router = AppRouter.shared
+    @State private var patchworkCreateRequest: PatchworkCreateRequest?
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
     @State private var selectedItemUrls: Set<String> = []
     @State private var searchText = ""
+    @State private var searchPresented = false
     @State private var searchHits: [SearchHit] = []
     @State private var searchTask: Task<Void, Never>?
     @State private var renamingUrl: String?
     @State private var renameText = ""
     @FocusState private var renameFocus: String?
     @FocusState private var sidebarFocused: Bool
+    @FocusState private var searchFocused: Bool
     @State private var expanded: Set<String> = []
     @State private var moveTarget: MoveTarget?
     @State private var pinnedExpanded = true
-    @State private var showingNewPatchwork = false
+    @State private var rightSidebarVisible = false
+    @State private var rightSidebarTab: RightSidebarTab = .history
+    @State private var selectedHistoryEntry: DocHistoryEntry?
 
     private static let expandedKey = "expandedFolders"
     private static let seededRootsKey = "seededRoots"
@@ -65,25 +80,29 @@ struct ContentView: View {
                 model.pendingIncoming = IncomingContent(payload: .file(url))
             }
         }
+        #if canImport(CoreSpotlight)
+        .onContinueUserActivity(CSSearchableItemActionType) { activity in
+            if let url = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String {
+                router.pending = .note(url)
+            }
+        }
+        #endif
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url else { return }
-            if !selectedItemUrls.contains(url) { selectedItemUrls = [url] }
+            selectedHistoryEntry = nil
+            if !selectedItemUrls.containsSidebarTag(for: url) { selectedItemUrls = [url] }
         }
-        .sheet(item: Binding(
-            get: { model.pendingIncoming },
-            set: { model.pendingIncoming = $0 }
-        )) { content in
-            IncomingContentSheet(content: content)
-                .environment(model)
+        .focusedSceneValue(\.noteSearchActions, NoteSearchActions(
+            focusNoteSearch: focusCurrentNoteSearch,
+            focusNotesSearch: focusNotesSearch
+        ))
+        .sheet(item: incomingContentBinding) { content in
+            incomingContentSheet(content)
         }
-        .sheet(isPresented: $showingNewPatchwork) {
-            NewPatchworkDocSheet { url, _ in
-                model.addDocToCurrentFolder(url: url)
-                selectedItemUrls = [url]
-            }
-            .environment(model)
+        .sheet(item: $patchworkCreateRequest) { request in
+            patchworkCreateSheet(request)
         }
         #else
         NavigationStack(path: $path) {
@@ -118,14 +137,38 @@ struct ContentView: View {
             guard let url, path.isEmpty else { return }
             path = [.note(url)]
         }
-        .sheet(item: Binding(
-            get: { model.pendingIncoming },
-            set: { model.pendingIncoming = $0 }
-        )) { content in
-            IncomingContentSheet(content: content)
-                .environment(model)
+        .sheet(item: incomingContentBinding) { content in
+            incomingContentSheet(content)
+        }
+        .sheet(item: $patchworkCreateRequest) { request in
+            patchworkCreateSheet(request)
         }
         #endif
+    }
+
+    private var incomingContentBinding: Binding<IncomingContent?> {
+        Binding(
+            get: { model.pendingIncoming },
+            set: { model.pendingIncoming = $0 }
+        )
+    }
+
+    private func incomingContentSheet(_ content: IncomingContent) -> some View {
+        IncomingContentSheet(content: content)
+            .environment(model)
+    }
+
+    private func patchworkCreateSheet(_ request: PatchworkCreateRequest) -> some View {
+        NewPatchworkDocSheet(preferredType: request.preferredType, preferredToolId: request.toolId, onPick: { url, tool in
+            PatchworkWeb.setLastTool(tool, for: url)
+            Task { await model.addDocToFolder(url: url, folderUrl: request.folderUrl) }
+            #if os(macOS)
+            selectedItemUrls = [url]
+            #else
+            path = [.patchwork(url)]
+            #endif
+        })
+        .environment(model)
     }
 
     private func processPending() {
@@ -133,7 +176,7 @@ struct ContentView: View {
         router.pending = nil
         switch action {
         case .newNote:
-            model.createNote(snap: contextTracker.snapshot)
+            model.createNoteInInbox(snap: contextTracker.snapshot)
             if let url = model.selectedNoteUrl {
                 open(url)
             }
@@ -142,20 +185,42 @@ struct ContentView: View {
                 model.pendingFocusUrl = url
                 open(url)
             } else {
-                model.createNote(snap: contextTracker.snapshot)
+                model.createNoteInInbox(snap: contextTracker.snapshot)
                 if let url = model.selectedNoteUrl {
                     open(url)
                 }
             }
+        case .capture:
+            #if os(macOS)
+            openWindow(id: "quick-capture")
+            NSApp.activate()
+            #else
+            if let url = model.quickNoteUrl {
+                open(url)
+            }
+            #endif
+        case .insertQuickNote(let text):
+            Task { _ = await model.appendToQuickNote(text) }
         case .note(let url):
             model.pendingFocusUrl = url
             open(url)
+        case .folder(let url):
+            Task { await model.selectFolder(url) }
+            openFolder(url)
         case .search(let query):
             #if os(macOS)
             searchText = query
             searchTask?.cancel()
             searchTask = Task { searchHits = await model.search(query) }
             #endif
+        case .createPatchwork(let preferredType, let toolId, let folderUrl):
+            patchworkCreateRequest = PatchworkCreateRequest(
+                preferredType: preferredType,
+                toolId: toolId,
+                folderUrl: folderUrl
+            )
+        case .share(let id):
+            model.pendingIncoming = IncomingContent.sharedHandoff(id: id)
         }
     }
 
@@ -165,6 +230,14 @@ struct ContentView: View {
         selectedItemUrls = [url]
         #else
         path = [.note(url)]
+        #endif
+    }
+
+    private func openFolder(_ url: String) {
+        #if os(macOS)
+        selectedItemUrls = [url]
+        #else
+        path = [.folder(url)]
         #endif
     }
 
@@ -178,22 +251,7 @@ struct ContentView: View {
                         .listRowInsets(sidebarRowInsets(depth: 0))
                     if pinnedExpanded {
                         ForEach(model.pinnedNodes) { node in
-                            NoteRowView(node: node, showFolder: true)
-                                .contentShape(Rectangle())
-                                .padding(.leading, 12)
-                                .onTapGesture {
-                                    selectedItemUrls = ["pinned:\(node.url)"]
-                                    Task { await model.selectItem(node.url) }
-                                }
-                                .tag("pinned:\(node.url)")
-                                .onDrag({ NSItemProvider(object: node.url as NSString) }, preview: {
-                                    DragPreviewView(name: node.displayName)
-                                })
-                                .listRowInsets(sidebarRowInsets(depth: 1))
-                                .listRowBackground(selectionBackground("pinned:\(node.url)", greyWhen: node.url))
-                                .contextMenu {
-                                    singleNoteContextMenu(for: node, showInFolder: true)
-                                }
+                            pinnedNoteRow(node)
                         }
                     }
                 }
@@ -240,14 +298,21 @@ struct ContentView: View {
         .onChange(of: model.folderTree, initial: true) {
             seedRootExpansion()
         }
-        .searchable(text: $searchText, placement: .sidebar, prompt: "Search notes")
+        .searchable(text: $searchText, isPresented: $searchPresented, placement: .sidebar, prompt: "Search notes")
+        .searchFocused($searchFocused)
         .toolbar {
             ToolbarItem {
                 Menu {
                     Button("Note") { model.createNote(snap: contextTracker.snapshot) }
                     Button("Folder") { model.createFolder() }
                     if PatchworkWeb.available {
-                        Button("Patchwork Doc…") { showingNewPatchwork = true }
+                        Button("Patchwork Doc…") {
+                            patchworkCreateRequest = PatchworkCreateRequest(
+                                preferredType: nil,
+                                toolId: nil,
+                                folderUrl: model.folderUrl
+                            )
+                        }
                     }
                 } label: {
                     Image(systemName: "square.and.pencil")
@@ -307,6 +372,20 @@ struct ContentView: View {
         .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
         .safeAreaInset(edge: .bottom) {
             HStack(spacing: 6) {
+                if model.loggedIn {
+                    if let data = model.contactAvatarData, let image = PImage(data: data) {
+                        Image(pImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 16, height: 16)
+                            .clipShape(Circle())
+                    }
+                    if let name = model.contactName, !name.isEmpty {
+                        Text(name)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+                }
                 Circle()
                     .fill(model.connected ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
@@ -319,6 +398,36 @@ struct ContentView: View {
             .padding(.vertical, 6)
             .background(.bar)
         }
+    }
+
+    private func focusCurrentNoteSearch() {
+        NSApp.sendAction(#selector(NSResponder.performTextFinderAction(_:)), to: nil, from: nil)
+    }
+
+    private func focusNotesSearch() {
+        searchPresented = true
+        searchFocused = true
+        sidebarFocused = true
+    }
+
+    private func pinnedNoteRow(_ node: FolderNode) -> some View {
+        let tag = "pinned:\(node.url)"
+        return NoteRowView(node: node, showFolder: true)
+            .contentShape(Rectangle())
+            .padding(.leading, 12)
+            .onTapGesture {
+                selectedItemUrls = [tag]
+                Task { await model.selectItem(node.url) }
+            }
+            .tag(tag)
+            .onDrag({ NSItemProvider(object: node.url as NSString) }, preview: {
+                DragPreviewView(name: node.displayName)
+            })
+            .listRowInsets(sidebarRowInsets(depth: 1))
+            .listRowBackground(selectionBackground(tag, greyWhen: node.url))
+            .contextMenu {
+                singleNoteContextMenu(for: node, showInFolder: true)
+            }
     }
 
     private func nodeRows(_ nodes: [FolderNode], depth: Int = 0) -> AnyView {
@@ -579,21 +688,35 @@ struct ContentView: View {
 
     @ViewBuilder
     private var detail: some View {
-        Group {
-            if let url = model.selectedNoteUrl {
-                detailContent(for: url)
-            } else if !model.status.isEmpty {
-                ContentUnavailableView {
-                    Label("Note", systemImage: "doc.richtext")
-                } description: {
-                    Text(model.status)
+        HSplitView {
+            Group {
+                if let url = model.selectedNoteUrl {
+                    detailContent(for: url)
+                } else if !model.status.isEmpty {
+                    ContentUnavailableView {
+                        Label("Note", systemImage: "doc.richtext")
+                    } description: {
+                        Text(model.status)
+                    }
+                } else {
+                    ContentUnavailableView(
+                        "No Note Selected",
+                        systemImage: "doc.richtext",
+                        description: Text("Select a note or create a new one.")
+                    )
                 }
-            } else {
-                ContentUnavailableView(
-                    "No Note Selected",
-                    systemImage: "doc.richtext",
-                    description: Text("Select a note or create a new one.")
+            }
+            .frame(minWidth: 360)
+
+            if rightSidebarVisible, let url = model.selectedNoteUrl {
+                RightSidebarView(
+                    url: url,
+                    node: model.node(for: url),
+                    selectedTab: $rightSidebarTab,
+                    selectedEntry: $selectedHistoryEntry
                 )
+                .environment(model)
+                .frame(minWidth: 240, idealWidth: 280, maxWidth: 360)
             }
         }
         .navigationTitle("")
@@ -603,7 +726,13 @@ struct ContentView: View {
                     Button("Note") { model.createNote(snap: contextTracker.snapshot) }
                     Button("Folder") { model.createFolder() }
                     if PatchworkWeb.available {
-                        Button("Patchwork Doc…") { showingNewPatchwork = true }
+                        Button("Patchwork Doc…") {
+                            patchworkCreateRequest = PatchworkCreateRequest(
+                                preferredType: nil,
+                                toolId: nil,
+                                folderUrl: model.folderUrl
+                            )
+                        }
                     }
                 } label: {
                     Image(systemName: "square.and.pencil")
@@ -619,14 +748,31 @@ struct ContentView: View {
     private func detailContent(for url: String) -> some View {
         let node = model.node(for: url)
         let isPatchwork = model.patchworkDocUrls.contains(url)
-        if node?.kind == "lush:script" {
+        if node == nil, isPatchwork {
+            // Known patchwork doc: open directly, no need to wait for the tree.
+            PatchworkDetail(docUrl: url)
+                .id(url)
+        } else if node == nil, url.hasPrefix("automerge:") {
+            // A doc url is enough to load the editor; the tree catches up.
+            NoteDetail(
+                noteUrl: url,
+                historyVersion: selectedHistoryEntry,
+                rightSidebarVisible: $rightSidebarVisible
+            )
+        } else if node == nil {
+            ResolvingDocumentView(url: url)
+        } else if node?.kind == "lush:script" {
             ScriptEditorView(url: url)
                 .environment(model)
                 .id(url)
         } else if !isPatchwork && (node?.isNote == true || (!url.hasPrefix("automerge:") && node?.isNote != false)) {
             // No .id here: the editor swaps documents through EditorCore.switchTo,
             // which keeps the text view, its layout manager and the asset cache.
-            NoteDetail(noteUrl: url)
+            NoteDetail(
+                noteUrl: url,
+                historyVersion: selectedHistoryEntry,
+                rightSidebarVisible: $rightSidebarVisible
+            )
         } else {
             PatchworkDetail(docUrl: url)
                 .id(url)
@@ -692,6 +838,12 @@ struct ContentView: View {
 }
 
 #if os(macOS)
+private extension Set where Element == String {
+    func containsSidebarTag(for url: String) -> Bool {
+        contains(url) || contains("pinned:\(url)")
+    }
+}
+
 private struct SuppressListSelectionHighlight: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { NSView() }
     func updateNSView(_ nsView: NSView, context: Context) {
@@ -978,6 +1130,9 @@ struct FolderScreen: View {
                         .font(.title2)
                         .padding(16)
                         .background(.regularMaterial, in: Circle())
+                } primaryAction: {
+                    model.createNote(snap: contextTracker.snapshot)
+                    if let url = model.selectedNoteUrl { push(.note(url)) }
                 }
                 .disabled(model.folderUrl == nil)
                 .padding(.trailing)
@@ -995,6 +1150,7 @@ struct FolderScreen: View {
             NavigationStack {
                 SettingsView()
                     .environment(model)
+                    .environment(contextTracker)
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
                             Button("Done") { showingSettings = false }
@@ -1157,6 +1313,443 @@ struct RecentsScreen: View {
 
 #endif
 
+enum RightSidebarTab: String, CaseIterable, Identifiable {
+    case history = "History"
+    case info = "Info"
+
+    var id: String { rawValue }
+}
+
+#if os(macOS)
+private struct ResolvingDocumentView: View {
+    let url: String
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Opening Document", systemImage: "doc.richtext")
+        } description: {
+            Text(url.shortHash)
+                .font(.system(.caption, design: .monospaced))
+        }
+    }
+}
+
+struct RightSidebarView: View {
+    let url: String
+    let node: FolderNode?
+    @Binding var selectedTab: RightSidebarTab
+    @Binding var selectedEntry: DocHistoryEntry?
+
+    @Environment(NotesModel.self) private var model
+    @State private var history = DocumentHistorySummary(changeCount: 0, heads: [], modified: nil, entries: [])
+    @State private var revertingHash: String?
+    @State private var historyRefreshTask: Task<Void, Never>?
+
+    private var selectedHistoryHash: String? {
+        selectedEntry?.hash
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Inspector", selection: $selectedTab) {
+                ForEach(RightSidebarTab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(10)
+
+            Divider()
+
+            switch selectedTab {
+            case .history:
+                historyView
+            case .info:
+                infoView
+            }
+        }
+        .background(.regularMaterial)
+        .task(id: url) {
+            selectedEntry = nil
+            await refreshHistory()
+        }
+        .onChange(of: model.previews[url]) {
+            scheduleHistoryRefresh()
+        }
+        .onChange(of: selectedTab) { _, tab in
+            if tab == .history {
+                scheduleHistoryRefresh(delay: .zero)
+            } else {
+                historyRefreshTask?.cancel()
+            }
+        }
+        .onDisappear {
+            historyRefreshTask?.cancel()
+        }
+    }
+
+    private var historyView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                HistoryCurrentRow(
+                    changeCount: history.changeCount,
+                    modified: history.modified,
+                    isSelected: selectedHistoryHash == nil
+                ) {
+                    selectedEntry = nil
+                }
+
+                HistoryTimelineView(
+                    entries: history.entries,
+                    selectedHash: selectedHistoryHash,
+                    revertingHash: revertingHash,
+                    onSelect: { entry in selectedEntry = entry },
+                    onRevert: { entry in
+                        revertingHash = entry.hash
+                        Task {
+                            await model.revertNote(url, to: entry.heads)
+                            await refreshHistory()
+                            selectedEntry = nil
+                            revertingHash = nil
+                        }
+                    }
+                )
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var infoView: some View {
+        Form {
+            Section("Document") {
+                LabeledContent("Name") {
+                    Text(node?.displayName.isEmpty == false ? node!.displayName : "Untitled")
+                }
+                LabeledContent("Kind") {
+                    Text(node?.kind ?? "Document")
+                }
+                Button("Copy URL") {
+                    Clipboard.copy(url)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func scheduleHistoryRefresh(delay: Duration = .milliseconds(650)) {
+        guard selectedTab == .history else { return }
+        historyRefreshTask?.cancel()
+        let refreshUrl = url
+        historyRefreshTask = Task {
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled, refreshUrl == url else { return }
+            await refreshHistory()
+        }
+    }
+
+    private func refreshHistory() async {
+        let summary = await model.documentHistorySummary(url: url)
+        guard !Task.isCancelled else { return }
+        history = summary
+        if let selectedHistoryHash, !summary.entries.contains(where: { $0.hash == selectedHistoryHash }) {
+            selectedEntry = nil
+        }
+    }
+}
+
+private struct HistoryCurrentRow: View {
+    let changeCount: Int
+    let modified: Date?
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("Main")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text("live")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.tint.opacity(0.16), in: Capsule())
+                }
+                HStack(spacing: 8) {
+                    Text("\(changeCount) changes")
+                    if let modified {
+                        Text("Updated \(modified, style: .relative)")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .padding(9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isSelected ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct HistoryTimelineView: View {
+    let entries: [DocHistoryEntry]
+    let selectedHash: String?
+    let revertingHash: String?
+    let onSelect: (DocHistoryEntry) -> Void
+    let onRevert: (DocHistoryEntry) -> Void
+
+    private var groups: [HistoryGroup] {
+        HistoryGroup.groups(from: entries)
+    }
+
+    var body: some View {
+        if entries.isEmpty {
+            Text("No local history yet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 8)
+        } else {
+            HStack(alignment: .top, spacing: 7) {
+                HistoryScrubber(count: entries.count)
+                    .padding(.top, 9)
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(groups) { group in
+                        HistoryGroupRow(
+                            group: group,
+                            selectedHash: selectedHash,
+                            revertingHash: revertingHash,
+                            onSelect: onSelect,
+                            onRevert: onRevert
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct HistoryScrubber: View {
+    let count: Int
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Circle()
+                .fill(.secondary)
+                .frame(width: 8, height: 8)
+            Rectangle()
+                .fill(.secondary.opacity(0.25))
+                .frame(width: 2)
+            Circle()
+                .fill(.secondary.opacity(0.55))
+                .frame(width: 6, height: 6)
+        }
+        .frame(width: 14)
+        .frame(minHeight: CGFloat(max(count, 1)) * 20)
+    }
+}
+
+private struct HistoryGroupRow: View {
+    let group: HistoryGroup
+    let selectedHash: String?
+    let revertingHash: String?
+    let onSelect: (DocHistoryEntry) -> Void
+    let onRevert: (DocHistoryEntry) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(group.title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(group.entries.count)")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+
+            ForEach(group.entries, id: \.hash) { entry in
+                Button {
+                    onSelect(entry)
+                } label: {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(entry.hash == selectedHash ? Color.accentColor : Color.secondary.opacity(0.35))
+                            .frame(width: 7, height: 7)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Text(entry.message?.isEmpty == false ? entry.message! : "Change \(entry.seq)")
+                                    .lineLimit(1)
+                                Spacer()
+                                Text(entry.date, style: .time)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(entry.hash.shortHash)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        if entry.hash == selectedHash {
+                            Button {
+                                onRevert(entry)
+                            } label: {
+                                if revertingHash == entry.hash {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Image(systemName: "arrow.uturn.backward.circle")
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Revert document to this point")
+                        }
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 6)
+                    .background(entry.hash == selectedHash ? Color.accentColor.opacity(0.12) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+#if os(macOS)
+private struct HistoricalNoteSnapshotView: View {
+    let noteUrl: String
+    let entry: DocHistoryEntry
+
+    @Environment(NotesModel.self) private var model
+    @State private var attributed = NSAttributedString(string: "")
+    @State private var isLoading = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Label("Read Only", systemImage: "clock.arrow.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(entry.hash.shortHash)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.bar)
+
+            HistorySnapshotTextView(attributed: attributed)
+        }
+        .task(id: "\(noteUrl):\(entry.heads.joined(separator: ","))") {
+            isLoading = true
+            attributed = await model.renderedSnapshot(for: noteUrl, heads: entry.heads)
+            isLoading = false
+        }
+    }
+}
+
+private struct HistorySnapshotTextView: NSViewRepresentable {
+    let attributed: NSAttributedString
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let storage = NSTextStorage()
+        let layoutManager = ListMarkerLayoutManager()
+        storage.addLayoutManager(layoutManager)
+        let container = NSTextContainer(size: NSSize(
+            width: 0,
+            height: CGFloat.greatestFiniteMagnitude
+        ))
+        container.widthTracksTextView = true
+        layoutManager.addTextContainer(container)
+
+        let textView = NSTextView(frame: .zero, textContainer: container)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 20, height: 16)
+        textView.autoresizingMask = [.width]
+        textView.isVerticallyResizable = true
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        if textView.attributedString() != attributed {
+            textView.textStorage?.setAttributedString(attributed)
+        }
+    }
+}
+#endif
+
+private struct HistoryGroup: Identifiable {
+    let id = UUID()
+    let entries: [DocHistoryEntry]
+
+    var title: String {
+        guard let first = entries.first else { return "Changes" }
+        return first.date.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+    }
+
+    static func groups(from entries: [DocHistoryEntry]) -> [HistoryGroup] {
+        let newestFirst = entries.reversed()
+        var groups: [HistoryGroup] = []
+        var current: [DocHistoryEntry] = []
+        var previous: Date?
+        for entry in newestFirst {
+            let date = entry.date
+            if let previous, abs(previous.timeIntervalSince(date)) > 60, !current.isEmpty {
+                groups.append(HistoryGroup(entries: current))
+                current = []
+            }
+            current.append(entry)
+            previous = date
+        }
+        if !current.isEmpty {
+            groups.append(HistoryGroup(entries: current))
+        }
+        return groups
+    }
+}
+
+private extension DocHistoryEntry {
+    var date: Date {
+        Date(timeIntervalSince1970: TimeInterval(time))
+    }
+}
+
+private extension String {
+    var shortHash: String {
+        guard count > 10 else { return self }
+        return String(prefix(10))
+    }
+}
+#endif
+
 /// Pick a destination folder by name — the tap-friendly stand-in for
 /// drag and drop.
 struct MoveSheet: View {
@@ -1202,6 +1795,10 @@ struct MoveSheet: View {
 /// iOS pushed route.
 struct NoteDetail: View {
     let noteUrl: String
+    var historyVersion: DocHistoryEntry? = nil
+    #if os(macOS)
+    var rightSidebarVisible: Binding<Bool>? = nil
+    #endif
     @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
     @Environment(\.dismiss) private var dismiss
@@ -1212,14 +1809,14 @@ struct NoteDetail: View {
     @State private var moveTarget: MoveTarget?
     @State private var editorDropTargeted = false
     #if os(iOS)
-    @State private var photoItem: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
     #endif
 
     private var currentNode: FolderNode? { model.node(for: noteUrl) }
 
     var body: some View {
         VStack(spacing: 0) {
-            if editor.recorderVisible {
+            if editor.recorderVisible, historyVersion == nil {
                 RecorderBar(recorder: recorder) { data in
                     editor.recorderVisible = false
                     if let data {
@@ -1228,6 +1825,24 @@ struct NoteDetail: View {
                     }
                 }
             }
+            #if os(macOS)
+            if let historyVersion {
+                HistoricalNoteSnapshotView(
+                    noteUrl: noteUrl,
+                    entry: historyVersion
+                )
+                .environment(model)
+            } else {
+                RichTextEditor(noteUrl: noteUrl, model: model, controller: editor, contextTracker: contextTracker)
+                    .mask {
+                        VStack(spacing: 0) {
+                            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                                .frame(height: 16)
+                            Color.black
+                        }
+                    }
+            }
+            #else
             RichTextEditor(noteUrl: noteUrl, model: model, controller: editor, contextTracker: contextTracker)
                 .mask {
                     VStack(spacing: 0) {
@@ -1236,6 +1851,7 @@ struct NoteDetail: View {
                         Color.black
                     }
                 }
+            #endif
         }
         .focusedSceneValue(\.editorController, editor)
         .overlay {
@@ -1249,6 +1865,7 @@ struct NoteDetail: View {
             of: [UTType.plainText.identifier, UTType.fileURL.identifier],
             isTargeted: $editorDropTargeted
         ) { providers in
+            guard historyVersion == nil else { return false }
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
                     provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
@@ -1409,6 +2026,16 @@ struct NoteDetail: View {
                 }
                 .disabled(currentNode == nil)
             }
+            #if os(macOS)
+            ToolbarSpacer(.flexible)
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    rightSidebarVisible?.wrappedValue.toggle()
+                } label: {
+                    Label("Info", systemImage: "info.circle")
+                }
+            }
+            #endif
         }
         .sheet(item: Binding(
             get: { editor.sheet },
@@ -1436,20 +2063,24 @@ struct NoteDetail: View {
                 get: { editor.photoPickerVisible },
                 set: { editor.photoPickerVisible = $0 }
             ),
-            selection: $photoItem,
+            selection: $photoItems,
+            maxSelectionCount: 12,
             matching: .any(of: [.images, .videos])
         )
-        .onChange(of: photoItem) {
-            guard let item = photoItem else { return }
-            photoItem = nil
+        .onChange(of: photoItems) {
+            guard !photoItems.isEmpty else { return }
+            let items = photoItems
+            photoItems = []
             Task {
-                guard let data = try? await item.loadTransferable(type: Data.self) else {
-                    return
+                for (offset, item) in items.enumerated() {
+                    guard let data = try? await item.loadTransferable(type: Data.self) else {
+                        continue
+                    }
+                    let ext = item.supportedContentTypes.first?
+                        .preferredFilenameExtension ?? "png"
+                    let stamp = Int(Date().timeIntervalSince1970)
+                    editor.insertData(data, name: "photo-\(stamp)-\(offset).\(ext)")
                 }
-                let ext = item.supportedContentTypes.first?
-                    .preferredFilenameExtension ?? "png"
-                let stamp = Int(Date().timeIntervalSince1970)
-                editor.insertData(data, name: "photo-\(stamp).\(ext)")
             }
         }
         .fileImporter(
@@ -1743,17 +2374,52 @@ struct PatchworkDetail: View {
     let docUrl: String
     @Environment(NotesModel.self) private var model
     @State private var tools: [ToolChoice] = []
-    @State private var toolInput: String = ""
+    @State private var toolInput: String
     @State private var appliedToolId: String?
+    @State private var toolsLoaded = false
+
+    init(docUrl: String) {
+        self.docUrl = docUrl
+        let remembered = PatchworkWeb.lastTool(for: docUrl)
+        _appliedToolId = State(initialValue: remembered)
+        _toolInput = State(initialValue: remembered ?? "")
+    }
+
+    private func applyTool(_ tool: String?) {
+        appliedToolId = tool
+        PatchworkWeb.setLastTool(tool, for: docUrl)
+        if let kind = model.node(for: docUrl)?.kind, !kind.isEmpty {
+            PatchworkWeb.setLastTool(tool, forType: kind)
+        }
+    }
+
+    private func rememberedTool() -> String? {
+        if let tool = PatchworkWeb.lastTool(for: docUrl) { return tool }
+        if let kind = model.node(for: docUrl)?.kind, !kind.isEmpty {
+            return PatchworkWeb.lastTool(forType: kind)
+        }
+        return nil
+    }
+
+    private var shouldShowToolPicker: Bool {
+        guard !docUrl.isEmpty else { return false }
+        guard toolsLoaded else { return false }
+        #if os(macOS)
+        return model.selectedNoteUrl == docUrl
+        #else
+        return true
+        #endif
+    }
 
     var body: some View {
         Group {
             if PatchworkWeb.available {
-                SharedPatchworkWebViewWrapper(
+                PatchworkBoxWebViewWrapper(
                     docUrl: docUrl,
                     toolId: appliedToolId,
                     onTools: { newTools, current in
                         tools = newTools
+                        toolsLoaded = true
                         if toolInput.isEmpty {
                             toolInput = current ?? ""
                         }
@@ -1768,31 +2434,41 @@ struct PatchworkDetail: View {
             }
         }
         .navigationTitle(model.node(for: docUrl)?.displayName ?? "")
+        .onAppear {
+            if appliedToolId == nil, let remembered = rememberedTool() {
+                appliedToolId = remembered
+                toolInput = remembered
+            }
+        }
         .onChange(of: docUrl) {
             tools = []
-            toolInput = ""
-            appliedToolId = nil
+            toolsLoaded = false
+            let remembered = rememberedTool()
+            toolInput = remembered ?? ""
+            appliedToolId = remembered
         }
         .toolbar {
-            ToolbarItem {
-                HStack(spacing: 4) {
-                    TextField("tool-id", text: $toolInput)
-                        .frame(width: 200)
-                        .onSubmit {
-                            let id = toolInput.trimmingCharacters(in: .whitespaces)
-                            appliedToolId = id.isEmpty ? nil : id
-                        }
-                    Menu {
-                        ForEach(tools) { tool in
-                            Button(tool.name) {
-                                toolInput = tool.id
-                                appliedToolId = tool.id
+            if shouldShowToolPicker {
+                ToolbarItem {
+                    HStack(spacing: 4) {
+                        TextField("tool-id", text: $toolInput)
+                            .frame(width: 200)
+                            .onSubmit {
+                                let id = toolInput.trimmingCharacters(in: .whitespaces)
+                                applyTool(id.isEmpty ? nil : id)
                             }
+                        Menu {
+                            ForEach(tools) { tool in
+                                Button(tool.name) {
+                                    toolInput = tool.id
+                                    applyTool(tool.id)
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "chevron.down")
                         }
-                    } label: {
-                        Image(systemName: "chevron.down.compact")
+                        .disabled(tools.isEmpty)
                     }
-                    .disabled(tools.isEmpty)
                 }
             }
         }
@@ -1806,10 +2482,7 @@ struct IncomingContentSheet: View {
     @State private var search = ""
 
     private var displayTitle: String {
-        switch content.payload {
-        case .text(let t): return String(t.prefix(50)).components(separatedBy: .newlines).first ?? "Import"
-        case .file(let url): return url.lastPathComponent
-        }
+        content.displayTitle
     }
 
     private var allNotes: [FolderNode] {
@@ -1845,7 +2518,8 @@ struct IncomingContentSheet: View {
                     Section("Open in existing note") {
                         ForEach(filtered) { note in
                             Button {
-                                if case .text(let text) = content.payload {
+                                if case .text(let text) = content.flattenedPayloads.first,
+                                   content.flattenedPayloads.count == 1 {
                                     Clipboard.copy(text)
                                 }
                                 model.selectedNoteUrl = note.url

@@ -6,9 +6,9 @@ use sedimentree_core::{
     id::SedimentreeId,
     loose_commit::{id::CommitId, LooseCommit},
 };
+use sedimentree_fs_storage::{FsStorage, FsStorageError};
 use subduction_core::storage::traits::Storage;
 use subduction_crypto::verified_meta::VerifiedMeta;
-use sedimentree_fs_storage::{FsStorage, FsStorageError};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -126,11 +126,7 @@ impl Storage<Sendable> for ObservedStorage {
         commit_id: CommitId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Option<VerifiedMeta<LooseCommit>>, Self::Error>>
     {
-        <FsStorage as Storage<Sendable>>::load_loose_commit(
-            &self.inner,
-            sedimentree_id,
-            commit_id,
-        )
+        <FsStorage as Storage<Sendable>>::load_loose_commit(&self.inner, sedimentree_id, commit_id)
     }
 
     fn delete_loose_commit(
@@ -163,12 +159,8 @@ impl Storage<Sendable> for ObservedStorage {
             blob: verified.blob().clone(),
         };
         Sendable::from_future(async move {
-            <FsStorage as Storage<Sendable>>::save_fragment(
-                &self.inner,
-                sedimentree_id,
-                verified,
-            )
-            .await?;
+            <FsStorage as Storage<Sendable>>::save_fragment(&self.inner, sedimentree_id, verified)
+                .await?;
             let _ = stored.send(StoredBatch {
                 sedimentree_id,
                 commits: Vec::new(),
@@ -184,11 +176,7 @@ impl Storage<Sendable> for ObservedStorage {
         fragment_head: CommitId,
     ) -> <Sendable as FutureForm>::Future<'_, Result<Option<VerifiedMeta<Fragment>>, Self::Error>>
     {
-        <FsStorage as Storage<Sendable>>::load_fragment(
-            &self.inner,
-            sedimentree_id,
-            fragment_head,
-        )
+        <FsStorage as Storage<Sendable>>::load_fragment(&self.inner, sedimentree_id, fragment_head)
     }
 
     fn list_fragment_ids(

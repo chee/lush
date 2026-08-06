@@ -22,6 +22,18 @@ extension UIBezierPath {
 }
 #endif
 
+import SwiftUI
+
+extension Image {
+    init(pImage: PImage) {
+        #if os(macOS)
+        self.init(nsImage: pImage)
+        #else
+        self.init(uiImage: pImage)
+        #endif
+    }
+}
+
 enum Clipboard {
     static func copy(_ string: String) {
         #if os(macOS)

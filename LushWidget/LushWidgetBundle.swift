@@ -11,6 +11,12 @@ import SwiftUI
 @main
 struct LushWidgetBundle: WidgetBundle {
     var body: some Widget {
-        LushWidget()
+        FolderContentWidget()
+        QuickNoteLockScreenWidget()
+        NewNoteLockScreenWidget()
+        if #available(iOS 18.0, macOS 15.0, *) {
+            QuickNoteControlWidget()
+            NewNoteControlWidget()
+        }
     }
 }

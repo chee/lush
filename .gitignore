@@ -21,3 +21,4 @@ xcuserdata/
 
 *.p12
 AuthKey_*.p8
+build/

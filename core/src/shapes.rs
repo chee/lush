@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use automerge::{
     hydrate,
@@ -28,6 +31,13 @@ pub enum SpanJson {
 
 fn tx<O>(r: automerge::transaction::Result<O, automerge::AutomergeError>) -> anyhow::Result<O> {
     r.map(|s| s.result).map_err(|f| anyhow::Error::new(f.error))
+}
+
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Write a string field as a collaborative Text object — the representation
@@ -86,24 +96,27 @@ fn fix_scalar_string<T: Transactable>(
 /// before the representation was fixed. Idempotent; a no-op transaction
 /// records no change.
 pub fn normalize_strings(doc: &mut Automerge) -> anyhow::Result<()> {
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        fix_scalar_string(t, &ROOT, "title")?;
-        if let Some((_, pw)) = t.get(ROOT, "@patchwork")? {
-            fix_scalar_string(t, &pw, "type")?;
-            fix_scalar_string(t, &pw, "title")?;
-            fix_scalar_string(t, &pw, "suggestedImportUrl")?;
-        }
-        if let Some((_, docs)) = t.get(ROOT, "docs")? {
-            for i in 0..t.length(&docs) {
-                if let Some((_, entry)) = t.get(&docs, i)? {
-                    fix_scalar_string(t, &entry, "name")?;
-                    fix_scalar_string(t, &entry, "type")?;
-                    fix_scalar_string(t, &entry, "url")?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            fix_scalar_string(t, &ROOT, "title")?;
+            if let Some((_, pw)) = t.get(ROOT, "@patchwork")? {
+                fix_scalar_string(t, &pw, "type")?;
+                fix_scalar_string(t, &pw, "title")?;
+                fix_scalar_string(t, &pw, "suggestedImportUrl")?;
+            }
+            if let Some((_, docs)) = t.get(ROOT, "docs")? {
+                for i in 0..t.length(&docs) {
+                    if let Some((_, entry)) = t.get(&docs, i)? {
+                        fix_scalar_string(t, &entry, "name")?;
+                        fix_scalar_string(t, &entry, "type")?;
+                        fix_scalar_string(t, &entry, "url")?;
+                    }
                 }
             }
-        }
-        Ok(())
-    }))?;
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
@@ -263,7 +276,10 @@ pub fn update_spans_from_json_at(
 ) -> anyhow::Result<bool> {
     let content = match doc.get(ROOT, "content")? {
         Some((_, id)) => id,
-        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+        None => tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(timestamp),
+            |t| t.put_object(ROOT, "content", ObjType::Text),
+        ))?,
     };
     let before = doc.get_heads();
     tx(doc.transact_with(
@@ -284,18 +300,24 @@ pub fn update_spans_from_json_at(
 pub fn update_spans_from_json(doc: &mut Automerge, spans: &[SpanJson]) -> anyhow::Result<bool> {
     let content = match doc.get(ROOT, "content")? {
         Some((_, id)) => id,
-        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+        None => tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(now_seconds()),
+            |t| t.put_object(ROOT, "content", ObjType::Text),
+        ))?,
     };
     let before = doc.get_heads();
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        t.update_spans(
-            &content,
-            UpdateSpansConfig::default(),
-            json_spans_to_spans(spans),
-        )?;
-        set_note_title_tx(t, false, &title_from_spans(spans))?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            t.update_spans(
+                &content,
+                UpdateSpansConfig::default(),
+                json_spans_to_spans(spans),
+            )?;
+            set_note_title_tx(t, false, &title_from_spans(spans))?;
+            Ok(())
+        },
+    ))?;
     Ok(doc.get_heads() != before)
 }
 
@@ -308,14 +330,20 @@ pub fn splice_note_text(
 ) -> anyhow::Result<bool> {
     let content = match doc.get(ROOT, "content")? {
         Some((_, id)) => id,
-        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+        None => tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(now_seconds()),
+            |t| t.put_object(ROOT, "content", ObjType::Text),
+        ))?,
     };
     let before = doc.get_heads();
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        t.splice_text(&content, index, delete_count as isize, insert)?;
-        set_note_title_tx(t, false, title)?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            t.splice_text(&content, index, delete_count as isize, insert)?;
+            set_note_title_tx(t, false, title)?;
+            Ok(())
+        },
+    ))?;
     Ok(doc.get_heads() != before)
 }
 
@@ -329,22 +357,28 @@ pub fn apply_note_mark(
 ) -> anyhow::Result<bool> {
     let content = match doc.get(ROOT, "content")? {
         Some((_, id)) => id,
-        None => tx(doc.transact(|t| t.put_object(ROOT, "content", ObjType::Text)))?,
+        None => tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(now_seconds()),
+            |t| t.put_object(ROOT, "content", ObjType::Text),
+        ))?,
     };
     let before = doc.get_heads();
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        if let Some(value) = value {
-            t.mark(
-                &content,
-                Mark::new(name.to_string(), json_to_scalar(&value), start, end),
-                ExpandMark::Both,
-            )?;
-        } else {
-            t.unmark(&content, name, start, end, ExpandMark::Both)?;
-        }
-        set_note_title_tx(t, false, title)?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            if let Some(value) = value {
+                t.mark(
+                    &content,
+                    Mark::new(name.to_string(), json_to_scalar(&value), start, end),
+                    ExpandMark::Both,
+                )?;
+            } else {
+                t.unmark(&content, name, start, end, ExpandMark::Both)?;
+            }
+            set_note_title_tx(t, false, title)?;
+            Ok(())
+        },
+    ))?;
     Ok(doc.get_heads() != before)
 }
 
@@ -377,12 +411,15 @@ pub fn init_script(doc: &mut Automerge, name: &str) -> anyhow::Result<()> {
         format!("{name}.js")
     };
     init_file_doc(doc, &filename, "js", "application/javascript", Vec::new())?;
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        let lush = t.put_object(ROOT, "@lush", ObjType::Map)?;
-        put_text(t, &lush, "type", "script")?;
-        put_text(t, &ROOT, "content", "")?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let lush = t.put_object(ROOT, "@lush", ObjType::Map)?;
+            put_text(t, &lush, "type", "script")?;
+            put_text(t, &ROOT, "content", "")?;
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
@@ -392,31 +429,37 @@ pub fn lush_type(doc: &Automerge) -> Option<String> {
 }
 
 pub fn init_rich_note(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
-        put_text(t, &pw, "type", "rich")?;
-        put_text(t, &pw, "title", title)?;
-        put_text(t, &pw, "suggestedImportUrl", RICH_TOOL_URL)?;
-        put_text(t, &ROOT, "title", title)?;
-        let content = t.put_object(ROOT, "content", ObjType::Text)?;
-        t.update_spans(
-            &content,
-            UpdateSpansConfig::default(),
-            [Span::Block(paragraph_block())],
-        )?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+            put_text(t, &pw, "type", "rich")?;
+            put_text(t, &pw, "title", title)?;
+            put_text(t, &pw, "suggestedImportUrl", RICH_TOOL_URL)?;
+            put_text(t, &ROOT, "title", title)?;
+            let content = t.put_object(ROOT, "content", ObjType::Text)?;
+            t.update_spans(
+                &content,
+                UpdateSpansConfig::default(),
+                [Span::Block(paragraph_block())],
+            )?;
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
 pub fn init_folder(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
-        put_text(t, &pw, "type", "folder")?;
-        put_text(t, &ROOT, "title", title)?;
-        t.put_object(ROOT, "docs", ObjType::List)?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+            put_text(t, &pw, "type", "folder")?;
+            put_text(t, &ROOT, "title", title)?;
+            t.put_object(ROOT, "docs", ObjType::List)?;
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
@@ -440,20 +483,23 @@ pub fn folder_entries(doc: &Automerge) -> anyhow::Result<Vec<DocLink>> {
 }
 
 pub fn add_folder_entry(doc: &mut Automerge, link: &DocLink) -> anyhow::Result<()> {
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        let docs = match t.get(ROOT, "docs")? {
-            Some((_, id)) => id,
-            None => t.put_object(ROOT, "docs", ObjType::List)?,
-        };
-        let entry = t.insert_object(&docs, t.length(&docs), ObjType::Map)?;
-        put_text(t, &entry, "name", &link.name)?;
-        put_text(t, &entry, "type", &link.kind)?;
-        put_text(t, &entry, "url", &link.url)?;
-        if let Some(lush) = &link.lush {
-            put_text(t, &entry, "lush", lush)?;
-        }
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let docs = match t.get(ROOT, "docs")? {
+                Some((_, id)) => id,
+                None => t.put_object(ROOT, "docs", ObjType::List)?,
+            };
+            let entry = t.insert_object(&docs, t.length(&docs), ObjType::Map)?;
+            put_text(t, &entry, "name", &link.name)?;
+            put_text(t, &entry, "type", &link.kind)?;
+            put_text(t, &entry, "url", &link.url)?;
+            if let Some(lush) = &link.lush {
+                put_text(t, &entry, "lush", lush)?;
+            }
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
@@ -462,12 +508,56 @@ pub fn remove_folder_entry(doc: &mut Automerge, url: &str) -> anyhow::Result<boo
     let Some(index) = entries.iter().position(|e| e.url == url) else {
         return Ok(false);
     };
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        if let Some((_, docs)) = t.get(ROOT, "docs")? {
-            t.delete(&docs, index)?;
-        }
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            if let Some((_, docs)) = t.get(ROOT, "docs")? {
+                t.delete(&docs, index)?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(true)
+}
+
+/// Bring an entry's name and type in line with what the doc itself says.
+/// Returns false when the entry is absent or already correct.
+pub fn refresh_folder_entry(
+    doc: &mut Automerge,
+    url: &str,
+    name: &str,
+    kind: &str,
+) -> anyhow::Result<bool> {
+    let entries = folder_entries(doc)?;
+    let Some(index) = entries.iter().position(|e| e.url == url) else {
+        return Ok(false);
+    };
+    let entry = &entries[index];
+    let new_name = if name.is_empty() {
+        entry.name.as_str()
+    } else {
+        name
+    };
+    let new_kind = if kind.is_empty() {
+        entry.kind.as_str()
+    } else {
+        kind
+    };
+    if entry.name == new_name && entry.kind == new_kind {
+        return Ok(false);
+    }
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            if let Some((_, docs)) = t.get(ROOT, "docs")? {
+                if let Some((_, entry)) = t.get(&docs, index)? {
+                    set_text(t, &entry, "name", new_name)?;
+                    set_text(t, &entry, "type", new_kind)?;
+                }
+            }
+            Ok(())
+        },
+    ))?;
     Ok(true)
 }
 
@@ -476,14 +566,17 @@ pub fn rename_folder_entry(doc: &mut Automerge, url: &str, name: &str) -> anyhow
     let Some(index) = entries.iter().position(|e| e.url == url) else {
         return Ok(false);
     };
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        if let Some((_, docs)) = t.get(ROOT, "docs")? {
-            if let Some((_, entry)) = t.get(&docs, index)? {
-                set_text(t, &entry, "name", name)?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            if let Some((_, docs)) = t.get(ROOT, "docs")? {
+                if let Some((_, entry)) = t.get(&docs, index)? {
+                    set_text(t, &entry, "name", name)?;
+                }
             }
-        }
-        Ok(())
-    }))?;
+            Ok(())
+        },
+    ))?;
     Ok(true)
 }
 
@@ -496,7 +589,107 @@ fn read_str(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<String
     }
 }
 
-fn doc_patchwork_type(doc: &Automerge) -> Option<String> {
+// ---- patchwork account + lush config doc ----
+
+pub fn account_field(doc: &Automerge, key: &str) -> Option<String> {
+    read_str(doc, &ROOT, key)
+}
+
+pub fn account_tools_lush(doc: &Automerge) -> Option<String> {
+    let (_, tools) = doc.get(ROOT, "tools").ok()??;
+    read_str(doc, &tools, "lush")
+}
+
+pub fn set_account_tools_lush(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let tools = match t.get(ROOT, "tools")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "tools", ObjType::Map)?,
+            };
+            put_text(t, &tools, "lush", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn init_lush_config(doc: &mut Automerge) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+            put_text(t, &pw, "type", "lush:config")?;
+            put_text(t, &pw, "title", "Lush Config")?;
+            t.put_object(ROOT, "folders", ObjType::Map)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+/// `.folders` is an object keyed by numeric index: `{0: url, 1: url}`.
+pub fn config_folders(doc: &Automerge) -> Vec<String> {
+    let Ok(Some((_, folders))) = doc.get(ROOT, "folders") else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(u64, String)> = doc
+        .keys(&folders)
+        .filter_map(|key| {
+            let index: u64 = key.parse().ok()?;
+            let url = read_str(doc, &folders, &key)?;
+            Some((index, url))
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    entries.into_iter().map(|entry| entry.1).collect()
+}
+
+pub fn config_set_folders(doc: &mut Automerge, urls: &[String]) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let folders = match t.get(ROOT, "folders")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "folders", ObjType::Map)?,
+            };
+            let stale: Vec<String> = t
+                .keys(&folders)
+                .filter(|key| {
+                    key.parse::<usize>()
+                        .map(|index| index >= urls.len())
+                        .unwrap_or(true)
+                })
+                .collect();
+            for key in stale {
+                t.delete(&folders, key.as_str())?;
+            }
+            for (index, url) in urls.iter().enumerate() {
+                set_text(t, &folders, &index.to_string(), url)?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn config_inbox(doc: &Automerge) -> Option<String> {
+    read_str(doc, &ROOT, "inbox")
+}
+
+pub fn config_set_inbox(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            set_text(t, &ROOT, "inbox", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn doc_patchwork_type(doc: &Automerge) -> Option<String> {
     let (_, pw) = doc.get(ROOT, "@patchwork").ok()??;
     string_at(doc, &pw, "type")
 }
@@ -539,7 +732,10 @@ pub fn set_note_title(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     let is_file = doc_patchwork_type(doc).as_deref() == Some("file");
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| set_note_title_tx(t, is_file, title)))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| set_note_title_tx(t, is_file, title),
+    ))?;
     Ok(())
 }
 
@@ -567,15 +763,18 @@ pub fn init_file_doc(
     mime_type: &str,
     bytes: Vec<u8>,
 ) -> anyhow::Result<()> {
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
-        put_text(t, &pw, "type", "file")?;
-        put_text(t, &ROOT, "name", name)?;
-        put_text(t, &ROOT, "extension", extension)?;
-        put_text(t, &ROOT, "mimeType", mime_type)?;
-        t.put(ROOT, "content", ScalarValue::Bytes(bytes))?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+            put_text(t, &pw, "type", "file")?;
+            put_text(t, &ROOT, "name", name)?;
+            put_text(t, &ROOT, "extension", extension)?;
+            put_text(t, &ROOT, "mimeType", mime_type)?;
+            t.put(ROOT, "content", ScalarValue::Bytes(bytes))?;
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
@@ -636,15 +835,18 @@ pub fn set_vision_metadata(
     description: &str,
     ocr: &str,
 ) -> anyhow::Result<()> {
-    tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-        let cv = match t.get(ROOT, "@computervision")? {
-            Some((automerge::Value::Object(ObjType::Map), id)) => id,
-            _ => t.put_object(ROOT, "@computervision", ObjType::Map)?,
-        };
-        set_text(t, &cv, "description", description)?;
-        set_text(t, &cv, "ocr", ocr)?;
-        Ok(())
-    }))?;
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let cv = match t.get(ROOT, "@computervision")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "@computervision", ObjType::Map)?,
+            };
+            set_text(t, &cv, "description", description)?;
+            set_text(t, &cv, "ocr", ocr)?;
+            Ok(())
+        },
+    ))?;
     Ok(())
 }
 
@@ -735,12 +937,15 @@ mod tests {
     #[test]
     fn normalize_converts_scalars_and_is_idempotent() {
         let mut doc = Automerge::new();
-        tx(doc.transact::<_, _, automerge::AutomergeError>(|t| {
-            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
-            t.put(&pw, "type", "folder")?;
-            t.put(ROOT, "title", "old scalar")?;
-            Ok(())
-        }))
+        tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(now_seconds()),
+            |t| {
+                let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+                t.put(&pw, "type", "folder")?;
+                t.put(ROOT, "title", "old scalar")?;
+                Ok(())
+            },
+        ))
         .unwrap();
         normalize_strings(&mut doc).unwrap();
         assert!(field_is_text(&doc, &ROOT, "title"));
@@ -861,4 +1066,41 @@ pub fn search_snippet(text: &str, query: &str) -> Option<String> {
 
 pub fn doc_field(doc: &Automerge, key: &str) -> String {
     read_str(doc, &ROOT, key).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod embed_resize_tests {
+    use super::*;
+
+    fn spans_json(raw: &str) -> Vec<SpanJson> {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn embed_block_survives_width_attr_update() {
+        let mut doc = Automerge::new();
+        let initial = spans_json(
+            r#"[
+              {"type":"block","value":{"type":"embed","parents":[],"isEmbed":true,
+                "attrs":{"url":"automerge:abc","tool":"patternwitch"}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"hello"}
+            ]"#,
+        );
+        update_spans_from_json(&mut doc, &initial).unwrap();
+        let resized = spans_json(
+            r#"[
+              {"type":"block","value":{"type":"embed","parents":[],"isEmbed":true,
+                "attrs":{"url":"automerge:abc","tool":"patternwitch","width":420.0,"height":300.0}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"hello"}
+            ]"#,
+        );
+        update_spans_from_json(&mut doc, &resized).unwrap();
+        let out = spans_to_json(&doc).unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("\"embed\""), "embed block vanished: {json}");
+        assert!(json.contains("automerge:abc"), "embed url vanished: {json}");
+        assert!(json.contains("420"), "width attr missing: {json}");
+    }
 }

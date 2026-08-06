@@ -18,6 +18,12 @@ sedimentree_fs_storage = { git = "https://github.com/inkandswitch/subduction", r
 subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["system_time"] }
 subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["std"] }
 subduction_websocket = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["tokio_client", "tokio_server_any"] }
+subduction_iroh = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec" }
+subduction_http_longpoll = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["server"] }
+iroh = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server-auto", "tokio"] }
+http-body-util = "0.1"
 async-tungstenite = { version = "0.31", default-features = false, features = ["tokio-runtime"] }
 future_form = "0.3.0"
 # pure-Rust blake3 so its C kernels can't collide with the copy inside
