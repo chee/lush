@@ -96,6 +96,7 @@ struct ColumnEditor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSTextView {
         let textView = NSTextView(usingTextLayoutManager: true)
         textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         textView.allowsUndo = true
@@ -135,6 +136,11 @@ struct ColumnEditor: NSViewRepresentable {
                     textLayoutManager: layoutManager,
                     storage: storage
                 )
+                invalidateCodeRun(
+                    around: textView.selectedRange().location,
+                    textLayoutManager: layoutManager,
+                    storage: storage
+                )
             }
         }
     }
@@ -153,6 +159,7 @@ struct ColumnEditor: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
         let textView = UITextView(usingTextLayoutManager: true)
         textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.isScrollEnabled = false
         textView.backgroundColor = .clear
         textView.textContainerInset = UIEdgeInsets(top: 4, left: 2, bottom: 4, right: 2)
@@ -181,6 +188,11 @@ struct ColumnEditor: UIViewRepresentable {
             bridge.storageChanged(textView.textStorage)
             if let layoutManager = textView.textLayoutManager {
                 invalidateOrderedListRun(
+                    around: textView.selectedRange.location,
+                    textLayoutManager: layoutManager,
+                    storage: textView.textStorage
+                )
+                invalidateCodeRun(
                     around: textView.selectedRange.location,
                     textLayoutManager: layoutManager,
                     storage: textView.textStorage

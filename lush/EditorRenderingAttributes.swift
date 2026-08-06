@@ -1,0 +1,71 @@
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+/// Display-only paint for the main editor, composed in one validator:
+/// syntax colors, then find-match backgrounds. Nothing here touches the
+/// storage or the automerge round-trip.
+@MainActor
+final class EditorRenderingAttributes {
+    var findMatches: [NSRange] = []
+    var currentFindMatch: NSRange?
+    var globalMatches: [NSRange] = []
+
+    static var matchColor: PColor {
+        #if os(macOS)
+        PColor.findHighlightColor.withAlphaComponent(0.4)
+        #else
+        PColor.systemYellow.withAlphaComponent(0.4)
+        #endif
+    }
+
+    static var currentMatchColor: PColor {
+        #if os(macOS)
+        PColor.findHighlightColor
+        #else
+        PColor.systemYellow
+        #endif
+    }
+
+    static var globalMatchColor: PColor {
+        PColor.pTint.withAlphaComponent(0.18)
+    }
+
+    var validator: (NSTextLayoutManager, NSTextLayoutFragment) -> Void {
+        { [weak self] textLayoutManager, fragment in
+            MainActor.assumeIsolated {
+                CodeHighlight.applyRenderingAttributes(textLayoutManager, fragment)
+                self?.applyMatches(textLayoutManager, fragment)
+            }
+        }
+    }
+
+    private func applyMatches(_ textLayoutManager: NSTextLayoutManager, _ fragment: NSTextLayoutFragment) {
+        guard !findMatches.isEmpty || !globalMatches.isEmpty,
+              let contentStorage = textLayoutManager.textContentManager as? NSTextContentStorage,
+              let elementRange = fragment.textElement?.elementRange
+        else { return }
+        let start = contentStorage.offset(from: contentStorage.documentRange.location, to: elementRange.location)
+        let end = contentStorage.offset(from: contentStorage.documentRange.location, to: elementRange.endLocation)
+        guard start >= 0, end > start else { return }
+        let fragmentRange = NSRange(location: start, length: end - start)
+
+        func paint(_ matches: [NSRange], _ color: PColor) {
+            for match in matches {
+                let clipped = NSIntersectionRange(match, fragmentRange)
+                guard clipped.length > 0,
+                      let textRange = contentStorage.textRange(for: clipped)
+                else { continue }
+                textLayoutManager.setRenderingAttributes([.backgroundColor: color], for: textRange)
+            }
+        }
+
+        paint(globalMatches, Self.globalMatchColor)
+        paint(findMatches, Self.matchColor)
+        if let current = currentFindMatch {
+            paint([current], Self.currentMatchColor)
+        }
+    }
+}

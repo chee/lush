@@ -579,6 +579,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func assetInfo(url: String)  -> AssetInfo?
     
+    func assetMl(url: String)  -> AssetMl?
+    
     func assetVision(url: String)  -> AssetVision?
     
     /**
@@ -801,6 +803,11 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func startFolderUrl(url: String) throws 
     
     /**
+     * Write generated ML metadata onto a UnixFileEntry doc.
+     */
+    func updateAssetMl(url: String, summary: String, caption: String, keywords: String) throws 
+    
+    /**
      * Write Vision OCR + description onto a UnixFileEntry doc.
      */
     func updateAssetVision(url: String, description: String, ocr: String) throws 
@@ -916,6 +923,14 @@ open func assetBytes(url: String)async throws  -> Data  {
 open func assetInfo(url: String) -> AssetInfo?  {
     return try!  FfiConverterOptionTypeAssetInfo.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_asset_info(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+open func assetMl(url: String) -> AssetMl?  {
+    return try!  FfiConverterOptionTypeAssetML.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_asset_ml(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -1587,6 +1602,19 @@ open func startFolderUrl(url: String)throws   {try rustCallWithError(FfiConverte
 }
     
     /**
+     * Write generated ML metadata onto a UnixFileEntry doc.
+     */
+open func updateAssetMl(url: String, summary: String, caption: String, keywords: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_update_asset_ml(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(summary),
+        FfiConverterString.lower(caption),
+        FfiConverterString.lower(keywords),$0
+    )
+}
+}
+    
+    /**
      * Write Vision OCR + description onto a UnixFileEntry doc.
      */
 open func updateAssetVision(url: String, description: String, ocr: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -1852,6 +1880,84 @@ public func FfiConverterTypeAssetInfo_lift(_ buf: RustBuffer) throws -> AssetInf
 #endif
 public func FfiConverterTypeAssetInfo_lower(_ value: AssetInfo) -> RustBuffer {
     return FfiConverterTypeAssetInfo.lower(value)
+}
+
+
+public struct AssetMl {
+    public var summary: String
+    public var caption: String
+    public var keywords: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(summary: String, caption: String, keywords: String) {
+        self.summary = summary
+        self.caption = caption
+        self.keywords = keywords
+    }
+}
+
+#if compiler(>=6)
+extension AssetMl: Sendable {}
+#endif
+
+
+extension AssetMl: Equatable, Hashable {
+    public static func ==(lhs: AssetMl, rhs: AssetMl) -> Bool {
+        if lhs.summary != rhs.summary {
+            return false
+        }
+        if lhs.caption != rhs.caption {
+            return false
+        }
+        if lhs.keywords != rhs.keywords {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(summary)
+        hasher.combine(caption)
+        hasher.combine(keywords)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAssetML: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AssetMl {
+        return
+            try AssetMl(
+                summary: FfiConverterString.read(from: &buf), 
+                caption: FfiConverterString.read(from: &buf), 
+                keywords: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AssetMl, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.summary, into: &buf)
+        FfiConverterString.write(value.caption, into: &buf)
+        FfiConverterString.write(value.keywords, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAssetML_lift(_ buf: RustBuffer) throws -> AssetMl {
+    return try FfiConverterTypeAssetML.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAssetML_lower(_ value: AssetMl) -> RustBuffer {
+    return FfiConverterTypeAssetML.lower(value)
 }
 
 
@@ -2971,6 +3077,30 @@ fileprivate struct FfiConverterOptionTypeAssetInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAssetML: FfiConverterRustBuffer {
+    typealias SwiftType = AssetMl?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAssetML.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAssetML.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeAssetVision: FfiConverterRustBuffer {
     typealias SwiftType = AssetVision?
 
@@ -3339,6 +3469,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_asset_info() != 61101) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_asset_ml() != 7094) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_asset_vision() != 43383) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3505,6 +3638,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_start_folder_url() != 43861) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_update_asset_ml() != 42424) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_update_asset_vision() != 689) {

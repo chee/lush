@@ -5,149 +5,74 @@ import AppKit
 import UIKit
 #endif
 
-/// Positions live SwiftUI views over attachment characters, Proton-style:
-/// the attachment reserves space in the text flow, the hosted view sits on
-/// top of it and is repositioned after every layout pass.
+/// Hosts the live SwiftUI views for attachment characters. TextKit 2 places
+/// and sizes them through `NSTextAttachmentViewProvider`; this manager only
+/// owns the view cache, so embed state (a playing video, a focused column)
+/// survives fragments leaving and re-entering the viewport.
 @MainActor
 final class InlineViewManager {
     weak var core: EditorCore?
 
-    private struct Host {
+    struct Host {
         let view: PView
         let preferredSize: (CGFloat) -> CGSize
         let retained: AnyObject?
     }
 
     private var hosts: [ObjectIdentifier: Host] = [:]
-    private var reconcileScheduled = false
 
-    func setNeedsReconcile() {
-        guard !reconcileScheduled else { return }
-        reconcileScheduled = true
-        Task { @MainActor in
-            self.reconcileScheduled = false
-            self.reconcile()
-        }
-    }
-
-    func reconcile() {
-        guard let core, let view = core.view, let storage = view.pStorage,
-              let textLayoutManager = view.pTextLayoutManager,
-              let contentManager = textLayoutManager.textContentManager,
-              let textContainer = view.pTextContainer
-        else { return }
-        let origin = view.pTextOrigin
-        let containerWidth = max(
-            textContainer.size.width - textContainer.lineFragmentPadding * 2,
-            0
+    func viewProvider(
+        for attachment: EmbedAttachment,
+        location: NSTextLocation,
+        textContainer: NSTextContainer?
+    ) -> NSTextAttachmentViewProvider? {
+        guard let host = host(for: attachment.box) else { return nil }
+        let provider = EmbedViewProvider(
+            textAttachment: attachment,
+            parentView: core?.view?.pSelf,
+            textLayoutManager: textContainer?.textLayoutManager,
+            location: location
         )
-        var seen = Set<ObjectIdentifier>()
-        var resizes: [(location: Int, size: CGSize)] = []
-        let full = NSRange(location: 0, length: storage.length)
-
-        func place(_ host: Host, at location: Int) {
-            if host.view.superview !== view.pSelf {
-                view.pSelf.addSubview(host.view)
-            }
-            guard let textRange = contentManager.textRange(
-                for: NSRange(location: location, length: 1)
-            ) else { return }
-            textLayoutManager.ensureLayout(for: textRange)
-            var rect = CGRect.zero
-            textLayoutManager.enumerateTextSegments(
-                in: textRange, type: .standard, options: []
-            ) { _, frame, _, _ in
-                rect = frame
-                return false
-            }
-            rect.origin.x += origin.x
-            rect.origin.y += origin.y
-            guard containerWidth > 80 else {
-                if host.view.frame != rect { host.view.frame = rect }
-                return
-            }
-            let desired = host.preferredSize(containerWidth)
-            guard desired.width > 1, desired.height > 1 else {
-                if host.view.frame != rect { host.view.frame = rect }
-                return
-            }
-            // compare against the attachment's own bounds, not the layout
-            // rect — TextKit clamps wide attachments to the line fragment,
-            // and chasing that difference loops layout forever
-            let bounds = (storage.attribute(.attachment, at: location, effectiveRange: nil)
-                as? NSTextAttachment)?.bounds.size ?? rect.size
-            if abs(desired.width - bounds.width) > 1 || abs(desired.height - bounds.height) > 1 {
-                resizes.append((location, desired))
-            }
-            let targetFrame = CGRect(origin: rect.origin, size: desired)
-            if host.view.frame != targetFrame { host.view.frame = targetFrame }
-        }
-
-        storage.enumerateAttribute(.amTableBox, in: full) { value, range, _ in
-            guard let box = value as? TableBox else { return }
-            let id = ObjectIdentifier(box)
-            seen.insert(id)
-            let host = hosts[id] ?? makeTableHost(for: box)
-            hosts[id] = host
-            place(host, at: range.location)
-        }
-        storage.enumerateAttribute(.amColumnsBox, in: full) { value, range, _ in
-            guard let box = value as? ColumnsBox else { return }
-            let id = ObjectIdentifier(box)
-            guard let host = hosts[id] ?? makeColumnsHost(for: box) else { return }
-            seen.insert(id)
-            hosts[id] = host
-            place(host, at: range.location)
-        }
-        storage.enumerateAttribute(.amBlock, in: full) { value, range, _ in
-            guard let box = value as? BlockBox, box.value.isEmbedBlock else { return }
-            let id = ObjectIdentifier(box)
-            guard let host = hosts[id] ?? makeEmbedHost(for: box) else { return }
-            seen.insert(id)
-            hosts[id] = host
-            place(host, at: range.location)
-        }
-        for (id, host) in hosts where !seen.contains(id) {
-            host.view.removeFromSuperview()
-            hosts.removeValue(forKey: id)
-        }
-        for resize in resizes {
-            resizeAttachment(at: resize.location, to: resize.size)
-        }
-        if containerWidth > 80 {
-            clampImageAttachments(in: storage, textLayoutManager: textLayoutManager, to: containerWidth)
-        }
+        provider.host = host
+        provider.tracksTextAttachmentViewBounds = true
+        return provider
     }
 
-    /// Images and posters carry their ideal size; keep their bounds within
-    /// the column, growing back if the column widens.
-    private func clampImageAttachments(
-        in storage: NSTextStorage,
-        textLayoutManager: NSTextLayoutManager,
-        to containerWidth: CGFloat
-    ) {
+    private func host(for box: AnyObject) -> Host? {
+        let id = ObjectIdentifier(box)
+        if let hit = hosts[id] { return hit }
+        let host: Host? = switch box {
+        case let table as TableBox: makeTableHost(for: table)
+        case let columns as ColumnsBox: makeColumnsHost(for: columns)
+        case let block as BlockBox where block.value.isEmbedBlock: makeEmbedHost(for: block)
+        default: nil
+        }
+        hosts[id] = host
+        return host
+    }
+
+    /// A box's content changed shape (rows added, embed resized) — re-ask the
+    /// provider for bounds by invalidating the attachment's layout.
+    func embedChanged(_ box: AnyObject) {
+        guard let view = core?.view, let storage = view.pStorage,
+              let textLayoutManager = view.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager
+        else { return }
         storage.enumerateAttribute(
             .attachment,
             in: NSRange(location: 0, length: storage.length)
-        ) { value, range, _ in
-            guard let attachment = value as? FittingImageAttachment else { return }
-            let ideal = attachment.idealSize
-            guard ideal.width > 0, ideal.height > 0 else { return }
-            let width = min(ideal.width, containerWidth)
-            let target = CGSize(width: width, height: ideal.height * width / ideal.width)
-            let current = attachment.bounds.size
-            guard abs(current.width - target.width) > 1
-                || abs(current.height - target.height) > 1 else { return }
-            attachment.bounds = CGRect(origin: .zero, size: target)
-            let charRange = NSRange(location: range.location, length: 1)
-            if let textRange = textLayoutManager.textContentManager?.textRange(for: charRange) {
-                textLayoutManager.invalidateLayout(for: textRange)
-            }
+        ) { value, range, stop in
+            guard let attachment = value as? EmbedAttachment, attachment.box === box else { return }
+            stop.pointee = true
+            guard let textRange = contentManager.textRange(
+                for: NSRange(location: range.location, length: 1)
+            ) else { return }
+            textLayoutManager.invalidateLayout(for: textRange)
         }
     }
 
     func hasLiveView(at point: CGPoint) -> Bool {
-        hosts.values.contains { $0.view.frame.contains(point) }
+        hosts.values.contains { $0.view.superview != nil && $0.view.frame.contains(point) }
     }
 
     func resetHosts() {
@@ -155,24 +80,12 @@ final class InlineViewManager {
             host.view.removeFromSuperview()
         }
         hosts.removeAll()
-        setNeedsReconcile()
     }
 
-    private func resizeAttachment(at location: Int, to size: CGSize) {
-        guard let view = core?.view, let storage = view.pStorage,
-              location < storage.length,
-              let attachment = storage.attribute(.attachment, at: location, effectiveRange: nil)
-                as? NSTextAttachment,
-              let textLayoutManager = view.pTextLayoutManager,
-              let textRange = textLayoutManager.textContentManager?
-                .textRange(for: NSRange(location: location, length: 1))
-        else { return }
-        attachment.bounds = CGRect(origin: .zero, size: size)
-        textLayoutManager.invalidateLayout(for: textRange)
-    }
-
-    private func makeTableHost(for box: TableBox) -> Host {
-        let root = TableInlineView(box: box) { [weak self] in
+    private func makeTableHost(for box: TableBox) -> Host? {
+        guard let core else { return nil }
+        let cache = core.cache
+        let root = TableInlineView(box: box, cache: cache) { [weak self] in
             self?.core?.tableChanged(box)
         }
         let (view, _, retained) = makeHosting(root)
@@ -181,7 +94,9 @@ final class InlineViewManager {
             preferredSize: { width in
                 CGSize(
                     width: min(CGFloat(max(box.grid.columnCount, 1)) * 150 + 2, width),
-                    height: CGFloat(max(box.grid.rows.count, 1)) * 30 + 2
+                    height: box.grid.rows.reduce(CGFloat(2)) { sum, row in
+                        sum + TableInlineView.rowHeight(row, cache: cache)
+                    }
                 )
             },
             retained: retained
@@ -329,19 +244,54 @@ final class InlineViewManager {
     }
 }
 
+final class EmbedViewProvider: NSTextAttachmentViewProvider {
+    var host: InlineViewManager.Host?
+
+    override func loadView() {
+        view = host?.view
+    }
+
+    override func attachmentBounds(
+        for attributes: [NSAttributedString.Key: Any],
+        location: NSTextLocation,
+        textContainer: NSTextContainer?,
+        proposedLineFragment: CGRect,
+        position: CGPoint
+    ) -> CGRect {
+        let fallback = CGRect(origin: .zero, size: textAttachment?.bounds.size ?? .zero)
+        guard let host else { return fallback }
+        let padding = textContainer?.lineFragmentPadding ?? 5
+        let width = proposedLineFragment.width - padding * 2
+        guard width > 80 else { return fallback }
+        let size = host.preferredSize(width)
+        guard size.width > 1, size.height > 1 else { return fallback }
+        return CGRect(origin: .zero, size: size)
+    }
+}
+
 struct TableInlineView: View {
     let box: TableBox
+    let cache: AssetCache
     let onEdit: () -> Void
     @State private var grid: TableGrid
 
-    init(box: TableBox, onEdit: @escaping () -> Void) {
+    init(box: TableBox, cache: AssetCache, onEdit: @escaping () -> Void) {
         self.box = box
+        self.cache = cache
         self.onEdit = onEdit
         _grid = State(initialValue: box.grid)
     }
 
-    private let cellWidth: CGFloat = 150
+    static let cellWidth: CGFloat = 150
     private var line: Color { Color.secondary.opacity(0.35) }
+
+    @MainActor
+    static func rowHeight(_ row: [[SpanNode]], cache: AssetCache) -> CGFloat {
+        let tallest = row.map {
+            RichText.measuredHeight(of: $0, width: cellWidth - 12, cache: cache)
+        }.max() ?? 0
+        return max(30, tallest + 10)
+    }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -349,13 +299,16 @@ struct TableInlineView: View {
                 ForEach(0..<grid.rows.count, id: \.self) { r in
                     GridRow {
                         ForEach(0..<max(grid.columnCount, 1), id: \.self) { c in
-                            TextField("", text: cellBinding(r, c))
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 13, weight: isHeader(r) ? .semibold : .regular))
-                                .padding(.horizontal, 8)
-                                .frame(width: cellWidth, height: 30, alignment: .leading)
-                                .background(isHeader(r) ? Color.secondary.opacity(0.12) : .clear)
-                                .overlay(Rectangle().strokeBorder(line, lineWidth: 0.5))
+                            SpanCellEditor(spans: cellSpans(r, c), cache: cache) { spans in
+                                setCell(r, c, spans)
+                            }
+                            .frame(
+                                width: Self.cellWidth,
+                                height: Self.rowHeight(grid.rows[r], cache: cache),
+                                alignment: .topLeading
+                            )
+                            .background(isHeader(r) ? Color.secondary.opacity(0.12) : .clear)
+                            .overlay(Rectangle().strokeBorder(line, lineWidth: 0.5))
                         }
                     }
                 }
@@ -365,11 +318,11 @@ struct TableInlineView: View {
         .overlay(alignment: .topTrailing) {
             Menu {
                 Button("Add Row") {
-                    grid.rows.append(Array(repeating: "", count: max(grid.columnCount, 1)))
+                    grid.rows.append(Array(repeating: [], count: max(grid.columnCount, 1)))
                     commit()
                 }
                 Button("Add Column") {
-                    grid.rows = grid.rows.map { $0 + [""] }
+                    grid.rows = grid.rows.map { $0 + [[]] }
                     commit()
                 }
                 Divider()
@@ -404,18 +357,15 @@ struct TableInlineView: View {
         grid.hasHeader && row == 0
     }
 
-    private func cellBinding(_ r: Int, _ c: Int) -> Binding<String> {
-        Binding(
-            get: {
-                guard r < grid.rows.count, c < grid.rows[r].count else { return "" }
-                return grid.rows[r][c]
-            },
-            set: { value in
-                guard r < grid.rows.count, c < grid.rows[r].count else { return }
-                grid.rows[r][c] = value
-                commit()
-            }
-        )
+    private func cellSpans(_ r: Int, _ c: Int) -> [SpanNode] {
+        guard r < grid.rows.count, c < grid.rows[r].count else { return [] }
+        return grid.rows[r][c]
+    }
+
+    private func setCell(_ r: Int, _ c: Int, _ spans: [SpanNode]) {
+        guard r < grid.rows.count, c < grid.rows[r].count else { return }
+        grid.rows[r][c] = spans
+        commit()
     }
 
     private func commit() {
@@ -424,6 +374,106 @@ struct TableInlineView: View {
         onEdit()
     }
 }
+
+/// A one-cell rich editor: spans in, spans out on every edit.
+private struct SpanCellEditor {
+    let spans: [SpanNode]
+    let cache: AssetCache
+    let onEdit: ([SpanNode]) -> Void
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var onEdit: ([SpanNode]) -> Void
+        let markers = ListMarkerLayoutDelegate()
+
+        init(onEdit: @escaping ([SpanNode]) -> Void) {
+            self.onEdit = onEdit
+        }
+
+        func storageChanged(_ storage: NSTextStorage, textLayoutManager: NSTextLayoutManager?, caret: Int) {
+            onEdit(RichText.spans(from: storage))
+            guard let textLayoutManager else { return }
+            invalidateOrderedListRun(around: caret, textLayoutManager: textLayoutManager, storage: storage)
+            invalidateCodeRun(around: caret, textLayoutManager: textLayoutManager, storage: storage)
+        }
+    }
+
+    @MainActor
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onEdit: onEdit)
+    }
+}
+
+#if os(macOS)
+extension SpanCellEditor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = NSTextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
+        textView.textContainer?.widthTracksTextView = true
+        textView.isRichText = true
+        textView.allowsUndo = true
+        textView.drawsBackground = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.textContainerInset = NSSize(width: 2, height: 4)
+        textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        textView.delegate = context.coordinator
+        textView.autoresizingMask = [.width, .height]
+        if !spans.isEmpty {
+            textView.textStorage?.setAttributedString(RichText.attributed(from: spans, cache: cache))
+        }
+        return textView
+    }
+
+    func updateNSView(_ nsView: NSTextView, context: Context) {
+        context.coordinator.onEdit = onEdit
+    }
+}
+
+extension SpanCellEditor.Coordinator: NSTextViewDelegate {
+    func textDidChange(_ notification: Notification) {
+        guard let textView = notification.object as? NSTextView,
+              let storage = textView.textStorage else { return }
+        storageChanged(
+            storage,
+            textLayoutManager: textView.textLayoutManager,
+            caret: textView.selectedRange().location
+        )
+    }
+}
+#else
+extension SpanCellEditor: UIViewRepresentable {
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
+        textView.isScrollEnabled = false
+        textView.backgroundColor = .clear
+        textView.textContainerInset = UIEdgeInsets(top: 4, left: 2, bottom: 4, right: 2)
+        textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        textView.delegate = context.coordinator
+        if !spans.isEmpty {
+            textView.textStorage.setAttributedString(RichText.attributed(from: spans, cache: cache))
+        }
+        return textView
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        context.coordinator.onEdit = onEdit
+    }
+}
+
+extension SpanCellEditor.Coordinator: UITextViewDelegate {
+    func textViewDidChange(_ textView: UITextView) {
+        storageChanged(
+            textView.textStorage,
+            textLayoutManager: textView.textLayoutManager,
+            caret: textView.selectedRange.location
+        )
+    }
+}
+#endif
 
 struct UnknownBlockView: View {
     let block: BlockValue

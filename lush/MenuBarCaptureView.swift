@@ -3,7 +3,19 @@ import SwiftUI
 #if os(macOS)
 import AppKit
 
+struct LushMenuBarIcon: View {
+    var body: some View {
+        Image(systemName: "note.text")
+            .symbolRenderingMode(.monochrome)
+            .font(.system(size: 15, weight: .semibold))
+            .frame(width: 18, height: 18)
+    }
+}
+
 struct MenuBarCaptureView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(NotesModel.self) private var model
     @FocusState private var textFieldFocused: Bool
     @State private var text = ""
@@ -15,14 +27,14 @@ struct MenuBarCaptureView: View {
         VStack(alignment: .leading, spacing: 12) {
             header
 
-            TextField("Catch a thought", text: $text, axis: .vertical)
+            TextField("", text: $text, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(2...4)
                 .padding(10)
-                .background(.white.opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
+                .background(fieldBackground, in: RoundedRectangle(cornerRadius: 8))
                 .overlay {
                     RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.white.opacity(0.9), lineWidth: 1)
+                        .stroke(fieldBorder, lineWidth: 1)
                 }
                 .focused($textFieldFocused)
                 .onSubmit { submitText() }
@@ -46,7 +58,7 @@ struct MenuBarCaptureView: View {
             }
 
             Divider()
-                .overlay(Color.white.opacity(0.7))
+                .overlay(dividerColor)
 
             actionGrid
 
@@ -65,15 +77,7 @@ struct MenuBarCaptureView: View {
         .padding(14)
         .frame(width: 320)
         .background {
-            LinearGradient(
-                colors: [
-                    Color(red: 1.0, green: 0.93, blue: 0.88),
-                    Color(red: 1.0, green: 0.82, blue: 0.79),
-                    Color(red: 0.98, green: 0.93, blue: 0.78)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            panelBackground
         }
         .task {
             await model.start()
@@ -86,9 +90,11 @@ struct MenuBarCaptureView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Image(systemName: "text.badge.plus")
-                .font(.title3)
-                .foregroundStyle(Color(red: 0.72, green: 0.22, blue: 0.34))
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .renderingMode(.original)
+                .scaledToFit()
+                .frame(width: 18, height: 18)
             Text("Lush")
                 .font(.headline)
             Spacer()
@@ -118,6 +124,12 @@ struct MenuBarCaptureView: View {
                     AppRouter.shared.pending = .search("")
                     openLush()
                 }
+                menuAction("Quick Note", systemImage: "bolt.circle") {
+                    AppRouter.shared.pending = .quickNote
+                    openLush()
+                }
+            }
+            GridRow {
                 menuAction("Open Lush", systemImage: "arrow.up.forward.app") {
                     openLush()
                 }
@@ -167,7 +179,41 @@ struct MenuBarCaptureView: View {
             }
         }
         .padding(10)
-        .background(.white.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+        .background(sectionBackground, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var isDarkMode: Bool { colorScheme == .dark }
+
+    private var panelBackground: LinearGradient {
+        LinearGradient(
+            colors: isDarkMode ? [
+                Color(red: 0.10, green: 0.11, blue: 0.13),
+                Color(red: 0.13, green: 0.12, blue: 0.16),
+                Color(red: 0.12, green: 0.10, blue: 0.09)
+            ] : [
+                Color(red: 1.0, green: 0.93, blue: 0.88),
+                Color(red: 1.0, green: 0.82, blue: 0.79),
+                Color(red: 0.98, green: 0.93, blue: 0.78)
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    private var fieldBackground: Color {
+        isDarkMode ? Color.white.opacity(0.08) : Color.white.opacity(0.72)
+    }
+
+    private var sectionBackground: Color {
+        isDarkMode ? Color.white.opacity(0.06) : Color.white.opacity(0.55)
+    }
+
+    private var fieldBorder: Color {
+        isDarkMode ? Color.white.opacity(0.16) : Color.white.opacity(0.9)
+    }
+
+    private var dividerColor: Color {
+        isDarkMode ? Color.white.opacity(0.18) : Color.white.opacity(0.7)
     }
 
     private var trimmedText: String {
@@ -228,21 +274,36 @@ struct MenuBarCaptureView: View {
         Task {
             let transcript = await Transcriber.transcribe(data, fileExtension: "m4a")
             isTranscribing = false
-            guard let transcript else {
-                status = "Recording saved, but transcription is unavailable"
-                return
+            let url = await model.appendRecordingToQuickNote(data: data, transcript: transcript)
+            if url == nil {
+                status = "Couldn't update Quick Note"
+            } else if transcript == nil {
+                status = "Recording added; transcript unavailable"
+            } else {
+                status = "Recording and transcript added"
             }
-            let url = await model.appendToQuickNote(transcript)
-            status = url == nil ? "Couldn't update Quick Note" : "Recording transcript added"
         }
     }
 
     private func openLush() {
-        NSApp.activate(ignoringOtherApps: true)
+        dismiss()
+        openWindow(id: "main")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            NSApp.unhide(nil)
+            NSRunningApplication.current.activate(options: [.activateAllWindows])
+            NSApp.windows
+                .filter { $0.level == .normal && $0.canBecomeMain }
+                .forEach { window in
+                    if window.isMiniaturized {
+                        window.deminiaturize(nil)
+                    }
+                    window.makeKeyAndOrderFront(nil)
+                }
+        }
     }
 
     private func closeMenuWindow() {
-        NSApp.keyWindow?.performClose(nil)
+        dismiss()
     }
 
     private func timeString(_ t: TimeInterval) -> String {

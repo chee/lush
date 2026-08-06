@@ -818,9 +818,9 @@ struct ToolChoice: Identifiable, Equatable {
 }
 
 final class PatchworkEmbedBridge: NSObject, WKScriptMessageHandler {
-    let onTools: @MainActor ([ToolChoice], String?) -> Void
+    let onTools: @MainActor @Sendable ([ToolChoice], String?) -> Void
 
-    init(onTools: @escaping @MainActor ([ToolChoice], String?) -> Void) {
+    init(onTools: @escaping @MainActor @Sendable ([ToolChoice], String?) -> Void) {
         self.onTools = onTools
     }
 
@@ -848,7 +848,7 @@ final class PatchworkEmbedBridge: NSObject, WKScriptMessageHandler {
 struct PatchworkWebView: NSViewRepresentable {
     let docUrl: String
     let toolId: String?
-    var onTools: (@MainActor ([ToolChoice], String?) -> Void)?
+    var onTools: (@MainActor @Sendable ([ToolChoice], String?) -> Void)?
 
     func makeCoordinator() -> PatchworkEmbedBridge? {
         onTools.map { PatchworkEmbedBridge(onTools: $0) }
@@ -864,7 +864,7 @@ struct PatchworkWebView: NSViewRepresentable {
 struct PatchworkWebView: UIViewRepresentable {
     let docUrl: String
     let toolId: String?
-    var onTools: (@MainActor ([ToolChoice], String?) -> Void)?
+    var onTools: (@MainActor @Sendable ([ToolChoice], String?) -> Void)?
 
     func makeCoordinator() -> PatchworkEmbedBridge? {
         onTools.map { PatchworkEmbedBridge(onTools: $0) }
@@ -1106,9 +1106,9 @@ extension PatchworkWebView {
 }
 
 final class MutablePickerBridge: NSObject, WKScriptMessageHandler {
-    @MainActor var onPick: (@MainActor (String, String?) -> Void)?
+    @MainActor var onPick: (@MainActor @Sendable (String, String?) -> Void)?
 
-    init(onPick: (@MainActor (String, String?) -> Void)? = nil) {
+    init(onPick: (@MainActor @Sendable (String, String?) -> Void)? = nil) {
         self.onPick = onPick
         super.init()
     }
@@ -1136,7 +1136,7 @@ final class SharedPatchworkPickerView {
 
     var webView: WKWebView { host.webView }
 
-    var onPick: (@MainActor (String, String?) -> Void)? {
+    var onPick: (@MainActor @Sendable (String, String?) -> Void)? {
         get { bridge.onPick }
         set { bridge.onPick = newValue }
     }
@@ -1151,14 +1151,16 @@ final class SharedPatchworkPickerView {
 
 #if os(macOS)
 struct PatchworkPickerView: NSViewRepresentable {
-    let onPick: @MainActor (String, String?) -> Void
+    let onPick: @MainActor @Sendable (String, String?) -> Void
     var preferredType: String?
     var preferredToolId: String?
 
+    @MainActor
     func makeCoordinator() -> MutablePickerBridge {
         MutablePickerBridge(onPick: onPick)
     }
 
+    @MainActor
     func makeNSView(context: Context) -> WKWebView {
         if let preferredType {
             return makePatchworkWebView(
@@ -1174,6 +1176,7 @@ struct PatchworkPickerView: NSViewRepresentable {
         return SharedPatchworkPickerView.shared.webView
     }
 
+    @MainActor
     func updateNSView(_ nsView: WKWebView, context: Context) {
         if preferredType == nil {
             SharedPatchworkPickerView.shared.onPick = onPick
@@ -1184,7 +1187,7 @@ struct PatchworkPickerView: NSViewRepresentable {
 }
 #else
 struct PatchworkPickerView: UIViewRepresentable {
-    let onPick: @MainActor (String, String?) -> Void
+    let onPick: @MainActor @Sendable (String, String?) -> Void
     var preferredType: String?
     var preferredToolId: String?
 
@@ -1257,13 +1260,13 @@ struct PatchworkCreateSheet: View {
 struct NewPatchworkDocSheet: View {
     var preferredType: String?
     var preferredToolId: String?
-    let onPick: @MainActor (String, String?) -> Void
+    let onPick: @MainActor @Sendable (String, String?) -> Void
     @Environment(\.dismiss) private var dismiss
 
     init(
         preferredType: String? = nil,
         preferredToolId: String? = nil,
-        onPick: @escaping @MainActor (String, String?) -> Void
+        onPick: @escaping @MainActor @Sendable (String, String?) -> Void
     ) {
         self.preferredType = preferredType
         self.preferredToolId = preferredToolId
@@ -1320,11 +1323,13 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
     var activatable = false
     var toolCapturesPointer = false
     var active: Binding<Bool>? = nil
-    var onTraits: (@MainActor (Bool) -> Void)? = nil
-    var onTools: @MainActor ([ToolChoice], String?) -> Void
+    var onTraits: (@MainActor @Sendable (Bool) -> Void)? = nil
+    var onTools: @MainActor @Sendable ([ToolChoice], String?) -> Void
 
+    @MainActor
     func makeCoordinator() -> PatchworkBoxCoordinator { PatchworkBoxCoordinator() }
 
+    @MainActor
     func makeNSView(context: Context) -> WKWebView {
         let coord = context.coordinator
         let host = PatchworkWebViewHost(messageHandler: coord.bridge)
@@ -1338,6 +1343,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         return host.webView
     }
 
+    @MainActor
     func updateNSView(_ nsView: WKWebView, context: Context) {
         let coord = context.coordinator
         coord.bridge.onTools = onTools
@@ -1350,6 +1356,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         }
     }
 
+    @MainActor
     private func configureActivation(_ webView: WKWebView) {
         guard let embed = webView as? EmbedWebView else { return }
         embed.activatable = activatable
@@ -1370,8 +1377,8 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
     var activatable = false
     var toolCapturesPointer = false
     var active: Binding<Bool>? = nil
-    var onTraits: (@MainActor (Bool) -> Void)? = nil
-    var onTools: @MainActor ([ToolChoice], String?) -> Void
+    var onTraits: (@MainActor @Sendable (Bool) -> Void)? = nil
+    var onTools: @MainActor @Sendable ([ToolChoice], String?) -> Void
 
     func makeCoordinator() -> PatchworkBoxCoordinator { PatchworkBoxCoordinator() }
 
@@ -1635,8 +1642,8 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
 }
 
 final class MutablePatchworkBridge: NSObject, WKScriptMessageHandler {
-    @MainActor var onTools: (@MainActor ([ToolChoice], String?) -> Void)?
-    @MainActor var onTraits: (@MainActor (Bool) -> Void)?
+    @MainActor var onTools: (@MainActor @Sendable ([ToolChoice], String?) -> Void)?
+    @MainActor var onTraits: (@MainActor @Sendable (Bool) -> Void)?
 
     func userContentController(
         _ userContentController: WKUserContentController,

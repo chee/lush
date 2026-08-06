@@ -89,7 +89,7 @@
 			);
 			target = F073172430241AD500FFA544 /* LushFinderAction */;
 		};
-		F09B1ABE3020EA4300417560 /* Exceptions for "lush" folder in "Lush" target */ = {
+		F07318663024EF3600FFA544 /* Exceptions for "lush" folder in "Lush" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
@@ -123,10 +123,15 @@
 			path = LushFinderAction;
 			sourceTree = "<group>";
 		};
+		F07318543024EBD200FFA544 /* fonts */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = fonts;
+			sourceTree = "<group>";
+		};
 		F09B1AA13020DCF500417560 /* lush */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				F09B1ABE3020EA4300417560 /* Exceptions for "lush" folder in "Lush" target */,
+				F07318663024EF3600FFA544 /* Exceptions for "lush" folder in "Lush" target */,
 			);
 			path = lush;
 			sourceTree = "<group>";
@@ -172,6 +177,7 @@
 		F001D2FF301E8AA900E154BD = {
 			isa = PBXGroup;
 			children = (
+				F07318543024EBD200FFA544 /* fonts */,
 				F07316B63022831200FFA544 /* LushWidget */,
 				F073171030241ABC00FFA544 /* LushShareExtension */,
 				F073172630241AD500FFA544 /* LushFinderAction */,
@@ -222,6 +228,7 @@
 				F073173230241AD500FFA544 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
+				F07318543024EBD200FFA544 /* fonts */,
 				F09B1AA13020DCF500417560 /* lush */,
 			);
 			name = Lush;

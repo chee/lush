@@ -18,6 +18,8 @@ enum NoteChatAssistant {
     enum ChatError: LocalizedError {
         case emptyQuestion
         case appleIntelligenceUnavailable
+        case customModelNotConfigured
+        case customRuntimeUnavailable
         case generationFailed
 
         var errorDescription: String? {
@@ -26,6 +28,10 @@ enum NoteChatAssistant {
                 "Ask a question or describe the change you want."
             case .appleIntelligenceUnavailable:
                 "Apple Intelligence is not available on this device."
+            case .customModelNotConfigured:
+                "No Core ML model is configured for note chat."
+            case .customRuntimeUnavailable:
+                "The selected model is downloaded, but Lush does not have a Core ML runtime adapter for this model yet."
             case .generationFailed:
                 "The local model could not answer about this note."
             }
@@ -46,11 +52,35 @@ enum NoteChatAssistant {
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else { throw ChatError.emptyQuestion }
 
+        switch LocalModelSettings.backend(for: .noteChat) {
+        case .appleIntelligence:
+            return try await respondWithFoundationModels(
+                to: trimmedQuestion,
+                noteTitle: noteTitle,
+                noteMarkdown: noteMarkdown,
+                previousTurns: previousTurns
+            )
+        case .coreML:
+            return try await respondWithCoreMLModel(
+                to: trimmedQuestion,
+                noteTitle: noteTitle,
+                noteMarkdown: noteMarkdown,
+                previousTurns: previousTurns
+            )
+        }
+    }
+
+    private static func respondWithFoundationModels(
+        to trimmedQuestion: String,
+        noteTitle: String,
+        noteMarkdown: String,
+        previousTurns: [NoteChatTurn]
+    ) async throws -> (answer: String, proposedMarkdown: String?) {
         let model = SystemLanguageModel.default
         guard model.isAvailable else { throw ChatError.appleIntelligenceUnavailable }
 
         let instructions = """
-        You help someone understand and edit one note in Lush. Use only the supplied note and chat history. If the person asks a question, answer it directly. If the person asks you to change, rewrite, reorganize, summarize, expand, or otherwise edit the note, include the full revised note as editedMarkdown. Preserve the note's facts, voice, and formatting unless the person asks for a change. Return strict JSON with keys answer and editedMarkdown. editedMarkdown must be null when no note change is being proposed.
+        You help someone understand and edit one note in Lush. Use only the supplied note and chat history. If the person asks a question, answer it directly using the note. If the person asks you to change, rewrite, reorganize, summarize, expand, or otherwise edit the note, include the full revised note as editedMarkdown. Preserve the note's facts, voice, and formatting unless the person asks for a change. Return only strict JSON with keys answer and editedMarkdown. The answer value must be your real answer, not a schema description. editedMarkdown must be null when no note change is being proposed.
         """
         let prompt = """
         Note title: \(limited(noteTitle, to: 300))
@@ -64,20 +94,66 @@ enum NoteChatAssistant {
         Person request:
         \(trimmedQuestion)
 
-        JSON shape:
-        {"answer":"short helpful response","editedMarkdown":null}
-        or
-        {"answer":"what changed and why","editedMarkdown":"full revised note in Markdown"}
+        Return one JSON object and no other text.
+        Requirements for the JSON fields:
+        - answer: your actual response to the person's request
+        - editedMarkdown: null unless you are proposing a note change; otherwise the complete revised note in Markdown
         """
 
         let session = LanguageModelSession(instructions: instructions)
-        let response = try await session.respond(to: prompt)
+        let settings = LocalModelSettings.generationSettings(for: .noteChat)
+        let options = GenerationOptions(
+            temperature: settings.temperature,
+            maximumResponseTokens: settings.maximumResponseTokens
+        )
+        let response = try await session.respond(to: prompt, options: options)
         guard let generated = parse(response.content) else { throw ChatError.generationFailed }
 
         let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
         let proposedMarkdown = generated.editedMarkdown?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
+        guard !isPlaceholder(answer), !isPlaceholder(proposedMarkdown) else { throw ChatError.generationFailed }
+        guard !answer.isEmpty || proposedMarkdown != nil else { throw ChatError.generationFailed }
+        return (answer.isEmpty ? "I drafted a change for this note." : answer, proposedMarkdown)
+    }
+
+    private static func respondWithCoreMLModel(
+        to trimmedQuestion: String,
+        noteTitle: String,
+        noteMarkdown: String,
+        previousTurns: [NoteChatTurn]
+    ) async throws -> (answer: String, proposedMarkdown: String?) {
+        let config = LocalModelSettings.remoteModelConfig(for: .noteChat)
+        guard !config.repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ChatError.customModelNotConfigured
+        }
+
+        let prompt = """
+        You help someone understand and edit one note in Lush. Use only the supplied note and chat history. Return only strict JSON with keys answer and editedMarkdown. editedMarkdown must be null when no note change is being proposed.
+
+        Note title: \(limited(noteTitle, to: 300))
+
+        Current note in Markdown:
+        \(limited(noteMarkdown, to: 12_000))
+
+        Recent chat:
+        \(historySummary(from: previousTurns))
+
+        Person request:
+        \(trimmedQuestion)
+        """
+        let response = try await LocalLLMRuntime.generateText(
+            prompt: prompt,
+            config: config,
+            maxTokens: LocalModelSettings.generationSettings(for: .noteChat).maximumResponseTokens
+        )
+        guard let generated = parse(response) else { throw ChatError.generationFailed }
+        let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proposedMarkdown = generated.editedMarkdown?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        guard !isPlaceholder(answer), !isPlaceholder(proposedMarkdown) else { throw ChatError.generationFailed }
         guard !answer.isEmpty || proposedMarkdown != nil else { throw ChatError.generationFailed }
         return (answer.isEmpty ? "I drafted a change for this note." : answer, proposedMarkdown)
     }
@@ -93,6 +169,14 @@ enum NoteChatAssistant {
     private static func limited(_ value: String, to maxCharacters: Int) -> String {
         guard value.count > maxCharacters else { return value }
         return String(value.prefix(maxCharacters))
+    }
+
+    private static func isPlaceholder(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "short helpful response"
+            || normalized == "what changed and why"
+            || normalized == "full revised note in markdown"
     }
 
     private static func parse(_ raw: String) -> GeneratedReply? {
@@ -205,6 +289,7 @@ struct NoteChatView: View {
                 Button(action: submit) {
                     Image(systemName: "paperplane.fill")
                 }
+                .keyboardShortcut(.return, modifiers: .command)
                 .buttonStyle(.borderedProminent)
                 .disabled(isGenerating || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Send")
@@ -289,7 +374,7 @@ private struct NoteChatBubble: View {
                 .textSelection(.enabled)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
-                .background(backgroundStyle, in: RoundedRectangle(cornerRadius: 8))
+                .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 8))
                 .frame(maxWidth: .infinity, alignment: turn.role == .user ? .trailing : .leading)
 
             if let proposedMarkdown = turn.proposedMarkdown {
@@ -330,7 +415,7 @@ private struct NoteChatBubble: View {
         .frame(maxWidth: .infinity, alignment: turn.role == .user ? .trailing : .leading)
     }
 
-    private var backgroundStyle: some ShapeStyle {
+    private var bubbleBackground: AnyShapeStyle {
         turn.role == .user ? AnyShapeStyle(.tint.opacity(0.18)) : AnyShapeStyle(.quaternary.opacity(0.7))
     }
 }

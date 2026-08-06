@@ -14,6 +14,17 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleDisplayName</key>
 	<string>Lush Notes</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Caroni-Regular.otf</string>
+		<string>FantasqueSansMono-Regular.ttf</string>
+		<string>FantasqueSansMono-Bold.ttf</string>
+		<string>FantasqueSansMono-Italic.ttf</string>
+		<string>FantasqueSansMono-BoldItalic.ttf</string>
+		<string>jost-vf.ttf</string>
+		<string>Merriweather-VariableFont_opsz,wdth,wght.ttf</string>
+		<string>Merriweather-Italic-VariableFont_opsz,wdth,wght.ttf</string>
+	</array>
 	<key>NSDockTilePlugIn</key>
 	<string>LushDockTile</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
@@ -32,6 +43,7 @@
 		<key>NSUserActivityTypes</key>
 		<array>
 			<string>com.apple.corespotlightitem</string>
+			<string>party.chee.patchwork.lush.view</string>
 		</array>
 		<key>NSServices</key>
 		<array>

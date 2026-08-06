@@ -39,6 +39,8 @@ final class EditorController {
         ("heading1", "Title"),
         ("heading2", "Heading"),
         ("heading3", "Subheading"),
+        ("serif", "Serif"),
+        ("hand", "Hand"),
         ("unordered-list-item", "Bulleted List"),
         ("ordered-list-item", "Numbered List"),
         ("todo-list-item", "To-do List"),
@@ -59,12 +61,31 @@ final class EditorController {
     var highlightActive: String?
     var recorderVisible = false
     var sheet: EditorSheet?
+    var findVisible = false
+    var findQuery = ""
+    var findMatchCount = 0
+    var findIndex = 0
     #if os(iOS)
     var photoPickerVisible = false
     var filePickerVisible = false
     var cameraPickerVisible = false
     #endif
     @ObservationIgnored weak var core: EditorCore?
+
+    func openFind() {
+        findVisible = true
+        core?.updateFindMatches()
+    }
+
+    func closeFind() {
+        findVisible = false
+        findQuery = ""
+        core?.updateFindMatches()
+    }
+
+    func findQueryChanged() { core?.updateFindMatches() }
+    func findNext() { core?.stepFind(1) }
+    func findPrevious() { core?.stepFind(-1) }
 
     func applyStyle(_ key: String) {
         core?.applyBlockStyle(BlockValue.fromStyleKey(key))
@@ -152,12 +173,34 @@ final class EditorController {
         return await core.model.analyzeAssetVision(url)
     }
 
+    func assetML(_ url: String) async -> AssetMl? {
+        guard let core else { return nil }
+        return await core.model.assetML(url)
+    }
+
+    func updateAssetML(assetUrl: String, summary: String, caption: String, keywords: String) {
+        Task { [weak self] in
+            await self?.core?.model.updateAssetML(
+                assetUrl,
+                summary: summary,
+                caption: caption,
+                keywords: keywords
+            )
+        }
+    }
+
+    func generateAssetML(assetUrl: String, name: String? = nil) async -> AssetMl? {
+        guard let core else { return nil }
+        return await core.model.generateAssetML(assetUrl, name: name)
+    }
+
     func saveTranscript(assetUrl: String, transcript: String) {
         core?.cache.transcripts[assetUrl] = transcript
         Task { [weak self] in
             guard let self else { return }
             let vision = await self.assetVision(assetUrl)
             await self.core?.model.updateAssetVision(assetUrl, description: vision?.description ?? "", ocr: transcript)
+            _ = await self.generateAssetML(assetUrl: assetUrl)
         }
     }
 }
@@ -168,13 +211,28 @@ protocol EditorTextViewLike: AnyObject {
     var pSelectedRange: NSRange { get set }
     var pTypingAttributes: [NSAttributedString.Key: Any] { get set }
     var pTextLayoutManager: NSTextLayoutManager? { get }
-    var pLayoutManager: NSLayoutManager? { get }
     var pContentStorage: NSTextContentStorage? { get }
     var pTextContainer: NSTextContainer? { get }
-    var pTextOrigin: CGPoint { get }
     var pSelf: PView { get }
     func pInsertText(_ text: String)
     func pReplace(_ range: NSRange, with attributed: NSAttributedString)
+    func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void)
+    func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int?
+    func pScrollRangeToVisible(_ range: NSRange)
+}
+
+extension ListMarkerLayoutDelegate {
+    /// The trailing empty line's marker comes from whatever the caret at the
+    /// end of the document promises to type next.
+    @MainActor
+    func driveTypingAttributes(from view: any EditorTextViewLike) {
+        typingAttributesProvider = { [weak view] in
+            guard let view,
+                  view.pSelectedRange.location >= (view.pStorage?.length ?? 0)
+            else { return nil }
+            return view.pTypingAttributes
+        }
+    }
 }
 
 @MainActor
@@ -209,6 +267,8 @@ private enum EditorDocumentSessions {
 
 @MainActor
 final class EditorCore {
+    private static let softLineBreak = "\u{2028}"
+
     weak var view: (any EditorTextViewLike)?
     let model: NotesModel
     let controller: EditorController
@@ -228,6 +288,7 @@ final class EditorCore {
     let cache = AssetCache()
 
     let inline = InlineViewManager()
+    let rendering = EditorRenderingAttributes()
     private var settingsObserver: (any NSObjectProtocol)?
     private var noteObserverId: UUID?
 
@@ -256,7 +317,6 @@ final class EditorCore {
         remoteReloadTask?.cancel()
         textSpliceFlushTask?.cancel()
         saveTask?.cancel()
-        contextMonitorTask?.cancel()
         if let noteObserverId {
             Task { @MainActor [model] in
                 model.removeNoteObserver(noteObserverId)
@@ -283,7 +343,7 @@ final class EditorCore {
         noteUrl = url
         session = EditorDocumentSessions.session(for: url)
         attachViewToSharedStorage()
-        lastContextSnap = contextTracker?.snapshot ?? ContextSnapshot()
+        autoLoglineCheckedNoteUrl = nil
         load()
     }
 
@@ -323,10 +383,14 @@ final class EditorCore {
             MainActor.assumeIsolated {
                 guard let self, let storage = note.object as? NSTextStorage else { return }
                 let editedLocation = storage.editedRange.location
-                self.inline.setNeedsReconcile()
                 guard let textLayoutManager = self.view?.pTextLayoutManager else { return }
                 Task { @MainActor in
                     invalidateOrderedListRun(
+                        around: editedLocation,
+                        textLayoutManager: textLayoutManager,
+                        storage: storage
+                    )
+                    invalidateCodeRun(
                         around: editedLocation,
                         textLayoutManager: textLayoutManager,
                         storage: storage
@@ -337,42 +401,46 @@ final class EditorCore {
     }
 
     private weak var contextTracker: ContextTracker?
-    private var lastContextSnap = ContextSnapshot()
-    private var contextMonitorTask: Task<Void, Never>?
+    private var autoLoglineCheckedNoteUrl: String?
 
     func startContext(_ tracker: ContextTracker) {
         contextTracker = tracker
-        lastContextSnap = tracker.snapshot
-        contextMonitorTask?.cancel()
-        contextMonitorTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
-                guard !Task.isCancelled else { break }
-                self?.checkContextChange()
-            }
+        if session.loaded {
+            checkContextChangeOnOpen(in: SpanNode.decodeList(session.lastKnownJSON))
         }
     }
 
-    private func checkContextChange() {
+    private func checkContextChangeOnOpen(in spans: [SpanNode], force: Bool = false) {
+        guard force || autoLoglineCheckedNoteUrl != noteUrl else { return }
+        autoLoglineCheckedNoteUrl = noteUrl
         guard EditorSettings.autoInsertLogline else { return }
         guard let tracker = contextTracker else { return }
         let snap = tracker.snapshot
-        guard snap.hasSubstantialChange(from: lastContextSnap) else { return }
-        lastContextSnap = snap
+        guard let previous = spans.reversed().compactMap({ node -> ContextSnapshot? in
+            guard case .block(let block) = node else { return nil }
+            return ContextSnapshot(block: block)
+        }).first else { return }
+        guard snap.hasSubstantialChange(from: previous) else { return }
         insertContextBlockAtEnd(BlockValue.contextBlock(from: snap))
+        pushNow()
+    }
+
+    func checkContextChangeAfterReactivation() {
+        guard session.loaded else { return }
+        checkContextChangeOnOpen(in: SpanNode.decodeList(session.lastKnownJSON), force: true)
     }
 
     func insertLogline() {
         let snap = contextTracker?.snapshot ?? ContextSnapshot(timestamp: Date())
-        insertBlockAttachment(RichText.embedAttachment(for: BlockValue.contextBlock(from: snap), cache: cache))
-        inline.setNeedsReconcile()
+        insertBlockAttachment(RichText.contextLine(for: BlockValue.contextBlock(from: snap)))
     }
 
     private func insertContextBlockAtEnd(_ block: BlockValue) {
         guard let view, let storage = view.pStorage, storage.length > 0 else { return }
         let saved = view.pSelectedRange
         view.pSelectedRange = NSRange(location: max(0, storage.length - 1), length: 0)
-        insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
+        let line = block.type == "context" ? RichText.contextLine(for: block) : RichText.embedAttachment(for: block, cache: cache)
+        insertBlockAttachment(line)
         view.pSelectedRange = NSRange(location: min(saved.location, storage.length), length: 0)
     }
 
@@ -383,12 +451,17 @@ final class EditorCore {
             let session = self.session
             if session.loaded {
                 // The session survives across visits but this editor's asset
-                // cache does not; reclassify embeds before reconciling or
-                // they all render as empty space.
+                // cache does not; reconcile text first, then reclassify embeds.
                 let spans = SpanNode.decodeList(session.lastKnownJSON)
-                await self.fetchMissingAssets(in: spans)
                 guard self.noteUrl == url, self.session === session else { return }
                 self.syncFromSession()
+                self.checkContextChangeOnOpen(in: spans)
+                await self.fetchMissingAssets(in: spans)
+                guard self.noteUrl == url,
+                      self.session === session,
+                      self.session.lastKnownJSON == SpanNode.encodeList(spans)
+                else { return }
+                self.apply(spans: spans)
                 return
             }
             let task: Task<NoteSpansSnapshot, Never>
@@ -402,14 +475,20 @@ final class EditorCore {
             guard self.noteUrl == url, self.session === session else { return }
             let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
-            await self.fetchMissingAssets(in: spans)
-            guard self.noteUrl == url, self.session === session else { return }
+            let canonicalJSON = SpanNode.encodeList(spans)
             session.heads = snapshot.heads
             session.loaded = true
             session.loadTask = nil
             let shouldFocus = self.model.pendingFocusUrl == url
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
+            self.checkContextChangeOnOpen(in: spans)
+            await self.fetchMissingAssets(in: spans)
+            guard self.noteUrl == url,
+                  self.session === session,
+                  self.session.lastKnownJSON == canonicalJSON
+            else { return }
+            self.apply(spans: spans)
         }
     }
 
@@ -419,7 +498,6 @@ final class EditorCore {
         let location = min(view.pSelectedRange.location, session.storage.length)
         view.pSelectedRange = NSRange(location: location, length: 0)
         refreshFormattingState()
-        inline.setNeedsReconcile()
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async {
@@ -501,7 +579,6 @@ final class EditorCore {
             block.attrs["tool"] = .string(tool)
         }
         insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
-        inline.setNeedsReconcile()
     }
 
     private func prepareVideo(url: String, name: String, data: Data) async {
@@ -534,7 +611,7 @@ final class EditorCore {
     }
 
     private func apply(spans: [SpanNode], focus: Bool = false) {
-        guard let view, let storage = view.pStorage else { return }
+        guard let view, view.pStorage != nil else { return }
         let attributed = RichText.attributed(from: spans, cache: cache)
         let selection = view.pSelectedRange
         isApplyingDocumentState = true
@@ -547,7 +624,9 @@ final class EditorCore {
             isApplyingDocumentState = false
             session.isApplyingDocumentState = false
         }
-        storage.setAttributedString(attributed)
+        view.pPerformStorageEdit { storage in
+            storage.setAttributedString(attributed)
+        }
         var location = min(selection.location, attributed.length)
         if location == 0, attributed.length > 1 {
             let str = attributed.string as NSString
@@ -570,8 +649,6 @@ final class EditorCore {
         session.lastKnownJSON = SpanNode.encodeList(spans)
         session.title = RichText.title(from: spans)
         refreshFormattingState()
-        inline.setNeedsReconcile()
-        highlightCodeBlocks()
         if location == attributed.length, location > 0,
            let lastNonEmbed = spans.reversed().compactMap({ (s: SpanNode) -> BlockValue? in guard case .block(let b) = s, !b.isEmbedBlock else { return nil }; return b }).first {
             view.pTypingAttributes = RichText.attributes(block: lastNonEmbed, marks: [:])
@@ -604,13 +681,18 @@ final class EditorCore {
             guard !Task.isCancelled, self.noteUrl == url, self.remoteReloadGeneration == generation else { return }
             let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
-            await self.fetchMissingAssets(in: spans)
-            guard !Task.isCancelled, self.noteUrl == url, self.remoteReloadGeneration == generation else { return }
             self.session.heads = snapshot.heads
             let canonical = SpanNode.encodeList(spans)
             if canonical != self.session.lastKnownJSON {
                 self.apply(spans: spans)
             }
+            await self.fetchMissingAssets(in: spans)
+            guard !Task.isCancelled,
+                  self.noteUrl == url,
+                  self.remoteReloadGeneration == generation,
+                  self.session.lastKnownJSON == canonical
+            else { return }
+            self.apply(spans: spans)
         }
     }
 
@@ -1030,6 +1112,15 @@ final class EditorCore {
 
     // MARK: formatting
 
+    private func refreshEditorDisplay() {
+        guard let view else { return }
+        #if os(macOS)
+        view.pSelf.needsDisplay = true
+        #else
+        view.pSelf.setNeedsDisplay()
+        #endif
+    }
+
     func refreshFormattingState() {
         guard let view else { return }
         var typing = view.pTypingAttributes
@@ -1128,15 +1219,9 @@ final class EditorCore {
     /// paragraph style asks for.
     func todoBoxHit(at point: CGPoint) -> Int? {
         guard let storage = view?.pStorage, storage.length > 0,
-              let textLayoutManager = view?.pTextLayoutManager,
-              let contentManager = textLayoutManager.textContentManager,
-              let fragment = textLayoutManager.textLayoutFragment(for: point),
-              let elementRange = fragment.textElement?.elementRange
+              let rawIndex = view?.pCharacterIndex(atTextContainerPoint: point)
         else { return nil }
-        let index = min(
-            contentManager.offset(from: contentManager.documentRange.location, to: elementRange.location),
-            storage.length - 1
-        )
+        let index = min(max(rawIndex, 0), storage.length - 1)
         guard index >= 0,
               let style = storage.attribute(.paragraphStyle, at: index, effectiveRange: nil)
                 as? NSParagraphStyle,
@@ -1150,27 +1235,14 @@ final class EditorCore {
     /// The attachment character whose laid-out rect contains this point in
     /// the text container.
     func attachmentIndex(at point: CGPoint) -> Int? {
-        guard let storage = view?.pStorage, storage.length > 0,
-              let textLayoutManager = view?.pTextLayoutManager,
-              let contentManager = textLayoutManager.textContentManager,
-              let fragment = textLayoutManager.textLayoutFragment(for: point),
-              let elementRange = fragment.textElement?.elementRange
-        else { return nil }
-        let start = contentManager.offset(from: contentManager.documentRange.location, to: elementRange.location)
-        let end = contentManager.offset(from: contentManager.documentRange.location, to: elementRange.endLocation)
-        guard start >= 0, start < end, end <= storage.length else { return nil }
-        var result: Int?
-        storage.enumerateAttribute(.attachment, in: NSRange(location: start, length: end - start)) { value, range, stop in
-            guard value != nil,
-                  let textRange = contentManager.textRange(for: NSRange(location: range.location, length: 1))
-            else { return }
-            textLayoutManager.enumerateTextSegments(in: textRange, type: .standard, options: []) { _, rect, _, _ in
-                if rect.contains(point) { result = range.location }
-                return false
+        guard let storage = view?.pStorage, storage.length > 0 else { return nil }
+        let index = view?.pCharacterIndex(atTextContainerPoint: point) ?? NSNotFound
+        for candidate in [index, index - 1] where candidate >= 0 && candidate < storage.length {
+            if storage.attribute(.attachment, at: candidate, effectiveRange: nil) != nil {
+                return candidate
             }
-            if result != nil { stop.pointee = true }
         }
-        return result
+        return nil
     }
 
     /// The trailing empty line's marker comes from typing attributes, which
@@ -1206,12 +1278,14 @@ final class EditorCore {
             block.attrs["checked"] = .bool(true)
         }
         let selection = view.pSelectedRange
-        storage.beginEditing()
-        storage.enumerateAttributes(in: paragraph) { runAttrs, runRange, _ in
-            let marks = RichText.marks(from: runAttrs, block: box.value)
-            storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
+        view.pPerformStorageEdit { storage in
+            storage.beginEditing()
+            storage.enumerateAttributes(in: paragraph) { runAttrs, runRange, _ in
+                let marks = RichText.marks(from: runAttrs, block: box.value)
+                storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
+            }
+            storage.endEditing()
         }
-        storage.endEditing()
         view.pSelectedRange = selection
         refreshFormattingState()
         scheduleSave()
@@ -1226,30 +1300,30 @@ final class EditorCore {
         if storage.length == 0 {
             view.pTypingAttributes = newTypingAttributes
             refreshFormattingState()
+            refreshEditorDisplay()
             return
         }
         let paragraphRange = str.paragraphRange(for: selection)
         if paragraphRange.length > 0 {
-            storage.beginEditing()
-            storage.enumerateAttributes(in: paragraphRange) { runAttrs, runRange, _ in
-                let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
-                guard !oldBlock.isAtomic, runAttrs[.amTableBox] == nil,
-                      runAttrs[.amColumnsBox] == nil else { return }
-                let marks = RichText.marks(from: runAttrs, block: oldBlock)
-                storage.setAttributes(
-                    RichText.attributes(block: block, marks: marks),
-                    range: runRange
-                )
+            view.pPerformStorageEdit { storage in
+                storage.beginEditing()
+                storage.enumerateAttributes(in: paragraphRange) { runAttrs, runRange, _ in
+                    let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+                    guard !oldBlock.isAtomic, runAttrs[.amTableBox] == nil,
+                          runAttrs[.amColumnsBox] == nil else { return }
+                    let marks = RichText.marks(from: runAttrs, block: oldBlock)
+                    storage.setAttributes(
+                        RichText.attributes(block: block, marks: marks),
+                        range: runRange
+                    )
+                }
+                storage.endEditing()
             }
-            storage.endEditing()
         }
         view.pTypingAttributes = newTypingAttributes
         view.pSelectedRange = selection
         refreshFormattingState()
         scheduleSave()
-        if block.type == "code-block" {
-            highlightCodeBlocks(around: selection.location)
-        }
     }
 
     func toggleMark(_ mark: String) {
@@ -1277,25 +1351,38 @@ final class EditorCore {
             view.pTypingAttributes = newTypingAttributes
             controller.currentCodeLanguage = normalized
             refreshFormattingState()
+            refreshEditorDisplay()
             return
         }
         let str = storage.string as NSString
-        let paragraphRange = str.paragraphRange(for: selection)
-        storage.beginEditing()
-        storage.enumerateAttributes(in: paragraphRange) { runAttrs, runRange, _ in
-            guard let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value,
-                  oldBlock.type == "code-block"
-            else { return }
-            let marks = RichText.marks(from: runAttrs, block: oldBlock)
-            storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
+        // the whole visual block, not just the caret's line
+        let run = CodeHighlight.codeRun(
+            containing: str.paragraphRange(for: selection),
+            language: nil,
+            in: storage,
+            str: str
+        )
+        view.pPerformStorageEdit { storage in
+            storage.beginEditing()
+            storage.enumerateAttributes(in: run) { runAttrs, runRange, _ in
+                guard var oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value,
+                      oldBlock.type == "code-block"
+                else { return }
+                if normalized == CodeLanguage.plain.id {
+                    oldBlock.attrs.removeValue(forKey: "language")
+                } else {
+                    oldBlock.attrs["language"] = .string(normalized)
+                }
+                let marks = RichText.marks(from: runAttrs, block: oldBlock)
+                storage.setAttributes(RichText.attributes(block: oldBlock, marks: marks), range: runRange)
+            }
+            storage.endEditing()
         }
-        storage.endEditing()
         view.pTypingAttributes = newTypingAttributes
         view.pSelectedRange = selection
         controller.currentCodeLanguage = normalized
         refreshFormattingState()
         scheduleSave()
-        highlightCodeBlocks(around: selection.location)
     }
 
     /// Superscript and subscript are one axis: turning one on turns the other
@@ -1321,20 +1408,22 @@ final class EditorCore {
             return
         }
         let prepared = prepareTextMark(range: selection, value: value)
-        storage.beginEditing()
-        storage.enumerateAttributes(in: selection) { runAttrs, runRange, _ in
-            let block = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
-            guard !block.isAtomic, runAttrs[.amTableBox] == nil,
-                  runAttrs[.amColumnsBox] == nil else { return }
-            var marks = RichText.marks(from: runAttrs, block: block)
-            marks[mark] = value
-            var newAttrs = RichText.attributes(block: block, marks: marks)
-            if let link = runAttrs[.link], marks["link"] == nil {
-                newAttrs[.link] = link
+        view.pPerformStorageEdit { storage in
+            storage.beginEditing()
+            storage.enumerateAttributes(in: selection) { runAttrs, runRange, _ in
+                let block = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+                guard !block.isAtomic, runAttrs[.amTableBox] == nil,
+                      runAttrs[.amColumnsBox] == nil else { return }
+                var marks = RichText.marks(from: runAttrs, block: block)
+                marks[mark] = value
+                var newAttrs = RichText.attributes(block: block, marks: marks)
+                if let link = runAttrs[.link], marks["link"] == nil {
+                    newAttrs[.link] = link
+                }
+                storage.setAttributes(newAttrs, range: runRange)
             }
-            storage.setAttributes(newAttrs, range: runRange)
+            storage.endEditing()
         }
-        storage.endEditing()
         view.pSelectedRange = selection
         refreshFormattingState()
         guard let prepared else {
@@ -1385,11 +1474,25 @@ final class EditorCore {
         let paragraph = str.paragraphRange(for: view.pSelectedRange)
         let paragraphText = (paragraph.length > 0 ? str.substring(with: paragraph) : "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        if block.type == "code-block" {
+            insertParagraphBreak(currentBlock: block, nextBlock: block)
+            return true
+        }
+        if block.type == "blockquote" {
+            if leaveBlockquoteFromEmptySoftLine(block: block) {
+                return true
+            }
+            insertSoftLineBreak()
+            return true
+        }
+        if block.type == "paragraph" || block.type == "serif" || block.type == "hand" {
+            insertParagraphBreak(currentBlock: block, nextBlock: block)
+            return true
+        }
         let continuing = block.type == "unordered-list-item"
             || block.type == "ordered-list-item"
             || block.type == "todo-list-item"
             || block.type == "blockquote"
-            || block.type == "code-block"
         if continuing, paragraphText.isEmpty {
             // Return on an empty continuing block leaves it, like Notes.
             applyBlockStyle(.paragraph)
@@ -1397,32 +1500,105 @@ final class EditorCore {
         }
         // A new to-do starts unticked, however the one above it stands.
         if block.type == "todo-list-item" {
-            view.pInsertText("\n")
-            view.pTypingAttributes = RichText.attributes(block: .todo(checked: false), marks: [:])
-            restyleCaretParagraph(as: .todo(checked: false))
-            refreshFormattingState()
+            insertParagraphBreak(currentBlock: block, nextBlock: .todo(checked: false))
             return true
         }
         if block.type == "heading" || block.isAtomic {
-            view.pInsertText("\n")
-            view.pTypingAttributes = RichText.attributes(block: .paragraph, marks: [:])
-            restyleCaretParagraph(as: .paragraph)
-            refreshFormattingState()
+            insertParagraphBreak(currentBlock: block, nextBlock: .paragraph)
             return true
         }
-        // paragraphs, lists, quotes and code blocks continue their block
-        // On iOS, UITextView does not reliably carry custom block attributes
-        // across paragraph boundaries when it handles the newline internally.
-        // Mirror the heading case: insert the newline ourselves and set attrs.
+        // paragraphs and lists continue their block. On iOS, UITextView does
+        // not reliably carry custom block attributes across paragraph
+        // boundaries when it handles the newline internally.
         #if os(iOS)
         if continuing {
-            view.pInsertText("\n")
-            view.pTypingAttributes = RichText.attributes(block: block, marks: [:])
-            refreshFormattingState()
+            insertParagraphBreak(currentBlock: block, nextBlock: block)
             return true
         }
         #endif
         return false
+    }
+
+    private func insertParagraphBreak(currentBlock: BlockValue, nextBlock: BlockValue) {
+        guard let view else { return }
+        view.pTypingAttributes = RichText.attributes(block: currentBlock, marks: [:])
+        view.pInsertText("\n")
+        view.pTypingAttributes = RichText.attributes(block: nextBlock, marks: [:])
+        restyleCaretParagraph(as: nextBlock)
+        refreshFormattingState()
+    }
+
+    func insertSoftLineBreak() {
+        guard let view else { return }
+        view.pInsertText(Self.softLineBreak)
+        refreshFormattingState()
+    }
+
+    private func promoteSoftLineBreakToParagraph(currentBlock: BlockValue, nextBlock: BlockValue) -> Bool {
+        guard let view, let storage = view.pStorage, view.pSelectedRange.length == 0 else { return false }
+        let caret = view.pSelectedRange.location
+        guard caret > 0, caret <= storage.length else { return false }
+        let str = storage.string as NSString
+        guard str.character(at: caret - 1) == 0x2028 else { return false }
+
+        let currentAttributes = RichText.attributes(block: currentBlock, marks: [:])
+        let nextAttributes = RichText.attributes(block: nextBlock, marks: [:])
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(
+                in: NSRange(location: caret - 1, length: 1),
+                with: NSAttributedString(string: "\n", attributes: currentAttributes)
+            )
+        }
+        view.pSelectedRange = NSRange(location: caret, length: 0)
+        view.pTypingAttributes = nextAttributes
+        restyleCaretParagraph(as: nextBlock)
+        refreshFormattingState()
+        scheduleSave()
+        return true
+    }
+
+    private func leaveBlockquoteFromEmptySoftLine(block: BlockValue) -> Bool {
+        guard let view, let storage = view.pStorage, view.pSelectedRange.length == 0 else { return false }
+        let caret = view.pSelectedRange.location
+        guard caret > 0, caret <= storage.length else { return false }
+        let str = storage.string as NSString
+        guard str.character(at: caret - 1) == 0x2028 else { return false }
+        let paragraph = str.paragraphRange(for: NSRange(location: caret, length: 0))
+        guard caret == NSMaxRange(paragraph) || (
+            caret < storage.length && str.character(at: caret) == 0x0A
+        ) else { return false }
+
+        let quoteAttributes = RichText.attributes(block: block, marks: [:])
+        let bodyAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(
+                in: NSRange(location: caret - 1, length: 1),
+                with: NSAttributedString(string: "\n", attributes: quoteAttributes)
+            )
+        }
+        view.pSelectedRange = NSRange(location: caret, length: 0)
+        view.pTypingAttributes = bodyAttributes
+        refreshFormattingState()
+        scheduleSave()
+        return true
+    }
+
+    func leaveCodeBlock() -> Bool {
+        guard blockAtSelection().type == "code-block", let view else { return false }
+        guard handleReturn() else { return false }
+        applyBlockStyle(.paragraph)
+        let paragraphAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        let newlineLocation = view.pSelectedRange.location - 1
+        if let storage = view.pStorage,
+           newlineLocation >= 0,
+           newlineLocation < storage.length {
+            view.pPerformStorageEdit { storage in
+                storage.setAttributes(paragraphAttributes, range: NSRange(location: newlineLocation, length: 1))
+            }
+        }
+        view.pTypingAttributes = paragraphAttributes
+        refreshFormattingState()
+        return true
     }
 
     /// After return splits a paragraph, the caret's new paragraph starts with
@@ -1435,7 +1611,15 @@ final class EditorCore {
         let str = storage.string as NSString
         let paragraph = str.paragraphRange(for: NSRange(location: caret, length: 0))
         guard paragraph.length > 0 else { return }
-        storage.addAttribute(.amBlock, value: BlockBox(block), range: paragraph)
+        view.pPerformStorageEdit { storage in
+            storage.beginEditing()
+            storage.enumerateAttributes(in: paragraph) { runAttrs, runRange, _ in
+                let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+                let marks = RichText.marks(from: runAttrs, block: oldBlock)
+                storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
+            }
+            storage.endEditing()
+        }
     }
 
     /// Markdown-style prefixes: typing a space after `-`, `1.`, `#`…`###`
@@ -1556,23 +1740,26 @@ final class EditorCore {
     }
 
     func updateHtmlBlock(_ box: BlockBox, html: String) {
-        guard let storage = view?.pStorage else { return }
+        guard let view, let storage = view.pStorage else { return }
         guard let range = range(whereBlockBox: box, in: storage) else { return }
         let newBlock = BlockValue.html(html)
-        storage.replaceCharacters(
-            in: range,
-            with: RichText.embedAttachment(for: newBlock, cache: cache)
-        )
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(
+                in: range,
+                with: RichText.embedAttachment(for: newBlock, cache: cache)
+            )
+        }
         scheduleSave()
     }
 
     func removeEmbed(_ box: BlockBox) {
-        guard let storage = view?.pStorage else { return }
+        guard let view, let storage = view.pStorage else { return }
         guard let range = range(whereBlockBox: box, in: storage) else { return }
         NSLog("lush embed removed by user: %@", box.value.embedUrl ?? "?")
-        storage.replaceCharacters(in: range, with: NSAttributedString())
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: range, with: NSAttributedString())
+        }
         scheduleSave()
-        inline.setNeedsReconcile()
     }
 
     func updateEmbedTool(_ box: BlockBox, tool: String?) {
@@ -1592,50 +1779,20 @@ final class EditorCore {
     func updateEmbedSize(_ box: BlockBox, width: Double, height: Double, commit: Bool) {
         box.value.attrs["width"] = .number(width)
         box.value.attrs["height"] = .number(height)
-        inline.setNeedsReconcile()
+        inline.embedChanged(box)
         if commit { scheduleSave() }
     }
 
-    /// Repaint syntax colors on code-block paragraphs; scoped to the
-    /// paragraph at `location` when given, the whole doc otherwise. Colors
-    /// are display-only — the span encoder never reads them.
-    func highlightCodeBlocks(around location: Int? = nil) {
-        guard let storage = view?.pStorage, storage.length > 0 else { return }
-        let str = storage.string as NSString
-        let scope = location.map {
-            str.paragraphRange(for: NSRange(location: min($0, storage.length), length: 0))
-        } ?? NSRange(location: 0, length: storage.length)
-        var cursor = scope.location
-        storage.beginEditing()
-        while cursor < NSMaxRange(scope) {
-            let paragraph = str.paragraphRange(for: NSRange(location: cursor, length: 0))
-            if paragraph.length == 0 { break }
-            cursor = NSMaxRange(paragraph)
-            guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
-                  box.value.type == "code-block"
-            else { continue }
-            storage.addAttribute(.foregroundColor, value: PColor.pLabel, range: paragraph)
-            let text = str.substring(with: paragraph)
-            for token in CodeHighlight.tokens(in: text, language: box.value.codeLanguage) {
-                storage.addAttribute(
-                    .foregroundColor,
-                    value: CodeHighlight.color(for: token.kind),
-                    range: NSRange(location: paragraph.location + token.range.location, length: token.range.length)
-                )
-            }
-        }
-        storage.endEditing()
-    }
-
     private func replaceEmbedBlock(_ box: BlockBox, with newBlock: BlockValue) {
-        guard let storage = view?.pStorage else { return }
+        guard let view, let storage = view.pStorage else { return }
         guard let range = range(whereBlockBox: box, in: storage) else { return }
-        storage.replaceCharacters(
-            in: range,
-            with: RichText.embedAttachment(for: newBlock, cache: cache)
-        )
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(
+                in: range,
+                with: RichText.embedAttachment(for: newBlock, cache: cache)
+            )
+        }
         scheduleSave()
-        inline.setNeedsReconcile()
     }
 
     func replaceAsset(oldUrl: String, data: Data, name: String, fileExtension: String, mime: String) {
@@ -1649,7 +1806,7 @@ final class EditorCore {
             ) else { return }
             self.cache.names[newUrl] = name
             self.cache.fileURLs[newUrl] = Self.mediaFile(for: newUrl, name: name, data: data)
-            guard let storage = self.view?.pStorage else { return }
+            guard let view = self.view, let storage = view.pStorage else { return }
             var target: NSRange?
             storage.enumerateAttribute(
                 .amBlock,
@@ -1664,10 +1821,12 @@ final class EditorCore {
             }
             guard let target else { return }
             let newBlock = BlockValue.embed(url: newUrl)
-            storage.replaceCharacters(
-                in: target,
-                with: RichText.embedAttachment(for: newBlock, cache: self.cache)
-            )
+            view.pPerformStorageEdit { storage in
+                storage.replaceCharacters(
+                    in: target,
+                    with: RichText.embedAttachment(for: newBlock, cache: self.cache)
+                )
+            }
             self.scheduleSave()
             self.transcribeIfAudio(url: newUrl, data: data, name: name)
         }
@@ -1738,6 +1897,7 @@ final class EditorCore {
                             description: result.description,
                             ocr: result.ocr
                         )
+                        await model?.generateAssetML(url, name: name)
                     }
                 }
             } else {
@@ -1764,6 +1924,7 @@ final class EditorCore {
                   !transcript.isEmpty
             else { return }
             await model?.updateAssetVision(url, description: "voice recording", ocr: transcript)
+            await model?.generateAssetML(url, name: name)
             await self?.transcriptReady(url: url, transcript: transcript)
         }
     }
@@ -1776,12 +1937,11 @@ final class EditorCore {
     func insertTable() {
         let box = TableBox(raw: nil, grid: .empty(rows: 3, columns: 3))
         insertBlockAttachment(RichText.tableAttachment(for: box))
-        inline.setNeedsReconcile()
     }
 
     func tableChanged(_ box: TableBox) {
         scheduleSave()
-        inline.setNeedsReconcile()
+        inline.embedChanged(box)
     }
 
     func insertColumns() {
@@ -1790,12 +1950,11 @@ final class EditorCore {
             columns: [[.block(.paragraph)], [.block(.paragraph)]]
         )
         insertBlockAttachment(RichText.columnsAttachment(for: box))
-        inline.setNeedsReconcile()
     }
 
     func columnsChanged(_ box: ColumnsBox) {
         scheduleSave()
-        inline.setNeedsReconcile()
+        inline.embedChanged(box)
     }
 
     func insertHtmlBlock() {
@@ -1844,7 +2003,9 @@ final class EditorCore {
             string: "\n",
             attributes: RichText.attributes(block: .paragraph, marks: [:])
         ))
-        storage.insert(insertion, at: location)
+        view.pPerformStorageEdit { storage in
+            storage.insert(insertion, at: location)
+        }
         view.pSelectedRange = NSRange(location: location + insertion.length, length: 0)
         view.pTypingAttributes = RichText.attributes(block: .paragraph, marks: [:])
         scheduleSave()
@@ -1858,7 +2019,9 @@ final class EditorCore {
 final class EditorTextView: NSTextView, EditorTextViewLike {
     weak var core: EditorCore?
 
-    var pStorage: NSTextStorage? { textStorage }
+    /// `textStorage` can go stale after the content storage adopts the shared
+    /// session storage, so everything resolves through the content storage.
+    var pStorage: NSTextStorage? { pContentStorage?.textStorage }
     var pSelectedRange: NSRange {
         get { selectedRange() }
         set { setSelectedRange(newValue) }
@@ -1868,16 +2031,9 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         set { typingAttributes = newValue }
     }
     var pTextLayoutManager: NSTextLayoutManager? { textLayoutManager }
-    var pLayoutManager: NSLayoutManager? { layoutManager }
     var pContentStorage: NSTextContentStorage? { textContentStorage }
     var pTextContainer: NSTextContainer? { textContainer }
-    var pTextOrigin: CGPoint { textContainerOrigin }
     var pSelf: PView { self }
-
-    override func layout() {
-        super.layout()
-        core?.inline.setNeedsReconcile()
-    }
 
     func pInsertText(_ text: String) {
         insertText(text, replacementRange: selectedRange())
@@ -1888,6 +2044,35 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
             textStorage?.replaceCharacters(in: range, with: attributed)
             didChangeText()
         }
+    }
+
+    func pScrollRangeToVisible(_ range: NSRange) {
+        scrollRangeToVisible(range)
+    }
+
+    func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void) {
+        guard let storage = textStorage else { return }
+        edit(storage)
+    }
+
+    func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int? {
+        guard let textContainer, let layoutManager = textContainer.layoutManager else { return nil }
+        let index = layoutManager.characterIndex(
+            for: point,
+            in: textContainer,
+            fractionOfDistanceBetweenInsertionPoints: nil
+        )
+        guard index < (textStorage?.length ?? 0) else { return nil }
+        return index
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36,
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift),
+           core?.leaveCodeBlock() == true {
+            return
+        }
+        super.keyDown(with: event)
     }
 
     /// Automerge rich-text spans as JSON — the same shape automerge's spans
@@ -1939,7 +2124,6 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
            let json = pasteboard.string(forType: Self.spansPasteboardType),
            let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
             pReplace(selectedRange(), with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         if let core,
@@ -1949,7 +2133,6 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
            }),
            let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
             pReplace(selectedRange(), with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         if consumeAttachment(from: pasteboard) { return }
@@ -1957,7 +2140,6 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
            let html = pasteboard.string(forType: Self.htmlPasteboardType),
            let attributed = RichTextClipboard.attributed(fromHTML: html, cache: core.cache) {
             pReplace(selectedRange(), with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         if let core,
@@ -1965,7 +2147,6 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
                 ?? pasteboard.string(forType: .string),
            let attributed = RichTextClipboard.attributed(fromMarkdown: markdown, cache: core.cache) {
             pReplace(selectedRange(), with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         super.paste(sender)
@@ -2133,6 +2314,8 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
 }
 
 struct RichTextEditor: NSViewRepresentable {
+    @Environment(\.scenePhase) private var scenePhase
+
     let noteUrl: String
     let model: NotesModel
     let controller: EditorController
@@ -2145,6 +2328,7 @@ struct RichTextEditor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let textView = EditorTextView(usingTextLayoutManager: true)
         textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         // image-only pasteboards (screenshots) otherwise fail paste
@@ -2165,16 +2349,13 @@ struct RichTextEditor: NSViewRepresentable {
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.core = context.coordinator.core
-        context.coordinator.markers.typingAttributesProvider = { [weak textView] in
-            guard let textView,
-                  textView.selectedRange().location >= (textView.textStorage?.length ?? 0)
-            else { return nil }
-            return textView.typingAttributes
-        }
+        context.coordinator.markers.driveTypingAttributes(from: textView)
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = true
+        // the editor extends under the toolbar; content rests below it
+        scroll.automaticallyAdjustsContentInsets = true
         scroll.documentView = textView
 
         context.coordinator.core.view = textView
@@ -2192,22 +2373,27 @@ struct RichTextEditor: NSViewRepresentable {
         if context.coordinator.core.noteUrl != noteUrl {
             context.coordinator.core.switchTo(noteUrl)
         }
+        context.coordinator.scenePhaseChanged(to: scenePhase)
     }
 
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         let core: EditorCore
         let markers = ListMarkerLayoutDelegate()
+        private var lastScenePhase: ScenePhase?
 
         init(core: EditorCore) {
             self.core = core
         }
 
+        func scenePhaseChanged(to phase: ScenePhase) {
+            defer { lastScenePhase = phase }
+            guard phase == .active, lastScenePhase != nil, lastScenePhase != .active else { return }
+            core.checkContextChangeAfterReactivation()
+        }
+
         func textDidChange(_ notification: Notification) {
             core.textDidChange()
-            if core.blockAtSelection().type == "code-block" {
-                core.highlightCodeBlocks(around: core.view?.pSelectedRange.location)
-            }
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -2216,7 +2402,16 @@ struct RichTextEditor: NSViewRepresentable {
 
         func textView(_ view: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                return core.handleReturn()
+                let handled = core.handleReturn()
+                return handled
+            }
+            if commandSelector == #selector(NSResponder.insertLineBreak(_:))
+                || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+                if core.blockAtSelection().type == "code-block" {
+                    return core.leaveCodeBlock()
+                }
+                core.insertSoftLineBreak()
+                return true
             }
             if commandSelector == #selector(NSResponder.insertTab(_:)) {
                 return core.nestListItem()
@@ -2258,35 +2453,58 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     var pStorage: NSTextStorage? { pContentStorage?.textStorage }
     var pSelectedRange: NSRange {
         get { selectedRange }
-        set { selectedRange = newValue }
+        set { selectedRange = clampedRange(newValue) }
     }
     var pTypingAttributes: [NSAttributedString.Key: Any] {
         get { typingAttributes }
         set { typingAttributes = newValue }
     }
     var pTextLayoutManager: NSTextLayoutManager? { textLayoutManager }
-    var pLayoutManager: NSLayoutManager? { layoutManager }
     var pContentStorage: NSTextContentStorage? {
         textLayoutManager?.textContentManager as? NSTextContentStorage
     }
     var pTextContainer: NSTextContainer? { textContainer }
-    var pTextOrigin: CGPoint {
-        CGPoint(x: textContainerInset.left, y: textContainerInset.top)
-    }
     var pSelf: PView { self }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        core?.inline.setNeedsReconcile()
-    }
 
     func pInsertText(_ text: String) {
         insertText(text)
     }
 
     func pReplace(_ range: NSRange, with attributed: NSAttributedString) {
-        pStorage?.replaceCharacters(in: range, with: attributed)
+        let range = clampedRange(range)
+        pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: range, with: attributed)
+        }
         core?.scheduleSave()
+    }
+
+    func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void) {
+        guard let storage = pStorage else { return }
+        if let contentStorage = pContentStorage {
+            contentStorage.performEditingTransaction {
+                edit(storage)
+            }
+        } else {
+            edit(storage)
+        }
+    }
+
+    func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int? {
+        let viewPoint = CGPoint(
+            x: point.x + textContainerInset.left,
+            y: point.y + textContainerInset.top
+        )
+        guard let position = closestPosition(to: viewPoint) else { return nil }
+        let index = offset(from: beginningOfDocument, to: position)
+        guard index >= 0, index < (pStorage?.length ?? 0) else { return nil }
+        return index
+    }
+
+    private func clampedRange(_ range: NSRange) -> NSRange {
+        let length = pStorage?.length ?? 0
+        let location = min(max(range.location, 0), length)
+        let end = min(max(NSMaxRange(range), location), length)
+        return NSRange(location: location, length: end - location)
     }
 
     override var keyCommands: [UIKeyCommand]? {
@@ -2354,7 +2572,6 @@ final class EditorTextView: UITextView, EditorTextViewLike {
            let core,
            let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
             pReplace(selectedRange, with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         if let mapData = pasteboard.data(forPasteboardType: RichTextClipboard.webCustomMapIdentifier),
@@ -2364,7 +2581,6 @@ final class EditorTextView: UITextView, EditorTextViewLike {
            let core,
            let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
             pReplace(selectedRange, with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         if pasteboard.hasImages, let core {
@@ -2383,7 +2599,6 @@ final class EditorTextView: UITextView, EditorTextViewLike {
            let core,
            let attributed = RichTextClipboard.attributed(fromHTML: html, cache: core.cache) {
             pReplace(selectedRange, with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         if let markdown = pasteboard.value(forPasteboardType: RichTextClipboard.markdownTypeIdentifier)
@@ -2392,7 +2607,6 @@ final class EditorTextView: UITextView, EditorTextViewLike {
            let core,
            let attributed = RichTextClipboard.attributed(fromMarkdown: markdown, cache: core.cache) {
             pReplace(selectedRange, with: attributed)
-            core.inline.setNeedsReconcile()
             return
         }
         super.paste(sender)
@@ -2408,6 +2622,8 @@ final class EditorTextView: UITextView, EditorTextViewLike {
 }
 
 struct RichTextEditor: UIViewRepresentable {
+    @Environment(\.scenePhase) private var scenePhase
+
     let noteUrl: String
     let model: NotesModel
     let controller: EditorController
@@ -2420,25 +2636,13 @@ struct RichTextEditor: UIViewRepresentable {
     func makeUIView(context: Context) -> EditorTextView {
         let textView = EditorTextView(usingTextLayoutManager: true)
         textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
         textView.delegate = context.coordinator
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
-        context.coordinator.markers.typingAttributesProvider = { [weak textView] in
-            guard let textView,
-                  textView.selectedRange.location >= (textView.pStorage?.length ?? 0)
-            else { return nil }
-            return textView.typingAttributes
-        }
-
-        let tap = UITapGestureRecognizer(
-            target: context.coordinator,
-            action: #selector(Coordinator.handleTap(_:))
-        )
-        tap.delegate = context.coordinator
-        tap.cancelsTouchesInView = false
-        textView.addGestureRecognizer(tap)
+        context.coordinator.markers.driveTypingAttributes(from: textView)
 
         let accessory = UIHostingController(
             rootView: FormatAccessoryBar(controller: controller)
@@ -2463,23 +2667,28 @@ struct RichTextEditor: UIViewRepresentable {
         if context.coordinator.core.noteUrl != noteUrl {
             context.coordinator.core.switchTo(noteUrl)
         }
+        context.coordinator.scenePhaseChanged(to: scenePhase)
     }
 
     @MainActor
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate {
         let core: EditorCore
         let markers = ListMarkerLayoutDelegate()
         var accessory: UIHostingController<FormatAccessoryBar>?
+        private var lastScenePhase: ScenePhase?
 
         init(core: EditorCore) {
             self.core = core
         }
 
+        func scenePhaseChanged(to phase: ScenePhase) {
+            defer { lastScenePhase = phase }
+            guard phase == .active, lastScenePhase != nil, lastScenePhase != .active else { return }
+            core.checkContextChangeAfterReactivation()
+        }
+
         func textViewDidChange(_ textView: UITextView) {
             core.textDidChange()
-            if core.blockAtSelection().type == "code-block" {
-                core.highlightCodeBlocks(around: core.view?.pSelectedRange.location)
-            }
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -2502,32 +2711,6 @@ struct RichTextEditor: UIViewRepresentable {
             return true
         }
 
-        func gestureRecognizer(
-            _ gestureRecognizer: UIGestureRecognizer,
-            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
-        ) -> Bool {
-            true
-        }
-
-        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
-            guard let textView = gesture.view as? EditorTextView else { return }
-            let point = gesture.location(in: textView)
-            // If the tap landed on a live inline view (audio, table, etc.),
-            // let that view handle the interaction instead of opening a sheet.
-            guard !core.inline.hasLiveView(at: point) else { return }
-            // A tap in the text is a click outside every embed.
-            NotificationCenter.default.post(name: .lushDeactivateEmbeds, object: nil)
-            let containerPoint = CGPoint(
-                x: point.x - textView.textContainerInset.left,
-                y: point.y - textView.textContainerInset.top
-            )
-            if let todo = core.todoBoxHit(at: containerPoint),
-               core.toggleTodo(at: todo) {
-                return
-            }
-            guard let charIndex = core.attachmentIndex(at: containerPoint) else { return }
-            core.openAttachment(at: charIndex)
-        }
     }
 }
 

@@ -3,7 +3,7 @@ use std::{
     future::IntoFuture,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -14,7 +14,7 @@ use async_tungstenite::{
     tokio::TokioAdapter,
     tungstenite::{handshake::server::NoCallback, protocol::WebSocketConfig},
 };
-use automerge::{Automerge, ChangeHash, ReadDoc};
+use automerge::{Automerge, ChangeHash, Fragment as AutomergeFragment, ReadDoc};
 use future_form::Sendable;
 use futures::{future::BoxFuture, FutureExt};
 use sedimentree_core::{
@@ -22,7 +22,7 @@ use sedimentree_core::{
     collections::Map,
     crypto::digest::Digest,
     depth::CountLeadingZeroBytes,
-    fragment::Fragment,
+    fragment::Fragment as SedimentreeFragment,
     id::SedimentreeId,
     loose_commit::{id::CommitId, LooseCommit},
     sedimentree::{Sedimentree, SedimentreeItem},
@@ -74,6 +74,7 @@ const HEAL_DELAY: Duration = Duration::from_secs(5);
 const HEAL_MAX_ATTEMPTS: u32 = 12;
 const LOCAL_SERVER_PORT: u16 = 43219;
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
+const LOOSE_FRAGMENT_BATCH_SIZE: usize = 32;
 
 /// A local-peer WebSocket transport that intercepts incoming BatchSyncRequests
 /// and pre-fetches unknown docs from the remote server before letting the
@@ -179,41 +180,28 @@ impl Transport<Sendable> for WsTransport {
                 let inner = pt.inner.clone();
                 let prefetch_tx = pt.prefetch_tx.clone();
                 async move {
-                    let bytes = match Transport::<Sendable>::recv_bytes(&inner).await {
-                        Ok(b) => {
-                            tracing::info!(bytes = b.len(), "prefetch: recv_bytes ok");
-                            b
+                    loop {
+                        let bytes = match Transport::<Sendable>::recv_bytes(&inner).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return Err(TransportRecvError::Ws(e));
+                            }
+                        };
+                        if bytes.get(..4) == Some(b"SUE\x00") {
+                            continue;
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "prefetch: recv_bytes transport error");
-                            return Err(TransportRecvError::Ws(e));
-                        }
-                    };
-                    match SyncMessage::try_decode(&bytes) {
-                        Ok(SyncMessage::BatchSyncRequest(req)) => {
-                            tracing::info!(
-                                subscribe = req.subscribe,
-                                id = ?&req.id.as_bytes()[..8],
-                                "prefetch: BatchSyncRequest"
-                            );
-                            if req.subscribe
-                                && req.id.as_bytes()[16..].iter().all(|b| *b == 0)
-                            {
+                        if let Ok(SyncMessage::BatchSyncRequest(req)) =
+                            SyncMessage::try_decode(&bytes)
+                        {
+                            if req.subscribe {
                                 let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
                                 if prefetch_tx.send((req.id, done_tx)).is_ok() {
                                     let _ = done_rx.await;
-                                    tracing::info!("prefetch: done");
-                                } else {
-                                    tracing::warn!("prefetch: channel closed, cannot prefetch");
                                 }
                             }
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::debug!(error = %e, "prefetch: recv_bytes decode failed");
-                        }
+                        return Ok(bytes);
                     }
-                    Ok(bytes)
                 }
                 .boxed()
             }
@@ -429,9 +417,7 @@ async fn accept_local_peer(
             );
             let listen_ws = ws.clone();
             tokio::spawn(async move {
-                tracing::info!("prefetch: listen task starting");
-                let result = listen_ws.listen().await;
-                tracing::warn!(ok = result.is_ok(), "prefetch: listen task exited");
+                let _ = listen_ws.listen().await;
             });
             tokio::spawn(async move {
                 let _ = sender_fut.await;
@@ -458,9 +444,7 @@ async fn accept_local_peer(
         tracing::warn!(?peer_addr, "local peer handshake failed");
         return;
     };
-    tracing::info!(?peer_addr, "local peer handshake ok, adding connection");
     let _ = node.add_connection(authenticated).await;
-    tracing::info!(?peer_addr, "local peer connection added");
 
     tokio::spawn(async move {
         while let Some((sid, done_tx)) = prefetch_rx.recv().await {
@@ -608,9 +592,12 @@ pub struct Repo {
     docs: Mutex<HashMap<DocId, Arc<Mutex<DocState>>>>,
     syncs: Mutex<HashMap<DocId, SyncSlot>>,
     pending_saves: Mutex<HashMap<DocId, PendingSave>>,
+    last_server_heads: Mutex<HashMap<DocId, BTreeSet<CommitId>>>,
+    last_synced_local_heads: Mutex<HashMap<DocId, BTreeSet<CommitId>>>,
     next_save: AtomicU64,
     events: broadcast::Sender<RepoEvent>,
-    connected: std::sync::atomic::AtomicBool,
+    connected: AtomicBool,
+    connect_started: AtomicBool,
     local_port: Option<u16>,
     iroh_endpoint: Option<Arc<iroh::Endpoint>>,
 }
@@ -642,15 +629,15 @@ fn load_or_create_signer(path: &Path) -> Result<MemorySigner> {
 
 struct Ingested {
     commits: Vec<(LooseCommit, Blob)>,
-    fragments: Vec<(Fragment, Blob)>,
+    fragments: Vec<(SedimentreeFragment, Blob)>,
     commit_heads: Vec<ChangeHash>,
     fragment_heads: Vec<ChangeHash>,
 }
 
 /// Decompose the doc's automerge fragments into sedimentree records, skipping
-/// anything already stored. Level 0 becomes loose commits, level 1+ become
-/// fragments; filtering happens before bundling so a save only pays to encode
-/// what it is about to store.
+/// anything already stored. Level 0 commits are batched into fragment records
+/// once enough accumulate; the short tail remains loose so small edits still
+/// persist immediately.
 ///
 /// `Automerge::fragments` can panic on some change graphs (an upstream bug
 /// where a level-1 change escapes the cached fragment clock). A panic means no
@@ -669,12 +656,20 @@ fn ingest(
             commit_heads: Vec::new(),
             fragment_heads: Vec::new(),
         };
+        let mut pending_loose = Vec::new();
         for f in fragments {
             let head = f.head;
             let level = f.level;
             if (level == 0 && stored_commits.contains(&head))
                 || (level > 0 && stored_fragments.contains(&head))
             {
+                continue;
+            }
+            if level == 0 {
+                pending_loose.push(f);
+                if pending_loose.len() >= LOOSE_FRAGMENT_BATCH_SIZE {
+                    ingest_loose_batch(doc, sid, &mut pending_loose, stored_fragments, &mut out);
+                }
                 continue;
             }
             let boundary: BTreeSet<CommitId> =
@@ -688,19 +683,112 @@ fn ingest(
             let blob = Blob::new(bytes);
             let meta = BlobMeta::new(&blob);
             let id = CommitId::new(head.0);
-            if level == 0 {
-                out.commits
-                    .push((LooseCommit::new(sid, id, boundary, meta), blob));
-                out.commit_heads.push(head);
-            } else {
-                out.fragments
-                    .push((Fragment::new(sid, id, boundary, &checkpoints, meta), blob));
-                out.fragment_heads.push(head);
-            }
+            out.fragments.push((
+                SedimentreeFragment::new(sid, id, boundary, &checkpoints, meta),
+                blob,
+            ));
+            out.fragment_heads.push(head);
         }
+        ingest_loose_tail(doc, sid, pending_loose, stored_commits, &mut out);
         out
     }))
     .ok()
+}
+
+fn ingest_loose_batch(
+    doc: &Automerge,
+    sid: SedimentreeId,
+    pending: &mut Vec<AutomergeFragment>,
+    stored_fragments: &HashSet<ChangeHash>,
+    out: &mut Ingested,
+) {
+    let batch: Vec<_> = pending.drain(..).collect();
+    let Some(head) = batch.last().map(|fragment| fragment.head) else {
+        return;
+    };
+    if stored_fragments.contains(&head) {
+        return;
+    }
+    let members: Vec<ChangeHash> = batch.iter().map(|fragment| fragment.head).collect();
+    let covered_heads = members.clone();
+    let member_set: HashSet<ChangeHash> = members.iter().copied().collect();
+    let mut seen_boundary = HashSet::new();
+    let boundary: Vec<ChangeHash> = batch
+        .iter()
+        .flat_map(|fragment| fragment.boundary.iter().copied())
+        .filter(|hash| !member_set.contains(hash) && seen_boundary.insert(*hash))
+        .collect();
+    let checkpoints = members.clone();
+    let fragment = AutomergeFragment {
+        head,
+        level: 0,
+        boundary: boundary.clone(),
+        checkpoints: checkpoints.clone(),
+        members,
+    };
+    let Some(bytes) = doc.bundle_fragments([fragment]).into_iter().next() else {
+        tracing::warn!(
+            ?head,
+            "loose commit batch failed to bundle; retrying as loose commits"
+        );
+        return;
+    };
+    let blob = Blob::new(bytes);
+    let meta = BlobMeta::new(&blob);
+    let boundary_ids: BTreeSet<CommitId> = boundary
+        .into_iter()
+        .map(|hash| CommitId::new(hash.0))
+        .collect();
+    let checkpoint_ids: Vec<CommitId> = checkpoints
+        .into_iter()
+        .map(|hash| CommitId::new(hash.0))
+        .collect();
+    out.fragments.push((
+        SedimentreeFragment::new(
+            sid,
+            CommitId::new(head.0),
+            boundary_ids,
+            &checkpoint_ids,
+            meta,
+        ),
+        blob,
+    ));
+    out.commit_heads.extend(covered_heads);
+    out.fragment_heads.push(head);
+}
+
+fn ingest_loose_tail(
+    doc: &Automerge,
+    sid: SedimentreeId,
+    pending: Vec<AutomergeFragment>,
+    stored_commits: &HashSet<ChangeHash>,
+    out: &mut Ingested,
+) {
+    for fragment in pending {
+        let head = fragment.head;
+        if stored_commits.contains(&head) {
+            continue;
+        }
+        let boundary: BTreeSet<CommitId> = fragment
+            .boundary
+            .iter()
+            .map(|h| CommitId::new(h.0))
+            .collect();
+        let Some(bytes) = doc.bundle_fragments([fragment]).into_iter().next() else {
+            tracing::warn!(
+                ?head,
+                "loose commit failed to bundle; retrying on next save"
+            );
+            continue;
+        };
+        let blob = Blob::new(bytes);
+        let meta = BlobMeta::new(&blob);
+        out.commits.push((
+            LooseCommit::new(sid, CommitId::new(head.0), boundary, meta),
+            blob,
+        ));
+        out.commit_heads.push(head);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,7 +835,7 @@ where
 fn load_blob_batch(
     doc: &mut Automerge,
     commits: &[StoredRecord<LooseCommit>],
-    fragments: &[StoredRecord<Fragment>],
+    fragments: &[StoredRecord<SedimentreeFragment>],
 ) -> Result<Vec<Digest<Blob>>> {
     if commits.is_empty() && fragments.is_empty() {
         return Ok(Vec::new());
@@ -944,9 +1032,12 @@ impl Repo {
             docs: Mutex::new(HashMap::new()),
             syncs: Mutex::new(HashMap::new()),
             pending_saves: Mutex::new(HashMap::new()),
+            last_server_heads: Mutex::new(HashMap::new()),
+            last_synced_local_heads: Mutex::new(HashMap::new()),
             next_save: AtomicU64::new(0),
             events,
-            connected: std::sync::atomic::AtomicBool::new(false),
+            connected: AtomicBool::new(false),
+            connect_started: AtomicBool::new(false),
             local_port,
             iroh_endpoint,
         });
@@ -1013,11 +1104,16 @@ impl Repo {
             tokio::spawn(async move {
                 while let Some(batch) = stored_rx.recv().await {
                     let id = DocId::from_sedimentree_id(batch.sedimentree_id);
-                    if let Err(e) = repo.apply_stored_batch(batch).await {
+                    let result = repo.apply_stored_batch(batch).await;
+                    if let Err(ref e) = result {
                         tracing::warn!(doc = %id.to_url(), error = %e, "stored blobs failed to apply");
                         if let Err(e) = repo.apply_new_blobs(id).await {
                             tracing::warn!(doc = %id.to_url(), error = %e, "stored blob recovery failed");
                         }
+                    }
+                    if matches!(result, Ok(true)) {
+                        repo.last_server_heads.lock().await.remove(&id);
+                        repo.last_synced_local_heads.lock().await.remove(&id);
                     }
                 }
             });
@@ -1030,11 +1126,6 @@ impl Repo {
                 }
             });
         }
-        {
-            let repo = repo.clone();
-            tokio::spawn(async move { repo.connect_loop().await });
-        }
-
         Ok(repo)
     }
 
@@ -1055,6 +1146,14 @@ impl Repo {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         true
+    }
+
+    fn start_connect_loop_if_needed(self: &Arc<Self>) {
+        if self.connect_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let repo = self.clone();
+        tokio::spawn(async move { repo.connect_loop().await });
     }
 
     /// The discovery id a subduction websocket server registers itself under:
@@ -1130,7 +1229,7 @@ impl Repo {
     async fn resync_all(self: Arc<Self>) {
         let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
         for id in ids {
-            self.request_sync(id).await;
+            self.request_sync_forced(id).await;
         }
     }
 
@@ -1139,6 +1238,17 @@ impl Repo {
             return;
         }
         let id = DocId::from_sedimentree_id(sid);
+        if self.docs.lock().await.get(&id).is_none() {
+            return;
+        }
+        let heads_set: BTreeSet<CommitId> = heads.iter().cloned().collect();
+        {
+            let mut last = self.last_server_heads.lock().await;
+            if last.get(&id) == Some(&heads_set) {
+                return;
+            }
+            last.insert(id, heads_set);
+        }
         let hashes: Vec<ChangeHash> = heads
             .iter()
             .map(|head| ChangeHash(*head.as_bytes()))
@@ -1150,7 +1260,18 @@ impl Repo {
             let state = state.lock().await;
             !state.doc.get_missing_deps(&hashes).is_empty()
         };
-        if missing {
+        if !missing {
+            return;
+        }
+        let _ = self.apply_new_blobs(id).await;
+        let still_missing = {
+            let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+                return;
+            };
+            let state = state.lock().await;
+            !state.doc.get_missing_deps(&hashes).is_empty()
+        };
+        if still_missing {
             self.request_sync(id).await;
         }
     }
@@ -1173,11 +1294,39 @@ impl Repo {
         Ok(outcome)
     }
 
+    async fn local_heads_for_sync(&self, id: DocId) -> Option<BTreeSet<CommitId>> {
+        let state = self.docs.lock().await.get(&id).cloned()?;
+        let heads = state.lock().await.doc.get_heads();
+        Some(
+            heads
+                .into_iter()
+                .map(|head| CommitId::new(head.0))
+                .collect(),
+        )
+    }
+
     /// Ask for a sync round without waiting for it. Every background path goes
     /// through here so concurrent requests coalesce per doc.
     async fn request_sync(self: &Arc<Self>, id: DocId) {
+        self.request_sync_inner(id, false).await;
+    }
+
+    async fn request_sync_forced(self: &Arc<Self>, id: DocId) {
+        self.request_sync_inner(id, true).await;
+    }
+
+    async fn request_sync_inner(self: &Arc<Self>, id: DocId, force: bool) {
         if !self.is_connected() {
             return;
+        }
+        if !force {
+            if let Some(heads) = self.local_heads_for_sync(id).await {
+                if !heads.is_empty()
+                    && self.last_synced_local_heads.lock().await.get(&id) == Some(&heads)
+                {
+                    return;
+                }
+            }
         }
         {
             let mut syncs = self.syncs.lock().await;
@@ -1207,7 +1356,12 @@ impl Repo {
                         )));
                         true
                     }
-                    Ok(SyncOutcome::Succeeded { .. }) => false,
+                    Ok(SyncOutcome::Succeeded { .. }) => {
+                        if let Some(heads) = repo.local_heads_for_sync(id).await {
+                            repo.last_synced_local_heads.lock().await.insert(id, heads);
+                        }
+                        false
+                    }
                     Err(e) => {
                         tracing::warn!(doc = %id.to_url(), error = %e, "sync failed");
                         let _ = repo
@@ -1494,13 +1648,10 @@ impl Repo {
 
     pub async fn prefetch_doc(self: &Arc<Self>, id: DocId, timeout: Duration) {
         if self.docs.lock().await.contains_key(&id) {
-            tracing::debug!(doc = %id.to_url(), "prefetch_doc: already tracked");
             return;
         }
-        tracing::info!(doc = %id.to_url(), connected = %self.is_connected(), "prefetch_doc: fetching from remote");
         let _ = self.ensure_doc(id).await;
-        let ok = self.wait_for_doc(id, timeout).await;
-        tracing::info!(doc = %id.to_url(), ok, "prefetch_doc: wait_for_doc returned");
+        let _ = self.wait_for_doc(id, timeout).await;
     }
 
     pub async fn create_doc<F>(self: &Arc<Self>, init: F) -> Result<DocId>
@@ -1512,6 +1663,7 @@ impl Repo {
         init(&mut doc)?;
         self.docs.lock().await.insert(id, DocState::shared(doc));
         self.save_doc(id).await?;
+        self.start_connect_loop_if_needed();
         let repo = self.clone();
         tokio::spawn(async move {
             if repo.wait_connected(Duration::from_secs(15)).await {
@@ -1643,6 +1795,7 @@ impl Repo {
         if let Err(e) = self.apply_new_blobs(id).await {
             tracing::warn!(doc = %id.to_url(), error = %e, "local load failed");
         }
+        self.start_connect_loop_if_needed();
         self.request_sync(id).await;
     }
 
@@ -1854,6 +2007,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ingest_batches_level_zero_runs_into_fragments() {
+        let id = DocId([12; 16]);
+        let sid = id.sedimentree_id();
+        let mut source = Automerge::new().with_actor(ActorId::from([12; 16].as_slice()));
+
+        while get_level_zero_count(&source) < LOOSE_FRAGMENT_BATCH_SIZE {
+            let index = source.length(ROOT);
+            put(&mut source, &format!("value-{index}"), index as i64);
+        }
+
+        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+        assert!(
+            !ingested.fragments.is_empty(),
+            "level-0 changes should be batched into fragment records"
+        );
+        assert!(
+            ingested.commits.len() < LOOSE_FRAGMENT_BATCH_SIZE,
+            "only the below-threshold tail should remain loose"
+        );
+
+        let commits: Vec<_> = ingested
+            .commits
+            .into_iter()
+            .map(|(meta, blob)| StoredRecord { meta, blob })
+            .collect();
+        let fragments: Vec<_> = ingested
+            .fragments
+            .into_iter()
+            .map(|(meta, blob)| StoredRecord { meta, blob })
+            .collect();
+        let mut loaded = Automerge::new();
+        load_blob_batch(&mut loaded, &commits, &fragments).unwrap();
+
+        assert_eq!(loaded.get_heads(), source.get_heads());
+    }
+
+    fn get_level_zero_count(doc: &Automerge) -> usize {
+        doc.fragments(0..=0).len()
+    }
+
     #[tokio::test]
     async fn persisted_batches_advance_tracked_docs_and_durable_ids() {
         let (_dir, repo) = test_repo().await;
@@ -1923,7 +2117,7 @@ mod tests {
         assert!(ingested.fragments.is_empty());
         let (commit, blob) = ingested.commits.pop().unwrap();
         let head = commit.head();
-        let legacy = Fragment::new(
+        let legacy = SedimentreeFragment::new(
             sid,
             head,
             commit.parents().clone(),

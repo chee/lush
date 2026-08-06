@@ -237,7 +237,7 @@ enum NoteExporter {
                 }
             case .table(let subSpans):
                 closeLists()
-                out += tableHTML(RichText.parseTable(subSpans)) + "\n"
+                out += tableHTML(RichText.parseTable(subSpans), assetResolver: assetResolver) + "\n"
             case .columns(let subSpans):
                 closeLists()
                 let columns = RichText.parseColumns(subSpans)
@@ -293,12 +293,14 @@ enum NoteExporter {
         }
     }
 
-    private static func tableHTML(_ grid: TableGrid) -> String {
+    private static func tableHTML(_ grid: TableGrid, assetResolver: AssetResolver) -> String {
         var out = "<table>\n"
         for (rowIdx, row) in grid.rows.enumerated() {
             out += "<tr>\n"
             let cellTag = grid.hasHeader && rowIdx == 0 ? "th" : "td"
-            for cell in row { out += "<\(cellTag)>\(escape(cell))</\(cellTag)>\n" }
+            for cell in row {
+                out += "<\(cellTag)>\(htmlBody(from: cell, assetResolver: assetResolver))</\(cellTag)>\n"
+            }
             out += "</tr>\n"
         }
         out += "</table>"

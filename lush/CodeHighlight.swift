@@ -98,6 +98,7 @@ enum CodeHighlight {
 
     static func tokens(in text: String, language: String?) -> [Token] {
         let language = CodeLanguage.normalize(language ?? "plain")
+        guard language != "plain" else { return [] }
         let ns = text as NSString
         let full = NSRange(location: 0, length: ns.length)
         var claimed = IndexSet()
@@ -133,7 +134,7 @@ enum CodeHighlight {
             claim(typePattern, .type)
         }
 
-        let keywords = keywordsByLanguage[language] ?? (language == "plain" ? [] : fallbackKeywords)
+        let keywords = keywordsByLanguage[language] ?? fallbackKeywords
         for match in wordPattern.matches(in: text, range: full) {
             let range = match.range
             guard !claimed.contains(range.location) else { continue }
@@ -158,32 +159,121 @@ enum CodeHighlight {
         }
     }
 
+    static func renderingAttributes(for kind: TokenKind) -> [NSAttributedString.Key: Any] {
+        [.foregroundColor: color(for: kind)]
+    }
+
     private static func regex(_ pattern: String) -> NSRegularExpression {
         try! NSRegularExpression(pattern: pattern)
     }
 }
 
+/// Light mode uses Lychee; dark mode uses Gloom from Patchwork's base theme.
 private enum Palette {
-    static let comment = PColor.pSecondaryLabel
-    static let string = PColor.dynamicCodeColor(light: 0xB42318, dark: 0xFFB4A8)
-    static let number = PColor.dynamicCodeColor(light: 0x1D4ED8, dark: 0x9EC3FF)
-    static let keyword = PColor.dynamicCodeColor(light: 0x7E22CE, dark: 0xD8B4FE)
-    static let type = PColor.dynamicCodeColor(light: 0x047857, dark: 0x8FE3C0)
-    static let function = PColor.dynamicCodeColor(light: 0xB45309, dark: 0xF9C97C)
-    static let property = PColor.dynamicCodeColor(light: 0x0F766E, dark: 0x82DCD4)
-    static let operatorToken = PColor.dynamicCodeColor(light: 0x4B5563, dark: 0xCBD5E1)
+    static let comment = PColor.dynamicCodeColor(light: 0x8899AA, dark: 0x6272A4)
+    static let string = PColor.dynamicCodeColor(light: 0x208776, dark: 0xF1FA8C)
+    static let number = PColor.dynamicCodeColor(light: 0x3999FF, dark: 0xBD93F9)
+    static let keyword = PColor.dynamicCodeColor(light: 0x810005, dark: 0xFF79C6)
+    static let type = PColor.dynamicCodeColor(light: 0xDB4E80, dark: 0x8BE9FD)
+    static let function = PColor.dynamicCodeColor(light: 0x3999FF, dark: 0x50FA7B)
+    static let property = PColor.dynamicCodeColor(light: 0xDB4E80, dark: 0x50FA7B)
+    static let operatorToken = PColor.dynamicCodeColor(light: 0x086F8A, dark: 0xFF79C6)
+}
+
+extension CodeHighlight {
+    static let cardBackground = PColor.dynamicCodeColor(light: 0xF9FCFF, dark: 0x1A1B1E)
+    static let cardBorder = PColor.dynamicCodeColor(light: 0xE3F6FF, dark: 0x44475A)
+    static let cardVerticalPadding: CGFloat = 4
+
+    /// Rendering attributes are display-only and live in the layout manager,
+    /// so token colours never touch the storage or the automerge round-trip.
+    /// TextKit revalidates whenever a code paragraph lays out again. The whole
+    /// contiguous code run is tokenized as one text so block comments and
+    /// multi-line strings colour across paragraphs.
+    static func applyRenderingAttributes(
+        _ textLayoutManager: NSTextLayoutManager,
+        _ fragment: NSTextLayoutFragment
+    ) {
+        guard let paragraph = fragment.textElement as? NSTextParagraph,
+              let contentStorage = textLayoutManager.textContentManager as? NSTextContentStorage,
+              let storage = contentStorage.textStorage,
+              let elementRange = paragraph.elementRange
+        else { return }
+        let location = contentStorage.offset(
+            from: contentStorage.documentRange.location,
+            to: elementRange.location
+        )
+        let attributed = paragraph.attributedString
+        guard attributed.length > 0,
+              location >= 0,
+              location < storage.length,
+              location + attributed.length <= storage.length,
+              let box = attributed.attribute(.amBlock, at: 0, effectiveRange: nil) as? BlockBox,
+              box.value.type == "code-block"
+        else { return }
+        let str = attributed.string as NSString
+        let language = box.value.codeLanguage
+        let paragraphRange = NSRange(location: location, length: attributed.length)
+        for token in tokens(in: attributed.string, language: language) {
+            let absolute = NSRange(location: location + token.range.location, length: token.range.length)
+            let clipped = NSIntersectionRange(absolute, paragraphRange)
+            guard token.range.length > 0,
+                  NSMaxRange(token.range) <= str.length,
+                  NSMaxRange(absolute) <= storage.length,
+                  clipped.length > 0,
+                  let textRange = contentStorage.textRange(for: clipped)
+            else { continue }
+            textLayoutManager.setRenderingAttributes(
+                renderingAttributes(for: token.kind),
+                for: textRange
+            )
+        }
+    }
+
+    static func isCodeParagraph(_ range: NSRange, language: String?, in storage: NSTextStorage) -> Bool {
+        guard range.length > 0,
+              range.location >= 0,
+              range.location < storage.length,
+              let box = storage.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox,
+              box.value.type == "code-block"
+        else { return false }
+        guard let language else { return true }
+        return CodeLanguage.normalize(box.value.codeLanguage) == CodeLanguage.normalize(language)
+    }
+
+    /// The contiguous run of same-language code paragraphs around one.
+    static func codeRun(
+        containing paragraph: NSRange,
+        language: String?,
+        in storage: NSTextStorage,
+        str: NSString
+    ) -> NSRange {
+        var start = paragraph
+        while start.location > 0 {
+            let previous = str.paragraphRange(for: NSRange(location: start.location - 1, length: 0))
+            guard isCodeParagraph(previous, language: language, in: storage) else { break }
+            start = previous
+        }
+        var end = NSMaxRange(paragraph)
+        while end < storage.length {
+            let next = str.paragraphRange(for: NSRange(location: end, length: 0))
+            guard isCodeParagraph(next, language: language, in: storage) else { break }
+            end = NSMaxRange(next)
+        }
+        return NSRange(location: start.location, length: end - start.location)
+    }
 }
 
 extension PColor {
-    static func dynamicCodeColor(light: Int, dark: Int) -> PColor {
+    static func dynamicCodeColor(light: Int, dark: Int, alpha: CGFloat = 1) -> PColor {
         #if os(macOS)
         PColor(name: nil) { appearance in
             let best = appearance.bestMatch(from: [.darkAqua, .aqua])
-            return PColor(rgb: best == .darkAqua ? dark : light)
+            return PColor(rgb: best == .darkAqua ? dark : light, alpha: alpha)
         }
         #else
         PColor { traits in
-            PColor(rgb: traits.userInterfaceStyle == .dark ? dark : light)
+            PColor(rgb: traits.userInterfaceStyle == .dark ? dark : light, alpha: alpha)
         }
         #endif
     }

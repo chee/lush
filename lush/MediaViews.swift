@@ -341,6 +341,8 @@ struct EditorSheetView: View {
             AudioPlayerSheet(
                 fileURL: fileURL,
                 name: name,
+                fetchML: { await controller.assetML(assetUrl) },
+                generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name) },
                 fetchVision: { await controller.assetVision(assetUrl) },
                 saveTranscript: { transcript in
                     controller.saveTranscript(assetUrl: assetUrl, transcript: transcript)
@@ -361,6 +363,8 @@ struct EditorSheetView: View {
             AssetInfoSheet(
                 name: name,
                 image: image,
+                fetchML: { await controller.assetML(assetUrl) },
+                generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name) },
                 fetch: { await controller.assetVision(assetUrl) },
                 analyze: { await controller.analyzeAssetVision(assetUrl) }
             )
@@ -373,12 +377,16 @@ struct EditorSheetView: View {
 struct AssetInfoSheet: View {
     let name: String
     let image: PImage?
+    let fetchML: () async -> AssetMl?
+    let generateML: () async -> AssetMl?
     let fetch: () async -> AssetVision?
     let analyze: () async -> AssetVision?
     @Environment(\.dismiss) private var dismiss
+    @State private var ml: AssetMl?
     @State private var vision: AssetVision?
     @State private var loaded = false
     @State private var analyzing = false
+    @State private var generatingML = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -400,6 +408,17 @@ struct AssetInfoSheet: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    if let ml {
+                        if !ml.summary.isEmpty {
+                            CopyableText(title: "Summary", text: ml.summary)
+                        }
+                        if !ml.caption.isEmpty {
+                            CopyableText(title: "Caption", text: ml.caption)
+                        }
+                        if !ml.keywords.isEmpty {
+                            CopyableText(title: "Keywords", text: ml.keywords)
+                        }
+                    }
                     if let vision {
                         if !vision.description.isEmpty {
                             CopyableText(title: "Description", text: vision.description)
@@ -407,20 +426,34 @@ struct AssetInfoSheet: View {
                         if !vision.ocr.isEmpty {
                             CopyableText(title: "Text", text: vision.ocr)
                         }
-                    } else if analyzing {
+                    } else if ml == nil, analyzing {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
                             Text("Looking at the image…")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                    } else if loaded {
+                    } else if ml == nil, loaded {
                         Text("Nothing recognized in this image.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack {
+                Spacer()
+                Button {
+                    Task { await regenerateML() }
+                } label: {
+                    if generatingML {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(ml == nil ? "Generate Summary" : "Regenerate Summary")
+                    }
+                }
+                .disabled(generatingML || analyzing)
             }
             Button("Done") { dismiss() }
                 .keyboardShortcut(.defaultAction)
@@ -430,6 +463,7 @@ struct AssetInfoSheet: View {
         .frame(minWidth: 440, minHeight: 380)
         #endif
         .task {
+            ml = await fetchML()
             vision = await fetch()
             // Assets inserted on another device, or before there was an
             // analyzer, arrive with nothing — so look now rather than show an
@@ -441,6 +475,17 @@ struct AssetInfoSheet: View {
             }
             loaded = true
         }
+    }
+
+    private func regenerateML() async {
+        generatingML = true
+        defer { generatingML = false }
+        if vision == nil {
+            analyzing = true
+            vision = await analyze()
+            analyzing = false
+        }
+        ml = await generateML()
     }
 }
 
@@ -468,6 +513,8 @@ struct CopyableText: View {
 struct AudioPlayerSheet: View {
     let fileURL: URL
     let name: String
+    let fetchML: () async -> AssetMl?
+    let generateML: () async -> AssetMl?
     let fetchVision: () async -> AssetVision?
     let saveTranscript: ((String) -> Void)?
     let onTrimmed: (Data) -> Void
@@ -482,6 +529,8 @@ struct AudioPlayerSheet: View {
     @State private var exporting = false
     @State private var exportFailed = false
     @State private var levels: [Float] = []
+    @State private var ml: AssetMl?
+    @State private var generatingML = false
     @State private var editableTranscript = ""
 
     var body: some View {
@@ -552,6 +601,29 @@ struct AudioPlayerSheet: View {
                 }
             }
 
+            if let ml {
+                VStack(alignment: .leading, spacing: 8) {
+                    if !ml.summary.isEmpty {
+                        CopyableText(title: "Summary", text: ml.summary)
+                    }
+                    if !ml.keywords.isEmpty {
+                        CopyableText(title: "Keywords", text: ml.keywords)
+                    }
+                }
+            }
+
+            Button {
+                Task { await regenerateML() }
+            } label: {
+                if generatingML {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text(ml == nil ? "Generate Summary" : "Regenerate Summary")
+                }
+            }
+            .disabled(generatingML || editableTranscript.isEmpty)
+
             if !editableTranscript.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -595,6 +667,7 @@ struct AudioPlayerSheet: View {
                 levels = await Task.detached { WaveformView.levels(for: url) }.value
             }
             Task {
+                ml = await fetchML()
                 if let ocr = await fetchVision()?.ocr, !ocr.isEmpty {
                     editableTranscript = ocr
                 }
@@ -613,6 +686,14 @@ struct AudioPlayerSheet: View {
         .onDisappear {
             player?.stop()
         }
+    }
+
+    private func regenerateML() async {
+        guard !editableTranscript.isEmpty else { return }
+        generatingML = true
+        defer { generatingML = false }
+        saveTranscript?(editableTranscript)
+        ml = await generateML()
     }
 
     private func togglePlayback() {

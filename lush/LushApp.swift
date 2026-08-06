@@ -76,6 +76,10 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         continue userActivity: NSUserActivity,
         restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void
     ) -> Bool {
+        if LushHandoff.handle(userActivity) {
+            application.activate()
+            return true
+        }
         #if canImport(CoreSpotlight)
         guard userActivity.activityType == CSSearchableItemActionType,
               let url = userActivity.userInfo?[CSSearchableItemActivityIdentifier] as? String
@@ -177,6 +181,11 @@ struct FormatCommands: Commands {
                 .keyboardShortcut("9", modifiers: [.command, .shift])
             Button("Code Block") { editor?.applyStyle("code-block") }
                 .keyboardShortcut("m", modifiers: [.command, .shift])
+            Menu("Code Language") {
+                ForEach(CodeLanguage.all) { language in
+                    Button(language.name) { editor?.applyCodeLanguage(language) }
+                }
+            }
             Divider()
             Button("Attach Image…") { editor?.attachImageFromPanel() }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -242,7 +251,7 @@ struct LushApp: App {
 
     var body: some Scene {
         #if os(macOS)
-        WindowGroup {
+        WindowGroup(id: "main") {
             ContentView()
                 .environment(model)
                 .environment(contextTracker)
@@ -289,9 +298,12 @@ struct LushApp: App {
         .defaultSize(width: 340, height: 190)
         .windowResizability(.contentSize)
 
-        MenuBarExtra("Lush", systemImage: "text.badge.plus") {
-            QuickCaptureView()
+        MenuBarExtra {
+            MenuBarCaptureView()
                 .environment(model)
+        } label: {
+            LushMenuBarIcon()
+                .accessibilityLabel("Lush")
         }
         .menuBarExtraStyle(.window)
         #else

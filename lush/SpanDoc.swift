@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreText
 #if os(macOS)
 import AppKit
 #else
@@ -283,14 +284,14 @@ enum Highlight {
 }
 
 struct TableGrid: Equatable {
-    var rows: [[String]]
+    var rows: [[[SpanNode]]]
     var hasHeader: Bool
 
     var columnCount: Int { rows.map(\.count).max() ?? 0 }
 
     static func empty(rows: Int, columns: Int) -> TableGrid {
         TableGrid(
-            rows: Array(repeating: Array(repeating: "", count: columns), count: rows),
+            rows: Array(repeating: Array(repeating: [], count: columns), count: rows),
             hasHeader: true
         )
     }
@@ -349,6 +350,38 @@ final class FittingImageAttachment: NSTextAttachment {
     }
 }
 
+/// An attachment whose live view comes from the editor showing it: the view
+/// provider resolves through the requesting text view's core, so each window
+/// keeps its own hosted view over the same shared storage.
+final class EmbedAttachment: NSTextAttachment {
+    let box: AnyObject
+
+    init(box: AnyObject) {
+        self.box = box
+        super.init(data: nil, ofType: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func viewProvider(
+        for parentView: PView?,
+        location: NSTextLocation,
+        textContainer: NSTextContainer?
+    ) -> NSTextAttachmentViewProvider? {
+        var provider: NSTextAttachmentViewProvider?
+        MainActor.assumeIsolated {
+            provider = (parentView as? EditorTextView)?.core?.inline.viewProvider(
+                for: self,
+                location: location,
+                textContainer: textContainer
+            )
+        }
+        return provider
+    }
+}
+
 final class BlockBox: NSObject {
     var value: BlockValue
     init(_ value: BlockValue) { self.value = value }
@@ -386,29 +419,33 @@ final class AssetCache {
 /// render text re-load when `changed` is posted.
 enum EditorSettings {
     static let changed = Notification.Name("io.lush.editorSettingsChanged")
+    static let systemFontFamily = "__system__"
+    private static let bundledFonts = [
+        "Caroni-Regular.otf",
+        "FantasqueSansMono-Regular.ttf",
+        "FantasqueSansMono-Bold.ttf",
+        "FantasqueSansMono-Italic.ttf",
+        "FantasqueSansMono-BoldItalic.ttf",
+        "jost-vf.ttf",
+        "Merriweather-VariableFont_opsz,wdth,wght.ttf",
+        "Merriweather-Italic-VariableFont_opsz,wdth,wght.ttf",
+    ]
     private static let sizeKey = "editorBodySize"
     private static let designKey = "editorFontDesign"
+    private static let sansFamilyKey = "editorSansFamily"
+    private static let serifFamilyKey = "editorSerifFamily"
+    private static let monoFamilyKey = "editorMonoFamily"
+    private static let handFamilyKey = "editorHandFamily"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
 
-    static let designs: [(key: String, label: String)] = [
-        ("system", "System"),
-        ("serif", "New York"),
-        ("rounded", "Rounded"),
-        ("mono", "Monospaced"),
-        ("georgia", "Georgia"),
-        ("palatino", "Palatino"),
-        ("baskerville", "Baskerville"),
-        ("times", "Times New Roman"),
-        ("didot", "Didot"),
-        ("helvetica", "Helvetica Neue"),
-        ("avenir", "Avenir Next"),
-        ("optima", "Optima"),
-        ("typewriter", "Typewriter"),
-        ("courier", "Courier New"),
-        ("menlo", "Menlo"),
+    static let fontFamilies: [(key: String, label: String)] = [
+        ("sans", "Sans"),
+        ("serif", "Serif"),
+        ("mono", "Mono"),
+        ("hand", "Hand"),
     ]
 
-    private static let namedFonts: [String: String] = [
+    private static let legacyNamedFonts: [String: String] = [
         "georgia": "Georgia",
         "palatino": "Palatino",
         "baskerville": "Baskerville",
@@ -433,17 +470,19 @@ enum EditorSettings {
     // Rendering a document asks for these once per attribute run, so they are
     // read from UserDefaults once and dropped when a setter changes them.
     private static var cachedBodySize: Double?
-    private static var cachedDesign: String?
+    private static var cachedFamilies: [String: String] = [:]
     private static var fontCache: [FontKey: PFont] = [:]
+    private static var bundledFontsRegistered = false
 
     private struct FontKey: Hashable {
+        let family: String
         let size: CGFloat
         let weight: CGFloat
     }
 
     private static func invalidateTypography() {
         cachedBodySize = nil
-        cachedDesign = nil
+        cachedFamilies = [:]
         fontCache = [:]
         NotificationCenter.default.post(name: changed, object: nil)
     }
@@ -461,16 +500,38 @@ enum EditorSettings {
         invalidateTypography()
     }
 
+    static var availableFontFamilies: [String] {
+        registerBundledFonts()
+        #if os(macOS)
+        return NSFontManager.shared.availableFontFamilies.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+        #else
+        return UIFont.familyNames.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+        #endif
+    }
+
+    static func family(for key: String) -> String {
+        if let cached = cachedFamilies[key] { return cached }
+        let saved = UserDefaults.standard.string(forKey: familyDefaultsKey(for: key))
+        let family = saved ?? legacyDefaultFamily(for: key)
+        cachedFamilies[key] = family
+        return family
+    }
+
+    static func setFamily(_ family: String, for key: String) {
+        UserDefaults.standard.set(family, forKey: familyDefaultsKey(for: key))
+        invalidateTypography()
+    }
+
     static var design: String {
-        if let cachedDesign { return cachedDesign }
-        let design = UserDefaults.standard.string(forKey: designKey) ?? "system"
-        cachedDesign = design
-        return design
+        UserDefaults.standard.string(forKey: designKey) ?? "system"
     }
 
     static func setDesign(_ design: String) {
-        UserDefaults.standard.set(design, forKey: designKey)
-        invalidateTypography()
+        setFamily(legacyFamilyName(for: design), for: "sans")
     }
 
     static var autoInsertLogline: Bool {
@@ -482,37 +543,113 @@ enum EditorSettings {
         NotificationCenter.default.post(name: changed, object: nil)
     }
 
-    static func font(ofSize size: CGFloat, weight: PFont.Weight = .regular) -> PFont {
-        let key = FontKey(size: size, weight: weight.rawValue)
+    static func font(
+        family key: String = "sans",
+        ofSize size: CGFloat,
+        weight: PFont.Weight = .regular
+    ) -> PFont {
+        let family = family(for: key)
+        let key = FontKey(family: "\(key):\(family)", size: size, weight: weight.rawValue)
         if let hit = fontCache[key] { return hit }
-        let resolved = resolveFont(ofSize: size, weight: weight)
+        let resolved = resolveFont(family: family, role: key.family, ofSize: size, weight: weight)
         fontCache[key] = resolved
         return resolved
     }
 
-    private static func resolveFont(ofSize size: CGFloat, weight: PFont.Weight) -> PFont {
-        let base = PFont.systemFont(ofSize: size, weight: weight)
-        switch design {
-        case "serif":
-            guard let descriptor = base.fontDescriptor.withDesign(.serif) else { return base }
-            #if os(macOS)
-            return PFont(descriptor: descriptor, size: size) ?? base
-            #else
-            return PFont(descriptor: descriptor, size: size)
-            #endif
-        case "rounded":
-            guard let descriptor = base.fontDescriptor.withDesign(.rounded) else { return base }
-            #if os(macOS)
-            return PFont(descriptor: descriptor, size: size) ?? base
-            #else
-            return PFont(descriptor: descriptor, size: size)
-            #endif
-        case "mono":
+    private static func familyDefaultsKey(for key: String) -> String {
+        switch key {
+        case "serif": serifFamilyKey
+        case "mono": monoFamilyKey
+        case "hand": handFamilyKey
+        default: sansFamilyKey
+        }
+    }
+
+    private static func legacyDefaultFamily(for key: String) -> String {
+        switch key {
+        case "sans": return legacyFamilyName(for: design)
+        case "serif": return "Merriweather"
+        case "mono": return "Fantasque Sans Mono"
+        case "hand": return "Caroni"
+        default: return systemFontFamily
+        }
+    }
+
+    private static func legacyFamilyName(for design: String) -> String {
+        legacyNamedFonts[design] ?? "Jost*"
+    }
+
+    private static func resolveFont(
+        family: String,
+        role: String,
+        ofSize size: CGFloat,
+        weight: PFont.Weight
+    ) -> PFont {
+        registerBundledFonts()
+        if family != systemFontFamily,
+           let resolved = font(namedFamily: family, size: size, weight: weight) {
+            return resolved
+        }
+        if role.hasPrefix("serif") {
+            return systemFont(ofSize: size, weight: weight, design: .serif)
+        }
+        if role.hasPrefix("mono") {
             return .monospacedSystemFont(ofSize: size, weight: weight)
-        default:
-            guard let fontName = namedFonts[design],
-                  let named = PFont(name: fontName, size: size) else { return base }
-            return weight.rawValue > 0 ? named.addingTraits(bold: true) : named
+        }
+        if role.hasPrefix("hand"),
+           let hand = defaultHandFont(ofSize: size, weight: weight) {
+            return hand
+        }
+        return .systemFont(ofSize: size, weight: weight)
+    }
+
+    private static func systemFont(
+        ofSize size: CGFloat,
+        weight: PFont.Weight,
+        design: PFontDescriptor.SystemDesign
+    ) -> PFont {
+        let base = PFont.systemFont(ofSize: size, weight: weight)
+        guard let descriptor = base.fontDescriptor.withDesign(design) else { return base }
+        #if os(macOS)
+        return PFont(descriptor: descriptor, size: size) ?? base
+        #else
+        return PFont(descriptor: descriptor, size: size)
+        #endif
+    }
+
+    private static func font(namedFamily family: String, size: CGFloat, weight: PFont.Weight) -> PFont? {
+        let descriptor = PFontDescriptor(fontAttributes: [.family: family])
+        let matches = descriptor.matchingFontDescriptors(withMandatoryKeys: [.family])
+        let baseDescriptor = matches.first ?? descriptor
+        #if os(macOS)
+        guard let font = PFont(descriptor: baseDescriptor, size: size) else { return nil }
+        #else
+        let font = PFont(descriptor: baseDescriptor, size: size)
+        #endif
+        return weight.rawValue > 0 ? font.addingTraits(bold: true) : font
+    }
+
+    private static func defaultHandFont(ofSize size: CGFloat, weight: PFont.Weight) -> PFont? {
+        for family in ["Caroni", "Snell Roundhand", "Bradley Hand", "Marker Felt", "Chalkboard SE"] {
+            if let font = font(namedFamily: family, size: size, weight: weight) {
+                return font
+            }
+        }
+        return nil
+    }
+
+    private static func registerBundledFonts() {
+        guard !bundledFontsRegistered else { return }
+        bundledFontsRegistered = true
+        for filename in bundledFonts {
+            let basename = (filename as NSString).deletingPathExtension
+            let ext = (filename as NSString).pathExtension
+            let url = Bundle.main.url(forResource: basename, withExtension: ext)
+                ?? Bundle.main.url(forResource: basename, withExtension: ext, subdirectory: "fonts")
+            guard let url else {
+                continue
+            }
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
         }
     }
 }
@@ -528,8 +665,12 @@ enum RichText {
             case 2: return EditorSettings.font(ofSize: bodySize + 5, weight: .bold)
             default: return EditorSettings.font(ofSize: bodySize + 2, weight: .semibold)
             }
+        case "serif":
+            return EditorSettings.font(family: "serif", ofSize: bodySize)
+        case "hand":
+            return EditorSettings.font(family: "hand", ofSize: bodySize)
         case "code-block":
-            return .monospacedSystemFont(ofSize: bodySize - 1, weight: .regular)
+            return EditorSettings.font(family: "mono", ofSize: bodySize - 1)
         default:
             return EditorSettings.font(ofSize: bodySize)
         }
@@ -552,17 +693,21 @@ enum RichText {
 
     private static func buildParagraphStyle(for block: BlockValue) -> NSParagraphStyle {
         let ps = NSMutableParagraphStyle()
-        ps.paragraphSpacing = 6
+        ps.paragraphSpacing = 0
         var indent: CGFloat = 0
         // nested structures (list nesting, columns, table cells) indent by depth
         indent += CGFloat(block.parents.count) * 20
         switch block.type {
         case "heading":
             ps.paragraphSpacingBefore = 10
+            ps.paragraphSpacing = 6
         case "unordered-list-item", "ordered-list-item", "todo-list-item":
             indent += 32
         case "blockquote":
             indent += 16
+        case "code-block":
+            // room inside the card, tight lines within it
+            indent += 12
         default:
             break
         }
@@ -586,20 +731,17 @@ enum RichText {
         }
         if case .bool(true)? = marks["code"] {
             let size = font.pointSize - 1
-            font = PFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            font = EditorSettings.font(family: "mono", ofSize: size)
                 .addingTraits(bold: bold, italic: italic)
         }
         var out: [NSAttributedString.Key: Any] = [
             .font: font,
             .paragraphStyle: paragraphStyle(for: block),
-            .foregroundColor: block.type == "blockquote" ? PColor.pSecondaryLabel : PColor.pLabel,
+            .foregroundColor: PColor.pLabel,
             .amBlock: BlockBox(block),
         ]
         if case .bool(true)? = marks["code"] {
             out[.backgroundColor] = PColor.pLabel.withAlphaComponent(0.08)
-        }
-        if block.type == "code-block" {
-            out[.backgroundColor] = PColor.pLabel.withAlphaComponent(0.05)
         }
         if let name = marks["highlight"]?.stringValue {
             out[.amHighlight] = name
@@ -717,7 +859,9 @@ enum RichText {
                 }
                 block = b
                 sawAnything = true
-                if b.isEmbedBlock {
+                if b.type == "context" {
+                    out.append(contextLine(for: b))
+                } else if b.isEmbedBlock {
                     out.append(embedAttachment(for: b, cache: cache))
                 }
             case .text(let text, let marks):
@@ -734,57 +878,131 @@ enum RichText {
     }
 
     @MainActor
+    static func contextLine(for block: BlockValue) -> NSAttributedString {
+        let attrs = contextDisplayAttributes(for: block)
+        let line = NSMutableAttributedString()
+        let parts = contextLineParts(for: block)
+        for (index, part) in parts.enumerated() {
+            if index > 0 {
+                line.append(NSAttributedString(string: " | ", attributes: attrs))
+            }
+            var partAttrs = attrs
+            if part.isLocation, let url = mapsURL(for: block, location: part.text) {
+                partAttrs[.link] = url
+                partAttrs[.foregroundColor] = PColor.pTint
+                partAttrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            line.append(NSAttributedString(string: part.text, attributes: partAttrs))
+        }
+        if line.length == 0 {
+            line.append(NSAttributedString(string: "Logline", attributes: attrs))
+        }
+        return line
+    }
+
+    private static func contextLineParts(for block: BlockValue) -> [(text: String, isLocation: Bool)] {
+        var parts: [(text: String, isLocation: Bool)] = []
+        let fmt = ISO8601DateFormatter()
+        let isCreation = block.attrs["created"] != nil
+        if let raw = (block.attrs["created"] ?? block.attrs["ts"])?.stringValue,
+           let date = fmt.date(from: raw) {
+            if isCreation {
+                parts.append((date.formatted(.dateTime.month(.abbreviated).day().year().hour().minute()), false))
+            } else {
+                parts.append((date.formatted(.dateTime.hour().minute()), false))
+            }
+        }
+        if let weather = block.attrs["weather"]?.stringValue {
+            parts.append((weather, false))
+        }
+        if let location = block.attrs["location"]?.stringValue {
+            parts.append((location, true))
+        }
+        if let song = block.attrs["now_playing"]?.stringValue {
+            parts.append((song, false))
+        }
+        return parts
+    }
+
+    private static func mapsURL(for block: BlockValue, location: String) -> URL? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "maps.apple.com"
+        components.path = "/"
+        var items = [URLQueryItem(name: "q", value: location)]
+        if let lat = block.attrs["lat"]?.doubleValue,
+           let lon = block.attrs["lon"]?.doubleValue {
+            items.append(URLQueryItem(name: "ll", value: "\(lat),\(lon)"))
+        }
+        components.queryItems = items
+        return components.url
+    }
+
+    private static func contextDisplayAttributes(for block: BlockValue) -> [NSAttributedString.Key: Any] {
+        var attrs = attributes(block: block, marks: [:])
+        attrs[.font] = EditorSettings.font(ofSize: max(10, bodySize - 2))
+        attrs[.foregroundColor] = PColor.pSecondaryLabel
+        attrs[.amDisplayOnly] = true
+        attrs.removeValue(forKey: .backgroundColor)
+        return attrs
+    }
+
+    @MainActor
     static func embedAttachment(for block: BlockValue, cache: AssetCache) -> NSAttributedString {
         let url = block.embedUrl
-        let isLiveBox = block.type == "html"
-            || block.type == "context"
-            || url.map { cache.patchworkDocs.contains($0) } == true
-        let attachment: NSTextAttachment = isLiveBox
-            ? NSTextAttachment()
-            : FittingImageAttachment()
+        // the attachment and the .amBlock attribute must share one BlockBox:
+        // embed handlers mutate it in place and the span encoder reads it back
+        var attrs = attributes(block: block, marks: [:])
+        attrs.removeValue(forKey: .backgroundColor)
+        let box = attrs[.amBlock] as? BlockBox ?? BlockBox(block)
+        // A live box must have no image — TextKit only asks an attachment for
+        // its view provider when there is nothing to draw without one.
+        func liveBox(width: CGFloat, height: CGFloat) -> EmbedAttachment {
+            let live = EmbedAttachment(box: box)
+            live.bounds = CGRect(origin: .zero, size: CGSize(width: width, height: height))
+            return live
+        }
+        func imageBox(_ image: PImage?, bounds: CGRect, ideal: CGSize? = nil) -> FittingImageAttachment {
+            let fitting = FittingImageAttachment()
+            fitting.image = image
+            fitting.bounds = bounds
+            if let ideal { fitting.idealSize = ideal }
+            return fitting
+        }
+        let attachment: NSTextAttachment
         var displayName: String?
         if block.type == "html" {
-            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
-            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 220))
+            attachment = liveBox(width: 460, height: 220)
         } else if block.type == "context" {
-            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
-            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 28))
+            attachment = liveBox(width: 460, height: 28)
         } else if let url, cache.patchworkDocs.contains(url) {
-            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
-            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 300))
+            attachment = liveBox(width: 460, height: 300)
         } else if let url, let image = cache.images[url] {
-            attachment.image = image
             let size = Self.fitted(image.size)
-            attachment.bounds = CGRect(origin: .zero, size: size)
-            (attachment as? FittingImageAttachment)?.idealSize = size
-        } else if let url, let thumb = cache.videoThumbs[url] {
-            attachment.image = thumb
-            let size = Self.fitted(thumb.size)
-            attachment.bounds = CGRect(origin: .zero, size: size)
-            (attachment as? FittingImageAttachment)?.idealSize = size
+            attachment = imageBox(image, bounds: CGRect(origin: .zero, size: size), ideal: size)
+        } else if let url, cache.videoThumbs[url] != nil {
+            // the live VideoInlineView plays in place of the poster
+            let size = Self.fitted(cache.videoThumbs[url]!.size)
+            attachment = liveBox(width: size.width, height: size.height)
         } else if let url, let name = cache.names[url],
                   AssetCache.kind(forName: name) == "audio",
                   cache.fileURLs[url] != nil {
-            // rendered by the live AudioInlineView; reserve the box
-            attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
-            let height: CGFloat = cache.transcripts[url] != nil ? 132 : 84
-            attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: height))
+            attachment = liveBox(width: 460, height: cache.transcripts[url] != nil ? 132 : 84)
         } else if let url, let name = cache.names[url] {
             let symbol = switch AssetCache.kind(forName: name) {
             case "audio": "waveform.circle.fill"
             case "video": "play.rectangle.fill"
             default: "doc.fill"
             }
-            attachment.image = PImage.symbol(symbol)
-            attachment.bounds = CGRect(x: 0, y: -4, width: 20, height: 20)
+            attachment = imageBox(PImage.symbol(symbol), bounds: CGRect(x: 0, y: -4, width: 20, height: 20))
             displayName = name
+        } else if block.type != "embed" {
+            // unknown block types render as the live chip, never as blank space
+            attachment = liveBox(width: 320, height: 44)
         } else {
-            attachment.image = PImage.symbol("photo")
-            attachment.bounds = CGRect(x: 0, y: 0, width: 48, height: 36)
+            attachment = imageBox(PImage.symbol("photo"), bounds: CGRect(x: 0, y: 0, width: 48, height: 36))
         }
         let string = NSMutableAttributedString(attachment: attachment)
-        var attrs = attributes(block: block, marks: [:])
-        attrs.removeValue(forKey: .backgroundColor)
         string.addAttributes(attrs, range: NSRange(location: 0, length: string.length))
         if let displayName {
             var nameAttrs = attrs
@@ -812,32 +1030,33 @@ enum RichText {
 
     // MARK: tables
 
+    /// Cells hold span lists — marks, paragraphs, images — the same way
+    /// columns do; a plain string cell from an older doc parses to a single
+    /// text node.
     static func parseTable(_ spans: [SpanNode]) -> TableGrid {
-        var rows: [[String]] = []
+        var rows: [[[SpanNode]]] = []
         var hasHeader = false
         for node in spans {
             switch node {
-            case .block(let b):
-                switch b.type {
-                case "table-row":
-                    rows.append([])
-                case "table-cell", "table-header-cell":
-                    if rows.isEmpty { rows.append([]) }
-                    rows[rows.count - 1].append("")
-                    if b.type == "table-header-cell", rows.count == 1 {
-                        hasHeader = true
-                    }
-                default:
-                    break
+            case .block(let b) where b.type == "table-row":
+                rows.append([])
+            case .block(let b) where b.type == "table-cell" || b.type == "table-header-cell":
+                if rows.isEmpty { rows.append([]) }
+                rows[rows.count - 1].append([])
+                if b.type == "table-header-cell", rows.count == 1 {
+                    hasHeader = true
                 }
-            case .text(let text, _):
-                if !rows.isEmpty, !rows[rows.count - 1].isEmpty {
-                    rows[rows.count - 1][rows[rows.count - 1].count - 1] += text
-                }
+            case .block(var b):
+                guard !rows.isEmpty, !rows[rows.count - 1].isEmpty else { break }
+                b.parents = Array(b.parents.dropFirst(3))
+                rows[rows.count - 1][rows[rows.count - 1].count - 1].append(.block(b))
+            case .text:
+                guard !rows.isEmpty, !rows[rows.count - 1].isEmpty else { break }
+                rows[rows.count - 1][rows[rows.count - 1].count - 1].append(node)
             }
         }
         let cols = rows.map(\.count).max() ?? 0
-        rows = rows.map { $0 + Array(repeating: "", count: cols - $0.count) }
+        rows = rows.map { $0 + Array(repeating: [], count: cols - $0.count) }
         return TableGrid(rows: rows, hasHeader: hasHeader)
     }
 
@@ -848,12 +1067,24 @@ enum RichText {
             let cellType = grid.hasHeader && rowIndex == 0 ? "table-header-cell" : "table-cell"
             for cell in row {
                 spans.append(.block(BlockValue(type: cellType, parents: ["table", "table-row"])))
-                if !cell.isEmpty {
-                    spans.append(.text(cell, [:]))
+                for node in cell {
+                    if case .block(var b) = node {
+                        b.parents = ["table", "table-row", "table-cell"] + b.parents
+                        spans.append(.block(b))
+                    } else {
+                        spans.append(node)
+                    }
                 }
             }
         }
         return spans
+    }
+
+    static func plainText(of spans: [SpanNode]) -> String {
+        spans.compactMap {
+            if case .text(let text, _) = $0 { return text }
+            return nil
+        }.joined()
     }
 
     /// The attachment only reserves space in the text flow; the live
@@ -898,8 +1129,7 @@ enum RichText {
     }
 
     static func columnsAttachment(for box: ColumnsBox) -> NSAttributedString {
-        let attachment = NSTextAttachment()
-        attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+        let attachment = EmbedAttachment(box: box)
         attachment.bounds = CGRect(origin: .zero, size: CGSize(width: 460, height: 120))
         let string = NSMutableAttributedString(attachment: attachment)
         string.addAttributes([
@@ -923,8 +1153,7 @@ enum RichText {
     }
 
     static func tableAttachment(for box: TableBox) -> NSAttributedString {
-        let attachment = NSTextAttachment()
-        attachment.image = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+        let attachment = EmbedAttachment(box: box)
         let cols = max(box.grid.columnCount, 1)
         let rows = max(box.grid.rows.count, 1)
         attachment.bounds = CGRect(
@@ -1005,6 +1234,11 @@ enum RichText {
                 block = trailingBlock
             } else {
                 block = previousBlock
+            }
+            if block.type == "context" {
+                spans.append(.block(block))
+                previousBlock = block
+                continue
             }
             if block.isEmbedBlock {
                 let content = contentLength > 0

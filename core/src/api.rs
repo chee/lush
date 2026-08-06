@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use automerge::ChangeHash;
+use automerge::{ChangeHash, ChangeMetadata};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -151,6 +151,13 @@ pub struct AssetVision {
     pub ocr: String,
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AssetML {
+    pub summary: String,
+    pub caption: String,
+    pub keywords: String,
+}
+
 #[uniffi::export(callback_interface)]
 pub trait CoreDelegate: Send + Sync {
     fn on_doc_changed(&self, url: String);
@@ -164,6 +171,43 @@ pub struct Core {
     repo: Arc<Repo>,
     index: Arc<SearchIndex>,
     folder: std::sync::Mutex<Option<DocId>>,
+    history_cache: std::sync::Mutex<HashMap<DocId, CachedDocHistory>>,
+}
+
+#[derive(Clone)]
+struct CachedDocHistory {
+    heads: Vec<ChangeHash>,
+    frontier: HashSet<ChangeHash>,
+    known_hashes: HashSet<ChangeHash>,
+    entries: Vec<DocHistoryEntry>,
+}
+
+fn normalized_heads(mut heads: Vec<ChangeHash>) -> Vec<ChangeHash> {
+    heads.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    heads
+}
+
+fn append_history_entries(history: &mut CachedDocHistory, changes: Vec<ChangeMetadata<'_>>) {
+    for change in changes {
+        if !history.known_hashes.insert(change.hash) {
+            continue;
+        }
+        for dep in &change.deps {
+            history.frontier.remove(dep);
+        }
+        history.frontier.insert(change.hash);
+        let mut heads: Vec<String> = history.frontier.iter().map(ToString::to_string).collect();
+        heads.sort();
+        history.entries.push(DocHistoryEntry {
+            hash: change.hash.to_string(),
+            heads,
+            time: change.timestamp,
+            actor: change.actor.to_string(),
+            seq: change.seq,
+            message: change.message.map(|message| message.into_owned()),
+            deps: change.deps.into_iter().map(|dep| dep.to_string()).collect(),
+        });
+    }
 }
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -242,8 +286,9 @@ impl Core {
         TRACING.call_once(|| {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "lush_core=debug,subduction_websocket=info,subduction_core=debug,warn".into()),
+                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                        "lush_core=debug,subduction_websocket=warn,subduction_core=warn,warn".into()
+                    }),
                 )
                 .try_init();
         });
@@ -260,6 +305,7 @@ impl Core {
             repo,
             index,
             folder: std::sync::Mutex::new(None),
+            history_cache: std::sync::Mutex::new(HashMap::new()),
         });
         core.start_index_updates();
         Ok(core)
@@ -289,6 +335,7 @@ impl Core {
     pub fn resync_doc(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let id = DocId::from_url(&url)?;
+        self.history_cache.lock().unwrap().remove(&id);
         self.runtime.block_on(async move {
             repo.drop_doc(id).await;
             repo.ensure_doc(id).await
@@ -312,34 +359,42 @@ impl Core {
         let Ok(id) = DocId::from_url(&url) else {
             return Vec::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| {
-                let mut frontier = HashSet::<ChangeHash>::new();
-                let entries = doc
-                    .get_changes_meta(&[])
-                    .into_iter()
-                    .map(|change| {
-                        for dep in &change.deps {
-                            frontier.remove(dep);
-                        }
-                        frontier.insert(change.hash);
-                        let mut heads: Vec<String> =
-                            frontier.iter().map(ToString::to_string).collect();
-                        heads.sort();
-                        DocHistoryEntry {
-                            hash: change.hash.to_string(),
-                            heads,
-                            time: change.timestamp,
-                            actor: change.actor.to_string(),
-                            seq: change.seq,
-                            message: change.message.map(|message| message.into_owned()),
-                            deps: change.deps.into_iter().map(|dep| dep.to_string()).collect(),
-                        }
-                    })
-                    .collect();
-                Ok(entries)
+        let cached = self.history_cache.lock().unwrap().get(&id).cloned();
+        let history = self
+            .runtime
+            .block_on(self.repo.read_doc(id, move |doc| {
+                let current_heads = normalized_heads(doc.get_heads());
+                if let Some(cached) = cached {
+                    if cached.heads == current_heads {
+                        return Ok(cached);
+                    }
+
+                    let changes = doc.get_changes_meta(&cached.heads);
+                    if !cached.heads.is_empty() && !changes.is_empty() {
+                        let mut next = cached;
+                        next.heads = current_heads;
+                        append_history_entries(&mut next, changes);
+                        return Ok(next);
+                    }
+                }
+
+                let mut next = CachedDocHistory {
+                    heads: current_heads,
+                    frontier: HashSet::new(),
+                    known_hashes: HashSet::new(),
+                    entries: Vec::new(),
+                };
+                append_history_entries(&mut next, doc.get_changes_meta(&[]));
+                Ok(next)
             }))
-            .unwrap_or_default()
+            .ok();
+
+        let Some(history) = history else {
+            return Vec::new();
+        };
+        let entries = history.entries.clone();
+        self.history_cache.lock().unwrap().insert(id, history);
+        entries
     }
 
     pub fn is_connected(&self) -> bool {
@@ -1102,6 +1157,45 @@ impl Core {
             .ok()
             .flatten()
             .map(|(description, ocr)| AssetVision { description, ocr })
+    }
+
+    /// Write generated ML metadata onto a UnixFileEntry doc.
+    pub fn update_asset_ml(
+        &self,
+        url: String,
+        summary: String,
+        caption: String,
+        keywords: String,
+    ) -> Result<(), CoreError> {
+        let repo = self.repo.clone();
+        let reindex_url = url.clone();
+        self.runtime.block_on(async move {
+            let id = DocId::from_url(&url)?;
+            repo.ensure_doc(id).await?;
+            if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
+                anyhow::bail!("asset not found");
+            }
+            repo.change_doc(id, |doc| {
+                shapes::set_ml_metadata(doc, &summary, &caption, &keywords)
+            })
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        self.reindex_doc(DocId::from_url(&reindex_url)?);
+        Ok(())
+    }
+
+    pub fn asset_ml(&self, url: String) -> Option<AssetML> {
+        let id = DocId::from_url(&url).ok()?;
+        self.runtime
+            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::asset_ml(doc))))
+            .ok()
+            .flatten()
+            .map(|(summary, caption, keywords)| AssetML {
+                summary,
+                caption,
+                keywords,
+            })
     }
 
     pub async fn asset_bytes(&self, url: String) -> Result<Vec<u8>, CoreError> {

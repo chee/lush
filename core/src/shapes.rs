@@ -862,7 +862,43 @@ pub fn asset_vision(doc: &Automerge) -> Option<(String, String)> {
     }
 }
 
-/// Searchable text of a file doc: its name plus any vision metadata.
+/// Generated model metadata on a UnixFileEntry, written by local ML passes.
+pub fn set_ml_metadata(
+    doc: &mut Automerge,
+    summary: &str,
+    caption: &str,
+    keywords: &str,
+) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let ml = match t.get(ROOT, "@ml")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "@ml", ObjType::Map)?,
+            };
+            set_text(t, &ml, "summary", summary)?;
+            set_text(t, &ml, "caption", caption)?;
+            set_text(t, &ml, "keywords", keywords)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+/// Generated ML metadata of a file doc, if any has been written.
+pub fn asset_ml(doc: &Automerge) -> Option<(String, String, String)> {
+    let (_, ml) = doc.get(ROOT, "@ml").ok()??;
+    let summary = read_str(doc, &ml, "summary").unwrap_or_default();
+    let caption = read_str(doc, &ml, "caption").unwrap_or_default();
+    let keywords = read_str(doc, &ml, "keywords").unwrap_or_default();
+    if summary.is_empty() && caption.is_empty() && keywords.is_empty() {
+        None
+    } else {
+        Some((summary, caption, keywords))
+    }
+}
+
+/// Searchable text of a file doc: its name plus any generated metadata.
 pub fn asset_search_text(doc: &Automerge) -> String {
     let mut parts = Vec::new();
     if let Some(name) = read_str(doc, &ROOT, "name") {
@@ -874,6 +910,17 @@ pub fn asset_search_text(doc: &Automerge) -> String {
         }
         if let Some(o) = read_str(doc, &cv, "ocr") {
             parts.push(o);
+        }
+    }
+    if let Ok(Some((_, ml))) = doc.get(ROOT, "@ml") {
+        if let Some(summary) = read_str(doc, &ml, "summary") {
+            parts.push(summary);
+        }
+        if let Some(caption) = read_str(doc, &ml, "caption") {
+            parts.push(caption);
+        }
+        if let Some(keywords) = read_str(doc, &ml, "keywords") {
+            parts.push(keywords);
         }
     }
     parts.join("\n")

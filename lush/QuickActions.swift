@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AppIntents
 
@@ -63,6 +64,72 @@ final class AppRouter {
         default:
             break
         }
+    }
+}
+
+struct LushHandoffItem: Equatable {
+    enum Kind: String {
+        case note
+        case folder
+    }
+
+    let url: String
+    let title: String
+    let kind: Kind
+}
+
+enum LushHandoff {
+    static let activityType = "party.chee.patchwork.lush.view"
+
+    private static let urlKey = "url"
+    private static let kindKey = "kind"
+
+    @MainActor
+    static func item(for node: FolderNode?) -> LushHandoffItem? {
+        guard let node else { return nil }
+        if node.kind == "folder" {
+            return LushHandoffItem(
+                url: node.url,
+                title: node.displayName.isEmpty ? "Folder" : node.displayName,
+                kind: .folder
+            )
+        }
+        guard node.isNote else { return nil }
+        return LushHandoffItem(
+            url: node.url,
+            title: node.displayName.isEmpty ? "Untitled" : node.displayName,
+            kind: .note
+        )
+    }
+
+    static func configure(_ activity: NSUserActivity, item: LushHandoffItem) {
+        activity.title = item.title
+        activity.userInfo = [
+            urlKey: item.url,
+            kindKey: item.kind.rawValue
+        ]
+        activity.requiredUserInfoKeys = [urlKey, kindKey]
+        activity.isEligibleForHandoff = true
+        activity.isEligibleForSearch = false
+        activity.targetContentIdentifier = item.url
+    }
+
+    @MainActor
+    @discardableResult
+    static func handle(_ activity: NSUserActivity) -> Bool {
+        guard activity.activityType == activityType,
+              let url = activity.userInfo?[urlKey] as? String,
+              let rawKind = activity.userInfo?[kindKey] as? String,
+              let kind = LushHandoffItem.Kind(rawValue: rawKind)
+        else { return false }
+
+        switch kind {
+        case .note:
+            AppRouter.shared.pending = .note(url)
+        case .folder:
+            AppRouter.shared.pending = .folder(url)
+        }
+        return true
     }
 }
 

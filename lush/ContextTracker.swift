@@ -46,7 +46,6 @@ struct ContextSnapshot: Equatable {
     var extras: [String: String] = [:]
 
     func hasSubstantialChange(from previous: Self) -> Bool {
-        if timestamp.timeIntervalSince(previous.timestamp) > 600 { return true }
         if let lat = latitude, let lon = longitude,
            let prevLat = previous.latitude, let prevLon = previous.longitude {
             let d = sqrt(pow(lat - prevLat, 2) + pow(lon - prevLon, 2))
@@ -59,6 +58,43 @@ struct ContextSnapshot: Equatable {
         if nowPlaying != previous.nowPlaying { return true }
         if extras != previous.extras { return true }
         return false
+    }
+
+    init(
+        timestamp: Date = .distantPast,
+        locationName: String? = nil,
+        latitude: Double? = nil,
+        longitude: Double? = nil,
+        weatherDescription: String? = nil,
+        nowPlaying: String? = nil,
+        extras: [String: String] = [:]
+    ) {
+        self.timestamp = timestamp
+        self.locationName = locationName
+        self.latitude = latitude
+        self.longitude = longitude
+        self.weatherDescription = weatherDescription
+        self.nowPlaying = nowPlaying
+        self.extras = extras
+    }
+
+    init?(block: BlockValue) {
+        guard block.type == "context" else { return nil }
+        let fmt = ISO8601DateFormatter()
+        if let raw = (block.attrs["created"] ?? block.attrs["ts"])?.stringValue,
+           let date = fmt.date(from: raw) {
+            timestamp = date
+        }
+        locationName = block.attrs["location"]?.stringValue
+        latitude = block.attrs["lat"]?.doubleValue
+        longitude = block.attrs["lon"]?.doubleValue
+        weatherDescription = block.attrs["weather"]?.stringValue
+        nowPlaying = block.attrs["now_playing"]?.stringValue
+        extras = block.attrs.reduce(into: [:]) { result, pair in
+            let reserved = ["created", "ts", "location", "lat", "lon", "weather", "now_playing"]
+            guard !reserved.contains(pair.key), let value = pair.value.stringValue else { return }
+            result[pair.key] = value
+        }
     }
 }
 

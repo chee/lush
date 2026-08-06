@@ -4,6 +4,14 @@ import AppKit
 import UIKit
 #endif
 
+#if !os(macOS)
+private extension UIBezierPath {
+    func curve(to endPoint: CGPoint, controlPoint1: CGPoint, controlPoint2: CGPoint) {
+        addCurve(to: endPoint, controlPoint1: controlPoint1, controlPoint2: controlPoint2)
+    }
+}
+#endif
+
 /// TextKit 2 home of the list/quote decorations. Markers are pure decoration —
 /// they never exist in the text, so the automerge round-trip can't be
 /// corrupted by them.
@@ -61,21 +69,79 @@ enum MarkerDrawing {
         }
     }
 
-    static func quoteAccent(lineRect: CGRect, origin: CGPoint) {
-        let width: CGFloat = 3
-        let height = max(0, lineRect.height - 2)
-        let rect = CGRect(
-            x: origin.x + 1,
-            y: origin.y + lineRect.minY + 1,
-            width: width,
-            height: height
-        )
-
-        PColor.pTint.setFill()
+    static var quoteBackground: PColor {
         #if os(macOS)
-        NSBezierPath(roundedRect: rect, xRadius: width / 2, yRadius: width / 2).fill()
+        PColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? PColor(rgb: 0xFFFFFF, alpha: 0.035)
+                : PColor(rgb: 0xFFF0D6, alpha: 0.36)
+        }
         #else
-        UIBezierPath(roundedRect: rect, cornerRadius: width / 2).fill()
+        PColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? PColor(rgb: 0xFFFFFF, alpha: 0.035)
+                : PColor(rgb: 0xFFF0D6, alpha: 0.36)
+        }
+        #endif
+    }
+
+    static var quoteAccent: PColor {
+        #if os(macOS)
+        PColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? PColor(rgb: 0xFFB0D2, alpha: 0.95)
+                : PColor(rgb: 0xFF4D97, alpha: 0.9)
+        }
+        #else
+        PColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? PColor(rgb: 0xFFB0D2, alpha: 0.95)
+                : PColor(rgb: 0xFF4D97, alpha: 0.9)
+        }
+        #endif
+    }
+
+    private static func quoteRects(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat) -> (background: CGRect, accent: CGRect) {
+        // lineRect is already fragment-local; only container-space values
+        // (the 2.5 left margin, containerWidth) need origin applied
+        let contentLeft = lineRect.minX
+        let left = max(origin.x + 2.5, contentLeft - 18)
+        let contentRight = lineRect.maxX + 18
+        let maxRight = origin.x + containerWidth - 24
+        let minRight = left + 72
+        let right = min(maxRight, max(contentRight, minRight))
+        let background = CGRect(
+            x: left,
+            y: origin.y + lineRect.minY - 2,
+            width: max(0, right - left),
+            height: lineRect.height + 4
+        )
+        let accent = CGRect(
+            x: background.minX + 7,
+            y: background.minY + 4,
+            width: 3.5,
+            height: max(0, background.height - 8)
+        )
+        return (background, accent)
+    }
+
+    static func quoteBackground(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat) {
+        let rect = quoteRects(lineRect: lineRect, origin: origin, containerWidth: containerWidth).background
+        quoteBackground.setFill()
+        #if os(macOS)
+        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+        #else
+        UIBezierPath(roundedRect: rect, cornerRadius: 6).fill()
+        #endif
+    }
+
+    static func quoteAccent(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat) {
+        let rect = quoteRects(lineRect: lineRect, origin: origin, containerWidth: containerWidth).accent
+        quoteAccent.setFill()
+        #if os(macOS)
+        NSBezierPath(roundedRect: rect, xRadius: 1.75, yRadius: 1.75).fill()
+        #else
+        UIBezierPath(roundedRect: rect, cornerRadius: 1.75).fill()
         #endif
     }
 
@@ -110,7 +176,9 @@ enum MarkerDrawing {
 /// nesting.
 func listOrdinal(of location: Int, in storage: NSTextStorage) -> Int {
     let str = storage.string as NSString
-    guard let box = storage.attribute(.amBlock, at: location, effectiveRange: nil) as? BlockBox
+    guard location >= 0,
+          location < storage.length,
+          let box = storage.attribute(.amBlock, at: location, effectiveRange: nil) as? BlockBox
     else { return 1 }
     let parents = box.value.parents
     var count = 1
@@ -118,6 +186,8 @@ func listOrdinal(of location: Int, in storage: NSTextStorage) -> Int {
     while cursor > 0 {
         let previous = str.paragraphRange(for: NSRange(location: cursor - 1, length: 0))
         guard previous.length > 0,
+              previous.location >= 0,
+              previous.location < storage.length,
               let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
               prevBox.value.type == "ordered-list-item",
               prevBox.value.parents == parents
@@ -166,6 +236,26 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
 
     override var renderingSurfaceBounds: CGRect {
         let bounds = super.renderingSurfaceBounds
+        if drawsCodeCard, let width = textLayoutManager?.textContainer?.size.width, width > 0 {
+            return bounds.union(CGRect(
+                x: -40,
+                y: bounds.minY - CodeHighlight.cardVerticalPadding,
+                width: width + 80,
+                height: bounds.height + CodeHighlight.cardVerticalPadding * 2
+            ))
+        }
+        if drawsQuoteBackground, let width = textLayoutManager?.textContainer?.size.width, width > 0 {
+            // the fragment is inset by the quote indent, so container x = 0
+            // sits at local -(indent + padding) — reach past it or the card's
+            // left edge and the accent bar clip away
+            let indent = (paragraphAttributes?[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 16
+            return bounds.union(CGRect(
+                x: -(indent + 32),
+                y: bounds.minY - 4,
+                width: width + (indent + 32) * 2,
+                height: bounds.height + 8
+            ))
+        }
         var indent: CGFloat = 0
         if let attrs = paragraphAttributes, decoratedBlock(attrs) != nil {
             indent = (attrs[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
@@ -180,9 +270,172 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         return bounds.union(CGRect(x: -(indent + 24), y: bounds.minY, width: indent + 24, height: bounds.height))
     }
 
-    override func draw(at point: CGPoint, in context: CGContext) {
-        super.draw(at: point, in: context)
+    private var isCodeBlock: Bool {
+        (paragraphAttributes?[.amBlock] as? BlockBox)?.value.type == "code-block"
+    }
 
+    private var isTypingCodeBlockOnTrailingLine: Bool {
+        guard trailingEmptyLine != nil,
+              let box = typingAttributesProvider?()?[.amBlock] as? BlockBox
+        else { return false }
+        return box.value.type == "code-block"
+    }
+
+    private var isQuoteBlock: Bool {
+        (paragraphAttributes?[.amBlock] as? BlockBox)?.value.type == "blockquote"
+    }
+
+    private var isTypingQuoteBlockOnTrailingLine: Bool {
+        guard trailingEmptyLine != nil,
+              let box = typingAttributesProvider?()?[.amBlock] as? BlockBox
+        else { return false }
+        return box.value.type == "blockquote"
+    }
+
+    private var drawsCodeCard: Bool {
+        isCodeBlock || isTypingCodeBlockOnTrailingLine
+    }
+
+    private var drawsQuoteBackground: Bool {
+        isQuoteBlock || isTypingQuoteBlockOnTrailingLine
+    }
+
+    private func codeRunEdges() -> (first: Bool, last: Bool) {
+        guard let (storage, location) = storageContext(), storage.length > 0 else {
+            return (true, true)
+        }
+        let str = storage.string as NSString
+        let anchor = min(location, storage.length - 1)
+        let paragraph = str.paragraphRange(for: NSRange(location: anchor, length: 0))
+        var first = true
+        if paragraph.location > 0 {
+            let previous = str.paragraphRange(for: NSRange(location: paragraph.location - 1, length: 0))
+            first = !CodeHighlight.isCodeParagraph(previous, language: nil, in: storage)
+        }
+        var last = true
+        let end = NSMaxRange(paragraph)
+        if end < storage.length {
+            let next = str.paragraphRange(for: NSRange(location: end, length: 0))
+            last = !CodeHighlight.isCodeParagraph(next, language: nil, in: storage)
+        }
+        return (first, last)
+    }
+
+    private func codeCardPath(
+        rect: CGRect,
+        radius: CGFloat,
+        roundTop: Bool,
+        roundBottom: Bool
+    ) -> PBezierPath {
+        let r = min(radius, rect.width / 2, rect.height / 2)
+        let c = r * 0.5522847498
+        let path = PBezierPath()
+        path.move(to: CGPoint(x: rect.minX + (roundTop ? r : 0), y: rect.minY))
+        path.line(to: CGPoint(x: rect.maxX - (roundTop ? r : 0), y: rect.minY))
+        if roundTop {
+            path.curve(
+                to: CGPoint(x: rect.maxX, y: rect.minY + r),
+                controlPoint1: CGPoint(x: rect.maxX - r + c, y: rect.minY),
+                controlPoint2: CGPoint(x: rect.maxX, y: rect.minY + r - c)
+            )
+        }
+        path.line(to: CGPoint(x: rect.maxX, y: rect.maxY - (roundBottom ? r : 0)))
+        if roundBottom {
+            path.curve(
+                to: CGPoint(x: rect.maxX - r, y: rect.maxY),
+                controlPoint1: CGPoint(x: rect.maxX, y: rect.maxY - r + c),
+                controlPoint2: CGPoint(x: rect.maxX - r + c, y: rect.maxY)
+            )
+        }
+        path.line(to: CGPoint(x: rect.minX + (roundBottom ? r : 0), y: rect.maxY))
+        if roundBottom {
+            path.curve(
+                to: CGPoint(x: rect.minX, y: rect.maxY - r),
+                controlPoint1: CGPoint(x: rect.minX + r - c, y: rect.maxY),
+                controlPoint2: CGPoint(x: rect.minX, y: rect.maxY - r + c)
+            )
+        }
+        path.line(to: CGPoint(x: rect.minX, y: rect.minY + (roundTop ? r : 0)))
+        if roundTop {
+            path.curve(
+                to: CGPoint(x: rect.minX + r, y: rect.minY),
+                controlPoint1: CGPoint(x: rect.minX, y: rect.minY + r - c),
+                controlPoint2: CGPoint(x: rect.minX + r - c, y: rect.minY)
+            )
+        }
+        path.close()
+        return path
+    }
+
+    private func codeCardStrokePath(
+        rect: CGRect,
+        radius: CGFloat,
+        roundTop: Bool,
+        roundBottom: Bool
+    ) -> PBezierPath {
+        let r = min(radius, rect.width / 2, rect.height / 2)
+        let c = r * 0.5522847498
+        let path = PBezierPath()
+        if roundTop {
+            path.move(to: CGPoint(x: rect.minX + r, y: rect.minY))
+            path.line(to: CGPoint(x: rect.maxX - r, y: rect.minY))
+            path.curve(
+                to: CGPoint(x: rect.maxX, y: rect.minY + r),
+                controlPoint1: CGPoint(x: rect.maxX - r + c, y: rect.minY),
+                controlPoint2: CGPoint(x: rect.maxX, y: rect.minY + r - c)
+            )
+        } else {
+            path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+        }
+        path.line(to: CGPoint(x: rect.maxX, y: rect.maxY - (roundBottom ? r : 0)))
+        if roundBottom {
+            path.curve(
+                to: CGPoint(x: rect.maxX - r, y: rect.maxY),
+                controlPoint1: CGPoint(x: rect.maxX, y: rect.maxY - r + c),
+                controlPoint2: CGPoint(x: rect.maxX - r + c, y: rect.maxY)
+            )
+            path.line(to: CGPoint(x: rect.minX + r, y: rect.maxY))
+            path.curve(
+                to: CGPoint(x: rect.minX, y: rect.maxY - r),
+                controlPoint1: CGPoint(x: rect.minX + r - c, y: rect.maxY),
+                controlPoint2: CGPoint(x: rect.minX, y: rect.maxY - r + c)
+            )
+        } else {
+            path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+        path.line(to: CGPoint(x: rect.minX, y: rect.minY + (roundTop ? r : 0)))
+        return path
+    }
+
+    /// The card is one visual run drawn a fragment at a time. Only the outside
+    /// fragments draw horizontal borders; middle fragments are square bands so
+    /// later fragments never paint over neighboring text.
+    private func drawCodeCard(origin: CGPoint) {
+        guard let container = textLayoutManager?.textContainer else { return }
+        let width = container.size.width
+        guard width > 24 else { return }
+        let (first, last) = codeRunEdges()
+        let radius: CGFloat = 8
+        let padding = CodeHighlight.cardVerticalPadding
+        let top: CGFloat = first ? 0.5 - padding : 0
+        let bottom: CGFloat = last ? layoutFragmentFrame.height - 0.5 + padding : layoutFragmentFrame.height
+        let rect = CGRect(
+            x: origin.x + 2.5,
+            y: top,
+            width: width - 5,
+            height: bottom - top
+        )
+        let fillPath = codeCardPath(rect: rect, radius: radius, roundTop: first, roundBottom: last)
+        let strokePath = codeCardStrokePath(rect: rect, radius: radius, roundTop: first, roundBottom: last)
+        CodeHighlight.cardBackground.setFill()
+        fillPath.fill()
+        CodeHighlight.cardBorder.setStroke()
+        strokePath.lineWidth = 1
+        strokePath.stroke()
+    }
+
+    override func draw(at point: CGPoint, in context: CGContext) {
         #if os(macOS)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
@@ -194,36 +447,64 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
 
         let origin = CGPoint(x: -layoutFragmentFrame.minX, y: 0)
         let attrs = paragraphAttributes
-        if let block = decoratedBlock(attrs), let attrs {
-            let contentLines = textLineFragments.filter { $0.characterRange.length > 0 }
-            if block.type == "blockquote" {
-                let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
-                if !lineRect.isNull {
-                    MarkerDrawing.quoteAccent(lineRect: lineRect, origin: origin)
-                }
-            } else if let lineRect = contentLines.first?.typographicBounds {
-                let font = attrs[.font] as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
-                let indent = (attrs[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
-                MarkerDrawing.marker(
-                    block: block,
-                    ordinal: block.type == "ordered-list-item" ? ordinal() : 1,
-                    font: font,
-                    indent: indent,
-                    lineRect: lineRect,
-                    origin: origin
-                )
+        let contentLines = textLineFragments.filter { $0.characterRange.length > 0 }
+        if drawsCodeCard {
+            drawCodeCard(origin: origin)
+        }
+        if let block = decoratedBlock(attrs), block.type == "blockquote",
+           let width = textLayoutManager?.textContainer?.size.width {
+            let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
+            if !lineRect.isNull {
+                MarkerDrawing.quoteBackground(lineRect: lineRect, origin: origin, containerWidth: width)
             }
+        }
+        if isTypingQuoteBlockOnTrailingLine,
+           let extraLine = trailingEmptyLine,
+           let width = textLayoutManager?.textContainer?.size.width {
+            MarkerDrawing.quoteBackground(
+                lineRect: extraLine.typographicBounds,
+                origin: origin,
+                containerWidth: width
+            )
+        }
+        super.draw(at: point, in: context)
+        if let block = decoratedBlock(attrs), block.type == "blockquote",
+           let width = textLayoutManager?.textContainer?.size.width {
+            let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
+            if !lineRect.isNull {
+                MarkerDrawing.quoteAccent(lineRect: lineRect, origin: origin, containerWidth: width)
+            }
+        }
+        if isTypingQuoteBlockOnTrailingLine,
+           let extraLine = trailingEmptyLine,
+           let width = textLayoutManager?.textContainer?.size.width {
+            MarkerDrawing.quoteAccent(
+                lineRect: extraLine.typographicBounds,
+                origin: origin,
+                containerWidth: width
+            )
+        }
+        if let block = decoratedBlock(attrs), let attrs,
+           block.type != "blockquote",
+           let lineRect = contentLines.first?.typographicBounds {
+            let font = attrs[.font] as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
+            let indent = (attrs[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
+            MarkerDrawing.marker(
+                block: block,
+                ordinal: block.type == "ordered-list-item" ? ordinal() : 1,
+                font: font,
+                indent: indent,
+                lineRect: lineRect,
+                origin: origin
+            )
         }
 
         guard let extraLine = trailingEmptyLine,
               let typing = typingAttributesProvider?(),
-              let block = decoratedBlock(typing)
+              let block = decoratedBlock(typing),
+              block.type != "blockquote"
         else { return }
         let lineRect = extraLine.typographicBounds
-        if block.type == "blockquote" {
-            MarkerDrawing.quoteAccent(lineRect: lineRect, origin: origin)
-            return
-        }
         let font = typing[.font] as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
         let indent = (typing[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
         MarkerDrawing.marker(
@@ -246,6 +527,7 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
             from: contentStorage.documentRange.location,
             to: elementRange.location
         )
+        guard location >= 0, location <= storage.length else { return nil }
         return (storage, location)
     }
 
@@ -261,7 +543,9 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         guard let (storage, _) = storageContext(), storage.length > 0 else { return 1 }
         let str = storage.string as NSString
         let previous = str.paragraphRange(for: NSRange(location: storage.length - 1, length: 0))
-        guard let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
+        guard previous.location >= 0,
+              previous.location < storage.length,
+              let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
               prevBox.value.type == "ordered-list-item",
               prevBox.value.parents == block.parents
         else { return 1 }
@@ -300,6 +584,8 @@ func invalidateOrderedListRun(
 
     func isOrdered(_ range: NSRange) -> Bool {
         guard range.length > 0,
+              range.location >= 0,
+              range.location < storage.length,
               let box = storage.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox
         else { return false }
         return box.value.type == "ordered-list-item"
@@ -320,6 +606,54 @@ func invalidateOrderedListRun(
     guard run.length > 0,
           let contentManager = textLayoutManager.textContentManager,
           let textRange = contentManager.textRange(for: run)
+    else { return }
+    textLayoutManager.invalidateLayout(for: textRange)
+}
+
+/// Run-scoped tokenizing and card corners both depend on neighbouring
+/// paragraphs, so an edit in or next to a code run redraws the whole run.
+func invalidateCodeRun(
+    around location: Int,
+    textLayoutManager: NSTextLayoutManager,
+    storage: NSTextStorage
+) {
+    guard storage.length > 0 else { return }
+    let str = storage.string as NSString
+    let anchor = min(max(location, 0), storage.length - 1)
+    let paragraph = str.paragraphRange(for: NSRange(location: anchor, length: 0))
+
+    var start = paragraph.location
+    if start > 0 {
+        start = str.paragraphRange(for: NSRange(location: start - 1, length: 0)).location
+    }
+    var end = NSMaxRange(paragraph)
+    if end < storage.length {
+        end = NSMaxRange(str.paragraphRange(for: NSRange(location: end, length: 0)))
+    }
+    while start > 0 {
+        let previous = str.paragraphRange(for: NSRange(location: start - 1, length: 0))
+        guard CodeHighlight.isCodeParagraph(previous, language: nil, in: storage) else { break }
+        start = previous.location
+    }
+    while end < storage.length {
+        let next = str.paragraphRange(for: NSRange(location: end, length: 0))
+        guard CodeHighlight.isCodeParagraph(next, language: nil, in: storage) else { break }
+        end = NSMaxRange(next)
+    }
+
+    var containsCode = false
+    var cursor = start
+    while cursor < end {
+        let range = str.paragraphRange(for: NSRange(location: cursor, length: 0))
+        if CodeHighlight.isCodeParagraph(range, language: nil, in: storage) {
+            containsCode = true
+            break
+        }
+        cursor = NSMaxRange(range)
+    }
+    guard containsCode,
+          let contentManager = textLayoutManager.textContentManager,
+          let textRange = contentManager.textRange(for: NSRange(location: start, length: end - start))
     else { return }
     textLayoutManager.invalidateLayout(for: textRange)
 }

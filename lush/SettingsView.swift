@@ -10,6 +10,9 @@ struct SettingsView: View {
             Tab("Editor", systemImage: "textformat") {
                 EditorSettingsPane()
             }
+            Tab("AI", systemImage: "sparkles") {
+                AISettingsPane()
+            }
             Tab("Patchwork", systemImage: "shippingbox") {
                 PatchworkSettingsPane()
             }
@@ -31,6 +34,11 @@ struct SettingsView: View {
                 Label("Editor", systemImage: "textformat")
             }
             NavigationLink {
+                AISettingsPane()
+            } label: {
+                Label("AI", systemImage: "sparkles")
+            }
+            NavigationLink {
                 PatchworkSettingsPane()
             } label: {
                 Label("Patchwork", systemImage: "shippingbox")
@@ -38,6 +46,172 @@ struct SettingsView: View {
         }
         .navigationTitle("Settings")
         #endif
+    }
+}
+
+struct AISettingsPane: View {
+    var body: some View {
+        Form {
+            ForEach(LocalModelOperation.allCases) { operation in
+                LocalModelOperationSettingsView(operation: operation)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("AI")
+    }
+}
+
+struct LocalModelOperationSettingsView: View {
+    let operation: LocalModelOperation
+    @State private var backend: LocalModelBackend
+    @State private var config: RemoteModelConfig
+    @State private var generationSettings: LocalGenerationSettings
+    @State private var presetFilter = ""
+    @State private var downloading = false
+    @State private var status: String?
+
+    init(operation: LocalModelOperation) {
+        self.operation = operation
+        _backend = State(initialValue: LocalModelSettings.backend(for: operation))
+        _config = State(initialValue: LocalModelSettings.remoteModelConfig(for: operation))
+        _generationSettings = State(initialValue: LocalModelSettings.generationSettings(for: operation))
+    }
+
+    var body: some View {
+        Section {
+            Picker("Model", selection: $backend) {
+                ForEach(LocalModelBackend.allCases) { backend in
+                    Text(backend.label).tag(backend)
+                }
+            }
+            .onChange(of: backend) {
+                LocalModelSettings.setBackend(backend, for: operation)
+            }
+
+            if backend == .coreML {
+                TextField("Filter suggested models", text: $presetFilter)
+                    .autocorrectionDisabled()
+                let presets = filteredPresets
+                if presets.isEmpty {
+                    Text("No matching suggestions.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(presets) { preset in
+                        Button {
+                            config = preset.config
+                            status = preset.note
+                            LocalModelSettings.setRemoteModelConfig(config, for: operation)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(preset.label)
+                                Text(preset.note)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                TextField("owner/model", text: $config.repo)
+                    .autocorrectionDisabled()
+                    .onChange(of: config.repo) { saveConfig() }
+                TextField("revision", text: $config.revision)
+                    .autocorrectionDisabled()
+                    .onChange(of: config.revision) { saveConfig() }
+                TextField("model file or package path", text: $config.filename)
+                    .autocorrectionDisabled()
+                    .onChange(of: config.filename) { saveConfig() }
+                Button(downloading ? "Downloading..." : "Download") {
+                    Task { await downloadModel() }
+                }
+                .disabled(downloading || !config.isConfigured)
+                if let localPath = config.localPath {
+                    Text(localPath)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                if let status {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            DisclosureGroup("Advanced") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Temperature")
+                        Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
+                            .onChange(of: generationSettings.temperature) {
+                                saveGenerationSettings()
+                            }
+                        Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Stepper(
+                        "Max response tokens: \(generationSettings.maximumResponseTokens)",
+                        value: $generationSettings.maximumResponseTokens,
+                        in: 64...4096,
+                        step: 64
+                    )
+                    .onChange(of: generationSettings.maximumResponseTokens) {
+                        saveGenerationSettings()
+                    }
+                }
+            }
+        } header: {
+            Text(operation.label)
+        } footer: {
+            Text(footer)
+        }
+    }
+
+    private var filteredPresets: [HuggingFaceModelPreset] {
+        let presets = HuggingFaceModelPreset.presets(for: operation)
+        let query = presetFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return presets }
+        return presets.filter { preset in
+            preset.label.lowercased().contains(query)
+                || preset.note.lowercased().contains(query)
+                || preset.config.repo.lowercased().contains(query)
+                || preset.config.filename.lowercased().contains(query)
+        }
+    }
+
+    private var footer: String {
+        switch backend {
+        case .appleIntelligence:
+            "Uses Apple's on-device Foundation Models when Apple Intelligence is available. Advanced settings apply immediately."
+        case .coreML:
+            "CoreML-LLM models can load by repo on first generation when that package is linked. Single-file downloads are for staged artifacts; GGUF and Moonshine suggestions still need their own runtime adapters."
+        }
+    }
+
+    private func saveConfig() {
+        LocalModelSettings.setRemoteModelConfig(config, for: operation)
+    }
+
+    private func saveGenerationSettings() {
+        LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
+    }
+
+    private func downloadModel() async {
+        downloading = true
+        status = nil
+        saveConfig()
+        do {
+            let downloaded = try await RemoteModelDownloader.download(config, for: operation)
+            config = downloaded
+            LocalModelSettings.setRemoteModelConfig(downloaded, for: operation)
+            status = "Downloaded"
+        } catch {
+            status = error.localizedDescription
+        }
+        downloading = false
     }
 }
 
@@ -185,7 +359,10 @@ struct SyncSettingsPane: View {
 struct EditorSettingsPane: View {
     @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
-    @State private var fontDesign = EditorSettings.design
+    @State private var sansFamily = EditorSettings.family(for: "sans")
+    @State private var serifFamily = EditorSettings.family(for: "serif")
+    @State private var monoFamily = EditorSettings.family(for: "mono")
+    @State private var handFamily = EditorSettings.family(for: "hand")
     @State private var fontSize = EditorSettings.bodySize
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
     @State private var places = SavedPlaces.all
@@ -213,14 +390,10 @@ struct EditorSettingsPane: View {
                 Text("The Quick Note opens from the widget and Shortcuts. Set one from a note's context menu.")
             }
             Section("Type") {
-                Picker("Font", selection: $fontDesign) {
-                    ForEach(EditorSettings.designs, id: \.key) { design in
-                        Text(design.label).tag(design.key)
-                    }
-                }
-                .onChange(of: fontDesign) {
-                    EditorSettings.setDesign(fontDesign)
-                }
+                familyPicker("Sans", selection: $sansFamily, key: "sans")
+                familyPicker("Serif", selection: $serifFamily, key: "serif")
+                familyPicker("Mono", selection: $monoFamily, key: "mono")
+                familyPicker("Hand", selection: $handFamily, key: "hand")
                 HStack {
                     Text("Size")
                     Slider(value: $fontSize, in: 11...24, step: 1)
@@ -264,6 +437,18 @@ struct EditorSettingsPane: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Editor")
+    }
+
+    private func familyPicker(_ title: String, selection: Binding<String>, key: String) -> some View {
+        Picker(title, selection: selection) {
+            Text("System Default").tag(EditorSettings.systemFontFamily)
+            ForEach(EditorSettings.availableFontFamilies, id: \.self) { family in
+                Text(family).tag(family)
+            }
+        }
+        .onChange(of: selection.wrappedValue) {
+            EditorSettings.setFamily(selection.wrappedValue, for: key)
+        }
     }
 
     private func addPlace() {

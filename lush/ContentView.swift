@@ -87,12 +87,21 @@ struct ContentView: View {
             }
         }
         #endif
+        .onContinueUserActivity(LushHandoff.activityType) { activity in
+            _ = LushHandoff.handle(activity)
+        }
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url else { return }
             selectedHistoryEntry = nil
             if !selectedItemUrls.containsSidebarTag(for: url) { selectedItemUrls = [url] }
+        }
+        .onAppear {
+            if let url = model.selectedNoteUrl,
+               !selectedItemUrls.containsSidebarTag(for: url) {
+                selectedItemUrls = [url]
+            }
         }
         .focusedSceneValue(\.noteSearchActions, NoteSearchActions(
             focusNoteSearch: focusCurrentNoteSearch,
@@ -131,11 +140,19 @@ struct ContentView: View {
                 model.pendingIncoming = IncomingContent(payload: .file(url))
             }
         }
+        .onContinueUserActivity(LushHandoff.activityType) { activity in
+            _ = LushHandoff.handle(activity)
+        }
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url, path.isEmpty else { return }
             path = [.note(url)]
+        }
+        .onAppear {
+            if let url = model.selectedNoteUrl, path.isEmpty {
+                path = [.note(url)]
+            }
         }
         .sheet(item: incomingContentBinding) { content in
             incomingContentSheet(content)
@@ -210,8 +227,15 @@ struct ContentView: View {
         case .search(let query):
             #if os(macOS)
             searchText = query
-            searchTask?.cancel()
-            searchTask = Task { searchHits = await model.search(query) }
+            searchPresented = true
+            searchFocused = true
+            sidebarFocused = true
+            if query.isEmpty {
+                searchHits = []
+            } else {
+                searchTask?.cancel()
+                searchTask = Task { searchHits = await model.search(query) }
+            }
             #endif
         case .createPatchwork(let preferredType, let toolId, let folderUrl):
             patchworkCreateRequest = PatchworkCreateRequest(
@@ -1076,6 +1100,12 @@ struct FolderScreen: View {
             }
         }
         .navigationTitle(title)
+        .userActivity(
+            LushHandoff.activityType,
+            element: folderUrl.flatMap { LushHandoff.item(for: model.node(for: $0)) }
+        ) { item, activity in
+            LushHandoff.configure(activity, item: item)
+        }
         .searchable(text: $searchText, prompt: "Search notes")
         .onChange(of: searchText) {
             searchTask?.cancel()
@@ -1316,6 +1346,7 @@ struct RecentsScreen: View {
 enum RightSidebarTab: String, CaseIterable, Identifiable {
     case history = "History"
     case info = "Info"
+    case chat = "Chat"
 
     var id: String { rawValue }
 }
@@ -1366,6 +1397,8 @@ struct RightSidebarView: View {
                 historyView
             case .info:
                 infoView
+            case .chat:
+                NoteChatView(url: url, node: node)
             }
         }
         .background(.regularMaterial)
@@ -1390,7 +1423,7 @@ struct RightSidebarView: View {
 
     private var historyView: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
+            LazyVStack(alignment: .leading, spacing: 10) {
                 HistoryCurrentRow(
                     changeCount: history.changeCount,
                     modified: history.modified,
@@ -1522,7 +1555,7 @@ private struct HistoryTimelineView: View {
             HStack(alignment: .top, spacing: 7) {
                 HistoryScrubber(count: entries.count)
                     .padding(.top, 9)
-                VStack(alignment: .leading, spacing: 5) {
+                LazyVStack(alignment: .leading, spacing: 5) {
                     ForEach(groups) { group in
                         HistoryGroupRow(
                             group: group,
@@ -1566,7 +1599,7 @@ private struct HistoryGroupRow: View {
     let onRevert: (DocHistoryEntry) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        LazyVStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(group.title)
                     .font(.caption)
@@ -1673,6 +1706,7 @@ private struct HistorySnapshotTextView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let textView = NSTextView(usingTextLayoutManager: true)
         textView.textLayoutManager?.delegate = context.coordinator
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.textContainer?.widthTracksTextView = true
         textView.isEditable = false
         textView.isSelectable = true
@@ -1830,26 +1864,24 @@ struct NoteDetail: View {
                 .environment(model)
             } else {
                 RichTextEditor(noteUrl: noteUrl, model: model, controller: editor, contextTracker: contextTracker)
-                    .mask {
-                        VStack(spacing: 0) {
-                            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                                .frame(height: 16)
-                            Color.black
-                        }
-                    }
+                    .toolbarScrollFade()
             }
             #else
             RichTextEditor(noteUrl: noteUrl, model: model, controller: editor, contextTracker: contextTracker)
-                .mask {
-                    VStack(spacing: 0) {
-                        LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                            .frame(height: 16)
-                        Color.black
-                    }
-                }
+                .toolbarScrollFade()
             #endif
         }
         .focusedSceneValue(\.editorController, editor)
+        .userActivity(
+            LushHandoff.activityType,
+            element: LushHandoff.item(for: currentNode) ?? LushHandoffItem(
+                url: noteUrl,
+                title: "Lush Note",
+                kind: .note
+            )
+        ) { item, activity in
+            LushHandoff.configure(activity, item: item)
+        }
         .overlay {
             if editorDropTargeted {
                 RoundedRectangle(cornerRadius: 8)
@@ -1969,6 +2001,16 @@ struct NoteDetail: View {
                     }
                 }
                 .pickerStyle(.menu)
+            }
+            if editor.isCodeBlockActive {
+                ToolbarItem {
+                    Picker("Language", selection: languageBinding) {
+                        ForEach(CodeLanguage.all) { language in
+                            Text(language.name).tag(language.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
             }
             #endif
             ToolbarItem {
@@ -2116,7 +2158,68 @@ struct NoteDetail: View {
             set: { editor.applyStyle($0) }
         )
     }
+
+    private var languageBinding: Binding<String> {
+        Binding(
+            get: { CodeLanguage.named(editor.currentCodeLanguage).id },
+            set: { editor.applyCodeLanguage(CodeLanguage.named($0)) }
+        )
+    }
     #endif
+}
+
+/// The Notes-style treatment behind the floating toolbar: the editor extends
+/// under it, and only content that scrolls into that strip frosts and fades.
+/// Resting content sits below the toolbar (the scroll view's automatic
+/// insets) and is untouched.
+private struct ToolbarScrollFade: ViewModifier {
+    func body(content: Content) -> some View {
+        GeometryReader { proxy in
+            let inset = proxy.safeAreaInsets.top
+            let band = inset + 24
+            let edge = band > 0 ? inset / band : 0
+            content
+                .mask {
+                    VStack(spacing: 0) {
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0),
+                                .init(color: .black.opacity(0.5), location: edge),
+                                .init(color: .black, location: 1),
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                        .frame(height: max(band, 1))
+                        Color.black
+                    }
+                }
+                .overlay(alignment: .top) {
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .frame(height: max(band, 1))
+                        .mask {
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black, location: 0),
+                                    .init(color: .black.opacity(0.35), location: edge),
+                                    .init(color: .clear, location: 1),
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        }
+                        .allowsHitTesting(false)
+                }
+                .ignoresSafeArea(edges: .top)
+        }
+    }
+}
+
+extension View {
+    func toolbarScrollFade() -> some View {
+        modifier(ToolbarScrollFade())
+    }
 }
 
 private struct DragPreviewView: View {
