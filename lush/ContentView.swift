@@ -1666,18 +1666,14 @@ private struct HistoricalNoteSnapshotView: View {
 private struct HistorySnapshotTextView: NSViewRepresentable {
     let attributed: NSAttributedString
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let storage = NSTextStorage()
-        let layoutManager = ListMarkerLayoutManager()
-        storage.addLayoutManager(layoutManager)
-        let container = NSTextContainer(size: NSSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        ))
-        container.widthTracksTextView = true
-        layoutManager.addTextContainer(container)
+    func makeCoordinator() -> ListMarkerLayoutDelegate {
+        ListMarkerLayoutDelegate()
+    }
 
-        let textView = NSTextView(frame: .zero, textContainer: container)
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator
+        textView.textContainer?.widthTracksTextView = true
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = false

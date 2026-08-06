@@ -179,19 +179,38 @@ impl Transport<Sendable> for WsTransport {
                 let inner = pt.inner.clone();
                 let prefetch_tx = pt.prefetch_tx.clone();
                 async move {
-                    let bytes = Transport::<Sendable>::recv_bytes(&inner)
-                        .await
-                        .map_err(TransportRecvError::Ws)?;
-                    if let Ok(SyncMessage::BatchSyncRequest(req)) =
-                        SyncMessage::try_decode(&bytes)
-                    {
-                        if req.subscribe
-                            && req.id.as_bytes()[16..].iter().all(|b| *b == 0)
-                        {
-                            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-                            if prefetch_tx.send((req.id, done_tx)).is_ok() {
-                                let _ = done_rx.await;
+                    let bytes = match Transport::<Sendable>::recv_bytes(&inner).await {
+                        Ok(b) => {
+                            tracing::info!(bytes = b.len(), "prefetch: recv_bytes ok");
+                            b
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "prefetch: recv_bytes transport error");
+                            return Err(TransportRecvError::Ws(e));
+                        }
+                    };
+                    match SyncMessage::try_decode(&bytes) {
+                        Ok(SyncMessage::BatchSyncRequest(req)) => {
+                            tracing::info!(
+                                subscribe = req.subscribe,
+                                id = ?&req.id.as_bytes()[..8],
+                                "prefetch: BatchSyncRequest"
+                            );
+                            if req.subscribe
+                                && req.id.as_bytes()[16..].iter().all(|b| *b == 0)
+                            {
+                                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+                                if prefetch_tx.send((req.id, done_tx)).is_ok() {
+                                    let _ = done_rx.await;
+                                    tracing::info!("prefetch: done");
+                                } else {
+                                    tracing::warn!("prefetch: channel closed, cannot prefetch");
+                                }
                             }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(error = %e, "prefetch: recv_bytes decode failed");
                         }
                     }
                     Ok(bytes)
@@ -380,6 +399,8 @@ async fn accept_local_peer(
     server_peer_id: PeerId,
     discovery_audience: Option<Audience>,
 ) {
+    let peer_addr = tcp.peer_addr().ok();
+    tracing::info!(?peer_addr, "local peer connecting");
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(DEFAULT_MAX_MESSAGE_SIZE);
 
@@ -408,7 +429,9 @@ async fn accept_local_peer(
             );
             let listen_ws = ws.clone();
             tokio::spawn(async move {
-                let _ = listen_ws.listen().await;
+                tracing::info!("prefetch: listen task starting");
+                let result = listen_ws.listen().await;
+                tracing::warn!(ok = result.is_ok(), "prefetch: listen task exited");
             });
             tokio::spawn(async move {
                 let _ = sender_fut.await;
@@ -432,9 +455,12 @@ async fn accept_local_peer(
     .await;
 
     let Ok((authenticated, ())) = result else {
+        tracing::warn!(?peer_addr, "local peer handshake failed");
         return;
     };
+    tracing::info!(?peer_addr, "local peer handshake ok, adding connection");
     let _ = node.add_connection(authenticated).await;
+    tracing::info!(?peer_addr, "local peer connection added");
 
     tokio::spawn(async move {
         while let Some((sid, done_tx)) = prefetch_rx.recv().await {
@@ -924,6 +950,11 @@ impl Repo {
             local_port,
             iroh_endpoint,
         });
+
+        tracing::info!(
+            port = ?local_port,
+            "local subduction server listening on 127.0.0.1"
+        );
 
         if let Some(listener) = listener {
             let node = repo.core.clone();
@@ -1463,10 +1494,13 @@ impl Repo {
 
     pub async fn prefetch_doc(self: &Arc<Self>, id: DocId, timeout: Duration) {
         if self.docs.lock().await.contains_key(&id) {
+            tracing::debug!(doc = %id.to_url(), "prefetch_doc: already tracked");
             return;
         }
+        tracing::info!(doc = %id.to_url(), connected = %self.is_connected(), "prefetch_doc: fetching from remote");
         let _ = self.ensure_doc(id).await;
-        self.wait_for_doc(id, timeout).await;
+        let ok = self.wait_for_doc(id, timeout).await;
+        tracing::info!(doc = %id.to_url(), ok, "prefetch_doc: wait_for_doc returned");
     }
 
     pub async fn create_doc<F>(self: &Arc<Self>, init: F) -> Result<DocId>

@@ -606,6 +606,7 @@ enum PatchworkWeb {
     // chosen one (or take a pasted automerge: url), and hand the result to the
     // native side through the "lush" message handler.
     function renderPicker(repo) {
+      const params = new URLSearchParams(location.search)
       const preferredType = params.get("type")
       const preferredTool = params.get("tool-id")
       const post = (url, tool) => {

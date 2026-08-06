@@ -238,6 +238,16 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
 impl Core {
     #[uniffi::constructor]
     pub fn new(data_dir: String, server_url: Option<String>) -> Result<Arc<Self>, CoreError> {
+        static TRACING: std::sync::Once = std::sync::Once::new();
+        TRACING.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "lush_core=debug,subduction_websocket=info,subduction_core=debug,warn".into()),
+                )
+                .try_init();
+        });
+        tracing::info!("lush-core built {}", env!("LUSH_BUILD_TS"));
         let runtime = Runtime::new().map_err(|e| CoreError::General {
             msg: format!("tokio runtime: {e}"),
         })?;

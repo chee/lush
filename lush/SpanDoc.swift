@@ -319,20 +319,33 @@ final class TableBox: NSObject {
 final class FittingImageAttachment: NSTextAttachment {
     var idealSize: CGSize = .zero
 
-    override func attachmentBounds(
-        for textContainer: NSTextContainer?,
-        proposedLineFragment lineFrag: CGRect,
-        glyphPosition position: CGPoint,
-        characterIndex charIndex: Int
-    ) -> CGRect {
+    private func fitted(to lineFrag: CGRect, padding: CGFloat) -> CGRect {
         var size = bounds.size
-        let padding = textContainer?.lineFragmentPadding ?? 5
         let available = lineFrag.width - padding * 2
         if available > 40, size.width > available, size.width > 0 {
             let scale = available / size.width
             size = CGSize(width: available, height: size.height * scale)
         }
         return CGRect(origin: bounds.origin, size: size)
+    }
+
+    override func attachmentBounds(
+        for textContainer: NSTextContainer?,
+        proposedLineFragment lineFrag: CGRect,
+        glyphPosition position: CGPoint,
+        characterIndex charIndex: Int
+    ) -> CGRect {
+        fitted(to: lineFrag, padding: textContainer?.lineFragmentPadding ?? 5)
+    }
+
+    override func attachmentBounds(
+        for attributes: [NSAttributedString.Key: Any],
+        location: NSTextLocation,
+        textContainer: NSTextContainer?,
+        proposedLineFragment: CGRect,
+        position: CGPoint
+    ) -> CGRect {
+        fitted(to: proposedLineFragment, padding: textContainer?.lineFragmentPadding ?? 5)
     }
 }
 

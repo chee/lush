@@ -167,261 +167,14 @@ protocol EditorTextViewLike: AnyObject {
     var pStorage: NSTextStorage? { get }
     var pSelectedRange: NSRange { get set }
     var pTypingAttributes: [NSAttributedString.Key: Any] { get set }
+    var pTextLayoutManager: NSTextLayoutManager? { get }
     var pLayoutManager: NSLayoutManager? { get }
+    var pContentStorage: NSTextContentStorage? { get }
     var pTextContainer: NSTextContainer? { get }
     var pTextOrigin: CGPoint { get }
     var pSelf: PView { get }
     func pInsertText(_ text: String)
     func pReplace(_ range: NSRange, with attributed: NSAttributedString)
-}
-
-/// Draws list markers and quote accents in the margin. They are pure
-/// decoration — they never exist in the text, so the automerge round-trip
-/// can't be corrupted by them.
-final class ListMarkerLayoutManager: NSLayoutManager {
-    /// Paragraph location -> its 1-based ordinal, for the duration of one draw
-    /// pass. Without it every item in a numbered list rescans the whole run
-    /// above it, which is quadratic in the length of the list.
-    private var ordinals: [Int: Int] = [:]
-
-    /// The empty final paragraph has no characters to hang attributes on, so
-    /// its marker comes from the view's typing attributes via this hook.
-    var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
-
-    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
-        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
-        ordinals = [:]
-        defer { ordinals = [:] }
-        guard let storage = textStorage else { return }
-        let str = storage.string as NSString
-        let charRange = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
-        var location = charRange.location
-        while location < NSMaxRange(charRange) {
-            let paragraph = str.paragraphRange(for: NSRange(location: location, length: 0))
-            if paragraph.length == 0 { break }
-            defer { location = NSMaxRange(paragraph) }
-            guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox
-            else { continue }
-            let block = box.value
-            if block.type == "blockquote" {
-                drawQuoteAccent(for: paragraph, origin: origin)
-                continue
-            }
-
-            let isBullet = block.type == "unordered-list-item"
-            let isNumber = block.type == "ordered-list-item"
-            let isTodo = block.type == "todo-list-item"
-            guard isBullet || isNumber || isTodo else { continue }
-
-            let itemFont = storage.attribute(.font, at: paragraph.location, effectiveRange: nil)
-                as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
-            let indent = (storage.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil)
-                as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
-            // Force layout so empty paragraphs (just \n) have glyph info.
-            ensureLayout(forCharacterRange: paragraph)
-            let glyphIndex = glyphIndexForCharacter(at: paragraph.location)
-            var lineRect: CGRect = glyphIndex < numberOfGlyphs
-                ? lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-                : .zero
-            // Empty final paragraphs use extraLineFragmentRect.
-            if lineRect == .zero { lineRect = extraLineFragmentRect }
-            guard lineRect != .zero else { continue }
-            // Use font ascender for the baseline — glyph location y is 0
-            // for paragraph-separator null glyphs on empty lines.
-            drawMarker(
-                block: block,
-                ordinal: block.type == "ordered-list-item"
-                    ? ordinal(of: paragraph.location, in: storage, str: str)
-                    : 1,
-                font: itemFont,
-                indent: indent,
-                lineRect: lineRect,
-                origin: origin
-            )
-        }
-        drawTrailingParagraphMarker(storage: storage, str: str, origin: origin)
-    }
-
-    /// The empty final paragraph (doc ends in a newline) carries no
-    /// characters; its marker is what typing attributes promise the next
-    /// character will be.
-    private func drawTrailingParagraphMarker(storage: NSTextStorage, str: NSString, origin: CGPoint) {
-        guard extraLineFragmentRect != .zero,
-              storage.length > 0,
-              str.hasSuffix("\n"),
-              let typing = typingAttributesProvider?(),
-              let box = typing[.amBlock] as? BlockBox
-        else { return }
-        let block = box.value
-        if block.type == "blockquote" {
-            drawQuoteAccent(lineRect: extraLineFragmentRect, origin: origin)
-            return
-        }
-
-        guard block.type == "unordered-list-item"
-            || block.type == "ordered-list-item"
-            || block.type == "todo-list-item"
-        else { return }
-        let font = typing[.font] as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
-        let indent = (typing[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
-        var number = 1
-        if block.type == "ordered-list-item", storage.length > 0 {
-            let previous = str.paragraphRange(for: NSRange(location: storage.length - 1, length: 0))
-            if let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
-               prevBox.value.type == "ordered-list-item",
-               prevBox.value.parents == block.parents {
-                number = ordinal(of: previous.location, in: storage, str: str) + 1
-            }
-        }
-        drawMarker(
-            block: block,
-            ordinal: number,
-            font: font,
-            indent: indent,
-            lineRect: extraLineFragmentRect,
-            origin: origin
-        )
-    }
-
-    private func drawMarker(
-        block: BlockValue,
-        ordinal: Int,
-        font itemFont: PFont,
-        indent: CGFloat,
-        lineRect: CGRect,
-        origin: CGPoint
-    ) {
-        let baseline = origin.y + lineRect.minY + itemFont.ascender
-        let diameter: CGFloat = 6.5
-        switch block.type {
-        case "todo-list-item":
-            let side = itemFont.pointSize * 0.82
-            let rect = CGRect(
-                x: origin.x + indent - side - 6,
-                y: baseline - itemFont.xHeight / 2 - side / 2,
-                width: side,
-                height: side
-            )
-            Self.drawCheckbox(in: rect, checked: block.isChecked)
-        case "unordered-list-item":
-            let rect = CGRect(
-                x: origin.x + indent - diameter - 5,
-                y: baseline - itemFont.xHeight / 2 - diameter / 2,
-                width: diameter,
-                height: diameter
-            )
-            PColor.pLabel.setFill()
-            #if os(macOS)
-            NSBezierPath(ovalIn: rect).fill()
-            #else
-            UIBezierPath(ovalIn: rect).fill()
-            #endif
-        default:
-            let marker = "\(ordinal)."
-            let font = PFont.monospacedDigitSystemFont(ofSize: RichText.bodySize, weight: .regular)
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: PColor.pLabel,
-            ]
-            let markerWidth = (marker as NSString).size(withAttributes: attrs).width
-            let point = CGPoint(
-                x: origin.x + indent - markerWidth - 6,
-                y: baseline - font.ascender
-            )
-            marker.draw(at: point, withAttributes: attrs)
-        }
-    }
-
-    private func drawQuoteAccent(for paragraph: NSRange, origin: CGPoint) {
-        ensureLayout(forCharacterRange: paragraph)
-
-        var quoteRect = CGRect.null
-        let glyphRange = glyphRange(forCharacterRange: paragraph, actualCharacterRange: nil)
-        enumerateLineFragments(forGlyphRange: glyphRange) { lineRect, _, _, _, _ in
-            quoteRect = quoteRect.union(lineRect)
-        }
-
-        if quoteRect.isNull {
-            let glyphIndex = glyphIndexForCharacter(at: paragraph.location)
-            quoteRect = glyphIndex < numberOfGlyphs
-                ? lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
-                : extraLineFragmentRect
-        }
-
-        guard !quoteRect.isNull, quoteRect != .zero else { return }
-        drawQuoteAccent(lineRect: quoteRect, origin: origin)
-    }
-
-    private func drawQuoteAccent(lineRect: CGRect, origin: CGPoint) {
-        let width: CGFloat = 3
-        let height = max(0, lineRect.height - 2)
-        let rect = CGRect(
-            x: origin.x + 1,
-            y: origin.y + lineRect.minY + 1,
-            width: width,
-            height: height
-        )
-
-        PColor.pTint.setFill()
-        #if os(macOS)
-        NSBezierPath(roundedRect: rect, xRadius: width / 2, yRadius: width / 2).fill()
-        #else
-        UIBezierPath(roundedRect: rect, cornerRadius: width / 2).fill()
-        #endif
-    }
-
-    /// 1-based position among the contiguous run of ordered items with the
-    /// same nesting.
-    private func ordinal(of location: Int, in storage: NSTextStorage, str: NSString) -> Int {
-        if let hit = ordinals[location] { return hit }
-        guard let box = storage.attribute(.amBlock, at: location, effectiveRange: nil) as? BlockBox
-        else { return 1 }
-        let parents = box.value.parents
-        var count = 1
-        var cursor = location
-        while cursor > 0 {
-            let previous = str.paragraphRange(for: NSRange(location: cursor - 1, length: 0))
-            guard previous.length > 0,
-                  let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
-                  prevBox.value.type == "ordered-list-item",
-                  prevBox.value.parents == parents
-            else { break }
-            if let hit = ordinals[previous.location] {
-                count += hit
-                break
-            }
-            count += 1
-            cursor = previous.location
-        }
-        ordinals[location] = count
-        return count
-    }
-
-    /// The to-do box: an empty rounded square, or a filled one with a tick.
-    /// Clicking it is handled by the text view (`toggleTodo(at:)`).
-    static func drawCheckbox(in rect: CGRect, checked: Bool) {
-        let square = rect.insetBy(dx: 0.75, dy: 0.75)
-        #if os(macOS)
-        let box = NSBezierPath(roundedRect: square, xRadius: 3, yRadius: 3)
-        #else
-        let box = UIBezierPath(roundedRect: square, cornerRadius: 3)
-        #endif
-        guard checked else {
-            box.lineWidth = 1.5
-            PColor.pSecondaryLabel.setStroke()
-            box.stroke()
-            return
-        }
-        PColor.pTint.setFill()
-        box.fill()
-        let tick = PBezierPath()
-        tick.move(to: CGPoint(x: rect.minX + rect.width * 0.24, y: rect.midY + rect.height * 0.02))
-        tick.line(to: CGPoint(x: rect.minX + rect.width * 0.43, y: rect.maxY - rect.height * 0.24))
-        tick.line(to: CGPoint(x: rect.minX + rect.width * 0.76, y: rect.minY + rect.height * 0.24))
-        tick.lineWidth = max(1.5, rect.width * 0.14)
-        PColor.pOnTint.setStroke()
-        tick.stroke()
-    }
 }
 
 @MainActor
@@ -512,13 +265,12 @@ final class EditorCore {
         if let settingsObserver {
             NotificationCenter.default.removeObserver(settingsObserver)
         }
+        if let storageEditObserver {
+            NotificationCenter.default.removeObserver(storageEditObserver)
+        }
     }
 
     // MARK: loading
-
-    var sharedStorage: NSTextStorage {
-        session.storage
-    }
 
     func switchTo(_ url: String) {
         pushNow()
@@ -536,18 +288,52 @@ final class EditorCore {
     }
 
     func attachViewToSharedStorage() {
-        guard let layoutManager = view?.pLayoutManager else { return }
-        if layoutManager.textStorage !== session.storage {
-            layoutManager.textStorage?.removeLayoutManager(layoutManager)
-            session.storage.addLayoutManager(layoutManager)
+        guard let contentStorage = view?.pContentStorage else { return }
+        if contentStorage.textStorage !== session.storage {
+            contentStorage.textStorage = session.storage
         }
+        observeStorageEdits()
     }
 
     func detachViewFromSharedStorage() {
-        guard let layoutManager = view?.pLayoutManager,
-              layoutManager.textStorage === session.storage
+        if let storageEditObserver {
+            NotificationCenter.default.removeObserver(storageEditObserver)
+            self.storageEditObserver = nil
+        }
+        guard let contentStorage = view?.pContentStorage,
+              contentStorage.textStorage === session.storage
         else { return }
-        session.storage.removeLayoutManager(layoutManager)
+        contentStorage.textStorage = NSTextStorage()
+    }
+
+    /// The TextKit 1 pump was `didCompleteLayoutFor`; in TextKit 2 the
+    /// storage's edit notification drives overlay reconciliation and ordinal
+    /// renumbering, and the views trigger reconciles from `layout()`.
+    private var storageEditObserver: (any NSObjectProtocol)?
+
+    private func observeStorageEdits() {
+        if let storageEditObserver {
+            NotificationCenter.default.removeObserver(storageEditObserver)
+        }
+        storageEditObserver = NotificationCenter.default.addObserver(
+            forName: NSTextStorage.didProcessEditingNotification,
+            object: session.storage,
+            queue: nil
+        ) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let self, let storage = note.object as? NSTextStorage else { return }
+                let editedLocation = storage.editedRange.location
+                self.inline.setNeedsReconcile()
+                guard let textLayoutManager = self.view?.pTextLayoutManager else { return }
+                Task { @MainActor in
+                    invalidateOrderedListRun(
+                        around: editedLocation,
+                        textLayoutManager: textLayoutManager,
+                        storage: storage
+                    )
+                }
+            }
+        }
     }
 
     private weak var contextTracker: ContextTracker?
@@ -1285,6 +1071,7 @@ final class EditorCore {
         controller.superscriptActive = marks["superscript"] != nil
         controller.subscriptActive = marks["subscript"] != nil
         controller.highlightActive = marks["highlight"]?.stringValue
+        refreshTrailingMarker()
     }
 
     private func marksAtSelection() -> [String: JSONValue] {
@@ -1339,27 +1126,66 @@ final class EditorCore {
     /// The character in a to-do item whose box sits under this point in the
     /// text container — the marker gutter is the indent the item's own
     /// paragraph style asks for.
-    func todoBoxHit(
-        at point: CGPoint,
-        layoutManager: NSLayoutManager,
-        container: NSTextContainer
-    ) -> Int? {
-        guard let storage = view?.pStorage, storage.length > 0 else { return nil }
+    func todoBoxHit(at point: CGPoint) -> Int? {
+        guard let storage = view?.pStorage, storage.length > 0,
+              let textLayoutManager = view?.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager,
+              let fragment = textLayoutManager.textLayoutFragment(for: point),
+              let elementRange = fragment.textElement?.elementRange
+        else { return nil }
         let index = min(
-            layoutManager.characterIndex(
-                for: point,
-                in: container,
-                fractionOfDistanceBetweenInsertionPoints: nil
-            ),
+            contentManager.offset(from: contentManager.documentRange.location, to: elementRange.location),
             storage.length - 1
         )
-        guard let style = storage.attribute(.paragraphStyle, at: index, effectiveRange: nil)
+        guard index >= 0,
+              let style = storage.attribute(.paragraphStyle, at: index, effectiveRange: nil)
                 as? NSParagraphStyle,
               point.x >= 0, point.x < style.firstLineHeadIndent,
               let box = storage.attribute(.amBlock, at: index, effectiveRange: nil) as? BlockBox,
               box.value.type == "todo-list-item"
         else { return nil }
         return index
+    }
+
+    /// The attachment character whose laid-out rect contains this point in
+    /// the text container.
+    func attachmentIndex(at point: CGPoint) -> Int? {
+        guard let storage = view?.pStorage, storage.length > 0,
+              let textLayoutManager = view?.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager,
+              let fragment = textLayoutManager.textLayoutFragment(for: point),
+              let elementRange = fragment.textElement?.elementRange
+        else { return nil }
+        let start = contentManager.offset(from: contentManager.documentRange.location, to: elementRange.location)
+        let end = contentManager.offset(from: contentManager.documentRange.location, to: elementRange.endLocation)
+        guard start >= 0, start < end, end <= storage.length else { return nil }
+        var result: Int?
+        storage.enumerateAttribute(.attachment, in: NSRange(location: start, length: end - start)) { value, range, stop in
+            guard value != nil,
+                  let textRange = contentManager.textRange(for: NSRange(location: range.location, length: 1))
+            else { return }
+            textLayoutManager.enumerateTextSegments(in: textRange, type: .standard, options: []) { _, rect, _, _ in
+                if rect.contains(point) { result = range.location }
+                return false
+            }
+            if result != nil { stop.pointee = true }
+        }
+        return result
+    }
+
+    /// The trailing empty line's marker comes from typing attributes, which
+    /// leave no trace in the storage — redraw the last fragment whenever they
+    /// may have changed.
+    func refreshTrailingMarker() {
+        guard let view, let storage = view.pStorage, storage.length > 0,
+              (storage.string as NSString).hasSuffix("\n"),
+              let textLayoutManager = view.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager
+        else { return }
+        let str = storage.string as NSString
+        let last = str.paragraphRange(for: NSRange(location: storage.length - 1, length: 0))
+        guard let textRange = contentManager.textRange(for: last) else { return }
+        textLayoutManager.invalidateLayout(for: textRange)
     }
 
     /// Tick or untick the to-do item containing a character. Returns false
@@ -2041,10 +1867,17 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         get { typingAttributes }
         set { typingAttributes = newValue }
     }
+    var pTextLayoutManager: NSTextLayoutManager? { textLayoutManager }
     var pLayoutManager: NSLayoutManager? { layoutManager }
+    var pContentStorage: NSTextContentStorage? { textContentStorage }
     var pTextContainer: NSTextContainer? { textContainer }
     var pTextOrigin: CGPoint { textContainerOrigin }
     var pSelf: PView { self }
+
+    override func layout() {
+        super.layout()
+        core?.inline.setNeedsReconcile()
+    }
 
     func pInsertText(_ text: String) {
         insertText(text, replacementRange: selectedRange())
@@ -2205,19 +2038,9 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
                 .map(String.init)
                 .filter { $0.hasPrefix("automerge:") }
             if !urls.isEmpty {
-                if let layoutManager, let textContainer {
-                    let point = convert(sender.draggingLocation, from: nil)
-                    let containerPoint = CGPoint(
-                        x: point.x - textContainerOrigin.x,
-                        y: point.y - textContainerOrigin.y
-                    )
-                    let index = layoutManager.characterIndex(
-                        for: containerPoint,
-                        in: textContainer,
-                        fractionOfDistanceBetweenInsertionPoints: nil
-                    )
-                    setSelectedRange(NSRange(location: min(index, textStorage?.length ?? 0), length: 0))
-                }
+                let point = convert(sender.draggingLocation, from: nil)
+                let index = characterIndexForInsertion(at: point)
+                setSelectedRange(NSRange(location: min(index, textStorage?.length ?? 0), length: 0))
                 for url in urls {
                     core.insertPatchworkEmbed(url: url, tool: nil)
                 }
@@ -2231,42 +2054,23 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
     /// Media/table/html attachments open on click; images open their info
     /// sheet on double-click so a single click still places the selection.
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount <= 2, let core, let layoutManager, let textContainer {
+        if event.clickCount <= 2, let core {
             let point = convert(event.locationInWindow, from: nil)
             let containerPoint = CGPoint(
                 x: point.x - textContainerOrigin.x,
                 y: point.y - textContainerOrigin.y
             )
             if event.clickCount == 1,
-               let todo = core.todoBoxHit(
-                   at: containerPoint,
-                   layoutManager: layoutManager,
-                   container: textContainer
-               ),
+               let todo = core.todoBoxHit(at: containerPoint),
                core.toggleTodo(at: todo) {
                 return
             }
-            if let charIndex = attachmentIndex(at: containerPoint),
+            if let charIndex = core.attachmentIndex(at: containerPoint),
                core.openAttachment(at: charIndex, includeImages: event.clickCount == 2) {
                 return
             }
         }
         super.mouseDown(with: event)
-    }
-
-    private func attachmentIndex(at containerPoint: CGPoint) -> Int? {
-        guard let layoutManager, let textContainer, let storage = textStorage else { return nil }
-        let glyphIndex = layoutManager.glyphIndex(for: containerPoint, in: textContainer)
-        let rect = layoutManager.boundingRect(
-            forGlyphRange: NSRange(location: glyphIndex, length: 1),
-            in: textContainer
-        )
-        guard rect.contains(containerPoint) else { return nil }
-        let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
-        guard charIndex < storage.length,
-              storage.attribute(.attachment, at: charIndex, effectiveRange: nil) != nil
-        else { return nil }
-        return charIndex
     }
 
     /// Double-clicking an image opens its info, but nothing advertises that.
@@ -2279,7 +2083,7 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
             y: point.y - textContainerOrigin.y
         )
         guard let core,
-              let charIndex = attachmentIndex(at: containerPoint),
+              let charIndex = core.attachmentIndex(at: containerPoint),
               core.isImageAttachment(at: charIndex)
         else { return standard }
         let menu = standard ?? NSMenu()
@@ -2339,17 +2143,9 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let storage = context.coordinator.core.sharedStorage
-        let layoutManager = ListMarkerLayoutManager()
-        storage.addLayoutManager(layoutManager)
-        let container = NSTextContainer(size: NSSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        ))
-        container.widthTracksTextView = true
-        layoutManager.addTextContainer(container)
-
-        let textView = EditorTextView(frame: .zero, textContainer: container)
+        let textView = EditorTextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         // image-only pasteboards (screenshots) otherwise fail paste
         // validation and ⌘V just beeps; our paste override intercepts the
@@ -2369,8 +2165,7 @@ struct RichTextEditor: NSViewRepresentable {
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.core = context.coordinator.core
-        layoutManager.delegate = context.coordinator
-        layoutManager.typingAttributesProvider = { [weak textView] in
+        context.coordinator.markers.typingAttributesProvider = { [weak textView] in
             guard let textView,
                   textView.selectedRange().location >= (textView.textStorage?.length ?? 0)
             else { return nil }
@@ -2383,6 +2178,7 @@ struct RichTextEditor: NSViewRepresentable {
         scroll.documentView = textView
 
         context.coordinator.core.view = textView
+        context.coordinator.core.attachViewToSharedStorage()
         context.coordinator.core.load()
         context.coordinator.core.startContext(contextTracker)
         return scroll
@@ -2399,20 +2195,12 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate, NSLayoutManagerDelegate {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         let core: EditorCore
+        let markers = ListMarkerLayoutDelegate()
 
         init(core: EditorCore) {
             self.core = core
-        }
-
-        func layoutManager(
-            _ layoutManager: NSLayoutManager,
-            didCompleteLayoutFor textContainer: NSTextContainer?,
-            atEnd layoutFinishedFlag: Bool
-        ) {
-            guard layoutFinishedFlag else { return }
-            core.inline.setNeedsReconcile()
         }
 
         func textDidChange(_ notification: Notification) {
@@ -2465,7 +2253,9 @@ struct RichTextEditor: NSViewRepresentable {
 final class EditorTextView: UITextView, EditorTextViewLike {
     weak var core: EditorCore?
 
-    var pStorage: NSTextStorage? { textStorage }
+    /// `textStorage` can go stale after the content storage adopts the shared
+    /// session storage, so everything resolves through the content storage.
+    var pStorage: NSTextStorage? { pContentStorage?.textStorage }
     var pSelectedRange: NSRange {
         get { selectedRange }
         set { selectedRange = newValue }
@@ -2474,19 +2264,28 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         get { typingAttributes }
         set { typingAttributes = newValue }
     }
+    var pTextLayoutManager: NSTextLayoutManager? { textLayoutManager }
     var pLayoutManager: NSLayoutManager? { layoutManager }
+    var pContentStorage: NSTextContentStorage? {
+        textLayoutManager?.textContentManager as? NSTextContentStorage
+    }
     var pTextContainer: NSTextContainer? { textContainer }
     var pTextOrigin: CGPoint {
         CGPoint(x: textContainerInset.left, y: textContainerInset.top)
     }
     var pSelf: PView { self }
 
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        core?.inline.setNeedsReconcile()
+    }
+
     func pInsertText(_ text: String) {
         insertText(text)
     }
 
     func pReplace(_ range: NSRange, with attributed: NSAttributedString) {
-        textStorage.replaceCharacters(in: range, with: attributed)
+        pStorage?.replaceCharacters(in: range, with: attributed)
         core?.scheduleSave()
     }
 
@@ -2518,8 +2317,8 @@ final class EditorTextView: UITextView, EditorTextViewLike {
 
     private func copySelectionAsSpans(cut: Bool) -> Bool {
         let range = selectedRange
-        guard range.length > 0 else { return false }
-        let slice = textStorage.attributedSubstring(from: range)
+        guard range.length > 0, let storage = pStorage else { return false }
+        let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
         var item: [String: Any] = [
@@ -2619,26 +2418,16 @@ struct RichTextEditor: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> EditorTextView {
-        let storage = context.coordinator.core.sharedStorage
-        let layoutManager = ListMarkerLayoutManager()
-        storage.addLayoutManager(layoutManager)
-        let container = NSTextContainer(size: CGSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        ))
-        container.widthTracksTextView = true
-        layoutManager.addTextContainer(container)
-
-        let textView = EditorTextView(frame: .zero, textContainer: container)
+        let textView = EditorTextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
         textView.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
         textView.delegate = context.coordinator
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
-        layoutManager.delegate = context.coordinator
-        layoutManager.typingAttributesProvider = { [weak textView] in
+        context.coordinator.markers.typingAttributesProvider = { [weak textView] in
             guard let textView,
-                  textView.selectedRange.location >= textView.textStorage.length
+                  textView.selectedRange.location >= (textView.pStorage?.length ?? 0)
             else { return nil }
             return textView.typingAttributes
         }
@@ -2660,6 +2449,7 @@ struct RichTextEditor: UIViewRepresentable {
         context.coordinator.accessory = accessory
 
         context.coordinator.core.view = textView
+        context.coordinator.core.attachViewToSharedStorage()
         context.coordinator.core.load()
         context.coordinator.core.startContext(contextTracker)
         return textView
@@ -2676,22 +2466,13 @@ struct RichTextEditor: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate,
-        NSLayoutManagerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         let core: EditorCore
+        let markers = ListMarkerLayoutDelegate()
         var accessory: UIHostingController<FormatAccessoryBar>?
 
         init(core: EditorCore) {
             self.core = core
-        }
-
-        func layoutManager(
-            _ layoutManager: NSLayoutManager,
-            didCompleteLayoutFor textContainer: NSTextContainer?,
-            atEnd layoutFinishedFlag: Bool
-        ) {
-            guard layoutFinishedFlag else { return }
-            core.inline.setNeedsReconcile()
         }
 
         func textViewDidChange(_ textView: UITextView) {
@@ -2740,29 +2521,11 @@ struct RichTextEditor: UIViewRepresentable {
                 x: point.x - textView.textContainerInset.left,
                 y: point.y - textView.textContainerInset.top
             )
-            let layoutManager = textView.layoutManager
-            if let todo = core.todoBoxHit(
-                at: containerPoint,
-                layoutManager: layoutManager,
-                container: textView.textContainer
-            ), core.toggleTodo(at: todo) {
+            if let todo = core.todoBoxHit(at: containerPoint),
+               core.toggleTodo(at: todo) {
                 return
             }
-            let glyphIndex = layoutManager.glyphIndex(
-                for: containerPoint,
-                in: textView.textContainer
-            )
-            let rect = layoutManager.boundingRect(
-                forGlyphRange: NSRange(location: glyphIndex, length: 1),
-                in: textView.textContainer
-            )
-            guard rect.contains(containerPoint) else { return }
-            let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
-            guard charIndex < textView.textStorage.length,
-                  textView.textStorage.attribute(
-                    .attachment, at: charIndex, effectiveRange: nil
-                  ) != nil
-            else { return }
+            guard let charIndex = core.attachmentIndex(at: containerPoint) else { return }
             core.openAttachment(at: charIndex)
         }
     }

@@ -32,7 +32,8 @@ final class InlineViewManager {
 
     func reconcile() {
         guard let core, let view = core.view, let storage = view.pStorage,
-              let layoutManager = view.pLayoutManager,
+              let textLayoutManager = view.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager,
               let textContainer = view.pTextContainer
         else { return }
         let origin = view.pTextOrigin
@@ -48,11 +49,17 @@ final class InlineViewManager {
             if host.view.superview !== view.pSelf {
                 view.pSelf.addSubview(host.view)
             }
-            let glyphRange = layoutManager.glyphRange(
-                forCharacterRange: NSRange(location: location, length: 1),
-                actualCharacterRange: nil
-            )
-            var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+            guard let textRange = contentManager.textRange(
+                for: NSRange(location: location, length: 1)
+            ) else { return }
+            textLayoutManager.ensureLayout(for: textRange)
+            var rect = CGRect.zero
+            textLayoutManager.enumerateTextSegments(
+                in: textRange, type: .standard, options: []
+            ) { _, frame, _, _ in
+                rect = frame
+                return false
+            }
             rect.origin.x += origin.x
             rect.origin.y += origin.y
             guard containerWidth > 80 else {
@@ -108,7 +115,7 @@ final class InlineViewManager {
             resizeAttachment(at: resize.location, to: resize.size)
         }
         if containerWidth > 80 {
-            clampImageAttachments(in: storage, layoutManager: layoutManager, to: containerWidth)
+            clampImageAttachments(in: storage, textLayoutManager: textLayoutManager, to: containerWidth)
         }
     }
 
@@ -116,7 +123,7 @@ final class InlineViewManager {
     /// the column, growing back if the column widens.
     private func clampImageAttachments(
         in storage: NSTextStorage,
-        layoutManager: NSLayoutManager,
+        textLayoutManager: NSTextLayoutManager,
         to containerWidth: CGFloat
     ) {
         storage.enumerateAttribute(
@@ -133,8 +140,9 @@ final class InlineViewManager {
                 || abs(current.height - target.height) > 1 else { return }
             attachment.bounds = CGRect(origin: .zero, size: target)
             let charRange = NSRange(location: range.location, length: 1)
-            layoutManager.invalidateLayout(forCharacterRange: charRange, actualCharacterRange: nil)
-            layoutManager.invalidateDisplay(forCharacterRange: charRange)
+            if let textRange = textLayoutManager.textContentManager?.textRange(for: charRange) {
+                textLayoutManager.invalidateLayout(for: textRange)
+            }
         }
     }
 
@@ -155,12 +163,12 @@ final class InlineViewManager {
               location < storage.length,
               let attachment = storage.attribute(.attachment, at: location, effectiveRange: nil)
                 as? NSTextAttachment,
-              let layoutManager = view.pLayoutManager
+              let textLayoutManager = view.pTextLayoutManager,
+              let textRange = textLayoutManager.textContentManager?
+                .textRange(for: NSRange(location: location, length: 1))
         else { return }
         attachment.bounds = CGRect(origin: .zero, size: size)
-        let range = NSRange(location: location, length: 1)
-        layoutManager.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
-        layoutManager.invalidateDisplay(forCharacterRange: range)
+        textLayoutManager.invalidateLayout(for: textRange)
     }
 
     private func makeTableHost(for box: TableBox) -> Host {

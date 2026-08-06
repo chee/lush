@@ -94,17 +94,9 @@ struct ColumnEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSTextView {
-        let storage = NSTextStorage()
-        let layoutManager = ListMarkerLayoutManager()
-        storage.addLayoutManager(layoutManager)
-        let container = NSTextContainer(size: NSSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        ))
-        container.widthTracksTextView = true
-        layoutManager.addTextContainer(container)
-
-        let textView = NSTextView(frame: .zero, textContainer: container)
+        let textView = NSTextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         textView.allowsUndo = true
         textView.drawsBackground = false
@@ -115,7 +107,7 @@ struct ColumnEditor: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.autoresizingMask = [.width, .height]
         if index < box.columns.count {
-            storage.setAttributedString(
+            textView.textStorage?.setAttributedString(
                 RichText.attributed(from: box.columns[index], cache: cache)
             )
         }
@@ -127,6 +119,7 @@ struct ColumnEditor: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         let bridge: ColumnEditorBridge
+        let markers = ListMarkerLayoutDelegate()
 
         init(bridge: ColumnEditorBridge) {
             self.bridge = bridge
@@ -136,6 +129,13 @@ struct ColumnEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView,
                   let storage = textView.textStorage else { return }
             bridge.storageChanged(storage)
+            if let layoutManager = textView.textLayoutManager {
+                invalidateOrderedListRun(
+                    around: textView.selectedRange().location,
+                    textLayoutManager: layoutManager,
+                    storage: storage
+                )
+            }
         }
     }
 }
@@ -151,24 +151,15 @@ struct ColumnEditor: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UITextView {
-        let storage = NSTextStorage()
-        let layoutManager = ListMarkerLayoutManager()
-        storage.addLayoutManager(layoutManager)
-        let container = NSTextContainer(size: CGSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        ))
-        container.widthTracksTextView = true
-        layoutManager.addTextContainer(container)
-
-        let textView = UITextView(frame: .zero, textContainer: container)
+        let textView = UITextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
         textView.isScrollEnabled = false
         textView.backgroundColor = .clear
         textView.textContainerInset = UIEdgeInsets(top: 4, left: 2, bottom: 4, right: 2)
         textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
         textView.delegate = context.coordinator
         if index < box.columns.count {
-            storage.setAttributedString(
+            textView.textStorage.setAttributedString(
                 RichText.attributed(from: box.columns[index], cache: cache)
             )
         }
@@ -180,6 +171,7 @@ struct ColumnEditor: UIViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, UITextViewDelegate {
         let bridge: ColumnEditorBridge
+        let markers = ListMarkerLayoutDelegate()
 
         init(bridge: ColumnEditorBridge) {
             self.bridge = bridge
@@ -187,6 +179,13 @@ struct ColumnEditor: UIViewRepresentable {
 
         func textViewDidChange(_ textView: UITextView) {
             bridge.storageChanged(textView.textStorage)
+            if let layoutManager = textView.textLayoutManager {
+                invalidateOrderedListRun(
+                    around: textView.selectedRange.location,
+                    textLayoutManager: layoutManager,
+                    storage: textView.textStorage
+                )
+            }
         }
     }
 }
