@@ -110,8 +110,11 @@ enum PatchworkWeb {
         let localPort = ports.isEmpty
             ? ""
             : ", \"localWsPorts\": [\(ports.map(String.init).joined(separator: ", "))]"
-        let modules = (try? JSONSerialization.data(withJSONObject: moduleUrls))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        // "</script>" inside a module url would break out of the tag and
+        // inject script into the privileged page
+        let modules = ((try? JSONSerialization.data(withJSONObject: moduleUrls))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[]")
+            .replacingOccurrences(of: "</", with: "<\\/")
         return """
         <script>window.__patchwork_CONFIG = {"publicEndpoint": "\(endpoint)", \
         "signerSeedHex": "\(signerSeedHex)", "moduleUrls": \(modules)\(localPort)};</script>
@@ -894,10 +897,19 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
 
     private nonisolated static let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
 
-    private nonisolated func path(for key: [String]) -> URL {
-        key.reduce(root) {
-            $0.appendingPathComponent($1.addingPercentEncoding(withAllowedCharacters: Self.safe) ?? $1)
+    /// Storage keys come from webview JS, including third-party modules —
+    /// dot components must never survive into the path or they escape root.
+    private nonisolated func path(for key: [String]) -> URL? {
+        var url = root
+        for component in key {
+            guard !component.isEmpty, component != ".", component != ".." else { return nil }
+            let encoded = component.addingPercentEncoding(withAllowedCharacters: Self.safe) ?? component
+            guard !encoded.isEmpty, encoded != ".", encoded != ".." else { return nil }
+            url.appendPathComponent(encoded)
         }
+        let rootPath = root.standardizedFileURL.path
+        guard url.standardizedFileURL.path.hasPrefix(rootPath + "/") else { return nil }
+        return url
     }
 
     func userContentController(
@@ -927,12 +939,12 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
         let fm = FileManager.default
         switch op {
         case "load":
-            guard let data = try? Data(contentsOf: path(for: key)) else { return [:] }
+            guard let url = path(for: key), let data = try? Data(contentsOf: url) else { return [:] }
             return ["binary": data.base64EncodedString()]
         case "save":
             guard let base64 = body["binary"] as? String,
-                  let data = Data(base64Encoded: base64) else { return [:] }
-            let url = path(for: key)
+                  let data = Data(base64Encoded: base64),
+                  let url = path(for: key) else { return [:] }
             try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: url)
             return [:]
@@ -940,17 +952,17 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
             for entry in body["entries"] as? [[String: Any]] ?? [] {
                 guard let entryKey = entry["key"] as? [String],
                       let base64 = entry["binary"] as? String,
-                      let data = Data(base64Encoded: base64) else { continue }
-                let url = path(for: entryKey)
+                      let data = Data(base64Encoded: base64),
+                      let url = path(for: entryKey) else { continue }
                 try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? data.write(to: url)
             }
             return [:]
         case "remove":
-            try? fm.removeItem(at: path(for: key))
+            if let url = path(for: key) { try? fm.removeItem(at: url) }
             return [:]
         case "removeRange":
-            try? fm.removeItem(at: path(for: key))
+            if let url = path(for: key) { try? fm.removeItem(at: url) }
             return [:]
         case "loadRange":
             var chunks = loadRange(prefix: key)
@@ -967,7 +979,7 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
     }
 
     private nonisolated func loadRange(prefix: [String]) -> [[String: Any]] {
-        let base = path(for: prefix)
+        guard let base = path(for: prefix) else { return [] }
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(at: base, includingPropertiesForKeys: [.isRegularFileKey]) else {
             return []

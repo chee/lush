@@ -30,6 +30,7 @@ struct PatchworkCreateRequest: Identifiable {
 struct ContentView: View {
     @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
+    @Environment(\.scenePhase) private var scenePhase
     @State private var router = AppRouter.shared
     @State private var patchworkCreateRequest: PatchworkCreateRequest?
     #if os(macOS)
@@ -92,6 +93,12 @@ struct ContentView: View {
         }
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await model.drainSharedIntake() }
+            }
+        }
+        .task { await model.drainSharedIntake() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url else { return }
             selectedHistoryEntry = nil
@@ -145,6 +152,12 @@ struct ContentView: View {
         }
         .onChange(of: router.pending) { processPending() }
         .onChange(of: model.folderUrl) { processPending() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await model.drainSharedIntake() }
+            }
+        }
+        .task { await model.drainSharedIntake() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url, path.isEmpty else { return }
             path = [.note(url)]
@@ -243,8 +256,8 @@ struct ContentView: View {
                 toolId: toolId,
                 folderUrl: folderUrl
             )
-        case .share(let id):
-            model.pendingIncoming = IncomingContent.sharedHandoff(id: id)
+        case .share:
+            Task { await model.drainSharedIntake() }
         }
     }
 
@@ -347,6 +360,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: searchText) {
+            model.searchQuery = searchText
             searchTask?.cancel()
             searchTask = Task { searchHits = await model.search(searchText) }
         }
@@ -697,6 +711,10 @@ struct ContentView: View {
                 if !many {
                     Button("Rename") { beginRename(node) }
                     Button("Copy Note URL") { Clipboard.copy(node.url) }
+                    if isPatchworkDoc(node) {
+                        Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: node.url) }
+                        Button("Open in Patchwork") { model.openInPatchwork(node.url) }
+                    }
                 }
                 if node.parentUrl != nil {
                     Button(many ? "Delete \(targets.count) Items" : "Delete", role: .destructive) {
@@ -829,6 +847,10 @@ struct ContentView: View {
         Task { await model.selectItem(node.url) }
     }
 
+    private func isPatchworkDoc(_ node: FolderNode) -> Bool {
+        model.patchworkDocUrls.contains(node.url) || node.isPatchworkDoc
+    }
+
     @ViewBuilder
     private func singleNoteContextMenu(for node: FolderNode, showInFolder: Bool = false) -> some View {
         if node.kind == "lush" || node.kind == "rich" {
@@ -851,6 +873,10 @@ struct ContentView: View {
         }
         Button("Rename") { beginRename(node) }
         Button("Copy Note URL") { Clipboard.copy(node.url) }
+        if isPatchworkDoc(node) {
+            Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: node.url) }
+            Button("Open in Patchwork") { model.openInPatchwork(node.url) }
+        }
         if node.parentUrl != nil {
             Button("Delete", role: .destructive) {
                 model.removeEntry(parentUrl: node.parentUrl, url: node.url)
@@ -1108,6 +1134,7 @@ struct FolderScreen: View {
         }
         .searchable(text: $searchText, prompt: "Search notes")
         .onChange(of: searchText) {
+            model.searchQuery = searchText
             searchTask?.cancel()
             searchTask = Task { searchHits = await model.search(searchText) }
         }
@@ -1244,6 +1271,10 @@ struct FolderScreen: View {
         Button(node.kind == "folder" ? "Copy Folder URL" : "Copy Note URL") {
             Clipboard.copy(node.url)
         }
+        if model.patchworkDocUrls.contains(node.url) || node.isPatchworkDoc {
+            Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: node.url) }
+            Button("Open in Patchwork") { model.openInPatchwork(node.url) }
+        }
         if node.parentUrl != nil {
             Button("Delete", role: .destructive) {
                 model.removeEntry(parentUrl: node.parentUrl, url: node.url)
@@ -1305,6 +1336,10 @@ struct RecentsScreen: View {
                     renameTarget = entry.node
                 }
                 Button("Copy Note URL") { Clipboard.copy(entry.node.url) }
+                if model.patchworkDocUrls.contains(entry.node.url) || entry.node.isPatchworkDoc {
+                    Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: entry.node.url) }
+                    Button("Open in Patchwork") { model.openInPatchwork(entry.node.url) }
+                }
                 if entry.node.parentUrl != nil {
                     Button("Delete", role: .destructive) {
                         model.removeEntry(parentUrl: entry.node.parentUrl, url: entry.node.url)
@@ -1344,11 +1379,23 @@ struct RecentsScreen: View {
 #endif
 
 enum RightSidebarTab: String, CaseIterable, Identifiable {
+    case outline = "Outline"
+    case canvas = "Canvas"
     case history = "History"
     case info = "Info"
     case chat = "Chat"
 
     var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .outline: "list.bullet.indent"
+        case .canvas: "square.grid.3x3.topleft.filled"
+        case .history: "clock.arrow.circlepath"
+        case .info: "info.circle"
+        case .chat: "bubble.left"
+        }
+    }
 }
 
 #if os(macOS)
@@ -1382,17 +1429,24 @@ struct RightSidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Inspector", selection: $selectedTab) {
+            Picker("", selection: $selectedTab) {
                 ForEach(RightSidebarTab.allCases) { tab in
-                    Text(tab.rawValue).tag(tab)
+                    Image(systemName: tab.icon)
+                        .help(tab.rawValue)
+                        .tag(tab)
                 }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(10)
 
             Divider()
 
             switch selectedTab {
+            case .outline:
+                OutlineListView(controller: model.activeEditor)
+            case .canvas:
+                CanvasStashView(controller: model.activeEditor)
             case .history:
                 historyView
             case .info:
@@ -1690,7 +1744,7 @@ private struct HistoricalNoteSnapshotView: View {
         }
         .task(id: "\(noteUrl):\(entry.heads.joined(separator: ","))") {
             isLoading = true
-            attributed = await model.renderedSnapshot(for: noteUrl, heads: entry.heads)
+            attributed = await model.renderedSnapshot(for: noteUrl, entry: entry)
             isLoading = false
         }
     }
@@ -1844,6 +1898,60 @@ struct NoteDetail: View {
 
     private var currentNode: FolderNode? { model.node(for: noteUrl) }
 
+    @ViewBuilder
+    private var findOverlay: some View {
+        if editor.findVisible, historyVersion == nil {
+            FindBar(controller: editor)
+                .padding(.top, 10)
+                .padding(.trailing, 16)
+        }
+    }
+
+    @ViewBuilder
+    private var minimapOverlay: some View {
+        #if os(macOS)
+        if historyVersion == nil, EditorSettings.minimapVisible, !editor.minimapRows.isEmpty {
+            MinimapView(controller: editor)
+                .padding(.top, 64)
+                .padding(.bottom, 20)
+                .padding(.trailing, 2)
+        }
+        #endif
+    }
+
+
+    private func joinPresence() {
+        if historyVersion == nil {
+            model.presence.join(noteUrl)
+        }
+    }
+
+    private func handleEditorDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard historyVersion == nil else { return false }
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
+                    guard let url = droppedString(from: item), url.hasPrefix("automerge:") else { return }
+                    Task { @MainActor in editor.insertPatchworkEmbed(url: url, tool: nil) }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    let fileUrl: URL?
+                    if let u = item as? URL { fileUrl = u }
+                    else if let data = item as? Data { fileUrl = URL(dataRepresentation: data, relativeTo: nil) }
+                    else { return }
+                    guard let fileUrl else { return }
+                    let scoped = fileUrl.startAccessingSecurityScopedResource()
+                    defer { if scoped { fileUrl.stopAccessingSecurityScopedResource() } }
+                    guard let data = try? Data(contentsOf: fileUrl) else { return }
+                    let name = fileUrl.lastPathComponent
+                    Task { @MainActor in editor.insertData(data, name: name) }
+                }
+            }
+        }
+        return true
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if editor.recorderVisible, historyVersion == nil {
@@ -1872,6 +1980,13 @@ struct NoteDetail: View {
             #endif
         }
         .focusedSceneValue(\.editorController, editor)
+        .overlay(alignment: .topTrailing) { findOverlay }
+        .overlay(alignment: .trailing) { minimapOverlay }
+        .onChange(of: model.searchQuery) {
+            editor.core?.updateGlobalMatches()
+        }
+        .onAppear { model.activeEditor = editor }
+        .task(id: noteUrl) { model.activeEditor = editor }
         .userActivity(
             LushHandoff.activityType,
             element: LushHandoff.item(for: currentNode) ?? LushHandoffItem(
@@ -1892,31 +2007,7 @@ struct NoteDetail: View {
         .onDrop(
             of: [UTType.plainText.identifier, UTType.fileURL.identifier],
             isTargeted: $editorDropTargeted
-        ) { providers in
-            guard historyVersion == nil else { return false }
-            for provider in providers {
-                if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) {
-                    provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
-                        guard let url = droppedString(from: item), url.hasPrefix("automerge:") else { return }
-                        Task { @MainActor in editor.insertPatchworkEmbed(url: url, tool: nil) }
-                    }
-                } else if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                        let fileUrl: URL?
-                        if let u = item as? URL { fileUrl = u }
-                        else if let data = item as? Data { fileUrl = URL(dataRepresentation: data, relativeTo: nil) }
-                        else { return }
-                        guard let fileUrl else { return }
-                        let scoped = fileUrl.startAccessingSecurityScopedResource()
-                        defer { if scoped { fileUrl.stopAccessingSecurityScopedResource() } }
-                        guard let data = try? Data(contentsOf: fileUrl) else { return }
-                        let name = fileUrl.lastPathComponent
-                        Task { @MainActor in editor.insertData(data, name: name) }
-                    }
-                }
-            }
-            return true
-        }
+        ) { handleEditorDrop($0) }
         .toolbar {
             ToolbarItem {
                 Menu {
@@ -2033,6 +2124,10 @@ struct NoteDetail: View {
                             showingRename = true
                         }
                         Button("Copy Note URL") { Clipboard.copy(noteUrl) }
+                        if model.patchworkDocUrls.contains(noteUrl) || node.isPatchworkDoc {
+                            Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: noteUrl) }
+                            Button("Open in Patchwork") { model.openInPatchwork(noteUrl) }
+                        }
                         #if os(macOS)
                         Menu("Export") {
                             Button("Export as HTML…") {
@@ -2067,6 +2162,10 @@ struct NoteDetail: View {
             #if os(macOS)
             ToolbarSpacer(.flexible)
             ToolbarItem(placement: .primaryAction) {
+                PresenceFacesView(presence: model.presence)
+            }
+            ToolbarSpacer(.fixed)
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     rightSidebarVisible?.wrappedValue.toggle()
                 } label: {
@@ -2075,6 +2174,7 @@ struct NoteDetail: View {
             }
             #endif
         }
+        .task(id: noteUrl) { joinPresence() }
         .sheet(item: Binding(
             get: { editor.sheet },
             set: { editor.sheet = $0 }
@@ -2172,6 +2272,350 @@ struct NoteDetail: View {
 /// under it, and only content that scrolls into that strip frosts and fades.
 /// Resting content sits below the toolbar (the scroll view's automatic
 /// insets) and is untouched.
+private struct PresenceFacesView: View {
+    let presence: PresenceManager
+    @Environment(NotesModel.self) private var model
+
+    @ViewBuilder
+    private func face(name: String?, color: String?, focused: Bool, avatar: Data? = nil) -> some View {
+        Group {
+            if let avatar, let image = PImage(data: avatar) {
+                Image(pImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 22, height: 22)
+                    .clipShape(Circle())
+            } else {
+                Text(String((name ?? "?").prefix(1)).uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .frame(width: 22, height: 22)
+                    .background(Circle().fill(PresenceManager.swatch(color).opacity(0.25)))
+            }
+        }
+        .overlay(Circle().strokeBorder(PresenceManager.swatch(color), lineWidth: 2))
+        .opacity(focused ? 1 : 0.35)
+        .help(name ?? "Anonymous")
+    }
+
+    var body: some View {
+        let peers = presence.orderedPeers
+        // only when someone else is here — then self first, like patchwork
+        if presence.docUrl != nil, !peers.isEmpty {
+            HStack(spacing: 3) {
+                face(
+                    name: model.contactName ?? "Anonymous",
+                    color: PresenceManager.stableColor(for: model.presenceContactUrl ?? "self"),
+                    focused: true,
+                    avatar: model.contactAvatarData
+                )
+                ForEach(peers) { peer in
+                    face(name: peer.name, color: peer.color, focused: peer.focused)
+                }
+            }
+            .animation(.default, value: peers.map(\.senderId))
+        }
+    }
+}
+
+private struct MinimapView: View {
+    let controller: EditorController
+
+    private func color(for kind: MinimapKind) -> Color {
+        switch kind {
+        case .heading: .primary.opacity(0.75)
+        case .code: Color(red: 0.26, green: 0.52, blue: 0.75).opacity(0.5)
+        case .quote: Color(red: 1.0, green: 0.30, blue: 0.59).opacity(0.5)
+        case .embed: .secondary.opacity(0.45)
+        case .text: .secondary.opacity(0.22)
+        }
+    }
+
+    private func width(for kind: MinimapKind) -> CGFloat {
+        switch kind {
+        case .heading: 18
+        case .code, .embed: 14
+        case .quote: 12
+        case .text: 10
+        }
+    }
+
+    var body: some View {
+        let rows = controller.minimapRows
+        let docHeight = max(controller.minimapDocHeight, 1)
+        GeometryReader { proxy in
+            let scale = min(proxy.size.height / docHeight, 0.12)
+            Canvas { context, _ in
+                for row in rows {
+                    let rect = CGRect(
+                        x: 2,
+                        y: row.y * scale,
+                        width: width(for: row.kind),
+                        height: max(row.kind == .text ? 1.5 : 2.5, row.height * scale - 1)
+                    )
+                    context.fill(Path(roundedRect: rect, cornerRadius: 1), with: .color(color(for: row.kind)))
+                }
+                if let viewport = controller.minimapViewport {
+                    let lens = CGRect(
+                        x: 0,
+                        y: viewport.y * scale,
+                        width: 22,
+                        height: max(6, viewport.height * scale)
+                    )
+                    context.fill(Path(roundedRect: lens, cornerRadius: 3), with: .color(.secondary.opacity(0.14)))
+                    context.stroke(Path(roundedRect: lens, cornerRadius: 3), with: .color(.secondary.opacity(0.35)), lineWidth: 1)
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let mapHeight = docHeight * scale
+                        guard mapHeight > 0 else { return }
+                        controller.minimapJump(fraction: value.location.y / mapHeight)
+                    }
+            )
+        }
+        .frame(width: 22)
+    }
+}
+
+private struct CanvasStashView: View {
+    let controller: EditorController?
+
+    var body: some View {
+        if let controller, let core = controller.core {
+            let _ = controller.docVersion
+            let cards = core.stashedCards()
+            if cards.isEmpty {
+                ContentUnavailableView(
+                    "Nothing Stashed",
+                    systemImage: "square.grid.3x1.folder.badge.plus",
+                    description: Text("Format → Stash Paragraph to Canvas parks the current paragraph here; drag a card back into the note to return it.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView([.vertical, .horizontal]) {
+                    ZStack(alignment: .topLeading) {
+                        Color.clear
+                            .frame(
+                                width: max(400, (cards.map(\.x).max() ?? 0) + 240),
+                                height: max(400, (cards.map(\.y).max() ?? 0) + 220)
+                            )
+                        ForEach(cards) { card in
+                            StashCardView(card: card, core: core)
+                        }
+                    }
+                }
+            }
+        } else {
+            ContentUnavailableView("No Note Open", systemImage: "square.grid.3x1.folder.badge.plus")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+}
+
+private struct StashSnippetView {
+    let attributed: NSAttributedString
+
+    @MainActor
+    final class Coordinator {
+        let markers = ListMarkerLayoutDelegate()
+    }
+
+    @MainActor
+    func makeCoordinator() -> Coordinator { Coordinator() }
+}
+
+#if os(macOS)
+extension StashSnippetView: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = NSTextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
+        textView.textContainer?.widthTracksTextView = true
+        textView.isEditable = false
+        textView.isSelectable = false
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 4, height: 0)
+        textView.textStorage?.setAttributedString(attributed)
+        return textView
+    }
+
+    func updateNSView(_ nsView: NSTextView, context: Context) {
+        if nsView.attributedString() != attributed {
+            nsView.textStorage?.setAttributedString(attributed)
+        }
+    }
+}
+#else
+extension StashSnippetView: UIViewRepresentable {
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
+        textView.isEditable = false
+        textView.isSelectable = false
+        textView.isScrollEnabled = false
+        textView.backgroundColor = .clear
+        textView.textContainerInset = UIEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
+        textView.textStorage.setAttributedString(attributed)
+        return textView
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if !uiView.textStorage.isEqual(to: attributed) {
+            uiView.textStorage.setAttributedString(attributed)
+        }
+    }
+}
+#endif
+
+private struct StashCardView: View {
+    let card: StashedCard
+    let core: EditorCore
+    @State private var dragOffset: CGSize = .zero
+
+    private var paper: Color {
+        #if os(macOS)
+        Color(nsColor: .textBackgroundColor)
+        #else
+        Color(uiColor: .systemBackground)
+        #endif
+    }
+
+    private var tilt: Angle {
+        .degrees(Double(card.location % 5) - 2)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            StashSnippetView(attributed: card.attributed)
+                .frame(height: min(card.contentHeight + 4, 150))
+                .allowsHitTesting(false)
+                .clipped()
+            HStack {
+                // dragging the grip carries the card into the note; dragging
+                // the body just repositions it on the canvas
+                Image(systemName: "arrow.up.left.square")
+                    .foregroundStyle(.tertiary)
+                    .imageScale(.small)
+                    .help("Drag into the note to return this paragraph")
+                    .onDrag { NSItemProvider(object: "lush-stash:\(card.location)" as NSString) }
+                Spacer()
+            }
+        }
+        .padding(10)
+        .frame(width: 184, alignment: .leading)
+        .background(paper, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.18)))
+        .shadow(color: .black.opacity(0.16), radius: 5, y: 3)
+        .rotationEffect(tilt)
+        .offset(x: card.x + dragOffset.width, y: card.y + dragOffset.height)
+        .gesture(
+            DragGesture()
+                .onChanged { dragOffset = $0.translation }
+                .onEnded { value in
+                    core.moveStash(card.box, to: CGPoint(
+                        x: card.x + value.translation.width,
+                        y: card.y + value.translation.height
+                    ))
+                    dragOffset = .zero
+                }
+        )
+        .contextMenu {
+            Button("Return to Note") { core.unstashInPlace(card.box) }
+        }
+    }
+}
+
+private struct OutlineListView: View {
+    let controller: EditorController?
+
+    var body: some View {
+        if let controller, let core = controller.core {
+            let _ = controller.docVersion
+            let items = core.outlineItems()
+            if items.isEmpty {
+                ContentUnavailableView(
+                    "No Headings",
+                    systemImage: "list.bullet.indent",
+                    description: Text("Headings in this note appear here.")
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(items) { item in
+                            Button {
+                                controller.scrollTo(location: item.location)
+                            } label: {
+                                Text(item.text.isEmpty ? "Untitled" : item.text)
+                                    .font(item.level == 1 ? .callout.weight(.semibold) : .callout)
+                                    .foregroundStyle(item.level >= 3 ? .secondary : .primary)
+                                    .lineLimit(1)
+                                    .padding(.leading, CGFloat(item.level - 1) * 14)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.vertical, 4)
+                            .padding(.horizontal, 12)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+            }
+        } else {
+            ContentUnavailableView(
+                "No Note Open",
+                systemImage: "list.bullet.indent"
+            )
+        }
+    }
+}
+
+private struct FindBar: View {
+    @Bindable var controller: EditorController
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Find in note", text: $controller.findQuery)
+                .textFieldStyle(.plain)
+                .focused($focused)
+                .frame(width: 170)
+                .onSubmit { controller.findNext() }
+                .onChange(of: controller.findQuery) { controller.findQueryChanged() }
+            Text(controller.findMatchCount == 0 ? "0" : "\(controller.findIndex)/\(controller.findMatchCount)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            Button {
+                controller.findPrevious()
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.plain)
+            .disabled(controller.findMatchCount == 0)
+            Button {
+                controller.findNext()
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.plain)
+            .disabled(controller.findMatchCount == 0)
+            Button("Done") { controller.closeFind() }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.25)))
+        .onEscape { controller.closeFind() }
+        .onAppear { focused = true }
+    }
+}
+
 private struct ToolbarScrollFade: ViewModifier {
     func body(content: Content) -> some View {
         GeometryReader { proxy in

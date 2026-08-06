@@ -45,6 +45,16 @@ enum Clipboard {
     }
 }
 
+enum ExternalBrowser {
+    static func open(_ url: URL) {
+        #if os(macOS)
+        NSWorkspace.shared.open(url)
+        #else
+        UIApplication.shared.open(url)
+        #endif
+    }
+}
+
 extension PColor {
     convenience init(rgb: Int, alpha: CGFloat = 1) {
         let r = CGFloat((rgb >> 16) & 0xFF) / 255

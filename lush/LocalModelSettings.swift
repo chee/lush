@@ -16,18 +16,49 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         case .noteChat: "Note chat"
         }
     }
+
+    var shortLabel: String {
+        switch self {
+        case .attachmentSummary: "Attachments"
+        case .imageCaption: "Images"
+        case .voiceNoteSummary: "Voice"
+        case .noteChat: "Chat"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .attachmentSummary: "paperclip"
+        case .imageCaption: "photo"
+        case .voiceNoteSummary: "waveform"
+        case .noteChat: "bubble.left.and.text.bubble.right"
+        }
+    }
+
+    var defaultSystemPrompt: String {
+        switch self {
+        case .attachmentSummary, .imageCaption, .voiceNoteSummary:
+            """
+            Create concise searchable metadata for a note attachment. Use only the supplied evidence. Do not add facts that are not present. Return strict JSON with keys summary, caption, keywords.
+            """
+        case .noteChat:
+            """
+            You help someone understand and edit one note in Lush. Use only the supplied note and chat history. If the person asks a question, answer it directly using the note. If the person asks you to change, rewrite, reorganize, summarize, expand, or otherwise edit the note, include the full revised note as editedMarkdown. Preserve the note's facts, voice, and formatting unless the person asks for a change. Return only strict JSON with keys answer and editedMarkdown. The answer value must be your real answer, not a schema description. editedMarkdown must be null when no note change is being proposed.
+            """
+        }
+    }
 }
 
 enum LocalModelBackend: String, CaseIterable, Identifiable {
     case appleIntelligence
-    case coreML
+    case mlx
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .appleIntelligence: "Apple Intelligence"
-        case .coreML: "Core ML model"
+        case .mlx: "MLX model"
         }
     }
 }
@@ -45,7 +76,6 @@ struct RemoteModelConfig: Codable, Equatable {
 
     var isConfigured: Bool {
         !repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -60,84 +90,64 @@ struct HuggingFaceModelPreset: Identifiable, Equatable {
         case .attachmentSummary, .noteChat:
             return [
                 HuggingFaceModelPreset(
-                    id: "lfm25-350m-coreml",
-                    label: "LFM2.5 350M Core ML",
-                    note: "Preferred small text model lane for summaries and chat when a Core ML runtime adapter is wired.",
+                    id: "lfm25-350m-mlx",
+                    label: "LFM2.5 350M 4-bit",
+                    note: "Small, fast LiquidAI model.",
                     config: RemoteModelConfig(
-                        repo: "mlboydaisuke/lfm2.5-350m-coreml",
+                        repo: "mlx-community/LFM2.5-350M-4bit",
                         revision: "main",
                         filename: ""
                     )
                 ),
                 HuggingFaceModelPreset(
-                    id: "lfm25-350m-gguf",
-                    label: "LFM2.5 350M GGUF",
-                    note: "Good fallback suggestion if we later add a GGUF/llama.cpp runtime.",
+                    id: "lfm25-1.2b-mlx",
+                    label: "LFM2.5 1.2B Instruct 4-bit",
+                    note: "Stronger LiquidAI model for MacBook-class hardware.",
                     config: RemoteModelConfig(
-                        repo: "LiquidAI/LFM2.5-350M-GGUF",
+                        repo: "mlx-community/LFM2.5-1.2B-Instruct-4bit",
                         revision: "main",
-                        filename: "LFM2.5-350M-Q4_K_M.gguf"
+                        filename: ""
                     )
                 ),
                 HuggingFaceModelPreset(
-                    id: "lfm25-1.2b-gguf",
-                    label: "LFM2.5 1.2B Instruct GGUF",
-                    note: "Stronger local text model for MacBook-class hardware; GGUF runtime required.",
+                    id: "lfm25-2.6b-mlx",
+                    label: "LFM2.5 2.6B 4-bit",
+                    note: "Bigger LiquidAI option for higher-memory Macs.",
                     config: RemoteModelConfig(
-                        repo: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+                        repo: "mlx-community/LFM2.5-2.6B-4bit",
                         revision: "main",
-                        filename: "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
+                        filename: ""
                     )
                 ),
                 HuggingFaceModelPreset(
-                    id: "lfm25-2.6b-gguf",
-                    label: "LFM2.5 2.6B GGUF",
-                    note: "Bigger, stronger LFM option for high-memory Macs; GGUF runtime required.",
+                    id: "qwen3-0.6b-mlx",
+                    label: "Qwen3 0.6B 4-bit",
+                    note: "Very small Qwen3 model.",
                     config: RemoteModelConfig(
-                        repo: "LiquidAI/LFM2.5-2.6B-GGUF",
+                        repo: "mlx-community/Qwen3-0.6B-4bit",
                         revision: "main",
-                        filename: "LFM2.5-2.6B-Q4_K_M.gguf"
+                        filename: ""
                     )
                 ),
                 HuggingFaceModelPreset(
-                    id: "lfm25-8b-a1b-gguf",
-                    label: "LFM2.5 8B-A1B GGUF",
-                    note: "Large active-parameter model for powerful Macs; GGUF runtime required.",
+                    id: "qwen3-1.7b-mlx",
+                    label: "Qwen3 1.7B 4-bit",
+                    note: "Mid-size Qwen3 model.",
                     config: RemoteModelConfig(
-                        repo: "LiquidAI/LFM2.5-8B-A1B-GGUF",
+                        repo: "mlx-community/Qwen3-1.7B-4bit",
                         revision: "main",
-                        filename: "LFM2.5-8B-A1B-Q4_K_M.gguf"
-                    )
-                ),
-                HuggingFaceModelPreset(
-                    id: "qwen3-0.6b-q4",
-                    label: "Qwen3 0.6B Q4",
-                    note: "Further suggestion; GGUF runtime required.",
-                    config: RemoteModelConfig(
-                        repo: "lm-kit/qwen-3-0.6b-instruct-gguf",
-                        revision: "main",
-                        filename: "qwen-3-0.6b-instruct-q4_k_m.gguf"
+                        filename: ""
                     )
                 ),
             ]
         case .imageCaption:
             return [
                 HuggingFaceModelPreset(
-                    id: "lfm25-vl-coreml",
-                    label: "LFM2.5-VL Core ML",
-                    note: "Core ML vision-language candidate for richer image captions.",
+                    id: "lfm25-vl-mlx",
+                    label: "LFM2.5-VL 1.6B 4-bit",
+                    note: "LiquidAI vision-language model for image captions.",
                     config: RemoteModelConfig(
-                        repo: "mweinbach/LFM2.5-VL-1.6B-CoreML",
-                        revision: "main",
-                        filename: ""
-                    )
-                ),
-                HuggingFaceModelPreset(
-                    id: "blip-base",
-                    label: "BLIP base",
-                    note: "Further suggestion; requires a converted Core ML package or model-specific runtime.",
-                    config: RemoteModelConfig(
-                        repo: "Salesforce/blip-image-captioning-base",
+                        repo: "mlx-community/LFM2.5-VL-1.6B-Instruct-4bit",
                         revision: "main",
                         filename: ""
                     )
@@ -146,43 +156,13 @@ struct HuggingFaceModelPreset: Identifiable, Equatable {
         case .voiceNoteSummary:
             return [
                 HuggingFaceModelPreset(
-                    id: "moonshine-streaming-tiny",
-                    label: "Moonshine Streaming Tiny",
-                    note: "Preferred speech-recognition suggestion; needs an ASR runtime adapter.",
+                    id: "lfm25-1.2b-transcript-mlx",
+                    label: "LFM2.5 1.2B Instruct 4-bit",
+                    note: "Summarizes transcripts on MacBook-class hardware.",
                     config: RemoteModelConfig(
-                        repo: "cstr/moonshine-streaming-tiny-GGUF",
+                        repo: "mlx-community/LFM2.5-1.2B-Instruct-4bit",
                         revision: "main",
-                        filename: "moonshine-streaming-tiny-q4_k.gguf"
-                    )
-                ),
-                HuggingFaceModelPreset(
-                    id: "moonshine-streaming-small",
-                    label: "Moonshine Streaming Small",
-                    note: "Bigger Moonshine option for better speech recognition on Macs; ASR runtime adapter required.",
-                    config: RemoteModelConfig(
-                        repo: "cstr/moonshine-streaming-small-GGUF",
-                        revision: "main",
-                        filename: "moonshine-streaming-small-q4_k.gguf"
-                    )
-                ),
-                HuggingFaceModelPreset(
-                    id: "lfm25-1.2b-transcript-summary",
-                    label: "LFM2.5 1.2B Instruct GGUF",
-                    note: "Summarizes transcripts well on stronger local hardware; GGUF runtime required.",
-                    config: RemoteModelConfig(
-                        repo: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
-                        revision: "main",
-                        filename: "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
-                    )
-                ),
-                HuggingFaceModelPreset(
-                    id: "whisper-small",
-                    label: "Whisper small GGUF",
-                    note: "Further suggestion; requires a whisper.cpp-style runtime adapter.",
-                    config: RemoteModelConfig(
-                        repo: "forkjoin-ai/whisper-small-gguf",
-                        revision: "main",
-                        filename: "whisper-small-gguf.gguf"
+                        filename: ""
                     )
                 ),
             ]
@@ -194,13 +174,14 @@ enum LocalModelSettings {
     private static let backendPrefix = "ml.backend."
     private static let remoteModelPrefix = "ml.remoteModel."
     private static let generationPrefix = "ml.generation."
+    private static let systemPromptPrefix = "ml.systemPrompt."
 
     static func backend(for operation: LocalModelOperation) -> LocalModelBackend {
         guard let raw = UserDefaults.standard.string(forKey: backendPrefix + operation.rawValue) else {
             return .appleIntelligence
         }
-        if raw == "huggingFace" {
-            return .coreML
+        if raw == "huggingFace" || raw == "coreML" {
+            return .mlx
         }
         guard let backend = LocalModelBackend(rawValue: raw) else { return .appleIntelligence }
         return backend
@@ -236,6 +217,22 @@ enum LocalModelSettings {
             try? JSONEncoder().encode(settings),
             forKey: generationPrefix + operation.rawValue
         )
+    }
+
+    static func systemPrompt(for operation: LocalModelOperation) -> String {
+        guard let prompt = UserDefaults.standard.string(forKey: systemPromptPrefix + operation.rawValue)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !prompt.isEmpty
+        else { return operation.defaultSystemPrompt }
+        return prompt
+    }
+
+    static func setSystemPrompt(_ prompt: String, for operation: LocalModelOperation) {
+        UserDefaults.standard.set(prompt, forKey: systemPromptPrefix + operation.rawValue)
+    }
+
+    static func resetSystemPrompt(for operation: LocalModelOperation) {
+        UserDefaults.standard.removeObject(forKey: systemPromptPrefix + operation.rawValue)
     }
 }
 

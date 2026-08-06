@@ -176,10 +176,9 @@ struct ContextInlineView: View {
             Spacer(minLength: 0)
         }
         .labelStyle(.titleAndIcon)
-        .font(.caption2)
+        .font(.system(size: max(10, RichText.bodySize - 4)))
         .foregroundStyle(.tertiary)
         .lineLimit(1)
-        .padding(.horizontal, 4)
         .padding(.vertical, 4)
     }
 }
@@ -246,7 +245,7 @@ final class ContextTracker {
     #if os(macOS)
     /// MPNowPlayingInfoCenter only reports this app's own playback, so ask
     /// the players themselves. `is running` doesn't launch them.
-    private static let nowPlayingScript = NSAppleScript(source: """
+    nonisolated(unsafe) private static let nowPlayingScript = NSAppleScript(source: """
         tell application "System Events"
             set musicRunning to (name of processes) contains "Music"
             set spotifyRunning to (name of processes) contains "Spotify"
@@ -269,10 +268,14 @@ final class ContextTracker {
         """)
 
     private func updateNowPlaying() {
-        var error: NSDictionary?
-        let result = Self.nowPlayingScript?.executeAndReturnError(&error)
-        let playing = result?.stringValue ?? ""
-        snapshot.nowPlaying = playing.isEmpty ? nil : playing
+        Task.detached { [weak self] in
+            var error: NSDictionary?
+            let result = ContextTracker.nowPlayingScript?.executeAndReturnError(&error)
+            let playing = result?.stringValue ?? ""
+            await MainActor.run { [weak self] in
+                self?.snapshot.nowPlaying = playing.isEmpty ? nil : playing
+            }
+        }
     }
     #else
     private func updateNowPlaying() {

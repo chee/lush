@@ -1,46 +1,25 @@
-//
-//  ActionViewController.swift
-//  LushFinderAction
-//
-//  Created by chee on 2026-08-06.
-//
-
 import Cocoa
 
 class ActionViewController: NSViewController {
-
-    @IBOutlet var myTextView: NSTextView!
-    
-    override var nibName: NSNib.Name? {
-        return NSNib.Name("ActionViewController")
-    }
+    private let handler = FinderActionRequestHandler()
+    private var started = false
 
     override func loadView() {
-        super.loadView()
-    
-        // Insert code here to customize the view
-        NSLog("Input Items = %@", self.extensionContext!.inputItems as NSArray)
-    
-        let sharedItem = self.extensionContext!.inputItems[0] as! NSExtensionItem
-        let text = sharedItem.attributedContentText?.string
-        
-        if text != nil && !text!.isEmpty {
-            self.myTextView.string = text!
-        }
+        let label = NSTextField(labelWithString: "Adding to Lush…")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 72))
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        view = container
     }
 
-    @IBAction func send(_ sender: AnyObject?) {
-        // Note: The extension information in the Info.plist is set to accept any type of content, but this example code only handles text. You should declare the specific types to be supported by your extension in the extension's Info.plist and then make sure to handle all your supported types.
-        let outputItem = NSExtensionItem()
-        outputItem.attributedContentText = self.myTextView.attributedString()
-    
-        let outputItems = [outputItem]
-        self.extensionContext!.completeRequest(returningItems: outputItems, completionHandler: nil)
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard !started, let context = extensionContext else { return }
+        started = true
+        handler.beginRequest(with: context)
     }
-
-    @IBAction func cancel(_ sender: AnyObject?) {
-        let cancelError = NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
-        self.extensionContext!.cancelRequest(withError: cancelError)
-    }
-
 }

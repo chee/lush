@@ -2229,6 +2229,7 @@ dependencies = [
  "serde_json",
  "subduction_core",
  "subduction_crypto",
+ "subduction_ephemeral",
  "subduction_http_longpoll",
  "subduction_iroh",
  "subduction_websocket",
@@ -3970,6 +3971,24 @@ dependencies = [
  "sedimentree_core",
  "serde",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "subduction_ephemeral"
+version = "0.7.0"
+source = "git+https://github.com/inkandswitch/subduction?rev=9c0fbfd06bd499d4a8b53548788119d33af0d1ec#9c0fbfd06bd499d4a8b53548788119d33af0d1ec"
+dependencies = [
+ "async-channel",
+ "async-lock",
+ "bijoux",
+ "future_form",
+ "futures",
+ "nonempty",
+ "sedimentree_core",
+ "subduction_core",
+ "subduction_crypto",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]

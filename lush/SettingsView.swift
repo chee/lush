@@ -10,8 +10,8 @@ struct SettingsView: View {
             Tab("Editor", systemImage: "textformat") {
                 EditorSettingsPane()
             }
-            Tab("AI", systemImage: "sparkles") {
-                AISettingsPane()
+            Tab("Machine Learning", systemImage: "sparkles.tv") {
+                MachineLearningSettingsPane()
             }
             Tab("Patchwork", systemImage: "shippingbox") {
                 PatchworkSettingsPane()
@@ -34,9 +34,9 @@ struct SettingsView: View {
                 Label("Editor", systemImage: "textformat")
             }
             NavigationLink {
-                AISettingsPane()
+                MachineLearningSettingsPane()
             } label: {
-                Label("AI", systemImage: "sparkles")
+                Label("Machine Learning", systemImage: "sparkles.tv")
             }
             NavigationLink {
                 PatchworkSettingsPane()
@@ -49,15 +49,27 @@ struct SettingsView: View {
     }
 }
 
-struct AISettingsPane: View {
+struct MachineLearningSettingsPane: View {
+    @State private var selectedOperation: LocalModelOperation = .attachmentSummary
+
     var body: some View {
-        Form {
-            ForEach(LocalModelOperation.allCases) { operation in
-                LocalModelOperationSettingsView(operation: operation)
+        VStack(spacing: 0) {
+            Picker("Operation", selection: $selectedOperation) {
+                ForEach(LocalModelOperation.allCases) { operation in
+                    Label(operation.shortLabel, systemImage: operation.symbolName)
+                        .tag(operation)
+                }
             }
+            .pickerStyle(.segmented)
+            .padding([.horizontal, .top])
+
+            Form {
+                LocalModelOperationSettingsView(operation: selectedOperation)
+                    .id(selectedOperation)
+            }
+            .formStyle(.grouped)
         }
-        .formStyle(.grouped)
-        .navigationTitle("AI")
+        .navigationTitle("Machine Learning")
     }
 }
 
@@ -66,8 +78,8 @@ struct LocalModelOperationSettingsView: View {
     @State private var backend: LocalModelBackend
     @State private var config: RemoteModelConfig
     @State private var generationSettings: LocalGenerationSettings
+    @State private var systemPrompt: String
     @State private var presetFilter = ""
-    @State private var downloading = false
     @State private var status: String?
 
     init(operation: LocalModelOperation) {
@@ -75,10 +87,11 @@ struct LocalModelOperationSettingsView: View {
         _backend = State(initialValue: LocalModelSettings.backend(for: operation))
         _config = State(initialValue: LocalModelSettings.remoteModelConfig(for: operation))
         _generationSettings = State(initialValue: LocalModelSettings.generationSettings(for: operation))
+        _systemPrompt = State(initialValue: LocalModelSettings.systemPrompt(for: operation))
     }
 
     var body: some View {
-        Section {
+        Section(header: Text("Model"), footer: Text(footer)) {
             Picker("Model", selection: $backend) {
                 ForEach(LocalModelBackend.allCases) { backend in
                     Text(backend.label).tag(backend)
@@ -88,85 +101,80 @@ struct LocalModelOperationSettingsView: View {
                 LocalModelSettings.setBackend(backend, for: operation)
             }
 
-            if backend == .coreML {
-                TextField("Filter suggested models", text: $presetFilter)
-                    .autocorrectionDisabled()
-                let presets = filteredPresets
-                if presets.isEmpty {
-                    Text("No matching suggestions.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(presets) { preset in
-                        Button {
-                            config = preset.config
-                            status = preset.note
-                            LocalModelSettings.setRemoteModelConfig(config, for: operation)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(preset.label)
-                                Text(preset.note)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+            if backend == .mlx {
+                DisclosureGroup("Suggested Models") {
+                    TextField("Filter suggested models", text: $presetFilter)
+                        .autocorrectionDisabled()
+                    let presets = filteredPresets
+                    if presets.isEmpty {
+                        Text("No matching suggestions.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(presets) { preset in
+                            Button {
+                                config = preset.config
+                                status = preset.note
+                                LocalModelSettings.setRemoteModelConfig(config, for: operation)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(preset.label)
+                                    Text(preset.note)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
                     }
                 }
+
                 TextField("owner/model", text: $config.repo)
                     .autocorrectionDisabled()
                     .onChange(of: config.repo) { saveConfig() }
                 TextField("revision", text: $config.revision)
                     .autocorrectionDisabled()
                     .onChange(of: config.revision) { saveConfig() }
-                TextField("model file or package path", text: $config.filename)
-                    .autocorrectionDisabled()
-                    .onChange(of: config.filename) { saveConfig() }
-                Button(downloading ? "Downloading..." : "Download") {
-                    Task { await downloadModel() }
-                }
-                .disabled(downloading || !config.isConfigured)
-                if let localPath = config.localPath {
-                    Text(localPath)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
                 if let status {
                     Text(status)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
+        }
 
-            DisclosureGroup("Advanced") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Temperature")
-                        Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
-                            .onChange(of: generationSettings.temperature) {
-                                saveGenerationSettings()
-                            }
-                        Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Stepper(
-                        "Max response tokens: \(generationSettings.maximumResponseTokens)",
-                        value: $generationSettings.maximumResponseTokens,
-                        in: 64...4096,
-                        step: 64
-                    )
-                    .onChange(of: generationSettings.maximumResponseTokens) {
+        Section(header: Text("Generation")) {
+            HStack {
+                Text("Temperature")
+                Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
+                    .onChange(of: generationSettings.temperature) {
                         saveGenerationSettings()
                     }
-                }
+                Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
-        } header: {
-            Text(operation.label)
-        } footer: {
-            Text(footer)
+            Stepper(
+                "Max response tokens: \(generationSettings.maximumResponseTokens)",
+                value: $generationSettings.maximumResponseTokens,
+                in: 64...4096,
+                step: 64
+            )
+            .onChange(of: generationSettings.maximumResponseTokens) {
+                saveGenerationSettings()
+            }
+        }
+
+        Section(header: Text("System Prompt")) {
+            TextEditor(text: $systemPrompt)
+                .font(.caption.monospaced())
+                .frame(minHeight: 150)
+                .onChange(of: systemPrompt) {
+                    saveSystemPrompt()
+                }
+            Button("Reset System Prompt") {
+                systemPrompt = operation.defaultSystemPrompt
+                LocalModelSettings.resetSystemPrompt(for: operation)
+            }
         }
     }
 
@@ -186,8 +194,8 @@ struct LocalModelOperationSettingsView: View {
         switch backend {
         case .appleIntelligence:
             "Uses Apple's on-device Foundation Models when Apple Intelligence is available. Advanced settings apply immediately."
-        case .coreML:
-            "CoreML-LLM models can load by repo on first generation when that package is linked. Single-file downloads are for staged artifacts; GGUF and Moonshine suggestions still need their own runtime adapters."
+        case .mlx:
+            "MLX models download from HuggingFace automatically on first use. Enter any mlx-community repo ID."
         }
     }
 
@@ -199,20 +207,10 @@ struct LocalModelOperationSettingsView: View {
         LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
     }
 
-    private func downloadModel() async {
-        downloading = true
-        status = nil
-        saveConfig()
-        do {
-            let downloaded = try await RemoteModelDownloader.download(config, for: operation)
-            config = downloaded
-            LocalModelSettings.setRemoteModelConfig(downloaded, for: operation)
-            status = "Downloaded"
-        } catch {
-            status = error.localizedDescription
-        }
-        downloading = false
+    private func saveSystemPrompt() {
+        LocalModelSettings.setSystemPrompt(systemPrompt, for: operation)
     }
+
 }
 
 struct SyncSettingsPane: View {
@@ -365,6 +363,8 @@ struct EditorSettingsPane: View {
     @State private var handFamily = EditorSettings.family(for: "hand")
     @State private var fontSize = EditorSettings.bodySize
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var typewriterMode = EditorSettings.typewriterMode
+    @State private var minimapVisible = EditorSettings.minimapVisible
     @State private var places = SavedPlaces.all
     @State private var placeName = ""
 
@@ -406,6 +406,14 @@ struct EditorSettingsPane: View {
                 }
             }
             Section("Logline") {
+                Toggle("Typewriter mode (center caret, dim other paragraphs)", isOn: $typewriterMode)
+                    .onChange(of: typewriterMode) {
+                        EditorSettings.setTypewriterMode(typewriterMode)
+                    }
+                Toggle("Show minimap", isOn: $minimapVisible)
+                    .onChange(of: minimapVisible) {
+                        EditorSettings.setMinimapVisible(minimapVisible)
+                    }
                 Toggle("Add logline when context changes", isOn: $autoInsertLogline)
                     .onChange(of: autoInsertLogline) {
                         EditorSettings.setAutoInsertLogline(autoInsertLogline)

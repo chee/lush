@@ -17,6 +17,9 @@ final class InlineViewManager {
         let view: PView
         let preferredSize: (CGFloat) -> CGSize
         let retained: AnyObject?
+        /// Retaining the box keeps its ObjectIdentifier from being recycled
+        /// while the host is cached.
+        var box: AnyObject?
     }
 
     private var hosts: [ObjectIdentifier: Host] = [:]
@@ -40,13 +43,14 @@ final class InlineViewManager {
 
     private func host(for box: AnyObject) -> Host? {
         let id = ObjectIdentifier(box)
-        if let hit = hosts[id] { return hit }
-        let host: Host? = switch box {
+        if let hit = hosts[id], hit.box === box { return hit }
+        var host: Host? = switch box {
         case let table as TableBox: makeTableHost(for: table)
         case let columns as ColumnsBox: makeColumnsHost(for: columns)
         case let block as BlockBox where block.value.isEmbedBlock: makeEmbedHost(for: block)
         default: nil
         }
+        host?.box = box
         hosts[id] = host
         return host
     }

@@ -6,3 +6,4 @@ pub mod api;
 pub mod repo;
 pub mod search;
 pub mod shapes;
+pub mod wire;

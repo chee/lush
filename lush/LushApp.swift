@@ -16,6 +16,12 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.servicesProvider = LushServicesProvider.shared
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        NotesModel.shared.activeEditor?.core?.pushNow()
+        NotesModel.shared.presence.leave()
+        NotesModel.shared.core?.shutdown()
+    }
+
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(
@@ -187,6 +193,19 @@ struct FormatCommands: Commands {
                 }
             }
             Divider()
+            Button("Fold Section") {
+                editor?.core?.toggleFoldAtSelection()
+            }
+            .keyboardShortcut("-", modifiers: [.command, .option])
+            Button("Stash Paragraph to Canvas") {
+                editor?.core?.stashSelection()
+            }
+            .keyboardShortcut("s", modifiers: [.command, .control])
+            Button("Typewriter Mode") {
+                EditorSettings.setTypewriterMode(!EditorSettings.typewriterMode)
+            }
+            .keyboardShortcut("t", modifiers: [.command, .control])
+            Divider()
             Button("Attach Image…") { editor?.attachImageFromPanel() }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
             Button("Attach File…") { editor?.attachFileFromPanel() }
@@ -209,13 +228,29 @@ struct FormatCommands: Commands {
 #if os(macOS)
 struct SearchCommands: Commands {
     @FocusedValue(\.noteSearchActions) private var searchActions
+    @FocusedValue(\.editorController) private var editor
 
     var body: some Commands {
         CommandGroup(after: .textEditing) {
-            Button("Find") {
-                searchActions?.focusNoteSearch()
+            Button("Find in Note") {
+                editor?.openFind()
             }
             .keyboardShortcut("f")
+
+            Button("Select Next Occurrence") {
+                editor?.core?.selectNextOccurrence()
+            }
+            .keyboardShortcut("d")
+
+            Button("Find Next") {
+                editor?.findNext()
+            }
+            .keyboardShortcut("g")
+
+            Button("Find Previous") {
+                editor?.findPrevious()
+            }
+            .keyboardShortcut("g", modifiers: [.command, .shift])
 
             Button("Search Notes") {
                 searchActions?.focusNotesSearch()

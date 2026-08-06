@@ -106,10 +106,7 @@ enum MarkerDrawing {
         // (the 2.5 left margin, containerWidth) need origin applied
         let contentLeft = lineRect.minX
         let left = max(origin.x + 2.5, contentLeft - 18)
-        let contentRight = lineRect.maxX + 18
-        let maxRight = origin.x + containerWidth - 24
-        let minRight = left + 72
-        let right = min(maxRight, max(contentRight, minRight))
+        let right = origin.x + containerWidth - 24
         let background = CGRect(
             x: left,
             y: origin.y + lineRect.minY - 2,
@@ -117,7 +114,7 @@ enum MarkerDrawing {
             height: lineRect.height + 4
         )
         let accent = CGRect(
-            x: background.minX + 7,
+            x: background.minX + 2,
             y: background.minY + 4,
             width: 3.5,
             height: max(0, background.height - 8)
@@ -125,23 +122,119 @@ enum MarkerDrawing {
         return (background, accent)
     }
 
-    static func quoteBackground(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat) {
-        let rect = quoteRects(lineRect: lineRect, origin: origin, containerWidth: containerWidth).background
+    private static func roundedBlockPath(rect: CGRect, radius: CGFloat, roundTop: Bool, roundBottom: Bool) -> PBezierPath {
+        let r = min(radius, rect.width / 2, rect.height / 2)
+        let c = r * 0.5522847498
+        let path = PBezierPath()
+        path.move(to: CGPoint(x: rect.minX + (roundTop ? r : 0), y: rect.minY))
+        path.line(to: CGPoint(x: rect.maxX - (roundTop ? r : 0), y: rect.minY))
+        if roundTop {
+            path.curve(
+                to: CGPoint(x: rect.maxX, y: rect.minY + r),
+                controlPoint1: CGPoint(x: rect.maxX - r + c, y: rect.minY),
+                controlPoint2: CGPoint(x: rect.maxX, y: rect.minY + r - c)
+            )
+        }
+        path.line(to: CGPoint(x: rect.maxX, y: rect.maxY - (roundBottom ? r : 0)))
+        if roundBottom {
+            path.curve(
+                to: CGPoint(x: rect.maxX - r, y: rect.maxY),
+                controlPoint1: CGPoint(x: rect.maxX, y: rect.maxY - r + c),
+                controlPoint2: CGPoint(x: rect.maxX - r + c, y: rect.maxY)
+            )
+        }
+        path.line(to: CGPoint(x: rect.minX + (roundBottom ? r : 0), y: rect.maxY))
+        if roundBottom {
+            path.curve(
+                to: CGPoint(x: rect.minX, y: rect.maxY - r),
+                controlPoint1: CGPoint(x: rect.minX + r - c, y: rect.maxY),
+                controlPoint2: CGPoint(x: rect.minX, y: rect.maxY - r + c)
+            )
+        }
+        path.line(to: CGPoint(x: rect.minX, y: rect.minY + (roundTop ? r : 0)))
+        if roundTop {
+            path.curve(
+                to: CGPoint(x: rect.minX + r, y: rect.minY),
+                controlPoint1: CGPoint(x: rect.minX, y: rect.minY + r - c),
+                controlPoint2: CGPoint(x: rect.minX + r - c, y: rect.minY)
+            )
+        }
+        path.close()
+        return path
+    }
+
+    static func quoteBackground(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat, first: Bool = true, last: Bool = true) {
+        var rect = quoteRects(lineRect: lineRect, origin: origin, containerWidth: containerWidth).background
+        if !first {
+            rect.origin.y += 2
+            rect.size.height -= 2
+        }
+        if !last {
+            rect.size.height -= 2
+        }
         quoteBackground.setFill()
+        roundedBlockPath(rect: rect, radius: 6, roundTop: first, roundBottom: last).fill()
+    }
+
+    static func quoteAccent(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat, first: Bool = true, last: Bool = true) {
+        var rect = quoteRects(lineRect: lineRect, origin: origin, containerWidth: containerWidth).accent
+        if !first {
+            rect.origin.y -= 4
+            rect.size.height += 4
+        }
+        if !last {
+            rect.size.height += 4
+        }
+        quoteAccent.setFill()
         #if os(macOS)
-        NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+        NSBezierPath(roundedRect: rect, xRadius: first || last ? 1.75 : 0, yRadius: first || last ? 1.75 : 0).fill()
         #else
-        UIBezierPath(roundedRect: rect, cornerRadius: 6).fill()
+        UIBezierPath(roundedRect: rect, cornerRadius: first || last ? 1.75 : 0).fill()
         #endif
     }
 
-    static func quoteAccent(lineRect: CGRect, origin: CGPoint, containerWidth: CGFloat) {
-        let rect = quoteRects(lineRect: lineRect, origin: origin, containerWidth: containerWidth).accent
-        quoteAccent.setFill()
+    static var changeBarColor: PColor {
         #if os(macOS)
-        NSBezierPath(roundedRect: rect, xRadius: 1.75, yRadius: 1.75).fill()
+        PColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? PColor(rgb: 0xDA702C, alpha: 0.85)
+                : PColor(rgb: 0xBC5215, alpha: 0.85)
+        }
         #else
-        UIBezierPath(roundedRect: rect, cornerRadius: 1.75).fill()
+        PColor { traits in
+            traits.userInterfaceStyle == .dark
+                ? PColor(rgb: 0xDA702C, alpha: 0.85)
+                : PColor(rgb: 0xBC5215, alpha: 0.85)
+        }
+        #endif
+    }
+
+    /// A folded heading's disclosure triangle, drawn in the container inset.
+    static func foldChevron(lineRect: CGRect, origin: CGPoint, font: PFont) {
+        let size = font.pointSize * 0.42
+        let midY = origin.y + lineRect.minY + font.ascender - font.xHeight / 2
+        let path = PBezierPath()
+        path.move(to: CGPoint(x: origin.x - 15, y: midY - size))
+        path.line(to: CGPoint(x: origin.x - 15 + size * 1.4, y: midY))
+        path.line(to: CGPoint(x: origin.x - 15, y: midY + size))
+        path.close()
+        PColor.pTint.setFill()
+        path.fill()
+    }
+
+    /// History viewer: this paragraph differs from the parent version.
+    static func changeBar(lineRect: CGRect, origin: CGPoint) {
+        let rect = CGRect(
+            x: origin.x + 2,
+            y: origin.y + lineRect.minY + 1,
+            width: 3,
+            height: max(0, lineRect.height - 2)
+        )
+        changeBarColor.setFill()
+        #if os(macOS)
+        NSBezierPath(roundedRect: rect, xRadius: 1.5, yRadius: 1.5).fill()
+        #else
+        UIBezierPath(roundedRect: rect, cornerRadius: 1.5).fill()
         #endif
     }
 
@@ -203,6 +296,19 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
     /// attributes on, so its marker comes from the view's typing attributes
     /// via this hook.
     var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
+    var foldedHeadingsProvider: (() -> Set<HeadingFoldKey>)?
+
+    private var headingFoldKey: HeadingFoldKey? {
+        guard let paragraph = textElement as? NSTextParagraph,
+              let box = paragraphAttributes?[.amBlock] as? BlockBox,
+              box.value.type == "heading"
+        else { return nil }
+        return HeadingFoldKey(
+            text: paragraph.attributedString.string
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            level: box.value.headingLevel ?? 1
+        )
+    }
 
     private var paragraphAttributes: [NSAttributedString.Key: Any]? {
         guard let paragraph = textElement as? NSTextParagraph,
@@ -264,6 +370,13 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
             let typingIndent = (typing[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
             indent = max(indent, typingIndent)
         }
+        if paragraphAttributes?[.amChanged] != nil {
+            indent = max(indent, 12)
+        }
+        if let key = headingFoldKey,
+           foldedHeadingsProvider?().contains(key) == true {
+            indent = max(indent, 12)
+        }
         guard indent > 0 else { return bounds }
         // The fragment hugs the text, so container x = 0 sits at local
         // -(indent + lineFragmentPadding); markers live left of the text.
@@ -317,6 +430,39 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         if end < storage.length {
             let next = str.paragraphRange(for: NSRange(location: end, length: 0))
             last = !CodeHighlight.isCodeParagraph(next, language: nil, in: storage)
+        }
+        return (first, last)
+    }
+
+    private func quoteRunEdges() -> (first: Bool, last: Bool) {
+        guard let (storage, location) = storageContext(),
+              storage.length > 0,
+              let box = paragraphAttributes?[.amBlock] as? BlockBox
+        else { return (true, true) }
+        let str = storage.string as NSString
+        let anchor = min(location, storage.length - 1)
+        let paragraph = str.paragraphRange(for: NSRange(location: anchor, length: 0))
+
+        func isMatchingQuote(_ range: NSRange) -> Bool {
+            guard range.length > 0,
+                  range.location >= 0,
+                  range.location < storage.length,
+                  let other = storage.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox
+            else { return false }
+            return other.value.type == "blockquote" && other.value.parents == box.value.parents
+        }
+
+        var first = true
+        if paragraph.location > 0 {
+            let previous = str.paragraphRange(for: NSRange(location: paragraph.location - 1, length: 0))
+            first = !isMatchingQuote(previous)
+        }
+
+        var last = true
+        let end = NSMaxRange(paragraph)
+        if end < storage.length {
+            let next = str.paragraphRange(for: NSRange(location: end, length: 0))
+            last = !isMatchingQuote(next)
         }
         return (first, last)
     }
@@ -455,7 +601,14 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
            let width = textLayoutManager?.textContainer?.size.width {
             let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
             if !lineRect.isNull {
-                MarkerDrawing.quoteBackground(lineRect: lineRect, origin: origin, containerWidth: width)
+                let edges = quoteRunEdges()
+                MarkerDrawing.quoteBackground(
+                    lineRect: lineRect,
+                    origin: origin,
+                    containerWidth: width,
+                    first: edges.first,
+                    last: edges.last
+                )
             }
         }
         if isTypingQuoteBlockOnTrailingLine,
@@ -472,7 +625,14 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
            let width = textLayoutManager?.textContainer?.size.width {
             let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
             if !lineRect.isNull {
-                MarkerDrawing.quoteAccent(lineRect: lineRect, origin: origin, containerWidth: width)
+                let edges = quoteRunEdges()
+                MarkerDrawing.quoteAccent(
+                    lineRect: lineRect,
+                    origin: origin,
+                    containerWidth: width,
+                    first: edges.first,
+                    last: edges.last
+                )
             }
         }
         if isTypingQuoteBlockOnTrailingLine,
@@ -483,6 +643,18 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
                 origin: origin,
                 containerWidth: width
             )
+        }
+        if attrs?[.amChanged] != nil {
+            let lineRect = textLineFragments.reduce(CGRect.null) { $0.union($1.typographicBounds) }
+            if !lineRect.isNull {
+                MarkerDrawing.changeBar(lineRect: lineRect, origin: origin)
+            }
+        }
+        if let key = headingFoldKey,
+           foldedHeadingsProvider?().contains(key) == true,
+           let lineRect = contentLines.first?.typographicBounds {
+            let font = attrs?[.font] as? PFont ?? PFont.systemFont(ofSize: RichText.bodySize)
+            MarkerDrawing.foldChevron(lineRect: lineRect, origin: origin, font: font)
         }
         if let block = decoratedBlock(attrs), let attrs,
            block.type != "blockquote",
@@ -660,6 +832,7 @@ func invalidateCodeRun(
 
 final class ListMarkerLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
     var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
+    var foldedHeadingsProvider: (() -> Set<HeadingFoldKey>)?
 
     func textLayoutManager(
         _ textLayoutManager: NSTextLayoutManager,
@@ -671,6 +844,7 @@ final class ListMarkerLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
             range: textElement.elementRange
         )
         fragment.typingAttributesProvider = typingAttributesProvider
+        fragment.foldedHeadingsProvider = foldedHeadingsProvider
         return fragment
     }
 }

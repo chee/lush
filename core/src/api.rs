@@ -163,6 +163,7 @@ pub trait CoreDelegate: Send + Sync {
     fn on_doc_changed(&self, url: String);
     fn on_connection_changed(&self, connected: bool);
     fn on_sync_event(&self, message: String);
+    fn on_ephemeral_message(&self, url: String, payload: Vec<u8>);
 }
 
 #[derive(uniffi::Object)]
@@ -171,7 +172,7 @@ pub struct Core {
     repo: Arc<Repo>,
     index: Arc<SearchIndex>,
     folder: std::sync::Mutex<Option<DocId>>,
-    history_cache: std::sync::Mutex<HashMap<DocId, CachedDocHistory>>,
+    history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
 }
 
 #[derive(Clone)]
@@ -212,6 +213,7 @@ fn append_history_entries(history: &mut CachedDocHistory, changes: Vec<ChangeMet
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const LINK_TIMEOUT: Duration = Duration::from_secs(5);
+const HISTORY_CACHE_DOCS: usize = 8;
 
 impl Core {
     fn start_index_updates(self: &Arc<Self>) {
@@ -224,10 +226,14 @@ impl Core {
                     Ok(RepoEvent::DocChanged(id)) => {
                         tokio::spawn(index_doc(repo.clone(), index.clone(), id));
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("index missed {n} events");
+                        tracing::warn!("index missed {n} events; reindexing tracked docs");
+                        for id in repo.tracked_doc_ids().await {
+                            tokio::spawn(index_doc(repo.clone(), index.clone(), id));
+                        }
                     }
-                    _ => break,
+                    Ok(_) => {}
                 }
             }
         });
@@ -282,6 +288,7 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
 impl Core {
     #[uniffi::constructor]
     pub fn new(data_dir: String, server_url: Option<String>) -> Result<Arc<Self>, CoreError> {
+        let boot = std::time::Instant::now();
         static TRACING: std::sync::Once = std::sync::Once::new();
         TRACING.call_once(|| {
             let _ = tracing_subscriber::fmt()
@@ -296,10 +303,19 @@ impl Core {
         let runtime = Runtime::new().map_err(|e| CoreError::General {
             msg: format!("tokio runtime: {e}"),
         })?;
+        tracing::info!(
+            elapsed_ms = boot.elapsed().as_millis(),
+            "core runtime ready"
+        );
         let server = server_url.unwrap_or_else(|| DEFAULT_SERVER.to_string());
         let data_dir = PathBuf::from(data_dir);
         let index = Arc::new(SearchIndex::open(&data_dir)?);
+        tracing::info!(
+            elapsed_ms = boot.elapsed().as_millis(),
+            "search index opened"
+        );
         let repo = runtime.block_on(Repo::start(data_dir, server))?;
+        tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "repo started");
         let core = Arc::new(Core {
             runtime,
             repo,
@@ -308,6 +324,7 @@ impl Core {
             history_cache: std::sync::Mutex::new(HashMap::new()),
         });
         core.start_index_updates();
+        tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "core constructed");
         Ok(core)
     }
 
@@ -320,6 +337,9 @@ impl Core {
                     Ok(RepoEvent::Connected) => delegate.on_connection_changed(true),
                     Ok(RepoEvent::Disconnected) => delegate.on_connection_changed(false),
                     Ok(RepoEvent::SyncEvent(msg)) => delegate.on_sync_event(msg),
+                    Ok(RepoEvent::Ephemeral(id, payload)) => {
+                        delegate.on_ephemeral_message(id.to_url(), payload)
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("delegate missed {n} events");
                         delegate.on_sync_event(format!(
@@ -371,10 +391,10 @@ impl Core {
 
                     let changes = doc.get_changes_meta(&cached.heads);
                     if !cached.heads.is_empty() && !changes.is_empty() {
-                        let mut next = cached;
+                        let mut next = (*cached).clone();
                         next.heads = current_heads;
                         append_history_entries(&mut next, changes);
-                        return Ok(next);
+                        return Ok(Arc::new(next));
                     }
                 }
 
@@ -385,7 +405,7 @@ impl Core {
                     entries: Vec::new(),
                 };
                 append_history_entries(&mut next, doc.get_changes_meta(&[]));
-                Ok(next)
+                Ok(Arc::new(next))
             }))
             .ok();
 
@@ -393,7 +413,15 @@ impl Core {
             return Vec::new();
         };
         let entries = history.entries.clone();
-        self.history_cache.lock().unwrap().insert(id, history);
+        {
+            let mut cache = self.history_cache.lock().unwrap();
+            if cache.len() >= HISTORY_CACHE_DOCS && !cache.contains_key(&id) {
+                if let Some(evicted) = cache.keys().next().copied() {
+                    cache.remove(&evicted);
+                }
+            }
+            cache.insert(id, history);
+        }
         entries
     }
 
@@ -1290,22 +1318,42 @@ impl Core {
         Ok(snapshot)
     }
 
-    pub fn update_note_spans(&self, url: String, spans_json: String) -> Result<(), CoreError> {
+    /// Replace the note's content with the given spans. When `heads` is
+    /// provided and the doc has advanced past them, the update is applied on a
+    /// fork at those heads and merged back (the `changeAt` pattern the splice
+    /// path uses), so concurrent remote edits survive a stale full-document
+    /// save. Returns the doc's heads after the change.
+    pub fn update_note_spans(
+        &self,
+        url: String,
+        spans_json: String,
+        heads: Option<Vec<String>>,
+    ) -> Result<Vec<String>, CoreError> {
         guarded(|| {
             let repo = self.repo.clone();
             let reindex_url = url.clone();
-            self.runtime.block_on(async move {
+            let heads = decode_heads(heads.unwrap_or_default())?;
+            let new_heads = self.runtime.block_on(async move {
                 let id = DocId::from_url(&url)?;
                 let spans: Vec<shapes::SpanJson> = serde_json::from_str(&spans_json)?;
-                repo.change_doc(id, |doc| {
-                    shapes::update_spans_from_json(doc, &spans)?;
-                    Ok(())
-                })
-                .await?;
-                Ok::<_, anyhow::Error>(())
+                if heads.is_empty() {
+                    repo.change_doc(id, |doc| {
+                        shapes::update_spans_from_json(doc, &spans)?;
+                        Ok(())
+                    })
+                    .await?;
+                } else {
+                    repo.change_doc_at(id, heads, |doc| {
+                        shapes::update_spans_from_json(doc, &spans)?;
+                        Ok(())
+                    })
+                    .await?;
+                }
+                repo.read_doc(id, |doc| Ok(encode_heads(doc.get_heads())))
+                    .await
             })?;
             self.reindex_doc(DocId::from_url(&reindex_url)?);
-            Ok(())
+            Ok(new_heads)
         })
     }
 
@@ -1370,6 +1418,42 @@ impl Core {
             })?;
             Ok(current_heads)
         })
+    }
+
+    /// Sign and broadcast opaque ephemeral bytes on the doc's topic.
+    /// Fire-and-forget: returns once the send is queued, not delivered.
+    pub fn publish_ephemeral(&self, url: String, payload: Vec<u8>) -> Result<(), CoreError> {
+        let id = DocId::from_url(&url)?;
+        let repo = self.repo.clone();
+        self.runtime
+            .spawn(async move { repo.publish_ephemeral(id, payload).await });
+        Ok(())
+    }
+
+    /// A stable automerge cursor string for an index into the note text
+    /// (the same text field the splice/spans APIs target).
+    /// Called synchronously from the UI thread, so it never waits on the doc
+    /// lock: a busy doc is an error the caller retries on its next tick.
+    pub fn text_cursor(&self, url: String, index: u64) -> Result<String, CoreError> {
+        let repo = self.repo.clone();
+        let cursor = self.runtime.block_on(async move {
+            let id = DocId::from_url(&url)?;
+            repo.try_read_doc(id, |doc| shapes::text_cursor(doc, index as usize))
+                .await
+        })?;
+        Ok(cursor)
+    }
+
+    /// The current index of an automerge cursor into the note text.
+    /// Non-blocking like `text_cursor`.
+    pub fn cursor_index(&self, url: String, cursor: String) -> Result<u64, CoreError> {
+        let repo = self.repo.clone();
+        let index = self.runtime.block_on(async move {
+            let id = DocId::from_url(&url)?;
+            repo.try_read_doc(id, |doc| shapes::cursor_index(doc, &cursor))
+                .await
+        })?;
+        Ok(index as u64)
     }
 
     /// Like `update_note_spans`, but the commit is stamped with the given
@@ -1516,6 +1600,44 @@ impl Core {
                 })
                 .await?;
                 Ok::<_, anyhow::Error>(note.to_url())
+            })?;
+            self.reindex_doc(DocId::from_url(&url)?);
+            Ok(url)
+        })
+    }
+
+    /// Store binary data as a patchwork UnixFileEntry doc linked into a
+    /// specific folder doc; returns the file doc's URL.
+    pub fn create_asset_in(
+        &self,
+        folder_url: String,
+        name: String,
+        extension: String,
+        mime_type: String,
+        data: Vec<u8>,
+    ) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let folder = DocId::from_url(&folder_url)?;
+                let file = repo
+                    .create_doc(|doc| {
+                        shapes::init_file_doc(doc, &name, &extension, &mime_type, data)
+                    })
+                    .await?;
+                repo.change_doc(folder, |doc| {
+                    shapes::add_folder_entry(
+                        doc,
+                        &shapes::DocLink {
+                            name: name.clone(),
+                            kind: "file".into(),
+                            url: file.to_url(),
+                            lush: None,
+                        },
+                    )
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(file.to_url())
             })?;
             self.reindex_doc(DocId::from_url(&url)?);
             Ok(url)

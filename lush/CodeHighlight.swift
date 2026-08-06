@@ -223,8 +223,9 @@ extension CodeHighlight {
                   clipped.length > 0,
                   let textRange = contentStorage.textRange(for: clipped)
             else { continue }
-            textLayoutManager.setRenderingAttributes(
-                renderingAttributes(for: token.kind),
+            textLayoutManager.addRenderingAttribute(
+                .foregroundColor,
+                value: color(for: token.kind),
                 for: textRange
             )
         }

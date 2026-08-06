@@ -17,6 +17,7 @@ sedimentree_core = { git = "https://github.com/inkandswitch/subduction", rev = "
 sedimentree_fs_storage = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec" }
 subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["system_time"] }
 subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["std"] }
+subduction_ephemeral = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["std"] }
 subduction_websocket = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["tokio_client", "tokio_server_any"] }
 subduction_iroh = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec" }
 subduction_http_longpoll = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", features = ["server"] }

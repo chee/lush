@@ -158,34 +158,58 @@ fn json_to_scalar(v: &Json) -> ScalarValue {
     }
 }
 
+/// Both conversions recurse over structures a remote peer controls, so
+/// nesting is capped rather than trusted — anything deeper flattens to null
+/// instead of overflowing the stack.
+const MAX_VALUE_DEPTH: usize = 64;
+
 fn hydrate_to_json(v: &hydrate::Value) -> Json {
+    hydrate_to_json_at(v, 0)
+}
+
+fn hydrate_to_json_at(v: &hydrate::Value, depth: usize) -> Json {
+    if depth >= MAX_VALUE_DEPTH {
+        return Json::Null;
+    }
     match v {
         hydrate::Value::Scalar(s) => scalar_to_json(s),
         hydrate::Value::Map(m) => {
             let mut out = serde_json::Map::new();
             for (k, entry) in m.iter() {
-                out.insert(k.to_string(), hydrate_to_json(&entry.value));
+                out.insert(k.to_string(), hydrate_to_json_at(&entry.value, depth + 1));
             }
             Json::Object(out)
         }
-        hydrate::Value::List(l) => {
-            Json::Array(l.iter().map(|item| hydrate_to_json(&item.value)).collect())
-        }
+        hydrate::Value::List(l) => Json::Array(
+            l.iter()
+                .map(|item| hydrate_to_json_at(&item.value, depth + 1))
+                .collect(),
+        ),
         hydrate::Value::Text(t) => json!(t.to_string()),
     }
 }
 
 fn json_to_hydrate(v: &Json) -> hydrate::Value {
+    json_to_hydrate_at(v, 0)
+}
+
+fn json_to_hydrate_at(v: &Json, depth: usize) -> hydrate::Value {
+    if depth >= MAX_VALUE_DEPTH {
+        return hydrate::Value::Scalar(ScalarValue::Null);
+    }
     match v {
         Json::Object(o) => {
             let m: std::collections::HashMap<String, hydrate::Value> = o
                 .iter()
-                .map(|(k, val)| (k.clone(), json_to_hydrate(val)))
+                .map(|(k, val)| (k.clone(), json_to_hydrate_at(val, depth + 1)))
                 .collect();
             hydrate::Value::Map(hydrate::Map::from(m))
         }
         Json::Array(a) => {
-            let l: Vec<hydrate::Value> = a.iter().map(json_to_hydrate).collect();
+            let l: Vec<hydrate::Value> = a
+                .iter()
+                .map(|item| json_to_hydrate_at(item, depth + 1))
+                .collect();
             hydrate::Value::List(hydrate::List::from(l))
         }
         other => hydrate::Value::Scalar(json_to_scalar(other)),
@@ -319,6 +343,32 @@ pub fn update_spans_from_json(doc: &mut Automerge, spans: &[SpanJson]) -> anyhow
         },
     ))?;
     Ok(doc.get_heads() != before)
+}
+
+fn content_id(doc: &Automerge) -> anyhow::Result<automerge::ObjId> {
+    match doc.get(ROOT, "content")? {
+        Some((automerge::Value::Object(ObjType::Text), id)) => Ok(id),
+        _ => anyhow::bail!("note has no text content"),
+    }
+}
+
+/// A stable automerge cursor string for a position in the note text.
+/// Matches JS `Automerge.getCursor`: indexes at or past the end become
+/// the end cursor.
+pub fn text_cursor(doc: &Automerge, index: usize) -> anyhow::Result<String> {
+    let content = content_id(doc)?;
+    let position = if index >= doc.length(&content) {
+        automerge::CursorPosition::End
+    } else {
+        automerge::CursorPosition::Index(index)
+    };
+    Ok(doc.get_cursor(&content, position, None)?.to_string())
+}
+
+pub fn cursor_index(doc: &Automerge, cursor: &str) -> anyhow::Result<usize> {
+    let content = content_id(doc)?;
+    let cursor = automerge::Cursor::try_from(cursor)?;
+    Ok(doc.get_cursor_position(&content, &cursor, None)?)
 }
 
 pub fn splice_note_text(
@@ -1007,6 +1057,57 @@ mod tests {
         let mut doc = Automerge::new();
         init_file_doc(&mut doc, "cat.png", "png", "image/png", vec![1, 2, 3]).unwrap();
         assert_eq!(file_bytes(&doc), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_not_overflowed() {
+        let mut v = json!(1);
+        for _ in 0..500 {
+            v = json!([v]);
+        }
+        let hydrated = json_to_hydrate(&v);
+        let _ = hydrate_to_json(&hydrated);
+    }
+
+    #[test]
+    fn stale_full_save_merges_with_concurrent_insert() {
+        let mut base = Automerge::new();
+        init_rich_note(&mut base, "hello").unwrap();
+        update_spans_from_json(
+            &mut base,
+            &[
+                SpanJson::Block {
+                    value: json!({ "type": "paragraph", "parents": [] }),
+                },
+                SpanJson::Text {
+                    value: "hello".into(),
+                    marks: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut remote = base.fork();
+        splice_note_text(&mut remote, 6, 0, " world", "hello world").unwrap();
+
+        let mut stale_save = base.fork();
+        update_spans_from_json(
+            &mut stale_save,
+            &[
+                SpanJson::Block {
+                    value: json!({ "type": "heading", "parents": [], "attrs": { "level": 1 } }),
+                },
+                SpanJson::Text {
+                    value: "hello".into(),
+                    marks: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        base.merge(&mut remote).unwrap();
+        base.merge(&mut stale_save).unwrap();
+        assert_eq!(full_text(&base), "hello world");
     }
 
     #[test]

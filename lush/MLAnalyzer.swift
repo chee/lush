@@ -44,7 +44,7 @@ enum MLAnalyzer {
         switch LocalModelSettings.backend(for: operation) {
         case .appleIntelligence:
             return try await analyzeWithFoundationModels(evidence, operation: operation)
-        case .coreML:
+        case .mlx:
             return try await analyzeWithCoreMLModel(evidence, operation: operation)
         }
     }
@@ -58,9 +58,7 @@ enum MLAnalyzer {
         let model = SystemLanguageModel.default
         guard model.isAvailable else { throw AnalyzerError.appleIntelligenceUnavailable }
 
-        let instructions = """
-        Create concise searchable metadata for a note attachment. Use only the supplied evidence. Do not add facts that are not present. Return strict JSON with keys summary, caption, keywords.
-        """
+        let instructions = LocalModelSettings.systemPrompt(for: operation)
         let prompt = """
         Attachment name: \(evidence.name)
         Attachment kind: \(evidence.kind)
@@ -111,7 +109,7 @@ enum MLAnalyzer {
         let text = evidence.text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         let description = evidence.description.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         let prompt = """
-        Create concise searchable metadata for a note attachment. Use only the supplied evidence. Do not add facts that are not present. Return strict JSON with keys summary, caption, keywords.
+        \(LocalModelSettings.systemPrompt(for: operation))
 
         Attachment name: \(evidence.name)
         Attachment kind: \(evidence.kind)

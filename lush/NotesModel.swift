@@ -11,6 +11,18 @@ final class NotesModel {
 
     private(set) var core: Core?
     var notes: [NoteInfo] = []
+    /// The sidebar search query, mirrored here so the editor can tint the
+    /// matches inside an opened note.
+    var searchQuery = ""
+    /// The frontmost note's editor, for inspector tabs that talk to it.
+    weak var activeEditor: EditorController?
+    let presence = PresenceManager()
+    /// The logged-in account's contact doc url — the presence identity key.
+    private(set) var presenceContactUrl: String?
+
+    func ephemeralMessageReceived(url: String, payload: Data) {
+        presence.receive(url: url, payload: payload)
+    }
     var folderUrl: String?
     var folderTitle: String = ""
     var connected = false
@@ -52,6 +64,7 @@ final class NotesModel {
     private var lastKnownCounts: [String: Int] = [:]
     private static let patchworkDocUrlsKey = "patchworkDocUrls"
     private static let launchSnapshotFileName = "LaunchStateSnapshot.json"
+    private static let bootStart = Date()
     private(set) var patchworkDocUrls: Set<String> = Set(
         UserDefaults.standard.stringArray(forKey: patchworkDocUrlsKey) ?? []
     )
@@ -63,18 +76,7 @@ final class NotesModel {
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
 
     init() {
-        guard let snapshot = Self.loadLaunchSnapshot() else { return }
-        rootFolderUrls = snapshot.rootFolderUrls
-        folderUrl = snapshot.folderUrl ?? snapshot.rootFolderUrls.first
-        folderTitle = snapshot.folderTitle
-        notes = snapshot.notes
-        folderTree = snapshot.folderTree
-        previews = snapshot.previews
-        thumbnails = snapshot.thumbnails
-        selectedNoteUrl = snapshot.selectedNoteUrl
-        launchNoteSnapshots = snapshot.noteSnapshots
-        metaFetched = Set(snapshot.previews.keys)
-        status = ""
+        Self.bootLog("model init")
     }
 
     /// Open editors register here to hear about local and remote changes.
@@ -166,6 +168,7 @@ final class NotesModel {
             refreshNotes()
         }
         guard let contactUrl = state.contactUrl, let core else { return }
+        presenceContactUrl = contactUrl
         let info = await Task.detached { core.contactInfo(url: contactUrl) }.value
         contactName = info?.name
         if let avatarUrl = info?.avatarUrl {
@@ -197,6 +200,11 @@ final class NotesModel {
 
     private func persistRoots() {
         UserDefaults.standard.set(rootFolderUrls, forKey: Self.foldersDefaultsKey)
+    }
+
+    private static func bootLog(_ message: String) {
+        let ms = Int(Date().timeIntervalSince(bootStart) * 1000)
+        NSLog("lush boot +%dms %@", ms, message)
     }
 
     private static func loadLaunchSnapshot() -> NotesLaunchSnapshot? {
@@ -261,6 +269,7 @@ final class NotesModel {
 
     private func startOnce() async {
         guard core == nil else { return }
+        Self.bootLog("startOnce begin")
         do {
             let support = FileManager.default.urls(
                 for: .applicationSupportDirectory,
@@ -275,6 +284,7 @@ final class NotesModel {
             let core = try await Task.detached {
                 try Core(dataDir: dataDir.path, serverUrl: nil)
             }.value
+            Self.bootLog("Core constructed")
             self.core = core
             PatchworkWeb.coreServerPort = core.localServerPort()
             NativeWebStorage.shared.core = core
@@ -282,7 +292,9 @@ final class NotesModel {
             let delegateBridge = DelegateBridge(model: self)
             self.delegateBridge = delegateBridge
             core.setDelegate(delegate: delegateBridge)
+            presence.model = self
             connected = core.isConnected()
+            Self.bootLog("Core bridged")
 
             // The last-open doc needs only its url, not the folder tree —
             // open it before any folder work so the editor loads immediately.
@@ -296,6 +308,7 @@ final class NotesModel {
                 // startFolderUrl sets self.folder in Rust and loads the doc
                 // from redb in the background; docChanged fires when ready.
                 try core.startFolderUrl(url: first)
+                Self.bootLog("root folder scheduled for local load")
                 rootFolderUrls = saved
                 persistRoots()
                 folderUrl = first
@@ -303,6 +316,7 @@ final class NotesModel {
                 core.prefetchNotes(urls: Array(saved.dropFirst()))
                 refreshNotes()
                 startPolling()
+                Self.bootLog("startup UI state queued")
                 appendSyncEvent("Started: \(saved.count) root folder(s)")
                 if let account = accountUrl {
                     Task { await self.logIn(accountUrl: account) }
@@ -313,6 +327,7 @@ final class NotesModel {
                 let url = try await Task.detached {
                     try core.ensureFolder(existingUrl: nil)
                 }.value
+                Self.bootLog("fresh root folder created")
                 saved = [url]
                 rootFolderUrls = saved
                 persistRoots()
@@ -320,10 +335,12 @@ final class NotesModel {
                 status = ""
                 refreshNotes()
                 startPolling()
+                Self.bootLog("fresh startup UI state queued")
                 appendSyncEvent("Started: new folder created")
             }
         } catch {
             status = "Failed to start: \(error.localizedDescription)"
+            Self.bootLog("startOnce failed \(error.localizedDescription)")
         }
     }
 
@@ -591,13 +608,16 @@ final class NotesModel {
         let rootUrls = rootFolderUrls
         let cache = folderNodeCache
         let fetched = metaFetched
+        Self.bootLog("refreshNotes begin roots=\(rootUrls.count)")
         Task.detached { [core, rootUrls, cache, fetched, weak self] in
+            let refreshStart = Date()
             async let notesTask = core.listNotes()
             async let titleTask = core.folderTitle()
             let notes = await notesTask
             let folderTitle = await titleTask
             let (tree, newCache) = await Self.computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
             let visible = Self.visibleNotes(in: tree)
+            let localMs = Int(Date().timeIntervalSince(refreshStart) * 1000)
             core.prefetchNotes(urls: notes.map(\.url))
             let richNotes = visible.filter { $0.kind == "rich" }.map {
                 NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
@@ -613,14 +633,19 @@ final class NotesModel {
                     self.selectedNoteUrl = nil
                 }
                 self.saveLaunchSnapshot()
+                Self.bootLog(
+                    "sidebar published notes=\(notes.count) visible=\(visible.count) localMs=\(localMs)"
+                )
                 #if os(macOS)
                 self.writeWidgetSnapshot()
                 #endif
             }
+            let metaStart = Date()
             let (newPreviews, newThumbnails) = await Self.fetchMeta(
                 core: core,
                 urls: urlsNeedingMeta
             )
+            let metaMs = Int(Date().timeIntervalSince(metaStart) * 1000)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.previews.merge(newPreviews) { _, new in new }
@@ -633,6 +658,9 @@ final class NotesModel {
                 self.backfillSpotlightIndex(for: richNotes)
                 self.backfillAssetVision()
                 self.saveLaunchSnapshot()
+                Self.bootLog(
+                    "metadata published previews=\(newPreviews.count) thumbnails=\(newThumbnails.count) metaMs=\(metaMs)"
+                )
                 #if os(macOS)
                 self.writeWidgetSnapshot()
                 #endif
@@ -1019,6 +1047,19 @@ final class NotesModel {
         Clipboard.copy(folderUrl)
     }
 
+    static func patchworkUrl(for documentUrl: String) -> String {
+        "https://patchwork.inkandswitch.com/#\(documentUrl)"
+    }
+
+    func copyPatchworkUrl(for documentUrl: String) {
+        Clipboard.copy(Self.patchworkUrl(for: documentUrl))
+    }
+
+    func openInPatchwork(_ documentUrl: String) {
+        guard let url = URL(string: Self.patchworkUrl(for: documentUrl)) else { return }
+        ExternalBrowser.open(url)
+    }
+
     func moveItem(_ url: String, into destination: String) {
         guard let core else { return }
         guard let moving = node(for: url), let from = moving.parentUrl else { return }
@@ -1080,6 +1121,7 @@ final class NotesModel {
 
     func spansSnapshot(for url: String) async -> NoteSpansSnapshot {
         if core == nil, let cached = launchNoteSnapshots[url] {
+            Self.bootLog("note snapshot served from launch cache")
             refreshCachedOpenNote(url)
             return cached
         }
@@ -1087,11 +1129,13 @@ final class NotesModel {
             await start()
         }
         guard let core else { return NoteSpansSnapshot(spansJson: "[]", heads: []) }
+        let start = Date()
         try? await core.openNote(url: url)
         let snapshot = (try? await core.noteSpansSnapshot(url: url))
             ?? NoteSpansSnapshot(spansJson: "[]", heads: [])
         launchNoteSnapshots[url] = snapshot
         saveLaunchSnapshot()
+        Self.bootLog("note snapshot loaded from core ms=\(Int(Date().timeIntervalSince(start) * 1000))")
         return snapshot
     }
 
@@ -1145,6 +1189,42 @@ final class NotesModel {
         }
         return attributed
     }
+
+    /// The snapshot with `.amChanged` stamped on paragraphs that differ from
+    /// the entry's parent version, for the history viewer's change bars.
+    func renderedSnapshot(for url: String, entry: DocHistoryEntry) async -> NSAttributedString {
+        let base = await renderedSnapshot(for: url, heads: entry.heads)
+        guard !entry.deps.isEmpty else { return base }
+        let parentSnapshot = await spansSnapshot(for: url, heads: entry.deps)
+        let parentSpans = await Task.detached {
+            SpanNode.decodeList(parentSnapshot.spansJson)
+        }.value
+        let parentText = RichText.attributed(from: parentSpans, cache: AssetCache()).string
+
+        func paragraphs(of text: String) -> (ranges: [NSRange], texts: [String]) {
+            let ns = text as NSString
+            var ranges: [NSRange] = []
+            var texts: [String] = []
+            var location = 0
+            while location < ns.length {
+                let range = ns.paragraphRange(for: NSRange(location: location, length: 0))
+                if range.length == 0 { break }
+                ranges.append(range)
+                texts.append(ns.substring(with: range))
+                location = NSMaxRange(range)
+            }
+            return (ranges, texts)
+        }
+
+        let current = paragraphs(of: base.string)
+        let parent = paragraphs(of: parentText).texts
+        let marked = NSMutableAttributedString(attributedString: base)
+        for change in current.texts.difference(from: parent) {
+            guard case .insert(let offset, _, _) = change, offset < current.ranges.count else { continue }
+            marked.addAttribute(.amChanged, value: true, range: current.ranges[offset])
+        }
+        return marked
+    }
     #endif
 
     func revertNote(_ url: String, to heads: [String]) async {
@@ -1174,12 +1254,13 @@ final class NotesModel {
         scheduleSemanticIndex(url: url, name: title)
     }
 
+    @discardableResult
     func updateDocument(
         _ url: String,
         json: String,
         title: String,
         origin: UUID? = nil
-    ) async {
+    ) async -> [String]? {
         let previous = noteWriteTasks[url]
         let task = Task { [weak self] () -> [String]? in
             _ = await previous?.value
@@ -1189,7 +1270,7 @@ final class NotesModel {
             return await self?.latestNoteHeads(for: url)
         }
         noteWriteTasks[url] = task
-        _ = await task.value
+        return await task.value
     }
 
     func spliceNoteText(
@@ -1810,7 +1891,73 @@ final class NotesModel {
         spans.append(.text(text, [:]))
     }
 
-    private func importFileEntries(from url: URL, core: Core) throws -> [String] {
+    func drainSharedIntake() async {
+        if core == nil {
+            await start()
+        }
+        guard core != nil else { return }
+        guard let root = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: SharedHandoff.appGroupIdentifier
+        ) else { return }
+        let intake = root.appendingPathComponent("SharedIntake", isDirectory: true)
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: intake,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        for entry in entries {
+            guard FileManager.default.fileExists(atPath: entry.appendingPathComponent("payload.json").path) else {
+                continue
+            }
+            guard let content = IncomingContent.sharedHandoff(id: entry.lastPathComponent) else {
+                try? FileManager.default.removeItem(at: entry)
+                continue
+            }
+            importToInbox(content)
+        }
+    }
+
+    func importToInbox(_ content: IncomingContent) {
+        guard let core else { return }
+        let target = inboxUrl ?? folderUrl
+        do {
+            var textSpans: [SpanNode] = []
+            var importedUrls: [String] = []
+
+            for payload in content.flattenedPayloads {
+                switch payload {
+                case .text(let text):
+                    appendText(text, to: &textSpans)
+                case .file(let url):
+                    importedUrls += try importFileEntries(from: url, core: core, folderUrl: target)
+                case .batch:
+                    break
+                }
+            }
+
+            let textJson = SpanNode.encodeList(textSpans)
+            if textJson != "[]" {
+                let noteUrl: String
+                if let target {
+                    noteUrl = try core.createNoteIn(folderUrl: target, title: content.textDisplayTitle)
+                } else {
+                    noteUrl = try core.createNote(title: content.textDisplayTitle)
+                }
+                try? core.updateNoteSpans(url: noteUrl, spansJson: textJson)
+                importedUrls.insert(noteUrl, at: 0)
+            }
+
+            refreshNotes()
+            if let first = importedUrls.first {
+                selectedNoteUrl = first
+            }
+            content.cleanupHandoff()
+        } catch {
+            status = "Couldn't import: \(error.localizedDescription)"
+        }
+    }
+
+    private func importFileEntries(from url: URL, core: Core, folderUrl: String? = nil) throws -> [String] {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
@@ -1826,21 +1973,31 @@ final class NotesModel {
             for file in files {
                 let values = try? file.resourceValues(forKeys: [.isRegularFileKey])
                 guard values?.isRegularFile == true else { continue }
-                imported.append(try importSingleFileEntry(file, displayName: relativeDisplayName(for: file, under: url), core: core))
+                imported.append(try importSingleFileEntry(file, displayName: relativeDisplayName(for: file, under: url), core: core, folderUrl: folderUrl))
             }
             return imported
         }
-        return [try importSingleFileEntry(url, displayName: url.lastPathComponent, core: core)]
+        return [try importSingleFileEntry(url, displayName: url.lastPathComponent, core: core, folderUrl: folderUrl)]
     }
 
     private func importSingleFileEntry(
         _ url: URL,
         displayName: String,
-        core: Core
+        core: Core,
+        folderUrl: String? = nil
     ) throws -> String {
         let data = try Data(contentsOf: url)
         let ext = url.pathExtension.lowercased()
         let name = displayName.isEmpty ? url.lastPathComponent : displayName
+        if let folderUrl {
+            return try core.createAssetIn(
+                folderUrl: folderUrl,
+                name: name,
+                extension: ext.isEmpty ? "bin" : ext,
+                mimeType: mimeType(for: ext),
+                data: data
+            )
+        }
         let assetUrl = try core.createAsset(
             name: name,
             extension: ext.isEmpty ? "bin" : ext,
@@ -1897,6 +2054,12 @@ private final class DelegateBridge: CoreDelegate {
     func onSyncEvent(message: String) {
         Task { @MainActor [model] in
             model?.appendSyncEvent(message)
+        }
+    }
+
+    func onEphemeralMessage(url: String, payload: Data) {
+        Task { @MainActor [model] in
+            model?.ephemeralMessageReceived(url: url, payload: payload)
         }
     }
 }
@@ -2008,6 +2171,9 @@ struct FolderNode: Identifiable, Hashable, Codable {
 
     var id: String { url }
     var isNote: Bool { kind == "lush" || kind == "rich" }
+    var isPatchworkDoc: Bool {
+        kind != "folder" && kind != "lush" && kind != "rich" && kind != "lush:script"
+    }
 }
 
 private struct LushWidgetSnapshot: Codable, Equatable {

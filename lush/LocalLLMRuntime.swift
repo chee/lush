@@ -1,27 +1,21 @@
 import Foundation
 
-#if canImport(CoreML)
-import CoreML
-#endif
-
-#if canImport(CoreMLLLM)
-import CoreMLLLM
+#if canImport(MLXLLM)
+import MLXLLM
+import MLXLMCommon
 #endif
 
 enum LocalLLMRuntime {
     enum RuntimeError: LocalizedError {
         case packageUnavailable
         case modelNotConfigured
-        case unsupportedArtifact(String)
 
         var errorDescription: String? {
             switch self {
             case .packageUnavailable:
-                "CoreML-LLM is not linked in this build."
+                "MLXLLM is not linked in this build. Add mlx-swift-examples and link MLXLLM + MLXLMCommon."
             case .modelNotConfigured:
-                "Select a Core ML model before generating."
-            case .unsupportedArtifact(let detail):
-                detail
+                "Select an MLX model before generating."
             }
         }
     }
@@ -35,50 +29,40 @@ enum LocalLLMRuntime {
         return try await generateText(
             prompt: prompt,
             config: config,
-            maxTokens: settings.maximumResponseTokens
+            maxTokens: settings.maximumResponseTokens,
+            temperature: settings.temperature
         )
     }
 
     static func generateText(
         prompt: String,
         config: RemoteModelConfig,
-        maxTokens: Int
+        maxTokens: Int,
+        temperature: Double = 0.2
     ) async throws -> String {
         let repo = config.repo.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !repo.isEmpty else { throw RuntimeError.modelNotConfigured }
 
-        if config.filename.lowercased().hasSuffix(".gguf") {
-            throw RuntimeError.unsupportedArtifact("GGUF models need a GGUF runtime; select a CoreML-LLM model for this backend.")
+        #if canImport(MLXLLM)
+        let modelConfig = ModelConfiguration(id: repo)
+        let container = try await LLMModelFactory.shared.loadContainer(configuration: modelConfig)
+        return try await container.perform { context in
+            let input = try await context.processor.prepare(
+                input: .init(messages: [["role": "user", "content": prompt]])
+            )
+            var tokenCount = 0
+            let result = try MLXLMCommon.generate(
+                input: input,
+                parameters: GenerateParameters(temperature: Float(temperature)),
+                context: context
+            ) { _ in
+                tokenCount += 1
+                return tokenCount < maxTokens ? .more : .stop
+            }
+            return result.output
         }
-
-        #if canImport(CoreMLLLM)
-        if let localPath = config.localPath, !localPath.isEmpty {
-            let url = URL(fileURLWithPath: localPath)
-            let llm = try await CoreMLLLM.load(from: localModelDirectory(from: url), computeUnits: computeUnits)
-            return try await llm.generate(prompt, maxTokens: maxTokens)
-        }
-
-        let llm = try await CoreMLLLM.load(repo: repo, computeUnits: computeUnits)
-        return try await llm.generate(prompt, maxTokens: maxTokens)
         #else
         throw RuntimeError.packageUnavailable
         #endif
     }
-
-    private static func localModelDirectory(from url: URL) -> URL {
-        if url.hasDirectoryPath {
-            return url
-        }
-        return url.deletingLastPathComponent()
-    }
-
-    #if canImport(CoreML)
-    private static var computeUnits: MLComputeUnits {
-        #if os(macOS) || os(iOS)
-        return .cpuAndNeuralEngine
-        #else
-        return .all
-        #endif
-    }
-    #endif
 }

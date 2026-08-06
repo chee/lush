@@ -72,8 +72,25 @@ enum RichTextClipboard {
             case "blockquote":
                 lines.append("> " + content)
             case "code-block":
+                var codeLines = [plainText(runs)]
+                while j < spans.count,
+                      case .block(let next) = spans[j],
+                      next.type == "code-block",
+                      next.codeLanguage == block.codeLanguage,
+                      next.parents == block.parents {
+                    var nextRuns: [(String, [String: JSONValue])] = []
+                    j += 1
+                    while j < spans.count {
+                        if case .block = spans[j] { break }
+                        if case .text(let text, let marks) = spans[j] {
+                            nextRuns.append((text, marks))
+                        }
+                        j += 1
+                    }
+                    codeLines.append(plainText(nextRuns))
+                }
                 let language = block.codeLanguage == CodeLanguage.plain.id ? "" : block.codeLanguage
-                lines.append("```" + language + "\n" + plainText(runs) + "\n```")
+                lines.append("```" + language + "\n" + codeLines.joined(separator: "\n") + "\n```")
             case "html":
                 if let source = block.htmlSource {
                     lines.append(source)
@@ -82,7 +99,7 @@ enum RichTextClipboard {
                 if block.isEmbedBlock {
                     lines.append("[attachment]")
                 } else {
-                    lines.append(content)
+                    lines.append(escapeLeadingMarker(content))
                 }
             }
             i = j
@@ -148,14 +165,20 @@ enum RichTextClipboard {
         var inFence = false
         var fenceLanguage = ""
         var fenceLines: [String] = []
+        var listTypeByDepth: [String] = []
+        let listTypes: Set<String> = ["unordered-list-item", "ordered-list-item", "todo-list-item"]
 
         func flushFence() {
             var block = BlockValue(type: "code-block")
             if !fenceLanguage.isEmpty {
                 block.attrs["language"] = .string(fenceLanguage)
             }
-            spans.append(.block(block))
-            spans.append(.text(fenceLines.joined(separator: "\n"), [:]))
+            for line in fenceLines.isEmpty ? [""] : fenceLines {
+                spans.append(.block(block))
+                if !line.isEmpty {
+                    spans.append(.text(line, [:]))
+                }
+            }
             fenceLines = []
             fenceLanguage = ""
         }
@@ -177,7 +200,7 @@ enum RichTextClipboard {
             }
 
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            let block: BlockValue
+            var block: BlockValue
             let content: String
             if line.hasPrefix("### ") {
                 block = .heading(level: 3)
@@ -206,6 +229,15 @@ enum RichTextClipboard {
             } else {
                 block = .paragraph
                 content = rawLine
+            }
+            if listTypes.contains(block.type) {
+                let indent = rawLine.prefix(while: { $0 == " " }).count / 2
+                let depth = min(indent, listTypeByDepth.count)
+                listTypeByDepth = Array(listTypeByDepth.prefix(depth))
+                block.parents = listTypeByDepth
+                listTypeByDepth.append(block.type)
+            } else {
+                listTypeByDepth = []
             }
             spans.append(.block(block))
             for run in inlineRuns(fromMarkdown: content) {
@@ -262,12 +294,13 @@ enum RichTextClipboard {
     private static func trimListMarker(in str: NSString, range: inout NSRange) {
         guard range.length > 0 else { return }
         let text = str.substring(with: range)
-        let markerLength: Int
+        let markerCharacters: Int
         if text.hasPrefix("- ") || text.hasPrefix("* ") {
-            markerLength = 2
+            markerCharacters = 2
         } else {
-            markerLength = orderedListPrefixLength(in: text) ?? 0
+            markerCharacters = orderedListPrefixLength(in: text) ?? 0
         }
+        let markerLength = String(text.prefix(markerCharacters)).utf16.count
         range.location += markerLength
         range.length = max(0, range.length - markerLength)
     }
@@ -288,13 +321,35 @@ enum RichTextClipboard {
     }
 
     private static func markdownInline(_ text: String, marks: [String: JSONValue]) -> String {
-        var out = text
-        if case .bool(true)? = marks["code"] { out = "`" + out + "`" }
+        let isCode = marks["code"] == .bool(true)
+        var out = isCode ? "`" + text + "`" : escapeMarkdown(text)
         if case .bool(true)? = marks["strong"] { out = "**" + out + "**" }
         if case .bool(true)? = marks["em"] { out = "*" + out + "*" }
         if case .bool(true)? = marks["strikethrough"] { out = "~~" + out + "~~" }
         if let link = marks["link"]?.stringValue { out = "[" + out + "](" + link + ")" }
         return out
+    }
+
+    private static func escapeMarkdown(_ text: String) -> String {
+        var out = ""
+        for character in text {
+            if "\\`*_~[".contains(character) { out.append("\\") }
+            out.append(character)
+        }
+        return out
+    }
+
+    /// A paragraph whose text starts like a block marker would import as that
+    /// block; a leading backslash keeps it a paragraph.
+    private static func escapeLeadingMarker(_ line: String) -> String {
+        if let first = line.first, "#->".contains(first) {
+            return "\\" + line
+        }
+        if let prefixLength = orderedListPrefixLength(in: line) {
+            let dot = line.index(line.startIndex, offsetBy: prefixLength - 2)
+            return String(line[..<dot]) + "\\" + String(line[dot...])
+        }
+        return line
     }
 
     private static func plainText(_ runs: [(String, [String: JSONValue])]) -> String {
@@ -311,9 +366,19 @@ enum RichTextClipboard {
             runs.append((String(text[plainStart..<end]), [:]))
         }
 
+        let punctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
         while index < text.endIndex {
             let rest = text[index...]
-            if rest.hasPrefix("**"),
+            if rest.hasPrefix("\\"),
+               text.index(after: index) < text.endIndex,
+               punctuation.contains(text[text.index(after: index)]) {
+                flushPlain(upTo: index)
+                let escaped = text.index(after: index)
+                runs.append((String(text[escaped]), [:]))
+                index = text.index(after: escaped)
+                plainStart = index
+            } else if rest.hasPrefix("**"),
                let end = text[rest.index(index, offsetBy: 2)...].range(of: "**")?.lowerBound {
                 flushPlain(upTo: index)
                 let bodyStart = text.index(index, offsetBy: 2)
@@ -356,6 +421,14 @@ enum RichTextClipboard {
             }
         }
         flushPlain(upTo: text.endIndex)
-        return runs
+        var merged: [(String, [String: JSONValue])] = []
+        for run in runs {
+            if let last = merged.last, last.1 == run.1 {
+                merged[merged.count - 1].0 += run.0
+            } else {
+                merged.append(run)
+            }
+        }
+        return merged
     }
 }

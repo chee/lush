@@ -598,6 +598,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func createAsset(name: String, `extension`: String, mimeType: String, data: Data) throws  -> String
     
+    /**
+     * Store binary data as a patchwork UnixFileEntry doc linked into a
+     * specific folder doc; returns the file doc's URL.
+     */
+    func createAssetIn(folderUrl: String, name: String, `extension`: String, mimeType: String, data: Data) throws  -> String
+    
     func createNote(title: String) throws  -> String
     
     /**
@@ -622,6 +628,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Create a folder doc inside a specific folder doc.
      */
     func createSubfolderIn(folderUrl: String, title: String) throws  -> String
+    
+    /**
+     * The current index of an automerge cursor into the note text.
+     * Non-blocking like `text_cursor`.
+     */
+    func cursorIndex(url: String, cursor: String) throws  -> UInt64
     
     func deleteNote(url: String) throws 
     
@@ -741,6 +753,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func prefetchNotes(urls: [String]) 
     
     /**
+     * Sign and broadcast opaque ephemeral bytes on the doc's topic.
+     * Fire-and-forget: returns once the send is queued, not delivered.
+     */
+    func publishEphemeral(url: String, payload: Data) throws 
+    
+    /**
      * Locally indexed notes, newest first. Served entirely from the search
      * index, so it costs one SQL query rather than a read per note.
      */
@@ -803,6 +821,14 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func startFolderUrl(url: String) throws 
     
     /**
+     * A stable automerge cursor string for an index into the note text
+     * (the same text field the splice/spans APIs target).
+     * Called synchronously from the UI thread, so it never waits on the doc
+     * lock: a busy doc is an error the caller retries on its next tick.
+     */
+    func textCursor(url: String, index: UInt64) throws  -> String
+    
+    /**
      * Write generated ML metadata onto a UnixFileEntry doc.
      */
     func updateAssetMl(url: String, summary: String, caption: String, keywords: String) throws 
@@ -812,7 +838,14 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func updateAssetVision(url: String, description: String, ocr: String) throws 
     
-    func updateNoteSpans(url: String, spansJson: String) throws 
+    /**
+     * Replace the note's content with the given spans. When `heads` is
+     * provided and the doc has advanced past them, the update is applied on a
+     * fork at those heads and merged back (the `changeAt` pattern the splice
+     * path uses), so concurrent remote edits survive a stale full-document
+     * save. Returns the doc's heads after the change.
+     */
+    func updateNoteSpans(url: String, spansJson: String, heads: [String]?) throws  -> [String]
     
     /**
      * Like `update_note_spans`, but the commit is stamped with the given
@@ -986,6 +1019,22 @@ open func createAsset(name: String, `extension`: String, mimeType: String, data:
 })
 }
     
+    /**
+     * Store binary data as a patchwork UnixFileEntry doc linked into a
+     * specific folder doc; returns the file doc's URL.
+     */
+open func createAssetIn(folderUrl: String, name: String, `extension`: String, mimeType: String, data: Data)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_create_asset_in(self.uniffiClonePointer(),
+        FfiConverterString.lower(folderUrl),
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(`extension`),
+        FfiConverterString.lower(mimeType),
+        FfiConverterData.lower(data),$0
+    )
+})
+}
+    
 open func createNote(title: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_create_note(self.uniffiClonePointer(),
@@ -1046,6 +1095,19 @@ open func createSubfolderIn(folderUrl: String, title: String)throws  -> String  
     uniffi_lush_core_fn_method_core_create_subfolder_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(title),$0
+    )
+})
+}
+    
+    /**
+     * The current index of an automerge cursor into the note text.
+     * Non-blocking like `text_cursor`.
+     */
+open func cursorIndex(url: String, cursor: String)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_cursor_index(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(cursor),$0
     )
 })
 }
@@ -1440,6 +1502,18 @@ open func prefetchNotes(urls: [String])  {try! rustCall() {
 }
     
     /**
+     * Sign and broadcast opaque ephemeral bytes on the doc's topic.
+     * Fire-and-forget: returns once the send is queued, not delivered.
+     */
+open func publishEphemeral(url: String, payload: Data)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_publish_ephemeral(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterData.lower(payload),$0
+    )
+}
+}
+    
+    /**
      * Locally indexed notes, newest first. Served entirely from the search
      * index, so it costs one SQL query rather than a read per note.
      */
@@ -1602,6 +1676,21 @@ open func startFolderUrl(url: String)throws   {try rustCallWithError(FfiConverte
 }
     
     /**
+     * A stable automerge cursor string for an index into the note text
+     * (the same text field the splice/spans APIs target).
+     * Called synchronously from the UI thread, so it never waits on the doc
+     * lock: a busy doc is an error the caller retries on its next tick.
+     */
+open func textCursor(url: String, index: UInt64)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_text_cursor(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterUInt64.lower(index),$0
+    )
+})
+}
+    
+    /**
      * Write generated ML metadata onto a UnixFileEntry doc.
      */
 open func updateAssetMl(url: String, summary: String, caption: String, keywords: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -1626,12 +1715,21 @@ open func updateAssetVision(url: String, description: String, ocr: String)throws
 }
 }
     
-open func updateNoteSpans(url: String, spansJson: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    /**
+     * Replace the note's content with the given spans. When `heads` is
+     * provided and the doc has advanced past them, the update is applied on a
+     * fork at those heads and merged back (the `changeAt` pattern the splice
+     * path uses), so concurrent remote edits survive a stale full-document
+     * save. Returns the doc's heads after the change.
+     */
+open func updateNoteSpans(url: String, spansJson: String, heads: [String]?)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_update_note_spans(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
-        FfiConverterString.lower(spansJson),$0
+        FfiConverterString.lower(spansJson),
+        FfiConverterOptionSequenceString.lower(heads),$0
     )
-}
+})
 }
     
     /**
@@ -2821,6 +2919,8 @@ public protocol CoreDelegate: AnyObject, Sendable {
     
     func onSyncEvent(message: String) 
     
+    func onEphemeralMessage(url: String, payload: Data) 
+    
 }
 
 
@@ -2894,6 +2994,32 @@ fileprivate struct UniffiCallbackInterfaceCoreDelegate {
                 }
                 return uniffiObj.onSyncEvent(
                      message: try FfiConverterString.lift(message)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onEphemeralMessage: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            payload: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCoreDelegate.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onEphemeralMessage(
+                     url: try FfiConverterString.lift(url),
+                     payload: try FfiConverterData.lift(payload)
                 )
             }
 
@@ -3165,6 +3291,30 @@ fileprivate struct FfiConverterOptionTypeContactInfo: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeContactInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceString.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3487,6 +3637,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_create_asset() != 18937) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_create_asset_in() != 48583) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_create_note() != 43728) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3503,6 +3656,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_subfolder_in() != 43470) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_cursor_index() != 28861) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_delete_note() != 536) {
@@ -3592,6 +3748,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 23856) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_publish_ephemeral() != 11927) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_recent_notes() != 1475) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3640,13 +3799,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_start_folder_url() != 43861) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_text_cursor() != 65402) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_update_asset_ml() != 42424) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_update_asset_vision() != 689) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_update_note_spans() != 5252) {
+    if (uniffi_lush_core_checksum_method_core_update_note_spans() != 63225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_update_note_spans_at() != 42222) {
@@ -3662,6 +3824,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_coredelegate_on_sync_event() != 24982) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_coredelegate_on_ephemeral_message() != 44822) {
         return InitializationResult.apiChecksumMismatch
     }
 

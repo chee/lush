@@ -27,16 +27,19 @@ enum NoteExporter {
             guard case .block(let b) = span, b.isEmbedBlock, let assetUrl = b.embedUrl else { continue }
             guard let data = await model.assetBytes(assetUrl) else { continue }
             let info = await model.assetInfo(assetUrl)
-            var name = info?.name.isEmpty == false ? info!.name : "attachment"
+            // names come from synced docs; strip anything path-like
+            var name = (info?.name ?? "").components(separatedBy: "/").last ?? ""
+            while name.hasPrefix(".") { name.removeFirst() }
+            if name.isEmpty { name = "attachment" }
             let original = name
             var suffix = 2
-            while usedNames.contains(name) {
+            while usedNames.contains(name.lowercased()) {
                 let ext = (original as NSString).pathExtension
                 let base = (original as NSString).deletingPathExtension
                 name = ext.isEmpty ? "\(base)-\(suffix)" : "\(base)-\(suffix).\(ext)"
                 suffix += 1
             }
-            usedNames.insert(name)
+            usedNames.insert(name.lowercased())
             let mime = info?.mimeType.isEmpty == false ? info!.mimeType : "application/octet-stream"
             fetched.append(FetchedAsset(url: assetUrl, data: data, name: name, mime: mime))
         }
@@ -68,6 +71,11 @@ enum NoteExporter {
                     try asset.data.write(to: assetsDir.appendingPathComponent(asset.name))
                 }
             } catch {
+                try? FileManager.default.removeItem(at: tmp)
+                let alert = NSAlert()
+                alert.messageText = "Export failed"
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
                 return
             }
 
@@ -165,7 +173,15 @@ enum NoteExporter {
                 if case .text(let t, let m) = spans[j] { runs.append((t, m)) }
                 j += 1
             }
-            segments.append(.simple(b, runs))
+            if b.type == "code-block",
+               case .simple(let previous, let previousRuns)? = segments.last,
+               previous.type == "code-block",
+               previous.codeLanguage == b.codeLanguage,
+               previous.parents == b.parents {
+                segments[segments.count - 1] = .simple(previous, previousRuns + [("\n", [:])] + runs)
+            } else {
+                segments.append(.simple(b, runs))
+            }
             i = j
         }
         return segments
@@ -225,7 +241,7 @@ enum NoteExporter {
                     closeLists()
                     switch b.type {
                     case "heading":
-                        let level = b.headingLevel ?? 1
+                        let level = min(max(b.headingLevel ?? 1, 1), 6)
                         out += "<h\(level)>\(content)</h\(level)>\n"
                     case "blockquote":
                         out += "<blockquote><p>\(content)</p></blockquote>\n"

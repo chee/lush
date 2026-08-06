@@ -49,8 +49,8 @@ enum JSONValue: Codable, Equatable {
 
     var intValue: Int? {
         switch self {
-        case .int(let i): return Int(i)
-        case .number(let d): return Int(d)
+        case .int(let i): return Int(exactly: i)
+        case .number(let d): return d.isFinite ? Int(exactly: d.rounded()) : nil
         default: return nil
         }
     }
@@ -225,6 +225,9 @@ extension NSAttributedString.Key {
     /// "superscript" or "subscript" — the mark behind a shifted baseline.
     static let amBaseline = NSAttributedString.Key("io.lush.baseline")
     static let amTableBox = NSAttributedString.Key("io.lush.tableBox")
+    /// Display-only: this paragraph differs from the parent version in the
+    /// history viewer; drawn as a margin change bar.
+    static let amChanged = NSAttributedString.Key("io.lush.changed")
     static let amColumnsBox = NSAttributedString.Key("io.lush.columnsBox")
 }
 
@@ -372,11 +375,20 @@ final class EmbedAttachment: NSTextAttachment {
     ) -> NSTextAttachmentViewProvider? {
         var provider: NSTextAttachmentViewProvider?
         MainActor.assumeIsolated {
-            provider = (parentView as? EditorTextView)?.core?.inline.viewProvider(
-                for: self,
-                location: location,
-                textContainer: textContainer
-            )
+            // on iOS the parent is an internal container view, not the text
+            // view itself — walk up to the editor
+            var candidate: PView? = parentView
+            while let view = candidate {
+                if let editor = view as? EditorTextView {
+                    provider = editor.core?.inline.viewProvider(
+                        for: self,
+                        location: location,
+                        textContainer: textContainer
+                    )
+                    break
+                }
+                candidate = view.superview
+            }
         }
         return provider
     }
@@ -437,6 +449,8 @@ enum EditorSettings {
     private static let monoFamilyKey = "editorMonoFamily"
     private static let handFamilyKey = "editorHandFamily"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
+    private static let typewriterModeKey = "editorTypewriterMode"
+    private static let minimapKey = "editorMinimapVisible"
 
     static let fontFamilies: [(key: String, label: String)] = [
         ("sans", "Sans"),
@@ -540,6 +554,25 @@ enum EditorSettings {
 
     static func setAutoInsertLogline(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: autoInsertLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static var typewriterMode: Bool {
+        UserDefaults.standard.bool(forKey: typewriterModeKey)
+    }
+
+    static var minimapVisible: Bool {
+        UserDefaults.standard.object(forKey: minimapKey) == nil
+            || UserDefaults.standard.bool(forKey: minimapKey)
+    }
+
+    static func setMinimapVisible(_ visible: Bool) {
+        UserDefaults.standard.set(visible, forKey: minimapKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static func setTypewriterMode(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: typewriterModeKey)
         NotificationCenter.default.post(name: changed, object: nil)
     }
 
@@ -940,7 +973,12 @@ enum RichText {
 
     private static func contextDisplayAttributes(for block: BlockValue) -> [NSAttributedString.Key: Any] {
         var attrs = attributes(block: block, marks: [:])
-        attrs[.font] = EditorSettings.font(ofSize: max(10, bodySize - 2))
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.paragraphSpacing = 0
+        paragraphStyle.firstLineHeadIndent = 0
+        paragraphStyle.headIndent = 0
+        attrs[.font] = EditorSettings.font(ofSize: max(10, bodySize - 4))
+        attrs[.paragraphStyle] = paragraphStyle
         attrs[.foregroundColor] = PColor.pSecondaryLabel
         attrs[.amDisplayOnly] = true
         attrs.removeValue(forKey: .backgroundColor)

@@ -2,16 +2,45 @@ import Foundation
 import FoundationModels
 import SwiftUI
 
-struct NoteChatTurn: Identifiable, Equatable {
-    enum Role: Equatable {
+struct NoteChatTurn: Identifiable, Codable, Equatable {
+    enum Role: String, Codable, Equatable {
         case user
         case assistant
     }
 
-    let id = UUID()
+    let id: UUID
     let role: Role
     let text: String
     let proposedMarkdown: String?
+
+    init(id: UUID = UUID(), role: Role, text: String, proposedMarkdown: String?) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.proposedMarkdown = proposedMarkdown
+    }
+}
+
+enum NoteChatStore {
+    static func turns(for url: String) -> [NoteChatTurn] {
+        guard let data = UserDefaults.standard.data(forKey: key(for: url)),
+              let turns = try? JSONDecoder().decode([NoteChatTurn].self, from: data)
+        else { return [] }
+        return turns
+    }
+
+    static func save(_ turns: [NoteChatTurn], for url: String) {
+        UserDefaults.standard.set(try? JSONEncoder().encode(turns), forKey: key(for: url))
+    }
+
+    static func clear(for url: String) {
+        UserDefaults.standard.removeObject(forKey: key(for: url))
+    }
+
+    private static func key(for url: String) -> String {
+        let safeURL = url.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? url
+        return "noteChat.turns.\(safeURL)"
+    }
 }
 
 enum NoteChatAssistant {
@@ -60,7 +89,7 @@ enum NoteChatAssistant {
                 noteMarkdown: noteMarkdown,
                 previousTurns: previousTurns
             )
-        case .coreML:
+        case .mlx:
             return try await respondWithCoreMLModel(
                 to: trimmedQuestion,
                 noteTitle: noteTitle,
@@ -79,9 +108,7 @@ enum NoteChatAssistant {
         let model = SystemLanguageModel.default
         guard model.isAvailable else { throw ChatError.appleIntelligenceUnavailable }
 
-        let instructions = """
-        You help someone understand and edit one note in Lush. Use only the supplied note and chat history. If the person asks a question, answer it directly using the note. If the person asks you to change, rewrite, reorganize, summarize, expand, or otherwise edit the note, include the full revised note as editedMarkdown. Preserve the note's facts, voice, and formatting unless the person asks for a change. Return only strict JSON with keys answer and editedMarkdown. The answer value must be your real answer, not a schema description. editedMarkdown must be null when no note change is being proposed.
-        """
+        let instructions = LocalModelSettings.systemPrompt(for: .noteChat)
         let prompt = """
         Note title: \(limited(noteTitle, to: 300))
 
@@ -130,7 +157,7 @@ enum NoteChatAssistant {
         }
 
         let prompt = """
-        You help someone understand and edit one note in Lush. Use only the supplied note and chat history. Return only strict JSON with keys answer and editedMarkdown. editedMarkdown must be null when no note change is being proposed.
+        \(LocalModelSettings.systemPrompt(for: .noteChat))
 
         Note title: \(limited(noteTitle, to: 300))
 
@@ -212,6 +239,24 @@ struct NoteChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                Label("Chat", systemImage: "bubble.left.and.text.bubble.right")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    clearChat()
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .disabled(turns.isEmpty || isGenerating)
+                .help("Clear Chat")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
+            Divider()
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
@@ -297,7 +342,7 @@ struct NoteChatView: View {
             .padding(10)
         }
         .task(id: url) {
-            turns = []
+            turns = NoteChatStore.turns(for: url)
             draft = ""
             errorMessage = nil
         }
@@ -314,6 +359,7 @@ struct NoteChatView: View {
         draft = ""
         isGenerating = true
         turns.append(NoteChatTurn(role: .user, text: question, proposedMarkdown: nil))
+        NoteChatStore.save(turns, for: url)
         let previousTurns = turns
         let noteName = node?.displayName ?? "Untitled"
         let currentUrl = url
@@ -334,12 +380,21 @@ struct NoteChatView: View {
                 )
                 guard !Task.isCancelled else { return }
                 turns.append(NoteChatTurn(role: .assistant, text: reply.answer, proposedMarkdown: reply.proposedMarkdown))
+                NoteChatStore.save(turns, for: currentUrl)
             } catch {
                 guard !Task.isCancelled else { return }
                 errorMessage = error.localizedDescription
             }
             isGenerating = false
         }
+    }
+
+    private func clearChat() {
+        chatTask?.cancel()
+        isGenerating = false
+        errorMessage = nil
+        turns = []
+        NoteChatStore.clear(for: url)
     }
 
     private func apply(_ markdown: String, from turnId: UUID) {
