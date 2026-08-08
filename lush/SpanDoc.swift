@@ -1215,6 +1215,8 @@ enum RichText {
                 sawAnything = true
                 if b.type == "context" {
                     out.append(contextLine(for: b))
+                } else if b.type == "calendar-event" {
+                    out.append(calendarLine(for: b))
                 } else if b.isEmbedBlock {
                     out.append(embedAttachment(for: b, cache: cache))
                 }
@@ -1254,6 +1256,53 @@ enum RichText {
             line.append(NSAttributedString(string: "Logline", attributes: attrs))
         }
         return line
+    }
+
+    /// A note about a calendar item shows the item itself as a display line
+    /// that links back to the Calendar view.
+    static func calendarLine(for block: BlockValue) -> NSAttributedString {
+        var attrs = contextDisplayAttributes(for: block)
+        attrs[.font] = EditorSettings.font(ofSize: max(11, bodySize - 2))
+        if let url = URL(string: "lush://calendar") {
+            attrs[.link] = url
+            attrs[.foregroundColor] = PColor.pTint
+        }
+        let line = NSMutableAttributedString()
+        let symbol = block.attrs["kind"]?.stringValue == "reminder" ? "☑︎ " : "🗓 "
+        line.append(NSAttributedString(string: symbol, attributes: attrs))
+        var titleAttrs = attrs
+        titleAttrs[.font] = EditorSettings.styled(
+            EditorSettings.font(ofSize: max(11, bodySize - 2)),
+            bold: true,
+            italic: false
+        )
+        line.append(NSAttributedString(
+            string: block.calendarEventTitle ?? "Calendar Item",
+            attributes: titleAttrs
+        ))
+        for part in calendarLineParts(for: block) {
+            line.append(NSAttributedString(string: " · \(part)", attributes: attrs))
+        }
+        return line
+    }
+
+    private static func calendarLineParts(for block: BlockValue) -> [String] {
+        var parts: [String] = []
+        if let start = block.calendarEventStart {
+            parts.append(start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
+            if block.attrs["allDay"]?.boolValue == true {
+                parts.append("all day")
+            } else {
+                var time = start.formatted(date: .omitted, time: .shortened)
+                if let end = block.calendarEventEnd, end > start {
+                    time += " – \(end.formatted(date: .omitted, time: .shortened))"
+                }
+                parts.append(time)
+            }
+        }
+        if let location = block.attrs["location"]?.stringValue { parts.append(location) }
+        if let calendar = block.attrs["calendar"]?.stringValue { parts.append(calendar) }
+        return parts
     }
 
     private static func contextLineParts(for block: BlockValue) -> [(text: String, isLocation: Bool)] {
@@ -1333,8 +1382,6 @@ enum RichText {
             attachment = liveBox(width: 460, height: 220)
         } else if block.type == "context" {
             attachment = liveBox(width: 460, height: 28)
-        } else if block.type == "calendar-event" {
-            attachment = liveBox(width: 460, height: 64)
         } else if let url, cache.patchworkDocs.contains(url) {
             attachment = liveBox(width: 460, height: 300)
         } else if let url, let image = cache.images[url] {
@@ -1594,7 +1641,7 @@ enum RichText {
             } else {
                 block = previousBlock
             }
-            if block.type == "context" {
+            if block.type == "context" || block.type == "calendar-event" {
                 spans.append(.block(block))
                 previousBlock = block
                 continue

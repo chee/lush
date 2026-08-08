@@ -11,6 +11,7 @@ struct FormatMenuButton: View {
         } label: {
             Text("Aa")
                 .font(glyphFont)
+                .baselineOffset(baselineShift)
                 .underline(controller.underlineActive)
                 .strikethrough(controller.strikethroughActive)
                 .foregroundStyle(marksActive ? Color.accentColor : Color.primary)
@@ -26,16 +27,33 @@ struct FormatMenuButton: View {
         controller.strongActive || controller.emActive || controller.underlineActive
             || controller.strikethroughActive || controller.codeActive
             || controller.superscriptActive || controller.subscriptActive
+            || controller.fontRoleActive != nil
+    }
+
+    private var baselineShift: CGFloat {
+        if controller.superscriptActive { return 3 }
+        if controller.subscriptActive { return -2 }
+        return 0
     }
 
     private var glyphFont: Font {
-        var font = Font.system(
-            size: 13,
-            weight: controller.strongActive ? .bold : .regular,
-            design: controller.codeActive ? .monospaced : .default
-        )
-        if controller.emActive { font = font.italic() }
-        return font
+        let size: CGFloat = baselineShift == 0 ? 13 : 10
+        var font: PFont
+        if controller.codeActive {
+            font = EditorSettings.font(family: "mono", ofSize: size)
+        } else if let role = controller.fontRoleActive {
+            font = EditorSettings.font(family: role, ofSize: size)
+        } else {
+            font = .systemFont(ofSize: size)
+        }
+        if controller.strongActive || controller.emActive {
+            font = EditorSettings.styled(
+                font,
+                bold: controller.strongActive,
+                italic: controller.emActive
+            )
+        }
+        return Font(font)
     }
 }
 
@@ -60,7 +78,9 @@ struct FormatPopover: View {
                     FormatStyleRow(
                         key: key,
                         active: controller.currentStyleKey == key,
-                        action: { controller.applyStyle(key) }
+                        action: {
+                            controller.applyStyle(controller.currentStyleKey == key ? "paragraph" : key)
+                        }
                     )
                 }
             }
@@ -76,7 +96,7 @@ struct FormatPopover: View {
     }
 
     private var marksRow: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 0) {
             markButton(active: controller.strongActive, action: controller.toggleStrong) {
                 Text("B").font(.system(size: 14, weight: .bold))
             }
@@ -90,9 +110,6 @@ struct FormatPopover: View {
                 Text("S").font(.system(size: 14)).strikethrough()
             }
             Divider().frame(height: 18)
-            markButton(active: controller.codeActive, action: controller.toggleCode) {
-                Image(systemName: "chevron.left.forwardslash.chevron.right").font(.system(size: 11))
-            }
             markButton(active: controller.superscriptActive, action: controller.toggleSuperscript) {
                 Image(systemName: "textformat.superscript").font(.system(size: 12))
             }
@@ -100,28 +117,46 @@ struct FormatPopover: View {
                 Image(systemName: "textformat.subscript").font(.system(size: 12))
             }
         }
+        .padding(2)
+        .background(Color.primary.opacity(0.06))
+        .clipShape(Capsule())
     }
 
     private var fontRow: some View {
         HStack(spacing: 6) {
-            Image(systemName: "textformat")
-                .font(.system(size: 12))
-                .foregroundStyle(controller.fontRoleActive != nil ? Color.accentColor : Color.secondary)
-                .frame(width: 22)
             ForEach(RichText.fontRoles, id: \.key) { role in
-                Button {
+                fontButton(
+                    label: role.label,
+                    family: role.key,
+                    active: controller.fontRoleActive == role.key
+                ) {
                     controller.applyFontRole(controller.fontRoleActive == role.key ? nil : role.key)
-                } label: {
-                    Text(role.label)
-                        .font(Font(EditorSettings.font(family: role.key, ofSize: 12)))
-                        .foregroundStyle(
-                            controller.fontRoleActive == role.key ? Color.accentColor : Color.primary
-                        )
                 }
-                .buttonStyle(.plain)
+            }
+            fontButton(label: "Code", family: "mono", active: controller.codeActive) {
+                controller.toggleCode()
             }
             Spacer()
         }
+    }
+
+    private func fontButton(
+        label: String,
+        family: String,
+        active: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(Font(EditorSettings.font(family: family, ofSize: 12)))
+                .foregroundStyle(active ? Color.accentColor : Color.primary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(active ? Color.accentColor.opacity(0.16) : Color.clear)
+                .clipShape(Capsule())
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var highlightRow: some View {
@@ -160,13 +195,18 @@ struct FormatPopover: View {
     }
 
     private var indentRow: some View {
-        HStack(spacing: 2) {
-            markButton(active: false, action: controller.outdentBlock) {
-                Image(systemName: "decrease.indent").font(.system(size: 12))
+        HStack(spacing: 0) {
+            HStack(spacing: 0) {
+                markButton(active: false, action: controller.outdentBlock) {
+                    Image(systemName: "decrease.indent").font(.system(size: 12))
+                }
+                markButton(active: false, action: controller.indentBlock) {
+                    Image(systemName: "increase.indent").font(.system(size: 12))
+                }
             }
-            markButton(active: false, action: controller.indentBlock) {
-                Image(systemName: "increase.indent").font(.system(size: 12))
-            }
+            .padding(2)
+            .background(Color.primary.opacity(0.06))
+            .clipShape(Capsule())
             Spacer()
         }
     }
@@ -198,8 +238,8 @@ struct FormatPopover: View {
             label()
                 .foregroundStyle(active ? Color.accentColor : Color.primary)
                 .frame(width: 26, height: 24)
-                .background(active ? Color.accentColor.opacity(0.14) : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .background(active ? Color.accentColor.opacity(0.16) : Color.clear)
+                .clipShape(Capsule())
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

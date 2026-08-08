@@ -11,13 +11,40 @@ struct NoteChatTurn: Identifiable, Codable, Equatable {
     let id: UUID
     let role: Role
     let text: String
+    /// Chats saved before the chat could edit spans directly still hold a
+    /// whole-note markdown draft.
     let proposedMarkdown: String?
+    var calls: [NoteChatToolCall]
+    var proposals: [NoteChatProposal]
+    var applied: Set<UUID>
 
-    init(id: UUID = UUID(), role: Role, text: String, proposedMarkdown: String?) {
+    init(
+        id: UUID = UUID(),
+        role: Role,
+        text: String,
+        proposedMarkdown: String? = nil,
+        calls: [NoteChatToolCall] = [],
+        proposals: [NoteChatProposal] = [],
+        applied: Set<UUID> = []
+    ) {
         self.id = id
         self.role = role
         self.text = text
         self.proposedMarkdown = proposedMarkdown
+        self.calls = calls
+        self.proposals = proposals
+        self.applied = applied
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        role = try c.decode(Role.self, forKey: .role)
+        text = try c.decode(String.self, forKey: .text)
+        proposedMarkdown = try c.decodeIfPresent(String.self, forKey: .proposedMarkdown)
+        calls = try c.decodeIfPresent([NoteChatToolCall].self, forKey: .calls) ?? []
+        proposals = try c.decodeIfPresent([NoteChatProposal].self, forKey: .proposals) ?? []
+        applied = try c.decodeIfPresent(Set<UUID>.self, forKey: .applied) ?? []
     }
 }
 
@@ -132,19 +159,22 @@ enum NoteChatAssistant {
         }
     }
 
-    private struct GeneratedReply: Decodable {
+    private struct GeneratedReply {
         let answer: String
+        let tool: String?
+        let arguments: [String: Any]
+        /// Older chats and models that ignore the tools still send a whole
+        /// rewritten note.
         let editedMarkdown: String?
-        let readAttachments: [Int]?
     }
 
-    /// One round of generation, then — if the model asked to see inside a
-    /// patchwork embed — a second round with those documents in the prompt.
+    static let maximumRounds = 8
+
+    /// Generate, run whatever tool was called, generate again — until the model
+    /// answers or the round budget runs out.
     static func respond(
         to question: String,
-        noteTitle: String,
-        noteMarkdown: String,
-        attachments: [NoteAttachment],
+        session: NoteChatSession,
         previousTurns: [NoteChatTurn],
         choice: ModelChoice? = nil
     ) async throws -> (answer: String, proposedMarkdown: String?) {
@@ -152,57 +182,61 @@ enum NoteChatAssistant {
         guard !trimmedQuestion.isEmpty else { throw ChatError.emptyQuestion }
         let choice = choice ?? LocalModelSettings.choice(for: .noteChat)
 
-        var documents = ""
-        for _ in 0...1 {
-            let body = prompt(
+        var transcript: [String] = []
+        for round in 0..<maximumRounds {
+            let body = await prompt(
                 question: trimmedQuestion,
-                noteTitle: noteTitle,
-                noteMarkdown: noteMarkdown,
-                attachments: attachments,
-                documents: documents,
-                previousTurns: previousTurns
+                session: session,
+                transcript: transcript,
+                previousTurns: previousTurns,
+                last: round == maximumRounds - 1
             )
             let generated = try await generate(body, choice: choice)
-            if documents.isEmpty, let wanted = generated.readAttachments, !wanted.isEmpty {
-                documents = await documentsSection(attachments, numbers: wanted)
-                if !documents.isEmpty { continue }
+            guard let tool = generated.tool, !tool.isEmpty else {
+                return try await reply(from: generated, session: session)
             }
-            return try reply(from: generated)
+            let result = await session.run(tool, arguments: generated.arguments)
+            transcript.append("\(tool) \(json(generated.arguments))\n→ \(limited(result, to: 6_000))")
         }
         throw ChatError.generationFailed
     }
 
     private static func prompt(
         question: String,
-        noteTitle: String,
-        noteMarkdown: String,
-        attachments: [NoteAttachment],
-        documents: String,
-        previousTurns: [NoteChatTurn]
-    ) -> String {
-        """
-        Note title: \(limited(noteTitle, to: 300))
+        session: NoteChatSession,
+        transcript: [String],
+        previousTurns: [NoteChatTurn],
+        last: Bool
+    ) async -> String {
+        let outline = await MainActor.run { session.outline }
+        let title = await MainActor.run { session.title }
+        let attachments = await MainActor.run { session.attachments }
+        return """
+        Note title: \(limited(title, to: 300))
 
-        Current note in Markdown:
-        \(limited(noteMarkdown, to: 12_000))
+        The note, one line per block, numbered for editing:
+        \(limited(outline, to: 12_000))
 
         Attachments:
         \(attachmentsSection(attachments))
-        \(documents.isEmpty ? "" : "\nAttachment document contents:\n\(documents)\n")
+
+        Tools:
+        \(NoteChatSession.catalog)
+
         Recent chat:
         \(historySummary(from: previousTurns))
+
+        Tools you have already called this turn:
+        \(transcript.isEmpty ? "None." : transcript.joined(separator: "\n\n"))
 
         Person request:
         \(question)
 
-        Return one JSON object and no other text.
-        Requirements for the JSON fields:
-        - answer: your actual response to the person's request
-        - editedMarkdown: null unless you are proposing a note change; otherwise \
-        the complete revised note in Markdown, keeping every [attachment n] line where it is
-        - readAttachments: an empty list, unless you need to read inside a patchwork \
-        document attachment before you can answer; then list its numbers, leave answer empty, \
-        and you will be asked again with those documents included
+        Return one JSON object and no other text. Either call one tool:
+        {"tool": "name", "arguments": {…}}
+        or answer, once you have everything you need:
+        {"answer": "your reply to the person"}
+        \(last ? "\nThis is the last round: answer now, do not call another tool." : "")
         """
     }
 
@@ -224,23 +258,10 @@ enum NoteChatAssistant {
                 lines.append("  summary: \(limited(attachment.summary, to: 1_000))")
             }
             if attachment.isPatchworkDoc {
-                lines.append("  contents readable — put \(attachment.number) in readAttachments to see them")
+                lines.append("  contents readable with read_attachment \(attachment.number)")
             }
             return lines.joined(separator: "\n")
         }.joined(separator: "\n")
-    }
-
-    private static func documentsSection(_ attachments: [NoteAttachment], numbers: [Int]) async -> String {
-        var sections: [String] = []
-        for number in numbers.prefix(4) {
-            guard let attachment = attachments.first(where: { $0.number == number }),
-                  attachment.isPatchworkDoc,
-                  let url = attachment.url,
-                  let json = try? await PatchworkScripting.shared.documentJSON(url)
-            else { continue }
-            sections.append("[attachment \(number)] as JSON:\n\(limited(json, to: 8_000))")
-        }
-        return sections.joined(separator: "\n\n")
     }
 
     private static func generate(_ body: String, choice: ModelChoice) async throws -> GeneratedReply {
@@ -281,14 +302,27 @@ enum NoteChatAssistant {
         return generated
     }
 
-    private static func reply(from generated: GeneratedReply) throws -> (answer: String, proposedMarkdown: String?) {
+    private static func reply(
+        from generated: GeneratedReply,
+        session: NoteChatSession
+    ) async throws -> (answer: String, proposedMarkdown: String?) {
         let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
         let proposedMarkdown = generated.editedMarkdown?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty
         guard !isPlaceholder(answer), !isPlaceholder(proposedMarkdown) else { throw ChatError.generationFailed }
-        guard !answer.isEmpty || proposedMarkdown != nil else { throw ChatError.generationFailed }
-        return (answer.isEmpty ? "I drafted a change for this note." : answer, proposedMarkdown)
+        let proposals = await MainActor.run { session.proposals }
+        guard !answer.isEmpty || proposedMarkdown != nil || !proposals.isEmpty else {
+            throw ChatError.generationFailed
+        }
+        return (answer.isEmpty ? "I drafted a change for you." : answer, proposedMarkdown)
+    }
+
+    private static func json(_ value: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func historySummary(from turns: [NoteChatTurn]) -> String {
@@ -325,8 +359,19 @@ enum NoteChatAssistant {
     }
 
     private static func decode(_ json: String) -> GeneratedReply? {
-        guard let data = json.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(GeneratedReply.self, from: data)
+        guard let data = json.data(using: .utf8),
+              let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        // some models nest the call, some spell the fields out flat
+        let call = value["tool_call"] as? [String: Any] ?? value
+        let tool = (call["tool"] as? String ?? call["name"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return GeneratedReply(
+            answer: value["answer"] as? String ?? value["text"] as? String ?? "",
+            tool: tool?.isEmpty == true ? nil : tool,
+            arguments: call["arguments"] as? [String: Any] ?? call["parameters"] as? [String: Any] ?? [:],
+            editedMarkdown: value["editedMarkdown"] as? String
+        )
     }
 
     /// The chat pipeline round-trips the note through markdown, which cannot
@@ -356,7 +401,7 @@ enum NoteChatAssistant {
             return nil
         }
         func isAtomicRoot(_ b: BlockValue) -> Bool {
-            b.isAtomic || b.type == "context"
+            b.isAtomic || b.type == "context" || b.type == "calendar-event"
         }
 
         var regions: [Region] = []
@@ -473,7 +518,7 @@ struct NoteChatView: View {
                             ContentUnavailableView {
                                 Label("Ask About This Note", systemImage: "sparkles")
                             } description: {
-                                Text("Questions stay grounded in the current note. Requested edits appear as drafts you can apply.")
+                                Text("It can read your other notes, attachments, and calendar. Anything it wants to change appears here for you to apply.")
                             }
                             .padding(.top, 28)
                         } else {
@@ -483,6 +528,9 @@ struct NoteChatView: View {
                                     isApplying: applyingTurnId == turn.id,
                                     applyDraft: { markdown in
                                         apply(markdown, from: turn.id)
+                                    },
+                                    applyProposal: { proposal in
+                                        apply(proposal, from: turn.id)
                                     }
                                 )
                                 .id(turn.id)
@@ -577,29 +625,60 @@ struct NoteChatView: View {
 
         chatTask?.cancel()
         chatTask = Task {
+            let spans = SpanNode.decodeList(await model.spansJSON(for: currentUrl))
+            let session = NoteChatSession(
+                model: model,
+                url: currentUrl,
+                title: noteName,
+                spans: spans,
+                attachments: await NoteAttachment.all(in: spans, model: model)
+            )
             do {
-                let json = await model.spansJSON(for: currentUrl)
-                let spans = SpanNode.decodeList(json)
-                let markdown = await MainActor.run {
-                    RichTextClipboard.markdown(from: spans) { "[attachment \($0 + 1)]" }
-                }
-                let attachments = await NoteAttachment.all(in: spans, model: model)
                 let reply = try await NoteChatAssistant.respond(
                     to: question,
-                    noteTitle: noteName,
-                    noteMarkdown: markdown,
-                    attachments: attachments,
+                    session: session,
                     previousTurns: previousTurns,
                     choice: modelChoice
                 )
                 guard !Task.isCancelled else { return }
-                turns.append(NoteChatTurn(role: .assistant, text: reply.answer, proposedMarkdown: reply.proposedMarkdown))
+                turns.append(NoteChatTurn(
+                    role: .assistant,
+                    text: reply.answer,
+                    proposedMarkdown: reply.proposedMarkdown,
+                    calls: session.calls,
+                    proposals: session.proposals
+                ))
                 NoteChatStore.save(turns, for: currentUrl)
             } catch {
                 guard !Task.isCancelled else { return }
-                errorMessage = error.localizedDescription
+                // work the model already did is worth keeping on screen
+                if !session.calls.isEmpty || !session.proposals.isEmpty {
+                    turns.append(NoteChatTurn(
+                        role: .assistant,
+                        text: error.localizedDescription,
+                        calls: session.calls,
+                        proposals: session.proposals
+                    ))
+                    NoteChatStore.save(turns, for: currentUrl)
+                } else {
+                    errorMessage = error.localizedDescription
+                }
             }
             isGenerating = false
+        }
+    }
+
+    private func apply(_ proposal: NoteChatProposal, from turnId: UUID) {
+        guard applyingTurnId == nil else { return }
+        applyingTurnId = turnId
+        errorMessage = nil
+        Task {
+            errorMessage = await proposal.action.apply(model: model)
+            if errorMessage == nil, let index = turns.firstIndex(where: { $0.id == turnId }) {
+                turns[index].applied.insert(proposal.id)
+                NoteChatStore.save(turns, for: url)
+            }
+            applyingTurnId = nil
         }
     }
 
@@ -639,9 +718,23 @@ private struct NoteChatBubble: View {
     let turn: NoteChatTurn
     let isApplying: Bool
     let applyDraft: (String) -> Void
+    let applyProposal: (NoteChatProposal) -> Void
 
     var body: some View {
         VStack(alignment: turn.role == .user ? .trailing : .leading, spacing: 6) {
+            ForEach(turn.calls) { call in
+                HStack(spacing: 5) {
+                    Image(systemName: "wrench.and.screwdriver")
+                    Text(call.name).monospaced()
+                    Text(call.detail)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                .uiFont(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Text(turn.text)
                 .uiFont(.callout)
                 .textSelection(.enabled)
@@ -649,6 +742,40 @@ private struct NoteChatBubble: View {
                 .padding(.vertical, 8)
                 .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 8))
                 .frame(maxWidth: .infinity, alignment: turn.role == .user ? .trailing : .leading)
+
+            ForEach(turn.proposals) { proposal in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(proposal.title)
+                        .uiFont(.callout, weight: .medium)
+                    ForEach(Array(proposal.detail.prefix(8).enumerated()), id: \.offset) { line in
+                        Text(line.element)
+                            .uiFont(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if turn.applied.contains(proposal.id) {
+                        Label("Applied", systemImage: "checkmark.circle.fill")
+                            .uiFont(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button {
+                            applyProposal(proposal)
+                        } label: {
+                            if isApplying {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("Apply", systemImage: "checkmark.circle")
+                            }
+                        }
+                        .uiFont(.caption)
+                        .disabled(isApplying)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+            }
 
             if let proposedMarkdown = turn.proposedMarkdown {
                 VStack(alignment: .leading, spacing: 8) {

@@ -347,22 +347,77 @@ enum RichTextClipboard {
     }
 
     private static func markdownInline(_ text: String, marks: [String: JSONValue]) -> String {
+        inlineMarkdown(text, marks: marks)
+    }
+
+    /// Marks markdown has no spelling for are written as the HTML tags the
+    /// note exporter already uses, so the round trip keeps them.
+    static func inlineMarkdown(_ text: String, marks: [String: JSONValue]) -> String {
         let isCode = marks["code"] == .bool(true)
         var out = isCode ? "`" + text + "`" : escapeMarkdown(text)
         if case .bool(true)? = marks["strong"] { out = "**" + out + "**" }
         if case .bool(true)? = marks["em"] { out = "*" + out + "*" }
         if case .bool(true)? = marks["strikethrough"] { out = "~~" + out + "~~" }
+        if case .bool(true)? = marks["underline"] { out = "<u>" + out + "</u>" }
+        if case .bool(true)? = marks["superscript"] { out = "<sup>" + out + "</sup>" }
+        if case .bool(true)? = marks["subscript"] { out = "<sub>" + out + "</sub>" }
+        if let name = marks["highlight"]?.stringValue { out = "<mark class=\"\(name)\">" + out + "</mark>" }
+        if let role = marks["font"]?.stringValue { out = "<span class=\"\(role)\">" + out + "</span>" }
         if let link = marks["link"]?.stringValue { out = "[" + out + "](" + link + ")" }
         return out
+    }
+
+    static func inlineSpans(fromMarkdown text: String) -> [SpanNode] {
+        inlineRuns(fromMarkdown: text).map { .text($0.text, $0.marks) }
     }
 
     private static func escapeMarkdown(_ text: String) -> String {
         var out = ""
         for character in text {
-            if "\\`*_~[".contains(character) { out.append("\\") }
+            if "\\`*_~[<".contains(character) { out.append("\\") }
             out.append(character)
         }
         return out
+    }
+
+    private static let inlineTagMarks = [
+        "u": "underline",
+        "sup": "superscript",
+        "sub": "subscript",
+        "mark": "highlight",
+        "span": "font",
+    ]
+
+    private static func inlineTag(
+        in text: String, at start: String.Index
+    ) -> (mark: String, value: JSONValue, body: String, end: String.Index)? {
+        guard let open = text[start...].firstIndex(of: ">") else { return nil }
+        let head = String(text[text.index(after: start)..<open])
+        let name = head.prefix { $0.isLetter }.lowercased()
+        guard let mark = inlineTagMarks[name],
+              let close = text[text.index(after: open)...].range(of: "</\(name)>")
+        else { return nil }
+        let body = String(text[text.index(after: open)..<close.lowerBound])
+        let value: JSONValue
+        switch mark {
+        case "highlight":
+            value = .string(tagClass(head).flatMap { Highlight.names.contains($0) ? $0 : nil } ?? "yellow")
+        case "font":
+            guard let role = tagClass(head),
+                  RichText.fontRoles.contains(where: { $0.key == role })
+            else { return nil }
+            value = .string(role)
+        default:
+            value = .bool(true)
+        }
+        return (mark, value, body, close.upperBound)
+    }
+
+    private static func tagClass(_ head: String) -> String? {
+        guard let range = head.range(of: "class=") else { return nil }
+        let rest = head[range.upperBound...].drop { $0 == "\"" || $0 == "'" }
+        let name = rest.prefix { $0.isLetter || $0.isNumber || $0 == "-" }
+        return name.isEmpty ? nil : String(name)
     }
 
     /// A paragraph whose text starts like a block marker would import as that
@@ -382,14 +437,25 @@ enum RichTextClipboard {
         runs.map(\.0).joined()
     }
 
-    private static func inlineRuns(fromMarkdown text: String) -> [(text: String, marks: [String: JSONValue])] {
+    private static func inlineRuns(
+        fromMarkdown text: String,
+        inherited: [String: JSONValue] = [:]
+    ) -> [(text: String, marks: [String: JSONValue])] {
         var runs: [(String, [String: JSONValue])] = []
         var index = text.startIndex
         var plainStart = index
 
         func flushPlain(upTo end: String.Index) {
             guard plainStart < end else { return }
-            runs.append((String(text[plainStart..<end]), [:]))
+            runs.append((String(text[plainStart..<end]), inherited))
+        }
+
+        /// Marks nest: the body of a construct is parsed again, carrying the
+        /// marks it sits inside.
+        func nested(_ body: String, _ mark: String, _ value: JSONValue) {
+            var marks = inherited
+            marks[mark] = value
+            runs.append(contentsOf: inlineRuns(fromMarkdown: body, inherited: marks))
         }
 
         let punctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
@@ -401,28 +467,42 @@ enum RichTextClipboard {
                punctuation.contains(text[text.index(after: index)]) {
                 flushPlain(upTo: index)
                 let escaped = text.index(after: index)
-                runs.append((String(text[escaped]), [:]))
+                runs.append((String(text[escaped]), inherited))
                 index = text.index(after: escaped)
                 plainStart = index
             } else if rest.hasPrefix("**"),
                let end = text[rest.index(index, offsetBy: 2)...].range(of: "**")?.lowerBound {
                 flushPlain(upTo: index)
                 let bodyStart = text.index(index, offsetBy: 2)
-                runs.append((String(text[bodyStart..<end]), ["strong": .bool(true)]))
+                nested(String(text[bodyStart..<end]), "strong", .bool(true))
                 index = text.index(end, offsetBy: 2)
                 plainStart = index
             } else if rest.hasPrefix("~~"),
                       let end = text[rest.index(index, offsetBy: 2)...].range(of: "~~")?.lowerBound {
                 flushPlain(upTo: index)
                 let bodyStart = text.index(index, offsetBy: 2)
-                runs.append((String(text[bodyStart..<end]), ["strikethrough": .bool(true)]))
+                nested(String(text[bodyStart..<end]), "strikethrough", .bool(true))
+                index = text.index(end, offsetBy: 2)
+                plainStart = index
+            } else if rest.hasPrefix("=="),
+                      let end = text[rest.index(index, offsetBy: 2)...].range(of: "==")?.lowerBound {
+                flushPlain(upTo: index)
+                let bodyStart = text.index(index, offsetBy: 2)
+                nested(String(text[bodyStart..<end]), "highlight", .string("yellow"))
                 index = text.index(end, offsetBy: 2)
                 plainStart = index
             } else if rest.hasPrefix("`"),
                       let end = text[text.index(after: index)...].firstIndex(of: "`") {
                 flushPlain(upTo: index)
-                runs.append((String(text[text.index(after: index)..<end]), ["code": .bool(true)]))
+                var marks = inherited
+                marks["code"] = .bool(true)
+                runs.append((String(text[text.index(after: index)..<end]), marks))
                 index = text.index(after: end)
+                plainStart = index
+            } else if rest.hasPrefix("<"), let tag = inlineTag(in: text, at: index) {
+                flushPlain(upTo: index)
+                nested(tag.body, tag.mark, tag.value)
+                index = tag.end
                 plainStart = index
             } else if rest.hasPrefix("["),
                       let close = text[index...].firstIndex(of: "]"),
@@ -433,13 +513,13 @@ enum RichTextClipboard {
                 let title = String(text[text.index(after: index)..<close])
                 let urlStart = text.index(after: text.index(after: close))
                 let url = String(text[urlStart..<end])
-                runs.append((title, ["link": .string(url)]))
+                nested(title, "link", .string(url))
                 index = text.index(after: end)
                 plainStart = index
             } else if rest.hasPrefix("*"),
                       let end = text[text.index(after: index)...].firstIndex(of: "*") {
                 flushPlain(upTo: index)
-                runs.append((String(text[text.index(after: index)..<end]), ["em": .bool(true)]))
+                nested(String(text[text.index(after: index)..<end]), "em", .bool(true))
                 index = text.index(after: end)
                 plainStart = index
             } else {

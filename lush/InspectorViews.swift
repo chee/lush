@@ -31,7 +31,7 @@ struct NoteStats: Equatable {
                 case "code-block": stats.codeBlocks += 1
                 case "table": stats.tables += 1
                 case "columns": stats.columns += 1
-                case "context": break
+                case "context", "calendar-event": break
                 default:
                     if block.isEmbedBlock {
                         let kind = block.type == "html"
@@ -239,9 +239,13 @@ private struct InfoField: View {
 final class ContextToolsState {
     var tools: [ToolChoice] = []
     var selected: String?
+    /// The webview has answered at least once — until then an empty list means
+    /// "still booting", not "nothing registered".
+    var loaded = false
 
     func offer(_ tools: [ToolChoice]) {
         self.tools = tools
+        loaded = true
         if let selected, tools.contains(where: { $0.id == selected }) { return }
         selected = PatchworkWeb.lastContextTool.flatMap { last in
             tools.first { $0.id == last }?.id
@@ -291,22 +295,32 @@ struct ContextToolsView: View {
                 Divider()
             }
 
-            if state.tools.isEmpty {
-                ContentUnavailableView {
-                    Label("No Context Tools", systemImage: "puzzlepiece.extension")
-                } description: {
-                    Text("Patchwork modules that register a context tool appear here.")
-                }
-            }
-
+            // the webview always holds the full panel, even while it boots and
+            // when it has nothing to show — anything else resizes the inspector
+            // out from under whatever is already on screen
             PatchworkContextToolsView(
                 docUrl: url,
                 accountUrl: model.accountUrl,
                 toolId: state.selected,
                 onTools: { [state] tools in state.offer(tools) }
             )
-            .frame(maxWidth: .infinity, maxHeight: state.tools.isEmpty ? 0 : .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay {
+                if state.tools.isEmpty {
+                    ZStack {
+                        Rectangle().fill(.background)
+                        if state.loaded {
+                            ContentUnavailableView {
+                                Label("No Context Tools", systemImage: "puzzlepiece.extension")
+                            } description: {
+                                Text("Patchwork modules that register a context tool appear here.")
+                            }
+                        }
+                    }
+                }
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

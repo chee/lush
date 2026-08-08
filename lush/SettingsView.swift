@@ -12,8 +12,8 @@ struct SettingsView: View {
             Tab("Patchwork", systemImage: "shippingbox") {
                 PatchworkSettingsPane()
             }
-            Tab("Editor", systemImage: "textformat") {
-                EditorSettingsPane()
+            Tab("Lush", systemImage: "leaf") {
+                LushSettingsPane()
             }
             Tab("Focus", systemImage: "moon") {
                 FocusSettingsPane()
@@ -40,6 +40,16 @@ struct SettingsView: View {
                 EditorSettingsPane()
             } label: {
                 Label("Editor", systemImage: "textformat")
+            }
+            NavigationLink {
+                CalendarSettingsPane()
+            } label: {
+                Label("Calendar", systemImage: "calendar")
+            }
+            NavigationLink {
+                CaptureSettingsPane()
+            } label: {
+                Label("Capture", systemImage: "tray.and.arrow.down")
             }
             NavigationLink {
                 FocusSettingsPane()
@@ -343,20 +353,66 @@ struct SyncSettingsPane: View {
     }
 }
 
+enum LushSettingsSection: String, CaseIterable, Identifiable {
+    case editor
+    case calendar
+    case capture
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .editor: "Editor"
+        case .calendar: "Calendar"
+        case .capture: "Capture"
+        }
+    }
+}
+
+struct LushSettingsPane: View {
+    @State private var section = LushSettingsSection.editor
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Section", selection: $section) {
+                ForEach(LushSettingsSection.allCases) { section in
+                    Text(section.title).tag(section)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            switch section {
+            case .editor: EditorSettingsPane()
+            case .calendar: CalendarSettingsPane()
+            case .capture: CaptureSettingsPane()
+            }
+        }
+        .navigationTitle("Lush")
+    }
+}
+
+struct CalendarSettingsPane: View {
+    @AppStorage(Agenda.dayInIconKey) private var calendarIconShowsDay = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Show today's date in the calendar icon", isOn: $calendarIconShowsDay)
+            } footer: {
+                Text("Events and reminders for the next two weeks show in the Calendar view. Double-click one to write a note about it.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Calendar")
+    }
+}
+
 struct EditorSettingsPane: View {
-    @Environment(ContextTracker.self) private var contextTracker
     @State private var fontSize = EditorSettings.bodySize
     @State private var limitWidth = EditorSettings.maxNoteWidth > 0
     @State private var maxWidth = EditorSettings.maxNoteWidth > 0 ? EditorSettings.maxNoteWidth : 700
-    @State private var autoInsertLogline = EditorSettings.autoInsertLogline
-    @State private var places = SavedPlaces.all
-    @State private var placeName = ""
-    @State private var contactPickerPresented = false
-    @State private var mapPickerPresented = false
-    @State private var importingMine = false
-    @State private var importStatus: String?
-    @AppStorage(NotesModel.importAsNotesKey) private var importTextFilesAsNotes = true
-    @AppStorage(Agenda.dayInIconKey) private var calendarIconShowsDay = false
 
     var body: some View {
         Form {
@@ -391,9 +447,25 @@ struct EditorSettingsPane: View {
                     }
                 }
             }
-            Section("Calendar") {
-                Toggle("Show today's date in the calendar icon", isOn: $calendarIconShowsDay)
-            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Editor")
+    }
+}
+
+struct CaptureSettingsPane: View {
+    @Environment(ContextTracker.self) private var contextTracker
+    @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var places = SavedPlaces.all
+    @State private var placeName = ""
+    @State private var contactPickerPresented = false
+    @State private var mapPickerPresented = false
+    @State private var importingMine = false
+    @State private var importStatus: String?
+    @AppStorage(NotesModel.importAsNotesKey) private var importTextFilesAsNotes = true
+
+    var body: some View {
+        Form {
             Section("Import") {
                 Picker("Markdown, text and RTF files", selection: $importTextFilesAsNotes) {
                     Text("Become Lush notes").tag(true)
@@ -452,7 +524,7 @@ struct EditorSettingsPane: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Editor")
+        .navigationTitle("Capture")
         .sheet(isPresented: $contactPickerPresented) {
             ContactPlacePicker { found in
                 add(found)

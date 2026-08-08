@@ -347,6 +347,7 @@ struct ContentView: View {
                         DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
                     })
                     .listRowInsets(sidebarRowInsets(depth: 0))
+                    .listRowBackground(selectionBackground(hit.url))
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
                             singleNoteContextMenu(for: node, showInFolder: true)
@@ -448,14 +449,18 @@ struct ContentView: View {
 
     private var calendarRow: some View {
         CalendarSidebarLabel()
+            .font(.title3.weight(.medium))
+            .foregroundStyle(.primary)
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 12)
-            .padding(.top, 8)
+            .padding(.top, 12)
+            .padding(.bottom, 5)
             .contentShape(Rectangle())
+            .background(SuppressListSelectionHighlight().frame(width: 0, height: 0))
             .onTapGesture { selectedItemUrls = [Agenda.sidebarTag] }
             .tag(Agenda.sidebarTag)
             .listRowInsets(sidebarRowInsets(depth: 0))
+            .listRowBackground(selectionBackground(Agenda.sidebarTag))
     }
 
     private var calendarSelected: Bool {
@@ -489,6 +494,7 @@ struct ContentView: View {
                     folderRow(for: node, depth: depth)
                         .tag(node.url)
                         .listRowInsets(sidebarRowInsets(depth: depth))
+                        .listRowBackground(selectionBackground(node.url))
                     if expanded.contains(node.url) {
                         nodeRows(model.orderedChildren(node.children ?? [], in: node.url), depth: depth + 1)
                     }
@@ -536,11 +542,13 @@ struct ContentView: View {
     @ViewBuilder
     private func selectionBackground(_ tag: String, greyWhen greyTag: String? = nil) -> some View {
         if selectedItemUrls.contains(tag) {
-            Color.clear
+            Self.selectionTint.opacity(0.22)
         } else if let greyTag, selectedItemUrls.contains(greyTag) {
             Color.secondary.opacity(0.12)
         }
     }
+
+    private static let selectionTint = Color(red: 1.0, green: 0.412, blue: 0.647)
 
     private func expansionBinding(_ url: String) -> Binding<Bool> {
         Binding(
@@ -1443,6 +1451,7 @@ enum RightSidebarTab: String, CaseIterable, Identifiable {
     case history = "History"
     case info = "Info"
     case chat = "Chat"
+    case tools = "Tools"
 
     var id: String { rawValue }
 
@@ -1453,6 +1462,7 @@ enum RightSidebarTab: String, CaseIterable, Identifiable {
         case .history: "clock.arrow.circlepath"
         case .info: "info.circle"
         case .chat: "bubble.left"
+        case .tools: "puzzlepiece.extension"
         }
     }
 }
@@ -1503,6 +1513,7 @@ struct RightSidebarView: View {
             switch tab {
             case .outline, .canvas: model.activeEditor != nil
             case .history, .info, .chat: node != nil
+            case .tools: node != nil && PatchworkWeb.available
             }
         }
     }
@@ -1538,6 +1549,8 @@ struct RightSidebarView: View {
                 infoView
             case .chat:
                 NoteChatView(url: model.resolvedNoteUrl(url), node: node)
+            case .tools:
+                ContextToolsView(url: model.resolvedNoteUrl(url))
             }
         }
         .background(.regularMaterial)
@@ -1678,24 +1691,11 @@ struct RightSidebarView: View {
     }
 
     private var infoView: some View {
-        Form {
-            Section("Document") {
-                LabeledContent("Name") {
-                    Text(node?.displayName.isEmpty == false ? node!.displayName : "Untitled")
-                }
-                LabeledContent("Kind") {
-                    Text(node?.kind ?? "Document")
-                }
-                Button("Copy URL") {
-                    Clipboard.copy(url)
-                }
-            }
-        }
-        .formStyle(.grouped)
+        DocumentInfoView(url: url, node: node, history: history)
     }
 
     private func scheduleHistoryRefresh(delay: Duration = .milliseconds(650)) {
-        guard selectedTab == .history else { return }
+        guard selectedTab == .history || selectedTab == .info else { return }
         historyRefreshTask?.cancel()
         let refreshUrl = url
         historyRefreshTask = Task {
@@ -2525,6 +2525,10 @@ struct NoteDetail: View {
     @ToolbarContentBuilder
     private var noteToolbar: some ToolbarContent {
         #if os(macOS)
+        ToolbarSpacer(.flexible)
+        ToolbarItem {
+            FormatMenuButton(controller: editor)
+        }
         ToolbarItem {
             Menu {
                 Button {
@@ -2571,9 +2575,6 @@ struct NoteDetail: View {
             } label: {
                 Label("Attach", systemImage: "paperclip")
             }
-        }
-        ToolbarItem {
-            FormatMenuButton(controller: editor)
         }
         ToolbarItem {
             PresenceFacesView(presence: model.presence)

@@ -203,6 +203,7 @@ enum NoteExporter {
             switch segment {
             case .simple(let b, let runs):
                 if b.type == "context" { continue }
+                if b.type == "calendar-event" { continue }
                 if b.isEmbedBlock {
                     closeLists()
                     if b.type == "html", let source = b.htmlSource {

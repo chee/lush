@@ -144,14 +144,6 @@ final class InlineViewManager {
                 retained: retained
             )
         }
-        if block.type == "calendar-event" {
-            let (view, _, retained) = makeHosting(CalendarEventInlineView(block: block))
-            return Host(
-                view: view,
-                preferredSize: { width in CGSize(width: min(460, width), height: 64) },
-                retained: retained
-            )
-        }
         if block.type == "context" {
             let (view, _, retained) = makeHosting(ContextInlineView(block: block))
             return Host(

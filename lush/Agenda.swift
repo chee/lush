@@ -78,11 +78,28 @@ enum Agenda {
         return Color(cgColor: cgColor)
     }
 
+    /// Every day in the window gets a section, empty or not, and an item that
+    /// runs over several days appears on each of them.
     static func days(_ items: [AgendaItem]) -> [(day: Date, items: [AgendaItem])] {
         let calendar = Calendar.current
-        let grouped = Dictionary(grouping: items) { calendar.startOfDay(for: $0.start) }
-        return grouped.keys.sorted().map { day in
-            let items = (grouped[day] ?? []).sorted {
+        let first = calendar.startOfDay(for: Date())
+        let window = (0..<horizonDays).compactMap {
+            calendar.date(byAdding: .day, value: $0, to: first)
+        }
+        guard let last = window.last else { return [] }
+        var byDay: [Date: [AgendaItem]] = [:]
+        for item in items {
+            let ends = item.end.map { $0 > item.start ? $0.addingTimeInterval(-1) : item.start } ?? item.start
+            var day = max(calendar.startOfDay(for: item.start), first)
+            let final = min(calendar.startOfDay(for: ends), last)
+            while day <= final {
+                byDay[day, default: []].append(item)
+                guard let next = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+                day = next
+            }
+        }
+        return window.map { day in
+            let items = (byDay[day] ?? []).sorted {
                 ($0.isAllDay ? 0 : 1, $0.start, $0.title) < ($1.isAllDay ? 0 : 1, $1.start, $1.title)
             }
             return (day, items)
@@ -107,7 +124,7 @@ struct CalendarSidebarLabel: View {
 
     var body: some View {
         Label {
-            Text("Calendar").fontWeight(.bold)
+            Text("Calendar")
         } icon: {
             Image(systemName: symbol)
                 .foregroundStyle(.red)
@@ -210,6 +227,8 @@ enum CalendarLinks {
         UserDefaults.standard.dictionary(forKey: key) as? [String: [String]] ?? [:]
     }
 
+    static var noteUrls: [String] { Array(map.keys) }
+
     static func notes(for itemId: String) -> [String] {
         map.compactMap { $0.value.contains(itemId) ? $0.key : nil }
     }
@@ -253,69 +272,32 @@ extension BlockValue {
         guard type == "calendar-event" else { return nil }
         return attrs["title"]?.stringValue
     }
-}
 
-struct CalendarEventInlineView: View {
-    let block: BlockValue
-
-    private var isReminder: Bool {
-        block.attrs["kind"]?.stringValue == AgendaItem.Kind.reminder.rawValue
+    var calendarEventStart: Date? {
+        guard type == "calendar-event" else { return nil }
+        return attrs["start"]?.stringValue.flatMap(Agenda.iso.date(from:))
     }
 
-    private var start: Date? {
-        block.attrs["start"]?.stringValue.flatMap(Agenda.iso.date(from:))
+    var calendarEventEnd: Date? {
+        guard type == "calendar-event" else { return nil }
+        return attrs["end"]?.stringValue.flatMap(Agenda.iso.date(from:))
     }
 
-    private var end: Date? {
-        block.attrs["end"]?.stringValue.flatMap(Agenda.iso.date(from:))
-    }
-
-    private var whenText: String {
-        guard let start else { return "" }
-        let day = start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
-        if block.attrs["allDay"]?.boolValue == true { return "\(day) · all day" }
-        let from = start.formatted(date: .omitted, time: .shortened)
-        guard let end, end > start else { return "\(day) · \(from)" }
-        return "\(day) · \(from) – \(end.formatted(date: .omitted, time: .shortened))"
-    }
-
-    var body: some View {
-        Button {
-            AppRouter.shared.pending = .calendar
-        } label: {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: isReminder ? "checklist" : "calendar")
-                    .font(.system(size: 16))
-                    .foregroundStyle(.red)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(block.attrs["title"]?.stringValue ?? "Untitled Event")
-                        .font(.system(size: RichText.bodySize, weight: .medium))
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        Text(whenText)
-                        if let location = block.attrs["location"]?.stringValue {
-                            Text("·")
-                            Text(location).lineLimit(1)
-                        }
-                        if let calendar = block.attrs["calendar"]?.stringValue {
-                            Text("·")
-                            Text(calendar).lineLimit(1)
-                        }
-                    }
-                    .font(.system(size: max(10, RichText.bodySize - 3)))
-                    .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
+    var calendarEventSearchText: String? {
+        guard let title = calendarEventTitle else { return nil }
+        var parts = [title]
+        if let start = calendarEventStart {
+            parts.append(start.formatted(.dateTime.weekday(.wide).day().month(.wide).year()))
+            if attrs["allDay"]?.boolValue == true {
+                parts.append("all day")
+            } else {
+                parts.append(start.formatted(date: .omitted, time: .shortened))
             }
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.secondary.opacity(0.1))
-            )
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .help("Show in Calendar")
+        if let location = attrs["location"]?.stringValue { parts.append(location) }
+        if let calendar = attrs["calendar"]?.stringValue { parts.append(calendar) }
+        parts.append(attrs["kind"]?.stringValue == AgendaItem.Kind.reminder.rawValue ? "reminder" : "calendar event")
+        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 }
 

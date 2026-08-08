@@ -2,7 +2,6 @@ import SwiftUI
 
 enum FontRole {
     static let all: [(key: String, label: String)] = [
-        ("ui", "Interface"),
         ("sans", "Sans"),
         ("serif", "Serif"),
         ("mono", "Mono"),
@@ -95,33 +94,50 @@ struct FontSettingsSections: View {
 
 /// Every role in one block, because pairing is only judgeable together.
 struct FontSpecimen: View {
+    var overrideRole: String?
+    var overrideFamily: String?
+    var overrideAdjustment: FontAdjustment?
+
+    private func font(_ role: String, size: CGFloat? = nil, weight: PFont.Weight = .regular) -> Font {
+        guard role == overrideRole else {
+            return FontRole.font(role, size: size, weight: weight)
+        }
+        return FontRole.font(
+            role,
+            family: overrideFamily,
+            adjustment: overrideAdjustment,
+            size: size,
+            weight: weight
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Hamburgefonstiv")
-                .font(FontRole.font("sans", size: EditorSettings.bodySize + 10, weight: .bold))
+                .font(font("sans", size: EditorSettings.bodySize + 10, weight: .bold))
             Text("Sans carries the body text, ")
-                .font(FontRole.font("sans"))
+                .font(font("sans"))
             + Text("bold sits inside it")
-                .font(FontRole.font("sans", weight: .bold))
+                .font(font("sans", weight: .bold))
             + Text(", and ")
-                .font(FontRole.font("sans"))
+                .font(font("sans"))
             + Text("italic leans")
-                .font(FontRole.font("sans").italic())
+                .font(font("sans").italic())
             + Text(".")
-                .font(FontRole.font("sans"))
+                .font(font("sans"))
 
             Text("Serif runs alongside at the same nominal size — 0123456789.")
-                .font(FontRole.font("serif"))
+                .font(font("serif"))
 
             Text("Mono for ")
-                .font(FontRole.font("sans"))
+                .font(font("sans"))
             + Text("let x = 1")
-                .font(FontRole.font("mono", size: EditorSettings.bodySize - 1))
+                .font(font("mono", size: EditorSettings.bodySize - 1))
             + Text(" inline.")
-                .font(FontRole.font("sans"))
+                .font(font("sans"))
 
             Text("Hand writes a line at the end.")
-                .font(FontRole.font("hand"))
+                .font(font("hand"))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
@@ -134,7 +150,6 @@ struct FontChooser: View {
     @Environment(\.dismiss) private var dismiss
     @State private var family: String
     @State private var adjustment: FontAdjustment
-    @State private var advanced = false
     @State private var search = ""
 
     init(role: String, label: String) {
@@ -174,14 +189,19 @@ struct FontChooser: View {
                             .disabled(adjustment.scale == 1)
                     }
                 }
-                Section(isExpanded: $advanced) {
+                Section("Weights") {
                     weightPicker("Normal", selection: $adjustment.regularWeight)
                     weightPicker("Bold", selection: $adjustment.boldWeight)
                     Text("Automatic uses the family's own regular and bold faces. A variable family can take any weight; others snap to the nearest face.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } header: {
-                    Text("Weights")
+                }
+                Section("Specimen") {
+                    FontSpecimen(
+                        overrideRole: role,
+                        overrideFamily: family,
+                        overrideAdjustment: adjustment
+                    )
                 }
                 Section("Family") {
                     familyRow(EditorSettings.systemFontFamily)

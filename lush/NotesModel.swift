@@ -157,6 +157,7 @@ final class NotesModel {
     private var semanticIndexTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var spotlightIndexTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var spotlightBackfilled: Set<String> = []
+    @ObservationIgnored private var calendarNotesReindexed = false
     private var previewUpdateTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var noteWriteTasks: [String: Task<[String]?, Never>] = [:]
@@ -1895,6 +1896,19 @@ final class NotesModel {
             for note in notes where !known.contains(note.url) {
                 self.scheduleSemanticIndex(url: note.url, name: note.name)
             }
+            self.reindexCalendarNotes()
+        }
+    }
+
+    /// Notes about calendar items index the event's date, place and calendar
+    /// alongside the text, so a note about a meeting last month is findable
+    /// long after it left the Calendar view.
+    private func reindexCalendarNotes() {
+        guard !calendarNotesReindexed else { return }
+        calendarNotesReindexed = true
+        for url in CalendarLinks.noteUrls {
+            scheduleSemanticIndex(url: url)
+            scheduleSpotlightIndex(url: url)
         }
     }
 

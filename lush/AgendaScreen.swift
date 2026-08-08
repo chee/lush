@@ -8,6 +8,7 @@ struct AgendaScreen: View {
     @Environment(ContextTracker.self) private var contextTracker
     @State private var agenda = AgendaStore.shared
     @State private var links = 0
+    @State private var hovered: String?
 
     var body: some View {
         Group {
@@ -39,77 +40,85 @@ struct AgendaScreen: View {
     }
 
     private var list: some View {
-        List {
-            ForEach(Agenda.days(agenda.items), id: \.day) { group in
-                Section {
-                    ForEach(group.items) { item in
-                        row(item)
-                    }
-                } header: {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Agenda.days(agenda.items), id: \.day) { group in
                     header(group.day)
+                    ForEach(group.items) { item in
+                        row(item, on: group.day)
+                    }
                 }
             }
+            .padding(.horizontal, 28)
+            .padding(.bottom, 40)
+            .frame(maxWidth: 720)
+            .frame(maxWidth: .infinity, alignment: .center)
         }
-        .listStyle(.plain)
         .id(links)
     }
 
     private func header(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("\(Calendar.current.component(.day, from: day))")
-                .font(.system(size: 26, weight: .bold))
+                .font(.system(size: 30, weight: .bold))
                 .foregroundStyle(.primary)
             Text(Agenda.dayName(day))
-                .font(.headline)
+                .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.secondary)
             VStack { Divider() }
+                .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 13 }
         }
-        .padding(.top, 14)
-        .padding(.bottom, 2)
-        .textCase(nil)
+        .padding(.top, 34)
+        .padding(.bottom, 10)
     }
 
-    private func row(_ item: AgendaItem) -> some View {
+    private func row(_ item: AgendaItem, on day: Date) -> some View {
         let noteUrl = model.noteUrl(for: item)
+        let key = "\(day.timeIntervalSince1970)|\(item.id)"
+        let hovering = hovered == key
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Group {
-                if let time = item.timeText {
-                    Text(time)
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(item.color)
-                } else {
-                    Capsule()
-                        .fill(item.color)
-                        .frame(width: 3, height: 12)
-                }
+            if let time = item.timeText {
+                Text(time)
+                    .font(.system(size: 15).monospacedDigit())
+                    .foregroundStyle(item.color)
+            } else {
+                Capsule()
+                    .fill(item.color)
+                    .frame(width: 3, height: 14)
             }
-            .frame(width: 76, alignment: .trailing)
             if item.kind == .reminder {
                 Image(systemName: "circle")
-                    .font(.caption)
+                    .font(.system(size: 12))
                     .foregroundStyle(item.color)
             }
             Text(item.title)
+                .font(.system(size: 16))
+                .underline(hovering)
                 .lineLimit(1)
             if noteUrl != nil {
                 Image(systemName: "doc.richtext")
-                    .font(.caption)
+                    .font(.system(size: 12))
                     .foregroundStyle(.tint)
             }
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
+        .onHover { inside in
+            hovered = inside ? key : (hovered == key ? nil : hovered)
+        }
         #if os(macOS)
-        .onTapGesture(count: 2) { openOrCreate(item) }
-        #else
-        .onTapGesture { openOrCreate(item) }
+        .pointerStyle(.link)
         #endif
+        .onTapGesture { openOrCreate(item) }
         .contextMenu {
             if let noteUrl {
                 Button("Open Note") { open(noteUrl) }
-                Button("New Note") { create(item) }
                 Button("Copy Note URL") { Clipboard.copy(noteUrl) }
+                Button("New Note") { create(item) }
+                Divider()
+                Button("Delete Note", role: .destructive) { model.deleteNote(noteUrl) }
             } else {
                 Button("New Note") { create(item) }
             }

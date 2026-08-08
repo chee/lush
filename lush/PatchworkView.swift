@@ -221,9 +221,12 @@ enum PatchworkWeb {
         display: block; height: 100%; overflow: auto;
         background: var(--editor-fill); color: var(--editor-line);
       }
-      body > .context-root, body > .context-root > repo-provider {
+      body > .context-root {
         display: block; height: 100%; overflow: auto;
         background: var(--editor-fill); color: var(--editor-line);
+      }
+      .context-root repo-provider, .context-root patchwork-view {
+        display: block; height: 100%;
       }
       #status { font: 12px system-ui, sans-serif; color: color-mix(in srgb, var(--editor-line) 55%, transparent); padding: 12px; }
       @keyframes lush-loading-pulse {
@@ -769,8 +772,9 @@ enum PatchworkWeb {
     // "context-tool" is offered to the native tab bar, and the chosen one is
     // rendered bare — no bound doc — the way patchwork's own frame does it.
     // Tools read the document they are about from a `patchwork:selected-doc`
-    // subscription, which a shim around the tree answers with the note the
-    // inspector is open on, standing in for patchwork's selected-doc provider.
+    // subscription, answered by patchwork's own selected-doc provider — which
+    // takes its selection from the location hash and from `open-document`
+    // events, so the note the inspector is open on is published as both.
     function installContextMode(params, toolsLoaded) {
       const accountUrl = params.get("account-url")
       let docUrl = params.get("doc-url")
@@ -805,20 +809,25 @@ enum PatchworkWeb {
           wrap("patchwork-tool-storage-provider", accountUrl)
           wrap("patchwork-account-provider", accountUrl)
         }
+        // the provider seeds its selection from `#doc=` when it loads, so set
+        // the hash before mounting it; the event covers a provider that was
+        // already listening
+        if (docUrl) location.hash = `doc=${docUrl}`
+        wrap("patchwork-selected-doc-provider")
+        const selectedDocProvider = root
         const provider = document.createElement("repo-provider")
         provider.appendChild(root)
-        const shim = document.createElement("div")
-        shim.className = "context-root"
-        shim.addEventListener("patchwork:subscribe", (event) => {
-          if (event.detail?.selector?.type !== "patchwork:selected-doc") return
-          event.stopPropagation()
-          event.detail.port.postMessage({
-            type: "change",
-            value: docUrl ? [docUrl] : [],
-          })
-        })
-        shim.appendChild(provider)
-        document.body.replaceChildren(shim)
+        const contextRoot = document.createElement("div")
+        contextRoot.className = "context-root"
+        contextRoot.appendChild(provider)
+        document.body.replaceChildren(contextRoot)
+        if (docUrl) {
+          selectedDocProvider.dispatchEvent(
+            new CustomEvent("patchwork:open-document", {
+              detail: { url: docUrl, toolId: null },
+            }),
+          )
+        }
       }
 
       registry.on?.("changed", publish)

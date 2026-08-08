@@ -2645,6 +2645,15 @@ final class EditorCore {
         return RichText.marks(from: view.pTypingAttributes, block: block)
     }
 
+    /// What the format buttons show: with a caret that's the typing
+    /// attributes, not the character behind it. Toggling has to read the same
+    /// state it displays, or a mark set at a run boundary never turns back off.
+    private func activeMarks() -> [String: JSONValue] {
+        guard let view else { return [:] }
+        if view.pSelectedRange.length > 0 { return marksAtSelection() }
+        return RichText.marks(from: view.pTypingAttributes, block: blockAtSelection())
+    }
+
     func blockAtSelection() -> BlockValue {
         guard let view, let storage = view.pStorage else { return .paragraph }
         let selection = view.pSelectedRange
@@ -2858,7 +2867,7 @@ final class EditorCore {
     }
 
     func toggleMark(_ mark: String) {
-        let turningOn = marksAtSelection()[mark] == nil
+        let turningOn = activeMarks()[mark] == nil
         applyMark(mark, value: turningOn ? .bool(true) : nil)
     }
 
@@ -2927,9 +2936,11 @@ final class EditorCore {
     /// off, since text can only sit on one baseline.
     func toggleBaseline(_ mark: String) {
         let other = mark == "superscript" ? "subscript" : "superscript"
-        let currentMarks = marksAtSelection()
+        let currentMarks = activeMarks()
         let turningOn = currentMarks[mark] == nil
-        let groupsSwap = turningOn && currentMarks[other] != nil
+        // Clearing the other baseline unconditionally: a selection spanning
+        // mixed runs can carry it even when the read at its start doesn't.
+        let groupsSwap = turningOn
         if groupsSwap {
             view?.pUndoManager?.beginUndoGrouping()
         }
@@ -3067,7 +3078,7 @@ final class EditorCore {
             insertParagraphBreak(currentBlock: block, nextBlock: .todo(checked: false))
             return true
         }
-        if block.type == "context" {
+        if block.type == "context" || block.type == "calendar-event" {
             let selection = view.pSelectedRange
             let paragraphStart = paragraph.location
             if selection.length == 0 && selection.location == paragraphStart {

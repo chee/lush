@@ -105,5 +105,7 @@
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>NSFocusStatusUsageDescription</key>
+	<string>Lush uses your Focus status to apply the folder and note settings you configured for each Focus.</string>
 </dict>
 </plist>

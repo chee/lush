@@ -23,6 +23,14 @@ actor SpotlightIndex {
         attributes.contentDescription = body.isEmpty ? nil : Self.snippet(from: body, limit: 900)
         attributes.textContent = body
         attributes.keywords = ["Lush", "note"]
+        if let event = spans.lazy.compactMap({ span -> BlockValue? in
+            guard case .block(let block) = span, block.calendarEventTitle != nil else { return nil }
+            return block
+        }).first {
+            attributes.keywords?.append(contentsOf: ["calendar", "event"])
+            attributes.startDate = event.calendarEventStart
+            attributes.endDate = event.calendarEventEnd
+        }
 
         var components = URLComponents()
         components.scheme = "lush"
@@ -53,8 +61,8 @@ actor SpotlightIndex {
                 if block.isEmbedBlock, let html = block.htmlSource {
                     parts.append(html)
                 }
-                if let title = block.calendarEventTitle {
-                    parts.append(title)
+                if let event = block.calendarEventSearchText {
+                    parts.append(event)
                 }
             case .text(let text, _):
                 parts.append(text)
