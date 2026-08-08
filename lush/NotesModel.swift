@@ -3,6 +3,8 @@ import Observation
 import WidgetKit
 #if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 
 @Observable @MainActor
@@ -104,6 +106,33 @@ final class NotesModel {
     var rootFolderUrl: String? { rootFolderUrls.first }
     var rootFolderUrls: [String] = []
     var folderTree: [FolderNode] = []
+    let focus = FocusModes()
+
+    /// The sidebar's tree, cut down to the folders the running Focus allows. A
+    /// folder outside the list stays if one of its descendants is in it, so the
+    /// chosen folder is still reachable.
+    var visibleFolderTree: [FolderNode] {
+        guard let shown = focus.state?.shownFolderUrls, !shown.isEmpty else { return folderTree }
+        let allowed = Set(shown)
+        func filter(_ nodes: [FolderNode]) -> [FolderNode] {
+            nodes.compactMap { node in
+                guard node.kind == "folder" else { return node }
+                if allowed.contains(node.url) { return node }
+                let children = filter(node.children ?? [])
+                guard children.contains(where: { $0.kind == "folder" }) else { return nil }
+                return FolderNode(
+                    url: node.url,
+                    name: node.name,
+                    kind: node.kind,
+                    parentUrl: node.parentUrl,
+                    children: children
+                )
+            }
+        }
+        return filter(folderTree)
+    }
+
+    var effectiveInboxUrl: String? { focus.state?.inboxUrl ?? inboxUrl }
     private(set) var syncLog: [String] = []
     private(set) var draftLists: [String: DraftListState] = [:]
     private(set) var checkedOutDrafts: [String: String] = [:]
@@ -182,15 +211,12 @@ final class NotesModel {
         }
     }
 
-    private static let folderDefaultsKey = "folderURL"
-    private static let foldersDefaultsKey = "folderURLs"
     private static let lastOpenNoteKey = "lastOpenNoteUrl"
-    private static let accountUrlKey = "patchworkAccountUrl"
     private static let appGroupIdentifier = "group.party.chee.patchwork.lush"
     private static let widgetSnapshotFileName = "LushWidgetSnapshot.json"
     private static let folderContentWidgetKind = "FolderContentWidget"
 
-    private(set) var accountUrl: String? = UserDefaults.standard.string(forKey: accountUrlKey)
+    private(set) var accountUrl: String? = LushShared.accountUrl
     private(set) var accountConfigUrl: String?
     private(set) var inboxUrl: String?
     private(set) var contactName: String?
@@ -219,7 +245,7 @@ final class NotesModel {
                 try core.loginAccount(accountUrl: normalized)
             }.value
             accountUrl = state.accountUrl
-            UserDefaults.standard.set(state.accountUrl, forKey: Self.accountUrlKey)
+            LushShared.accountUrl = state.accountUrl
             await applyAccount(state)
             status = ""
             appendSyncEvent("Logged in: \(state.accountUrl)")
@@ -238,7 +264,7 @@ final class NotesModel {
         contactAvatarData = nil
         presenceContactUrl = nil
         presence.leave()
-        UserDefaults.standard.removeObject(forKey: Self.accountUrlKey)
+        LushShared.accountUrl = nil
         appendSyncEvent("Logged out")
     }
 
@@ -280,15 +306,15 @@ final class NotesModel {
     /// Widget/shortcut note creation lands in the configured inbox folder.
     @discardableResult
     func createNoteInInbox(snap: ContextSnapshot? = nil) async -> String? {
-        if let inboxUrl {
-            return await createNote(inFolder: inboxUrl)
+        if let inbox = effectiveInboxUrl {
+            return await createNote(inFolder: inbox, snap: snap)
         } else {
             return await createNote(snap: snap)
         }
     }
 
     private func persistRoots() {
-        UserDefaults.standard.set(rootFolderUrls, forKey: Self.foldersDefaultsKey)
+        LushShared.rootFolderUrls = rootFolderUrls
     }
 
     private static func bootLog(_ message: String) {
@@ -378,17 +404,11 @@ final class NotesModel {
     private func startOnce() async {
         guard core == nil else { return }
         Self.bootLog("startOnce begin")
+        focus.watchSystemFocus()
+        Task { await focus.reconcileWithSystemFocus() }
         do {
-            let support = FileManager.default.urls(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask
-            )[0]
-            let dataDir = support.appendingPathComponent("LushCore", isDirectory: true)
-            var saved = UserDefaults.standard.stringArray(forKey: Self.foldersDefaultsKey) ?? []
-            if saved.isEmpty,
-               let legacy = UserDefaults.standard.string(forKey: Self.folderDefaultsKey) {
-                saved = [legacy]
-            }
+            let dataDir = LushShared.coreDataDirectory()
+            var saved = LushShared.rootFolderUrls
             let core = try await Task.detached {
                 try Core(dataDir: dataDir.path, serverUrl: nil)
             }.value
@@ -481,6 +501,10 @@ final class NotesModel {
     }
 
     func createFolder() {
+        if let folderUrl {
+            createSubfolder(in: folderUrl)
+            return
+        }
         guard let core else { return }
         Task.detached { [core, weak self] in
             do {
@@ -825,6 +849,48 @@ final class NotesModel {
         }
     }
 
+    func syncNow(budget: Duration) async {
+        if core == nil { await start() }
+        guard let core else { return }
+        activeEditor?.core?.pushNow()
+        core.connect()
+        await drainSharedIntake()
+        let urls = rootFolderUrls
+        await Task.detached { for url in urls { try? core.resyncDoc(url: url) } }.value
+
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        var counts = lastKnownCounts
+        var quiet = 0
+        while ContinuousClock.now < deadline, quiet < 3, !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(2))
+            var changed = false
+            for url in urls {
+                let count = await core.folderEntriesOf(url: url).count
+                if counts[url] != count {
+                    counts[url] = count
+                    changed = true
+                }
+            }
+            quiet = changed ? 0 : quiet + 1
+        }
+
+        lastKnownCounts = counts
+        refreshNotes()
+        try? await Task.sleep(for: .seconds(1))
+        writeWidgetSnapshot()
+        appendSyncEvent("Background sync finished")
+    }
+
+    /// Flush and close the core so the helper can open the same storage.
+    func releaseCore() {
+        pollTask?.cancel()
+        pollTask = nil
+        activeEditor?.core?.pushNow()
+        presence.leave()
+        core?.shutdown()
+        core = nil
+    }
+
     private func startPolling() {
         pollTask?.cancel()
         pollTask = Task.detached { [weak self] in
@@ -860,7 +926,7 @@ final class NotesModel {
         }
     }
 
-    private func writeWidgetSnapshot() {
+    func writeWidgetSnapshot() {
         guard let root = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: Self.appGroupIdentifier
         ) else { return }
@@ -924,8 +990,7 @@ final class NotesModel {
     }
 
     func clearStorage() {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dataDir = support.appendingPathComponent("LushCore", isDirectory: true)
+        let dataDir = LushShared.coreDataDirectory()
         do {
             try FileManager.default.removeItem(at: dataDir)
             appendSyncEvent("Cleared local storage — quitting")
@@ -961,7 +1026,7 @@ final class NotesModel {
             if let s = (b.attrs["created"] ?? b.attrs["ts"])?.stringValue { meta.created = fmt.date(from: s) }
             meta.location = b.attrs["location"]?.stringValue
             meta.weather = b.attrs["weather"]?.stringValue
-            meta.nowPlaying = b.attrs["now_playing"]?.stringValue
+            meta.nowPlaying = b.attrs["nowPlaying"]?.stringValue
             break
         }
         contextMetas[url] = meta
@@ -1067,6 +1132,9 @@ final class NotesModel {
 
     @discardableResult
     func createNote(snap: ContextSnapshot? = nil) async -> String? {
+        if let folderUrl {
+            return await createNote(inFolder: folderUrl, snap: snap)
+        }
         guard let core else { return nil }
         do {
             let url = try await Task.detached { [core, snap] () -> String in
@@ -1087,12 +1155,12 @@ final class NotesModel {
     }
 
     @discardableResult
-    func createNote(inFolder folderUrl: String) async -> String? {
+    func createNote(inFolder folderUrl: String, snap: ContextSnapshot? = nil) async -> String? {
         guard let core else { return nil }
         do {
-            let url = try await Task.detached { [core, folderUrl] () -> String in
+            let url = try await Task.detached { [core, folderUrl, snap] () -> String in
                 let url = try core.createNoteIn(folderUrl: folderUrl, title: "")
-                let initial: [SpanNode] = [.block(.creationBlock(snap: nil)), .block(.heading(level: 1))]
+                let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
                 return url
             }.value
@@ -1111,7 +1179,7 @@ final class NotesModel {
             await start()
         }
         guard let core else { return nil }
-        let target = folderUrl ?? inboxUrl ?? self.folderUrl
+        let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
         guard let target else { return nil }
         do {
             let url = try await Task.detached {
@@ -1131,7 +1199,12 @@ final class NotesModel {
     }
 
     func createScript() {
-        guard let core, let folderUrl else { return }
+        guard let folderUrl else { return }
+        createScript(in: folderUrl)
+    }
+
+    func createScript(in folderUrl: String) {
+        guard let core else { return }
         Task.detached { [core, weak self, folderUrl] in
             do {
                 let url = try core.createScriptIn(folderUrl: folderUrl, name: "")
@@ -1152,7 +1225,7 @@ final class NotesModel {
             await start()
         }
         guard let core else { return nil }
-        let target = folderUrl ?? inboxUrl ?? self.folderUrl
+        let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
         guard let target else { return nil }
         do {
             let url = try await Task.detached {
@@ -1223,7 +1296,12 @@ final class NotesModel {
         for (folder, order) in childOrder where order.contains(url) {
             childOrder[folder] = order.filter { $0 != url }
         }
-        if quickNoteUrl == url { setQuickNote(nil) }
+        if quickNoteUrl == url {
+            quickNoteUrl = nil
+            UserDefaults.standard.removeObject(forKey: Self.quickNoteKey)
+        }
+        focus.forgetDocument(url)
+        CalendarLinks.set([], for: url)
         if selectedNoteUrl == url { selectedNoteUrl = nil }
         saveLaunchSnapshot()
     }
@@ -1883,6 +1961,8 @@ final class NotesModel {
         if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
         try? await core.openNote(url: url)
         let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
+        let eventIds = await Task.detached { CalendarLinks.eventIds(in: SpanNode.decodeList(json)) }.value
+        CalendarLinks.set(eventIds, for: url)
         await semanticSearch.index(url: url, name: resolvedName ?? "", spansJson: json)
         semanticIndexTasks[url] = nil
     }
@@ -1981,7 +2061,11 @@ final class NotesModel {
     }
 
     @discardableResult
-    func generateAssetML(_ url: String, name fallbackName: String? = nil) async -> AssetMl? {
+    func generateAssetML(
+        _ url: String,
+        name fallbackName: String? = nil,
+        choice: ModelChoice? = nil
+    ) async -> AssetMl? {
         let info = await assetInfo(url)
         let name = fallbackName ?? info?.name ?? "attachment"
         var vision = await assetVision(url)
@@ -1997,7 +2081,7 @@ final class NotesModel {
         let operation: LocalModelOperation = evidence.kind == "audio"
             ? .voiceNoteSummary
             : .attachmentSummary
-        guard let result = try? await MLAnalyzer.analyze(evidence, operation: operation) else {
+        guard let result = try? await MLAnalyzer.analyze(evidence, operation: operation, choice: choice) else {
             return nil
         }
         await updateAssetML(
@@ -2141,6 +2225,8 @@ final class NotesModel {
     private static let quickNoteKey = "quickNoteUrl"
     var quickNoteUrl: String? = UserDefaults.standard.string(forKey: quickNoteKey)
 
+    var effectiveQuickNoteUrl: String? { focus.state?.quickNoteUrl ?? quickNoteUrl }
+
     func setQuickNote(_ url: String?) {
         quickNoteUrl = url
         UserDefaults.standard.set(url, forKey: Self.quickNoteKey)
@@ -2163,7 +2249,7 @@ final class NotesModel {
 
     func appendToQuickNote(_ snippet: String) async -> String? {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return quickNoteUrl }
+        guard !trimmed.isEmpty else { return effectiveQuickNoteUrl }
         guard let target = await quickNoteTarget() else { return nil }
         let core = target.core
         let url = target.url
@@ -2246,10 +2332,10 @@ final class NotesModel {
             await start()
         }
         guard let core else { return nil }
-        if let quickNoteUrl {
-            return (core, quickNoteUrl)
+        if let url = effectiveQuickNoteUrl {
+            return (core, url)
         }
-        let target = inboxUrl ?? folderUrl
+        let target = effectiveInboxUrl ?? folderUrl
         do {
             let url = try await Task.detached {
                 if let target {
@@ -2290,6 +2376,24 @@ final class NotesModel {
                     : "\(prefix) / \(node.displayName)"
                 out.append((node.url, path))
                 walk(node.children ?? [], prefix: path)
+            }
+        }
+        walk(folderTree, prefix: "")
+        return out
+    }
+
+    /// Every note in the tree as (url, "folder / note") choices.
+    func noteChoices() -> [(url: String, path: String)] {
+        var out: [(String, String)] = []
+        func walk(_ nodes: [FolderNode], prefix: String) {
+            for node in nodes {
+                let name = node.displayName.isEmpty ? "Untitled" : node.displayName
+                let path = prefix.isEmpty ? name : "\(prefix) / \(name)"
+                if node.kind == "folder" {
+                    walk(node.children ?? [], prefix: path)
+                } else {
+                    out.append((node.url, path))
+                }
             }
         }
         walk(folderTree, prefix: "")
@@ -2400,8 +2504,9 @@ final class NotesModel {
     // Incoming content (share / open-with) ------------------------------------
 
     var pendingIncoming: IncomingContent?
+    var showingFileImporter = false
 
-    func importAsNewNote(_ content: IncomingContent) {
+    func importAsNewNote(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) {
         guard let core else { return }
         do {
             var textSpans: [SpanNode] = []
@@ -2412,7 +2517,11 @@ final class NotesModel {
                 case .text(let text):
                     appendText(text, to: &textSpans)
                 case .file(let url):
-                    importedUrls += try importFileEntries(from: url, core: core)
+                    if textFilesAsNotes, Self.canImportAsNote(url) {
+                        importedUrls.append(try importFileAsNote(url, core: core, folderUrl: nil))
+                    } else {
+                        importedUrls += try importFileEntries(from: url, core: core)
+                    }
                 case .batch:
                     break
                 }
@@ -2466,10 +2575,10 @@ final class NotesModel {
         }
     }
 
-    func importToInbox(_ content: IncomingContent) {
+    func importToInbox(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) {
         guard let core else { return }
         defer { content.cleanupHandoff() }
-        let target = inboxUrl ?? folderUrl
+        let target = effectiveInboxUrl ?? folderUrl
         var textSpans: [SpanNode] = []
         var importedUrls: [String] = []
         var failures: [String] = []
@@ -2480,7 +2589,11 @@ final class NotesModel {
                 appendText(text, to: &textSpans)
             case .file(let url):
                 do {
-                    importedUrls += try importFileEntries(from: url, core: core, folderUrl: target)
+                    if textFilesAsNotes, Self.canImportAsNote(url) {
+                        importedUrls.append(try importFileAsNote(url, core: core, folderUrl: target))
+                    } else {
+                        importedUrls += try importFileEntries(from: url, core: core, folderUrl: target)
+                    }
                 } catch {
                     failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
                 }
@@ -2512,6 +2625,81 @@ final class NotesModel {
         if !failures.isEmpty {
             status = "Import incomplete: \(failures.joined(separator: "; "))"
         }
+    }
+
+    // File import ------------------------------------------------------------
+
+    static let noteImportExtensions: Set<String> = ["md", "markdown", "mdown", "txt", "text", "rtf"]
+
+    static let importAsNotesKey = "importTextFilesAsNotes"
+
+    nonisolated static var importsTextFilesAsNotes: Bool {
+        UserDefaults.standard.object(forKey: importAsNotesKey) as? Bool ?? true
+    }
+
+    static func canImportAsNote(_ url: URL) -> Bool {
+        noteImportExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    @discardableResult
+    func importFiles(_ urls: [URL], into folderUrl: String?, asNotes: Bool) -> [String] {
+        guard let core else { return [] }
+        let target = folderUrl ?? self.folderUrl
+        var imported: [String] = []
+        var failures: [String] = []
+        for url in urls {
+            do {
+                if asNotes, Self.canImportAsNote(url) {
+                    imported.append(try importFileAsNote(url, core: core, folderUrl: target))
+                } else {
+                    imported += try importFileEntries(from: url, core: core, folderUrl: target)
+                }
+            } catch {
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        refreshNotes()
+        if let first = imported.first { selectedNoteUrl = first }
+        status = failures.isEmpty
+            ? "Imported \(imported.count) item\(imported.count == 1 ? "" : "s")"
+            : "Import incomplete: \(failures.joined(separator: "; "))"
+        return imported
+    }
+
+    private func importFileAsNote(_ url: URL, core: Core, folderUrl: String?) throws -> String {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let title = url.deletingPathExtension().lastPathComponent
+        let spans = Self.noteSpans(fromFile: url)
+        let noteUrl: String
+        if let folderUrl {
+            noteUrl = try core.createNoteIn(folderUrl: folderUrl, title: title)
+        } else {
+            noteUrl = try core.createNote(title: title)
+        }
+        if !spans.isEmpty {
+            _ = try? core.updateNoteSpans(url: noteUrl, spansJson: SpanNode.encodeList(spans), heads: nil)
+        }
+        return noteUrl
+    }
+
+    static func noteSpans(fromFile url: URL) -> [SpanNode] {
+        if url.pathExtension.lowercased() == "rtf" {
+            guard let attributed = try? NSAttributedString(
+                url: url,
+                options: [.documentType: NSAttributedString.DocumentType.rtf],
+                documentAttributes: nil
+            ),
+            let html = try? attributed.data(
+                from: NSRange(location: 0, length: attributed.length),
+                documentAttributes: [.documentType: NSAttributedString.DocumentType.html]
+            ),
+            let text = String(data: html, encoding: .utf8)
+            else { return [] }
+            return RichTextClipboard.spans(fromHTML: text)
+        }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return RichTextClipboard.spans(fromMarkdown: text)
     }
 
     private func importFileEntries(from url: URL, core: Core, folderUrl: String? = nil) throws -> [String] {
@@ -2755,151 +2943,5 @@ struct FolderNode: Identifiable, Hashable, Codable {
     var isNote: Bool { kind == "lush" || kind == "rich" }
     var isPatchworkDoc: Bool {
         kind != "folder" && kind != "lush" && kind != "rich" && kind != "lush:script"
-    }
-}
-
-private struct LushWidgetSnapshot: Codable, Equatable {
-    let updatedAt: Date
-    let defaultFolderUrl: String?
-    let folders: [LushWidgetFolderSnapshot]
-}
-
-private struct LushWidgetFolderSnapshot: Codable, Equatable {
-    let url: String
-    let title: String
-    let path: String
-    let totalItemCount: Int
-    let items: [LushWidgetItemSnapshot]
-}
-
-private struct LushWidgetItemSnapshot: Codable, Equatable {
-    let url: String
-    let title: String
-    let preview: String
-    let kind: String
-}
-
-struct IncomingContent: Identifiable {
-    let id = UUID()
-    enum Payload {
-        case text(String)
-        case file(URL)
-        case batch([Payload])
-    }
-    let payload: Payload
-    let handoffDirectory: URL?
-
-    init(payload: Payload, handoffDirectory: URL? = nil) {
-        self.payload = payload
-        self.handoffDirectory = handoffDirectory
-    }
-
-    var flattenedPayloads: [Payload] {
-        switch payload {
-        case .text, .file:
-            return [payload]
-        case .batch(let payloads):
-            return payloads.flatMap { IncomingContent(payload: $0).flattenedPayloads }
-        }
-    }
-
-    var displayTitle: String {
-        switch payload {
-        case .text(let text):
-            let title = String(text.prefix(60)).components(separatedBy: .newlines).first ?? ""
-            return title.isEmpty ? "Shared Text" : title
-        case .file(let url):
-            return url.lastPathComponent.isEmpty ? "Shared File" : url.lastPathComponent
-        case .batch(let payloads):
-            if payloads.count == 1 {
-                return IncomingContent(payload: payloads[0]).displayTitle
-            }
-            return "\(payloads.count) Shared Items"
-        }
-    }
-
-    var textDisplayTitle: String {
-        for payload in flattenedPayloads {
-            if case .text(let text) = payload {
-                let title = String(text.prefix(60)).components(separatedBy: .newlines).first ?? ""
-                if !title.isEmpty { return title }
-            }
-        }
-        return "Shared Text"
-    }
-
-    func cleanupHandoff() {
-        guard let handoffDirectory else { return }
-        try? FileManager.default.removeItem(at: handoffDirectory)
-    }
-
-    static func sharedHandoff(id: String) -> IncomingContent? {
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: SharedHandoff.appGroupIdentifier
-        ) else { return nil }
-        let directory = root
-            .appendingPathComponent("SharedIntake", isDirectory: true)
-            .appendingPathComponent(id, isDirectory: true)
-        let payloadUrl = directory.appendingPathComponent("payload.json")
-        guard let data = try? Data(contentsOf: payloadUrl),
-              let handoff = try? JSONDecoder().decode(SharedHandoff.self, from: data) else {
-            return nil
-        }
-        let payloads = handoff.items.compactMap { item -> Payload? in
-            switch item {
-            case .text(let text):
-                return .text(text)
-            case .file(let relativePath, _):
-                return .file(directory.appendingPathComponent(relativePath))
-            }
-        }
-        guard !payloads.isEmpty else { return nil }
-        return IncomingContent(payload: .batch(payloads), handoffDirectory: directory)
-    }
-}
-
-private struct SharedHandoff: Codable {
-    static let appGroupIdentifier = "group.party.chee.patchwork.lush"
-
-    let createdAt: Date
-    let items: [SharedHandoffItem]
-}
-
-private enum SharedHandoffItem: Codable {
-    case text(String)
-    case file(relativePath: String, suggestedName: String)
-
-    private enum CodingKeys: String, CodingKey {
-        case kind, text, relativePath, suggestedName
-    }
-
-    private enum Kind: String, Codable {
-        case text, file
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        switch try container.decode(Kind.self, forKey: .kind) {
-        case .text:
-            self = .text(try container.decode(String.self, forKey: .text))
-        case .file:
-            self = .file(
-                relativePath: try container.decode(String.self, forKey: .relativePath),
-                suggestedName: try container.decode(String.self, forKey: .suggestedName)
-            )
-        }
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        switch self {
-        case .text(let text):
-            try container.encode(Kind.text, forKey: .kind)
-            try container.encode(text, forKey: .text)
-        case .file(let relativePath, let suggestedName):
-            try container.encode(Kind.file, forKey: .kind)
-            try container.encode(relativePath, forKey: .relativePath)
-            try container.encode(suggestedName, forKey: .suggestedName)
-        }
     }
 }

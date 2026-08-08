@@ -2,27 +2,42 @@
 import AppKit
 import CoreText
 
+@MainActor
 enum DockTilePreview {
-    static let appGroupIdentifier = "group.party.chee.patchwork.lush"
-    static let imageName = "DockTileImage.png"
+    nonisolated static let appGroupIdentifier = "group.party.chee.patchwork.lush"
+    nonisolated static let imageName = "DockTileImage.png"
+
+    private static var lastRendered: String?
+    private static let writeQueue = DispatchQueue(label: "party.chee.patchwork.lush.docktile")
 
     static func update(title: String, body: String) {
         guard let app = NSApp else { return }
+        let key = title + "\u{0}" + body
+        guard key != lastRendered else { return }
+        lastRendered = key
         guard let image = render(title: title, body: body, app: app) else { return }
         let view = NSImageView()
         view.image = image
         view.imageScaling = .scaleProportionallyUpOrDown
         app.dockTile.contentView = view
         app.dockTile.display()
-        write(image)
+        // encoding a 512px png and writing it to the group container is slow
+        // enough to stutter typing, and nothing on screen waits for it
+        var rect = CGRect(origin: .zero, size: image.size)
+        guard let cgImage = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
+        writeQueue.async { write(cgImage) }
     }
 
     static func clear() {
+        lastRendered = nil
         if let app = NSApp {
             app.dockTile.contentView = nil
             app.dockTile.display()
         }
-        if let url = fileURL() { try? FileManager.default.removeItem(at: url) }
+        let url = fileURL()
+        writeQueue.async {
+            if let url { try? FileManager.default.removeItem(at: url) }
+        }
     }
 
     private static let ruleFractions: [CGFloat] = [0.451, 0.584, 0.713]
@@ -66,7 +81,7 @@ enum DockTilePreview {
             let anchorX = leftX
             let anchorY = ruleBaseline(0, size: size)
             ctx.translateBy(x: anchorX, y: anchorY)
-            ctx.rotate(by: -4 * .pi / 180)
+            ctx.rotate(by: -1.68 * .pi / 180)
             ctx.translateBy(x: -anchorX, y: -anchorY)
             let typesetter = CTTypesetterCreateWithAttributedString(text)
             var start = 0
@@ -93,20 +108,19 @@ enum DockTilePreview {
         let fraction = index < ruleFractions.count
             ? ruleFractions[index]
             : ruleFractions[ruleFractions.count - 1] + CGFloat(index - ruleFractions.count + 1) * rulePitch
-        return (1 - fraction) * size + 0.012 * size
+        return (1 - fraction) * size + 0.016 * size
     }
 
-    private static func fileURL() -> URL? {
+    nonisolated private static func fileURL() -> URL? {
         FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
             .appendingPathComponent(imageName)
     }
 
-    private static func write(_ image: NSImage) {
+    nonisolated private static func write(_ image: CGImage) {
         guard let url = fileURL(),
-              let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:]) else { return }
+              let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+        else { return }
         try? png.write(to: url, options: .atomic)
     }
 }

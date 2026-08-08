@@ -115,7 +115,7 @@ struct AudioInlineView: View {
                 .buttonStyle(.plain)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(name)
-                        .font(.caption.weight(.medium))
+                        .uiFont(.caption, weight: .medium)
                         .lineLimit(1)
                     WaveformView(levels: levels, progress: progress) { frac in
                             seekTo(frac)
@@ -134,7 +134,7 @@ struct AudioInlineView: View {
             }
             if let transcript {
                 Text(transcript)
-                    .font(.caption2)
+                    .uiFont(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
@@ -342,7 +342,7 @@ struct EditorSheetView: View {
                 fileURL: fileURL,
                 name: name,
                 fetchML: { await controller.assetML(assetUrl) },
-                generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name) },
+                generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name, choice: $0) },
                 fetchVision: { await controller.assetVision(assetUrl) },
                 saveTranscript: { transcript in
                     controller.saveTranscript(assetUrl: assetUrl, transcript: transcript)
@@ -364,7 +364,7 @@ struct EditorSheetView: View {
                 name: name,
                 image: image,
                 fetchML: { await controller.assetML(assetUrl) },
-                generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name) },
+                generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name, choice: $0) },
                 fetch: { await controller.assetVision(assetUrl) },
                 analyze: { await controller.analyzeAssetVision(assetUrl) }
             )
@@ -378,7 +378,7 @@ struct AssetInfoSheet: View {
     let name: String
     let image: PImage?
     let fetchML: () async -> AssetMl?
-    let generateML: () async -> AssetMl?
+    let generateML: (ModelChoice?) async -> AssetMl?
     let fetch: () async -> AssetVision?
     let analyze: () async -> AssetVision?
     @Environment(\.dismiss) private var dismiss
@@ -387,11 +387,12 @@ struct AssetInfoSheet: View {
     @State private var loaded = false
     @State private var analyzing = false
     @State private var generatingML = false
+    @State private var modelChoice: ModelChoice?
 
     var body: some View {
         VStack(spacing: 12) {
             Text(name)
-                .font(.headline)
+                .uiFont(.headline)
                 .lineLimit(1)
             if let image {
                 #if os(macOS)
@@ -430,12 +431,12 @@ struct AssetInfoSheet: View {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
                             Text("Looking at the image…")
-                                .font(.caption)
+                                .uiFont(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     } else if ml == nil, loaded {
                         Text("Nothing recognized in this image.")
-                            .font(.caption)
+                            .uiFont(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -443,6 +444,9 @@ struct AssetInfoSheet: View {
             }
             HStack {
                 Spacer()
+                ModelChoiceMenu(operation: .attachmentSummary, selection: $modelChoice)
+                    .uiFont(.caption)
+                    .disabled(generatingML)
                 Button {
                     Task { await regenerateML() }
                 } label: {
@@ -485,7 +489,7 @@ struct AssetInfoSheet: View {
             vision = await analyze()
             analyzing = false
         }
-        ml = await generateML()
+        ml = await generateML(modelChoice)
     }
 }
 
@@ -497,11 +501,11 @@ struct CopyableText: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title)
-                    .font(.caption)
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Copy") { Clipboard.copy(text) }
-                    .font(.caption)
+                    .uiFont(.caption)
             }
             Text(text)
                 .textSelection(.enabled)
@@ -514,7 +518,7 @@ struct AudioPlayerSheet: View {
     let fileURL: URL
     let name: String
     let fetchML: () async -> AssetMl?
-    let generateML: () async -> AssetMl?
+    let generateML: (ModelChoice?) async -> AssetMl?
     let fetchVision: () async -> AssetVision?
     let saveTranscript: ((String) -> Void)?
     let onTrimmed: (Data) -> Void
@@ -531,12 +535,13 @@ struct AudioPlayerSheet: View {
     @State private var levels: [Float] = []
     @State private var ml: AssetMl?
     @State private var generatingML = false
+    @State private var modelChoice: ModelChoice?
     @State private var editableTranscript = ""
 
     var body: some View {
         VStack(spacing: 16) {
             Text(name)
-                .font(.headline)
+                .uiFont(.headline)
                 .lineLimit(1)
 
             if trimming {
@@ -582,7 +587,7 @@ struct AudioPlayerSheet: View {
             if trimming {
                 if exportFailed {
                     Text("Couldn't trim this recording.")
-                        .font(.caption)
+                        .uiFont(.caption)
                         .foregroundStyle(.red)
                 }
                 HStack(spacing: 12) {
@@ -612,30 +617,35 @@ struct AudioPlayerSheet: View {
                 }
             }
 
-            Button {
-                Task { await regenerateML() }
-            } label: {
-                if generatingML {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Text(ml == nil ? "Generate Summary" : "Regenerate Summary")
+            HStack {
+                ModelChoiceMenu(operation: .voiceNoteSummary, selection: $modelChoice)
+                    .uiFont(.caption)
+                    .disabled(generatingML)
+                Button {
+                    Task { await regenerateML() }
+                } label: {
+                    if generatingML {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(ml == nil ? "Generate Summary" : "Regenerate Summary")
+                    }
                 }
+                .disabled(generatingML || editableTranscript.isEmpty)
             }
-            .disabled(generatingML || editableTranscript.isEmpty)
 
             if !editableTranscript.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Transcript")
-                            .font(.caption)
+                            .uiFont(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button("Copy") { Clipboard.copy(editableTranscript) }
-                            .font(.caption)
+                            .uiFont(.caption)
                     }
                     TextEditor(text: $editableTranscript)
-                        .font(.caption)
+                        .uiFont(.caption)
                         .frame(minHeight: 80, maxHeight: 160)
                         .scrollContentBackground(.hidden)
                         .padding(6)
@@ -693,7 +703,7 @@ struct AudioPlayerSheet: View {
         generatingML = true
         defer { generatingML = false }
         saveTranscript?(editableTranscript)
-        ml = await generateML()
+        ml = await generateML(modelChoice)
     }
 
     private func togglePlayback() {
@@ -758,7 +768,7 @@ struct VideoPlayerSheet: View {
     var body: some View {
         VStack(spacing: 12) {
             Text(name)
-                .font(.headline)
+                .uiFont(.headline)
                 .lineLimit(1)
             PlatformVideoPlayer(player: player)
                 .frame(minHeight: 280)

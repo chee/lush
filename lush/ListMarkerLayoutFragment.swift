@@ -32,14 +32,14 @@ enum MarkerDrawing {
         let diameter: CGFloat = 6.5
         switch block.type {
         case "todo-list-item":
-            let side = itemFont.pointSize * 0.82
+            let side = itemFont.pointSize * 0.94
             let rect = CGRect(
                 x: origin.x + indent - side - 6,
                 y: baseline - itemFont.xHeight / 2 - side / 2,
                 width: side,
                 height: side
             )
-            checkbox(in: rect, checked: block.isChecked)
+            checkbox(in: rect, state: block.todoState)
         case "unordered-list-item":
             let rect = CGRect(
                 x: origin.x + indent - diameter - 5,
@@ -238,30 +238,60 @@ enum MarkerDrawing {
         #endif
     }
 
-    /// The to-do box: an empty rounded square, or a filled one with a tick.
-    /// Clicking it is handled by the text view (`toggleTodo(at:)`).
-    static func checkbox(in rect: CGRect, checked: Bool) {
-        let square = rect.insetBy(dx: 0.75, dy: 0.75)
+    /// The to-do box: an empty rounded square, or a filled one carrying the
+    /// glyph for its state. Clicking it is handled by the text view
+    /// (`toggleTodo(at:)`); right-click picks the state.
+    static func checkbox(in rect: CGRect, state: TodoState) {
+        let square = rect.insetBy(dx: 0.5, dy: 0.5)
+        let radius = square.width * 0.34
         #if os(macOS)
-        let box = NSBezierPath(roundedRect: square, xRadius: 3, yRadius: 3)
+        let box = NSBezierPath(roundedRect: square, xRadius: radius, yRadius: radius)
         #else
-        let box = UIBezierPath(roundedRect: square, cornerRadius: 3)
+        let box = UIBezierPath(roundedRect: square, cornerRadius: radius)
         #endif
-        guard checked else {
-            box.lineWidth = 1.5
-            PColor.pSecondaryLabel.setStroke()
+        switch state {
+        case .open:
+            box.lineWidth = 1
+            PColor.pSecondaryLabel.withAlphaComponent(0.5).setStroke()
             box.stroke()
             return
+        case .checked:
+            PColor.pTint.setFill()
+            box.fill()
+        case .canceled:
+            PColor.pSecondaryLabel.withAlphaComponent(0.55).setFill()
+            box.fill()
+        case .pending:
+            box.lineWidth = 1
+            PColor.pSecondaryLabel.withAlphaComponent(0.5).setStroke()
+            box.stroke()
         }
-        PColor.pTint.setFill()
-        box.fill()
-        let tick = PBezierPath()
-        tick.move(to: CGPoint(x: rect.minX + rect.width * 0.24, y: rect.midY + rect.height * 0.02))
-        tick.line(to: CGPoint(x: rect.minX + rect.width * 0.43, y: rect.maxY - rect.height * 0.24))
-        tick.line(to: CGPoint(x: rect.minX + rect.width * 0.76, y: rect.minY + rect.height * 0.24))
-        tick.lineWidth = max(1.5, rect.width * 0.14)
-        PColor.pOnTint.setStroke()
-        tick.stroke()
+
+        func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(x: rect.minX + rect.width * x, y: rect.minY + rect.height * y)
+        }
+        let glyph = PBezierPath()
+        switch state {
+        case .open:
+            return
+        case .checked:
+            glyph.move(to: point(0.184, 0.500))
+            glyph.line(to: point(0.381, 0.698))
+            glyph.line(to: point(0.816, 0.263))
+        case .canceled:
+            glyph.move(to: point(0.7375, 0.2625))
+            glyph.line(to: point(0.2625, 0.7375))
+            glyph.move(to: point(0.2625, 0.2625))
+            glyph.line(to: point(0.7375, 0.7375))
+        case .pending:
+            glyph.move(to: point(0.2625, 0.7375))
+            glyph.line(to: point(0.7375, 0.2625))
+        }
+        glyph.lineWidth = max(1.4, rect.width * 0.12)
+        glyph.lineCapStyle = .round
+        glyph.lineJoinStyle = .round
+        (state == .pending ? PColor.pTint : PColor.pOnTint).setStroke()
+        glyph.stroke()
     }
 }
 
@@ -304,6 +334,7 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
     /// via this hook.
     var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
     var foldedHeadingsProvider: (() -> Set<HeadingFoldKey>)?
+    var selectionProvider: (() -> (range: NSRange, color: PColor)?)?
 
     private var headingFoldKey: HeadingFoldKey? {
         guard let paragraph = textElement as? NSTextParagraph,
@@ -586,6 +617,35 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         CodeHighlight.cardBorder.setStroke()
         strokePath.lineWidth = 1
         strokePath.stroke()
+        drawSelection()
+    }
+
+    /// The card fill lands on top of the selection the text view painted into
+    /// the background, so the fragment repaints the covered part itself.
+    private func drawSelection() {
+        guard let selection = selectionProvider?(),
+              selection.range.length > 0,
+              let (_, elementStart) = storageContext()
+        else { return }
+        selection.color.setFill()
+        for line in textLineFragments {
+            let lineRange = NSRange(
+                location: elementStart + line.characterRange.location,
+                length: line.characterRange.length
+            )
+            let hit = NSIntersectionRange(lineRange, selection.range)
+            guard hit.length > 0 else { continue }
+            let start = line.locationForCharacter(at: hit.location - elementStart).x
+            let end = line.locationForCharacter(at: NSMaxRange(hit) - elementStart).x
+            guard end > start else { continue }
+            let bounds = line.typographicBounds
+            PBezierPath(rect: CGRect(
+                x: bounds.minX + start,
+                y: bounds.minY,
+                width: end - start,
+                height: bounds.height
+            )).fill()
+        }
     }
 
     override func draw(at point: CGPoint, in context: CGContext) {
@@ -840,6 +900,7 @@ func invalidateCodeRun(
 final class ListMarkerLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
     var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
     var foldedHeadingsProvider: (() -> Set<HeadingFoldKey>)?
+    var selectionProvider: (() -> (range: NSRange, color: PColor)?)?
 
     func textLayoutManager(
         _ textLayoutManager: NSTextLayoutManager,
@@ -852,6 +913,7 @@ final class ListMarkerLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
         )
         fragment.typingAttributesProvider = typingAttributesProvider
         fragment.foldedHeadingsProvider = foldedHeadingsProvider
+        fragment.selectionProvider = selectionProvider
         return fragment
     }
 }

@@ -103,7 +103,7 @@ struct RecorderBar: View {
             Spacer()
             if recorder.permissionDenied {
                 Text("Microphone access denied")
-                    .font(.caption)
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
             }
             Button("Cancel", role: .cancel) {

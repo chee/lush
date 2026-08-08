@@ -74,6 +74,23 @@ enum JSONValue: Codable, Equatable {
     }
 }
 
+/// A to-do item is open, done, abandoned, or waiting on something.
+enum TodoState: String, CaseIterable {
+    case open
+    case checked
+    case canceled
+    case pending
+
+    var label: String {
+        switch self {
+        case .open: return "To-do"
+        case .checked: return "Done"
+        case .canceled: return "Canceled"
+        case .pending: return "Pending"
+        }
+    }
+}
+
 struct BlockValue: Codable, Equatable {
     var type: String
     var parents: [String]
@@ -142,7 +159,28 @@ struct BlockValue: Codable, Equatable {
 
     /// A to-do item that has been ticked. Absent means unticked.
     var isChecked: Bool {
-        type == "todo-list-item" && attrs["checked"]?.boolValue == true
+        todoState == .checked
+    }
+
+    var todoState: TodoState {
+        guard type == "todo-list-item" else { return .open }
+        if let raw = attrs["state"]?.stringValue, let state = TodoState(rawValue: raw) {
+            return state
+        }
+        return attrs["checked"]?.boolValue == true ? .checked : .open
+    }
+
+    /// `checked` stays the source of truth for a ticked item so older readers
+    /// and the markdown/HTML exporters keep working; the other two states live
+    /// in `state`.
+    mutating func setTodoState(_ state: TodoState) {
+        attrs.removeValue(forKey: "checked")
+        attrs.removeValue(forKey: "state")
+        switch state {
+        case .open: break
+        case .checked: attrs["checked"] = .bool(true)
+        case .canceled, .pending: attrs["state"] = .string(state.rawValue)
+        }
     }
 
     var codeLanguage: String {
@@ -152,6 +190,12 @@ struct BlockValue: Codable, Equatable {
 
     static func todo(checked: Bool) -> BlockValue {
         BlockValue(type: "todo-list-item", attrs: checked ? ["checked": .bool(true)] : [:])
+    }
+
+    static func todo(state: TodoState) -> BlockValue {
+        var block = BlockValue(type: "todo-list-item")
+        block.setTodoState(state)
+        return block
     }
 
     /// Stable identifier for the format picker.
@@ -236,6 +280,9 @@ extension NSAttributedString.Key {
     /// Inline code, set by the editor. Read back independently of the font so a
     /// monospaced body font never reads as code.
     static let amCode = NSAttributedString.Key("io.lush.code")
+    /// "serif" or "hand" — the mark behind a swapped font family. Read back
+    /// from the key, not the font: family names vary by user setting.
+    static let amFontRole = NSAttributedString.Key("io.lush.fontRole")
 }
 
 /// A columns layout behind one attachment character: per-column span lists
@@ -375,6 +422,18 @@ final class EmbedAttachment: NSTextAttachment {
         fatalError("init(coder:) is not supported")
     }
 
+    /// Without an image TextKit draws its generic blank-document icon wherever
+    /// the live view is not available yet (or at all — dock tile, exports).
+    override func image(
+        forBounds imageBounds: CGRect,
+        textContainer: NSTextContainer?,
+        characterIndex charIndex: Int
+    ) -> PImage? {
+        Self.blank
+    }
+
+    private static let blank = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
+
     override func viewProvider(
         for parentView: PView?,
         location: NSTextLocation,
@@ -443,6 +502,47 @@ final class AssetCache {
     }
 }
 
+/// Per-family corrections. Two families set at the same point size rarely look
+/// the same size, and their "regular" and "bold" faces rarely match in colour,
+/// so each family carries a scale and a pair of weights.
+struct FontAdjustment: Codable, Hashable {
+    var scale: Double
+    var regularWeight: Double?
+    var boldWeight: Double?
+
+    static let none = FontAdjustment(scale: 1, regularWeight: nil, boldWeight: nil)
+
+    static let weights: [(value: Double, label: String)] = [
+        (100, "Thin"),
+        (200, "Extra Light"),
+        (300, "Light"),
+        (400, "Regular"),
+        (500, "Medium"),
+        (600, "Semibold"),
+        (700, "Bold"),
+        (800, "Extra Bold"),
+        (900, "Black"),
+    ]
+
+    static func label(for weight: Double?) -> String {
+        guard let weight else { return "Automatic" }
+        return weights.first { $0.value == weight }?.label ?? "\(Int(weight))"
+    }
+
+    init(scale: Double = 1, regularWeight: Double? = nil, boldWeight: Double? = nil) {
+        self.scale = scale
+        self.regularWeight = regularWeight
+        self.boldWeight = boldWeight
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        scale = try c.decodeIfPresent(Double.self, forKey: .scale) ?? 1
+        regularWeight = try c.decodeIfPresent(Double.self, forKey: .regularWeight)
+        boldWeight = try c.decodeIfPresent(Double.self, forKey: .boldWeight)
+    }
+}
+
 /// User-adjustable editor typography, persisted in UserDefaults. Views that
 /// render text re-load when `changed` is posted.
 enum EditorSettings {
@@ -464,9 +564,12 @@ enum EditorSettings {
     private static let serifFamilyKey = "editorSerifFamily"
     private static let monoFamilyKey = "editorMonoFamily"
     private static let handFamilyKey = "editorHandFamily"
+    private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
-    private static let typewriterModeKey = "editorTypewriterMode"
-    private static let minimapKey = "editorMinimapVisible"
+    static let typewriterModeKey = "editorTypewriterMode"
+    static let maxNoteWidthKey = "editorMaxNoteWidth"
+    static let minimapKey = "editorMinimapVisible"
+    static let zenModeKey = "editorZenMode"
 
     static let fontFamilies: [(key: String, label: String)] = [
         ("sans", "Sans"),
@@ -501,11 +604,14 @@ enum EditorSettings {
     // read from UserDefaults once and dropped when a setter changes them.
     private static var cachedBodySize: Double?
     private static var cachedFamilies: [String: String] = [:]
+    private static var cachedAdjustments: [String: FontAdjustment]?
     private static var fontCache: [FontKey: PFont] = [:]
     private static var bundledFontsRegistered = false
 
     private struct FontKey: Hashable {
+        let role: String
         let family: String
+        let adjustment: FontAdjustment
         let size: CGFloat
         let weight: CGFloat
     }
@@ -513,6 +619,7 @@ enum EditorSettings {
     private static func invalidateTypography() {
         cachedBodySize = nil
         cachedFamilies = [:]
+        cachedAdjustments = nil
         fontCache = [:]
         NotificationCenter.default.post(name: changed, object: nil)
     }
@@ -577,6 +684,17 @@ enum EditorSettings {
         UserDefaults.standard.bool(forKey: typewriterModeKey)
     }
 
+    /// Widest a note's text may get before it stops growing and centres. Zero
+    /// fills the editor.
+    static var maxNoteWidth: Double {
+        UserDefaults.standard.double(forKey: maxNoteWidthKey)
+    }
+
+    static func setMaxNoteWidth(_ width: Double) {
+        UserDefaults.standard.set(width, forKey: maxNoteWidthKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
     static var minimapVisible: Bool {
         UserDefaults.standard.object(forKey: minimapKey) == nil
             || UserDefaults.standard.bool(forKey: minimapKey)
@@ -598,11 +716,70 @@ enum EditorSettings {
         weight: PFont.Weight = .regular
     ) -> PFont {
         let family = family(for: key)
-        let key = FontKey(family: "\(key):\(family)", size: size, weight: weight.rawValue)
-        if let hit = fontCache[key] { return hit }
-        let resolved = resolveFont(family: family, role: key.family, ofSize: size, weight: weight)
-        fontCache[key] = resolved
+        return font(
+            role: key,
+            family: family,
+            adjustment: adjustment(family: family, role: key),
+            ofSize: size,
+            weight: weight
+        )
+    }
+
+    /// Resolution with the adjustment passed in, so a preview can render a
+    /// setting the user has not committed yet.
+    static func font(
+        role: String,
+        family: String,
+        adjustment: FontAdjustment,
+        ofSize size: CGFloat,
+        weight: PFont.Weight = .regular
+    ) -> PFont {
+        let cacheKey = FontKey(
+            role: role,
+            family: family,
+            adjustment: adjustment,
+            size: size,
+            weight: weight.rawValue
+        )
+        if let hit = fontCache[cacheKey] { return hit }
+        let resolved = resolveFont(
+            family: family,
+            role: role,
+            adjustment: adjustment,
+            ofSize: size * adjustment.scale,
+            weight: weight
+        )
+        fontCache[cacheKey] = resolved
         return resolved
+    }
+
+    /// System choices are stored per role — a role falling back to the system
+    /// serif is a different typeface from one falling back to the system sans.
+    static func adjustmentKey(family: String, role: String) -> String {
+        family == systemFontFamily ? "system:\(role.isEmpty ? "sans" : role)" : family
+    }
+
+    static func adjustment(family: String, role: String = "") -> FontAdjustment {
+        let key = adjustmentKey(family: family, role: role)
+        if let stored = storedAdjustments[key] { return stored }
+        return defaultAdjustments[key] ?? .none
+    }
+
+    static func setAdjustment(_ adjustment: FontAdjustment, family: String, role: String) {
+        var all = storedAdjustments
+        all[adjustmentKey(family: family, role: role)] = adjustment
+        if let data = try? JSONEncoder().encode(all) {
+            UserDefaults.standard.set(data, forKey: adjustmentsKey)
+        }
+        invalidateTypography()
+    }
+
+    private static var storedAdjustments: [String: FontAdjustment] {
+        if let cachedAdjustments { return cachedAdjustments }
+        let data = UserDefaults.standard.data(forKey: adjustmentsKey)
+        let all = data.flatMap { try? JSONDecoder().decode([String: FontAdjustment].self, from: $0) } ?? [:]
+        cachedAdjustments = all
+        return all
     }
 
     private static func familyDefaultsKey(for key: String) -> String {
@@ -631,22 +808,41 @@ enum EditorSettings {
     private static func resolveFont(
         family: String,
         role: String,
+        adjustment: FontAdjustment,
         ofSize size: CGFloat,
         weight: PFont.Weight
     ) -> PFont {
         registerBundledFonts()
+        let base = baseFont(family: family, role: role, ofSize: size, weight: weight)
+        let override: Double?
+        if weight.rawValue >= PFont.Weight.semibold.rawValue {
+            override = adjustment.boldWeight
+        } else if weight == .regular {
+            override = adjustment.regularWeight
+        } else {
+            override = nil
+        }
+        if let override { return weighted(base, to: override) }
+        return base
+    }
+
+    private static func baseFont(
+        family: String,
+        role: String,
+        ofSize size: CGFloat,
+        weight: PFont.Weight
+    ) -> PFont {
         if family != systemFontFamily,
            let resolved = font(namedFamily: family, size: size, weight: weight) {
             return resolved
         }
-        if role.hasPrefix("serif") {
+        if role == "serif" {
             return systemFont(ofSize: size, weight: weight, design: .serif)
         }
-        if role.hasPrefix("mono") {
+        if role == "mono" {
             return .monospacedSystemFont(ofSize: size, weight: weight)
         }
-        if role.hasPrefix("hand"),
-           let hand = defaultHandFont(ofSize: size, weight: weight) {
+        if role == "hand", let hand = defaultHandFont(ofSize: size, weight: weight) {
             return hand
         }
         return .systemFont(ofSize: size, weight: weight)
@@ -675,7 +871,66 @@ enum EditorSettings {
         #else
         let font = PFont(descriptor: baseDescriptor, size: size)
         #endif
-        return weight.rawValue > 0 ? font.addingTraits(bold: true) : font
+        return weight.rawValue > 0 ? styled(font, bold: true, italic: false) : font
+    }
+
+    /// Starting points for the families Lush ships, so the bundled pairing
+    /// reads evenly before anyone opens the font settings.
+    private static let defaultAdjustments: [String: FontAdjustment] = [
+        "Jost*": FontAdjustment(boldWeight: 600),
+        "Merriweather": FontAdjustment(scale: 0.94, regularWeight: 300, boldWeight: 600),
+        "Caroni": FontAdjustment(scale: 1.15),
+    ]
+
+    private static let weightAxis = 2003265652
+    private static let variationAttribute = PFontDescriptor.AttributeName(
+        rawValue: kCTFontVariationAttribute as String
+    )
+
+    static func styled(_ font: PFont, bold: Bool, italic: Bool) -> PFont {
+        let traited = font.addingTraits(bold: bold, italic: italic)
+        guard bold,
+              let family = font.pFamilyName,
+              let weight = adjustment(family: family).boldWeight
+        else { return traited }
+        return weighted(traited, to: weight)
+    }
+
+    /// Both a variation axis (for variable families) and a weight trait (to
+    /// pick the nearest static face), so one call covers either kind.
+    static func weighted(_ font: PFont, to weight: Double) -> PFont {
+        guard let family = font.pFamilyName else { return font }
+        let attributes: [PFontDescriptor.AttributeName: Any] = [
+            .family: family,
+            .traits: [PFontDescriptor.TraitKey.weight: platformWeight(weight).rawValue],
+            variationAttribute: [weightAxis: weight],
+        ]
+        let base = PFontDescriptor(fontAttributes: attributes)
+        #if os(macOS)
+        var traits = font.fontDescriptor.symbolicTraits
+        traits.remove(.bold)
+        let descriptor = base.withSymbolicTraits(traits)
+        return PFont(descriptor: descriptor, size: font.pointSize) ?? font
+        #else
+        var traits = font.fontDescriptor.symbolicTraits
+        traits.remove(.traitBold)
+        let descriptor = base.withSymbolicTraits(traits) ?? base
+        return PFont(descriptor: descriptor, size: font.pointSize)
+        #endif
+    }
+
+    static func platformWeight(_ weight: Double) -> PFont.Weight {
+        switch weight {
+        case ..<150: .ultraLight
+        case ..<250: .thin
+        case ..<350: .light
+        case ..<450: .regular
+        case ..<550: .medium
+        case ..<650: .semibold
+        case ..<750: .bold
+        case ..<850: .heavy
+        default: .black
+        }
     }
 
     private static func defaultHandFont(ofSize size: CGFloat, weight: PFont.Weight) -> PFont? {
@@ -687,7 +942,7 @@ enum EditorSettings {
         return nil
     }
 
-    private static func registerBundledFonts() {
+    static func registerBundledFonts() {
         guard !bundledFontsRegistered else { return }
         bundledFontsRegistered = true
         for filename in bundledFonts {
@@ -706,22 +961,40 @@ enum EditorSettings {
 enum RichText {
     static var bodySize: CGFloat { EditorSettings.bodySize }
 
-    static func baseFont(for block: BlockValue) -> PFont {
+    /// The families a `font` mark may name.
+    static let fontRoles: [(key: String, label: String)] = [
+        ("serif", "Serif"),
+        ("hand", "Hand"),
+    ]
+
+    private static func fontMetrics(for block: BlockValue) -> (size: CGFloat, weight: PFont.Weight) {
         switch block.type {
         case "heading":
             switch block.headingLevel ?? 1 {
-            case 1: return EditorSettings.font(ofSize: bodySize + 10, weight: .bold)
-            case 2: return EditorSettings.font(ofSize: bodySize + 5, weight: .bold)
-            default: return EditorSettings.font(ofSize: bodySize + 2, weight: .semibold)
+            case 1: return (bodySize + 10, .bold)
+            case 2: return (bodySize + 5, .bold)
+            default: return (bodySize + 2, .semibold)
             }
-        case "serif":
-            return EditorSettings.font(family: "serif", ofSize: bodySize)
-        case "hand":
-            return EditorSettings.font(family: "hand", ofSize: bodySize)
         case "code-block":
-            return EditorSettings.font(family: "mono", ofSize: bodySize - 1)
+            return (bodySize - 1, .regular)
         default:
-            return EditorSettings.font(ofSize: bodySize)
+            return (bodySize, .regular)
+        }
+    }
+
+    /// "serif" and "hand" are block types in documents written before they
+    /// became marks. They still render; nothing writes them any more.
+    static func baseFont(for block: BlockValue, marks: [String: JSONValue] = [:]) -> PFont {
+        let (size, weight) = fontMetrics(for: block)
+        if let role = marks["font"]?.stringValue,
+           fontRoles.contains(where: { $0.key == role }) {
+            return EditorSettings.font(family: role, ofSize: size, weight: weight)
+        }
+        switch block.type {
+        case "serif": return EditorSettings.font(family: "serif", ofSize: size)
+        case "hand": return EditorSettings.font(family: "hand", ofSize: size)
+        case "code-block": return EditorSettings.font(family: "mono", ofSize: size)
+        default: return EditorSettings.font(ofSize: size, weight: weight)
         }
     }
 
@@ -768,7 +1041,7 @@ enum RichText {
     }
 
     static func attributes(block: BlockValue, marks: [String: JSONValue]) -> [NSAttributedString.Key: Any] {
-        var font = baseFont(for: block)
+        var font = baseFont(for: block, marks: marks)
         var bold = false
         var italic = false
         if case .bool(true)? = marks["strong"], block.type != "heading" {
@@ -778,12 +1051,15 @@ enum RichText {
             italic = true
         }
         if bold || italic {
-            font = font.addingTraits(bold: bold, italic: italic)
+            font = EditorSettings.styled(font, bold: bold, italic: italic)
         }
         if case .bool(true)? = marks["code"] {
             let size = font.pointSize - 1
-            font = EditorSettings.font(family: "mono", ofSize: size)
-                .addingTraits(bold: bold, italic: italic)
+            font = EditorSettings.styled(
+                EditorSettings.font(family: "mono", ofSize: size),
+                bold: bold,
+                italic: italic
+            )
         }
         var out: [NSAttributedString.Key: Any] = [
             .font: font,
@@ -794,6 +1070,10 @@ enum RichText {
         if case .bool(true)? = marks["code"] {
             out[.backgroundColor] = CodeHighlight.cardBackground
             out[.amCode] = true
+        }
+        if let role = marks["font"]?.stringValue,
+           fontRoles.contains(where: { $0.key == role }) {
+            out[.amFontRole] = role
         }
         if let name = marks["highlight"]?.stringValue {
             out[.amHighlight] = name
@@ -859,13 +1139,23 @@ enum RichText {
         if let baseline = attrs[.amBaseline] as? String {
             marks[baseline] = .bool(true)
         }
+        if let role = attrs[.amFontRole] as? String {
+            marks["font"] = .string(role)
+        }
         return marks
+    }
+
+    private static func legacyMarks(_ font: String?) -> [String: JSONValue] {
+        font.map { ["font": .string($0)] } ?? [:]
     }
 
     @MainActor
     static func attributed(from spans: [SpanNode], cache: AssetCache) -> NSAttributedString {
         let out = NSMutableAttributedString()
         var block = BlockValue.paragraph
+        // legacy serif/hand blocks become paragraphs carrying a font mark, so
+        // the family survives being made a list item or a heading
+        var legacyFont: String?
         var sawAnything = false
         var i = 0
         while i < spans.count {
@@ -897,6 +1187,7 @@ enum RichText {
                     ))
                 }
                 block = BlockValue(type: root)
+                legacyFont = nil
                 sawAnything = true
                 i = j
                 continue
@@ -906,10 +1197,21 @@ enum RichText {
                 if sawAnything {
                     out.append(NSAttributedString(
                         string: "\n",
-                        attributes: attributes(block: block, marks: [:])
+                        attributes: attributes(block: block, marks: legacyMarks(legacyFont))
                     ))
                 }
-                block = b
+                if b.type == "serif" || b.type == "hand" {
+                    legacyFont = b.type
+                    block = BlockValue(
+                        type: "paragraph",
+                        parents: b.parents,
+                        attrs: b.attrs,
+                        isEmbed: b.isEmbed
+                    )
+                } else {
+                    legacyFont = nil
+                    block = b
+                }
                 sawAnything = true
                 if b.type == "context" {
                     out.append(contextLine(for: b))
@@ -918,6 +1220,8 @@ enum RichText {
                 }
             case .text(let text, let marks):
                 guard !block.isEmbedBlock else { break }
+                var marks = marks
+                if let legacyFont, marks["font"] == nil { marks["font"] = .string(legacyFont) }
                 out.append(NSAttributedString(
                     string: text,
                     attributes: attributes(block: block, marks: marks)
@@ -969,9 +1273,6 @@ enum RichText {
         }
         if let location = block.attrs["location"]?.stringValue {
             parts.append((location, true))
-        }
-        if let song = block.attrs["now_playing"]?.stringValue {
-            parts.append((song, false))
         }
         return parts
     }
@@ -1032,6 +1333,8 @@ enum RichText {
             attachment = liveBox(width: 460, height: 220)
         } else if block.type == "context" {
             attachment = liveBox(width: 460, height: 28)
+        } else if block.type == "calendar-event" {
+            attachment = liveBox(width: 460, height: 64)
         } else if let url, cache.patchworkDocs.contains(url) {
             attachment = liveBox(width: 460, height: 300)
         } else if let url, let image = cache.images[url] {

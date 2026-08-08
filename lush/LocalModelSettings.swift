@@ -56,6 +56,7 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
     case openAI
     case anthropic
     case compatible
+    case ollama
 
     var id: String { rawValue }
 
@@ -67,13 +68,22 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
         case .openAI: "OpenAI API"
         case .anthropic: "Anthropic API"
         case .compatible: "OpenAI-compatible API"
+        case .ollama: "Ollama"
         }
     }
 
-    var isCloud: Bool {
+    /// Reached over HTTP with a model name, rather than run in-process.
+    var usesEndpoint: Bool {
+        switch self {
+        case .openRouter, .openAI, .anthropic, .compatible, .ollama: true
+        case .appleIntelligence, .mlx: false
+        }
+    }
+
+    var needsAPIKey: Bool {
         switch self {
         case .openRouter, .openAI, .anthropic, .compatible: true
-        case .appleIntelligence, .mlx: false
+        case .appleIntelligence, .mlx, .ollama: false
         }
     }
 
@@ -83,7 +93,7 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
         case .openAI: "OpenAI API key"
         case .anthropic: "Anthropic API key"
         case .compatible: "API key"
-        case .appleIntelligence, .mlx: ""
+        case .appleIntelligence, .mlx, .ollama: ""
         }
     }
 
@@ -92,8 +102,28 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
         case .openRouter: "https://openrouter.ai/api/v1/chat/completions"
         case .openAI: "https://api.openai.com/v1/chat/completions"
         case .anthropic: "https://api.anthropic.com/v1/messages"
+        case .ollama: "http://localhost:11434/v1/chat/completions"
         case .compatible: ""
         case .appleIntelligence, .mlx: ""
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .appleIntelligence:
+            "Runs on this Mac using Apple Intelligence. No account or API key required."
+        case .mlx:
+            "Runs an MLX model locally. Models download from Hugging Face when first used."
+        case .openRouter:
+            "One OpenRouter connection provides Claude, OpenAI, Gemini, and other hosted models."
+        case .openAI:
+            "Uses OpenAI developer API billing. A ChatGPT subscription does not include API usage."
+        case .anthropic:
+            "Uses Anthropic developer API billing. A Claude subscription does not include API usage."
+        case .compatible:
+            "Uses an OpenAI-compatible chat-completions endpoint."
+        case .ollama:
+            "Runs models on this machine through Ollama. Start Ollama and pull a model; no API key required."
         }
     }
 
@@ -102,7 +132,7 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
         case .openRouter: "openrouter/auto"
         case .openAI: "gpt-5.6"
         case .anthropic: "claude-sonnet-5"
-        case .compatible, .appleIntelligence, .mlx: ""
+        case .compatible, .appleIntelligence, .mlx, .ollama: ""
         }
     }
 }
@@ -130,6 +160,23 @@ struct CloudModelConfig: Codable, Equatable {
     init(model: String = "", endpoint: String = "") {
         self.model = model
         self.endpoint = endpoint
+    }
+}
+
+/// A provider and the model to run on it. Tasks store one; anything that runs a
+/// model can be handed a different one at the moment it runs.
+struct ModelChoice: Equatable, Hashable, Identifiable {
+    var backend: LocalModelBackend
+    var model: String = ""
+
+    var id: String { backend.rawValue + "|" + model }
+
+    var label: String {
+        model.isEmpty ? backend.label : model
+    }
+
+    var detailedLabel: String {
+        model.isEmpty ? backend.label : "\(backend.label) · \(model)"
     }
 }
 
@@ -230,6 +277,9 @@ enum LocalModelSettings {
     private static let generationPrefix = "ml.generation."
     private static let systemPromptPrefix = "ml.systemPrompt."
     private static let cloudConfigPrefix = "ml.cloudConfig."
+    private static let providerModelPrefix = "ml.provider.model."
+    private static let providerEndpointPrefix = "ml.provider.endpoint."
+    private static let taskModelPrefix = "ml.taskModel."
 
     static func backend(for operation: LocalModelOperation) -> LocalModelBackend {
         guard let raw = UserDefaults.standard.string(forKey: backendPrefix + operation.rawValue) else {
@@ -260,26 +310,104 @@ enum LocalModelSettings {
         )
     }
 
-    static func cloudModelConfig(
+    // MARK: providers
+
+    /// The model a provider uses when a task has not named one of its own.
+    static func providerModel(for backend: LocalModelBackend) -> String {
+        let saved = UserDefaults.standard.string(forKey: providerModelPrefix + backend.rawValue)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let saved, !saved.isEmpty else { return backend.defaultModel }
+        return saved
+    }
+
+    static func setProviderModel(_ model: String, for backend: LocalModelBackend) {
+        UserDefaults.standard.set(model, forKey: providerModelPrefix + backend.rawValue)
+    }
+
+    static func endpoint(for backend: LocalModelBackend) -> String {
+        let saved = UserDefaults.standard.string(forKey: providerEndpointPrefix + backend.rawValue)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let saved, !saved.isEmpty else { return backend.defaultEndpoint }
+        return saved
+    }
+
+    static func setEndpoint(_ endpoint: String, for backend: LocalModelBackend) {
+        UserDefaults.standard.set(endpoint, forKey: providerEndpointPrefix + backend.rawValue)
+    }
+
+    static func isConnected(_ backend: LocalModelBackend) -> Bool {
+        guard backend.needsAPIKey else { return true }
+        return !ModelCredentialStore.apiKey(for: backend).isEmpty
+    }
+
+    // MARK: tasks
+
+    /// A task's own model, falling back to the provider's default.
+    static func model(for operation: LocalModelOperation, backend: LocalModelBackend) -> String {
+        let key = taskModelPrefix + backend.rawValue + "." + operation.rawValue
+        if let saved = UserDefaults.standard.string(forKey: key)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !saved.isEmpty {
+            return saved
+        }
+        // configs written before providers were their own thing
+        let legacyKey = cloudConfigPrefix + backend.rawValue + "." + operation.rawValue
+        if let data = UserDefaults.standard.data(forKey: legacyKey),
+           let config = try? JSONDecoder().decode(CloudModelConfig.self, from: data),
+           !config.model.isEmpty {
+            return config.model
+        }
+        return providerModel(for: backend)
+    }
+
+    static func setModel(
+        _ model: String,
         for operation: LocalModelOperation,
         backend: LocalModelBackend
-    ) -> CloudModelConfig {
-        let key = cloudConfigPrefix + backend.rawValue + "." + operation.rawValue
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let config = try? JSONDecoder().decode(CloudModelConfig.self, from: data)
-        else {
-            return CloudModelConfig(model: backend.defaultModel, endpoint: backend.defaultEndpoint)
+    ) {
+        let key = taskModelPrefix + backend.rawValue + "." + operation.rawValue
+        UserDefaults.standard.set(model, forKey: key)
+    }
+
+    /// The MLX repo to load: the task's saved config, with its repo swapped for
+    /// whatever the choice names when they differ.
+    static func mlxConfig(for operation: LocalModelOperation, choice: ModelChoice) -> RemoteModelConfig {
+        var config = remoteModelConfig(for: operation)
+        let repo = choice.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !repo.isEmpty, repo != config.repo {
+            config.repo = repo
+            config.localPath = nil
         }
         return config
     }
 
-    static func setCloudModelConfig(
-        _ config: CloudModelConfig,
-        for operation: LocalModelOperation,
-        backend: LocalModelBackend
-    ) {
-        let key = cloudConfigPrefix + backend.rawValue + "." + operation.rawValue
-        UserDefaults.standard.set(try? JSONEncoder().encode(config), forKey: key)
+    static func choice(for operation: LocalModelOperation) -> ModelChoice {
+        let backend = backend(for: operation)
+        return ModelChoice(backend: backend, model: model(for: operation, backend: backend))
+    }
+
+    /// Every provider/model pair worth offering at the moment of a task: each
+    /// connected provider's default, plus whatever models the tasks name.
+    static func availableChoices() -> [ModelChoice] {
+        var out: [ModelChoice] = []
+        var seen = Set<String>()
+        for backend in LocalModelBackend.allCases where isConnected(backend) {
+            var models = [providerModel(for: backend)]
+            models += LocalModelOperation.allCases.map { model(for: $0, backend: backend) }
+            if backend == .mlx {
+                models += LocalModelOperation.allCases.map { remoteModelConfig(for: $0).repo }
+            }
+            for model in models {
+                let choice = ModelChoice(
+                    backend: backend,
+                    model: model.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+                guard backend == .appleIntelligence || !choice.model.isEmpty,
+                      seen.insert(choice.id).inserted
+                else { continue }
+                out.append(choice)
+            }
+        }
+        return out
     }
 
     static func generationSettings(for operation: LocalModelOperation) -> LocalGenerationSettings {

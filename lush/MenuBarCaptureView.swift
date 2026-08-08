@@ -68,7 +68,7 @@ struct MenuBarCaptureView: View {
 
             if let status {
                 Text(status)
-                    .font(.caption)
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -96,7 +96,7 @@ struct MenuBarCaptureView: View {
                 .scaledToFit()
                 .frame(width: 18, height: 18)
             Text("Lush")
-                .font(.headline)
+                .uiFont(.headline)
             Spacer()
             Button {
                 closeMenuWindow()
@@ -169,11 +169,11 @@ struct MenuBarCaptureView: View {
                     ProgressView()
                         .controlSize(.small)
                     Text("Transcribing")
-                        .font(.caption)
+                        .uiFont(.caption)
                         .foregroundStyle(.secondary)
                 } else if recorder.permissionDenied {
                     Text("Microphone access denied")
-                        .font(.caption)
+                        .uiFont(.caption)
                         .foregroundStyle(.secondary)
                 }
             }

@@ -15,8 +15,28 @@ private extension NSResponder {
 
 @MainActor
 final class LushAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        LushShared.migrateDefaults()
+        HelperControl.registerIfEnabled()
+        HelperControl.stopAndWait()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = LushServicesProvider.shared
+    }
+
+    /// Flush, then hand the core back to the helper before we go — it can't
+    /// open the storage until this process has closed it.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        NotesModel.shared.releaseCore()
+        HelperControl.start {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { await NotesModel.shared.focus.reconcileWithSystemFocus() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -146,13 +166,52 @@ struct FolderCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New Note") { Task { await model.createNote() } }
-                .keyboardShortcut("n", modifiers: .command)
-            Button("New Script") { model.createScript() }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
+            Menu("New") {
+                NewItemMenuItems(model: model, shortcuts: true)
+            }
             Divider()
             Button("Copy Folder URL") { model.copyFolderUrl() }
                 .keyboardShortcut("c", modifiers: [.command, .shift])
+            #if os(macOS)
+            Divider()
+            Menu("Import") {
+                Button("File from Your Computer…") {
+                    model.showingFileImporter = true
+                }
+                .disabled(model.folderUrl == nil)
+                Button("From Apple Notes…") {
+                    Task { await model.importAppleNotes() }
+                }
+                .disabled(model.folderUrl == nil)
+                if !model.importStatus.isEmpty {
+                    Divider()
+                    Text(model.importStatus)
+                }
+            }
+            #endif
+        }
+    }
+}
+
+struct ViewCommands: Commands {
+    @AppStorage(EditorSettings.zenModeKey) private var zenMode = false
+    @AppStorage(EditorSettings.typewriterModeKey) private var typewriterMode = false
+    @AppStorage(EditorSettings.minimapKey) private var minimapVisible = true
+
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            Toggle("Zen Mode", isOn: $zenMode)
+                .keyboardShortcut("z", modifiers: [.command, .control])
+            Toggle("Typewriter Mode", isOn: Binding(
+                get: { typewriterMode },
+                set: { EditorSettings.setTypewriterMode($0) }
+            ))
+            .keyboardShortcut("t", modifiers: [.command, .control])
+            Toggle("Show Minimap", isOn: Binding(
+                get: { minimapVisible },
+                set: { EditorSettings.setMinimapVisible($0) }
+            ))
+            Divider()
         }
     }
 }
@@ -176,6 +235,15 @@ struct FormatCommands: Commands {
                 .keyboardShortcut("+", modifiers: [.command, .control])
             Button("Subscript") { editor?.toggleSubscript() }
                 .keyboardShortcut("-", modifiers: [.command, .control])
+            Menu("Font") {
+                ForEach(RichText.fontRoles, id: \.key) { role in
+                    Button(role.label) {
+                        editor?.applyFontRole(editor?.fontRoleActive == role.key ? nil : role.key)
+                    }
+                }
+                Divider()
+                Button("Default") { editor?.applyFontRole(nil) }
+            }
             Menu("Highlight") {
                 ForEach(Highlight.names, id: \.self) { name in
                     Button(name.capitalized) { editor?.applyHighlight(name) }
@@ -201,6 +269,16 @@ struct FormatCommands: Commands {
                 .keyboardShortcut("0", modifiers: [.command, .shift])
             Button("Block Quote") { editor?.applyStyle("blockquote") }
                 .keyboardShortcut("9", modifiers: [.command, .shift])
+            Divider()
+            Button("Move Item Up") { editor?.moveItemUp() }
+                .keyboardShortcut(.upArrow, modifiers: [.command, .control])
+            Button("Move Item Down") { editor?.moveItemDown() }
+                .keyboardShortcut(.downArrow, modifiers: [.command, .control])
+            Button("Move Checked to Bottom") { editor?.moveCheckedToBottom() }
+            Button(editor?.checkedItemsHidden == true ? "Show Checked Items" : "Hide Checked Items") {
+                editor?.toggleHideChecked()
+            }
+            Button("Delete Checked Items") { editor?.deleteChecked() }
             Button("Code Block") { editor?.applyStyle("code-block") }
                 .keyboardShortcut("m", modifiers: [.command, .shift])
             Menu("Code Language") {
@@ -217,10 +295,6 @@ struct FormatCommands: Commands {
                 editor?.core?.stashSelection()
             }
             .keyboardShortcut("s", modifiers: [.command, .control])
-            Button("Typewriter Mode") {
-                EditorSettings.setTypewriterMode(!EditorSettings.typewriterMode)
-            }
-            .keyboardShortcut("t", modifiers: [.command, .control])
             Divider()
             Button("Attach Image…") { editor?.attachImageFromPanel() }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
@@ -298,6 +372,10 @@ struct LushApp: App {
 
     init() {
         LushShortcuts.updateAppShortcutParameters()
+        InterfaceFont.applyNavigationBarAppearance(family: InterfaceFont.family)
+        #if os(iOS) || os(visionOS)
+        BackgroundSync.register()
+        #endif
     }
 
     var body: some Scene {
@@ -306,6 +384,7 @@ struct LushApp: App {
             ContentView()
                 .environment(model)
                 .environment(contextTracker)
+                .interfaceFont()
                 .task {
                     async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
@@ -317,6 +396,7 @@ struct LushApp: App {
         .commands {
             EditCommands()
             SearchCommands()
+            ViewCommands()
             FormatCommands()
             FolderCommands(model: model)
         }
@@ -326,6 +406,7 @@ struct LushApp: App {
                 NoteDetail(noteUrl: url)
                     .environment(model)
                     .environment(contextTracker)
+                    .interfaceFont()
                     .task {
                         async let server: Void = LocalSyncServer.startIfNeeded()
                         await model.start()
@@ -340,11 +421,13 @@ struct LushApp: App {
             SettingsView()
                 .environment(model)
                 .environment(contextTracker)
+                .interfaceFont()
         }
 
         WindowGroup("Quick Capture", id: "quick-capture") {
             QuickCaptureView()
                 .environment(model)
+                .interfaceFont()
         }
         .defaultSize(width: 340, height: 190)
         .windowResizability(.contentSize)
@@ -352,6 +435,7 @@ struct LushApp: App {
         MenuBarExtra {
             MenuBarCaptureView()
                 .environment(model)
+                .interfaceFont()
         } label: {
             LushMenuBarIcon()
                 .accessibilityLabel("Lush")
@@ -362,11 +446,26 @@ struct LushApp: App {
             ContentView()
                 .environment(model)
                 .environment(contextTracker)
+                .interfaceFont()
                 .task {
                     async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
                     await server
                     contextTracker.start()
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: UIApplication.didBecomeActiveNotification
+                    )
+                ) { _ in
+                    Task { await NotesModel.shared.focus.reconcileWithSystemFocus() }
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: UIApplication.didEnterBackgroundNotification
+                    )
+                ) { _ in
+                    BackgroundSync.didEnterBackground()
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)

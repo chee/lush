@@ -1,35 +1,40 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
+import Intents
+import CoreLocation
 
 struct SettingsView: View {
     var body: some View {
         #if os(macOS)
         TabView {
-            Tab("Sync", systemImage: "arrow.triangle.2.circlepath") {
-                SyncSettingsPane()
+            Tab("Patchwork", systemImage: "shippingbox") {
+                PatchworkSettingsPane()
             }
             Tab("Editor", systemImage: "textformat") {
                 EditorSettingsPane()
             }
+            Tab("Focus", systemImage: "moon") {
+                FocusSettingsPane()
+            }
+            Tab("Permissions", systemImage: "hand.raised") {
+                PermissionsSettingsPane()
+            }
             Tab("Machine Learning", systemImage: "sparkles.tv") {
                 MachineLearningSettingsPane()
             }
-            Tab("Agents", systemImage: "terminal") {
-                AgentSettingsPane()
-            }
-            Tab("Patchwork", systemImage: "shippingbox") {
-                PatchworkSettingsPane()
-            }
-            Tab("Import", systemImage: "square.and.arrow.down") {
-                ImportSettingsPane()
+            Tab("Sync", systemImage: "arrow.triangle.2.circlepath") {
+                SyncSettingsPane()
             }
         }
         .frame(width: 620, height: 620)
         #else
         List {
             NavigationLink {
-                SyncSettingsPane()
+                PatchworkSettingsPane()
             } label: {
-                Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                Label("Patchwork", systemImage: "shippingbox")
             }
             NavigationLink {
                 EditorSettingsPane()
@@ -37,14 +42,24 @@ struct SettingsView: View {
                 Label("Editor", systemImage: "textformat")
             }
             NavigationLink {
+                FocusSettingsPane()
+            } label: {
+                Label("Focus", systemImage: "moon")
+            }
+            NavigationLink {
+                PermissionsSettingsPane()
+            } label: {
+                Label("Permissions", systemImage: "hand.raised")
+            }
+            NavigationLink {
                 MachineLearningSettingsPane()
             } label: {
                 Label("Machine Learning", systemImage: "sparkles.tv")
             }
             NavigationLink {
-                PatchworkSettingsPane()
+                SyncSettingsPane()
             } label: {
-                Label("Patchwork", systemImage: "shippingbox")
+                Label("Sync", systemImage: "arrow.triangle.2.circlepath")
             }
         }
         .navigationTitle("Settings")
@@ -53,38 +68,34 @@ struct SettingsView: View {
 }
 
 #if os(macOS)
-struct AgentSettingsPane: View {
+struct AgentSettingsSection: View {
     @State private var status: String?
 
     var body: some View {
-        Form {
-            Section("Lush Documents") {
-                Text("Local agents can search, read, create, and edit documents while Lush is running.")
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Button("Install for Claude") { install(in: ".claude") }
-                    Button("Install for Codex") { install(in: ".codex") }
-                }
-                if let status {
-                    Text(status)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+        Section {
+            HStack {
+                Button("Install for Claude") { install(in: ".claude") }
+                Button("Install for Codex") { install(in: ".codex") }
             }
-            Section("Connection") {
-                Text("~/Library/Application Support/Lush/agent.json")
-                    .font(.caption.monospaced())
-                    .textSelection(.enabled)
-                Text("The bearer token changes whenever Lush starts and is readable only by this account.")
-                    .font(.caption)
+            Text("~/Library/Application Support/Lush/agent.json")
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            if let status {
+                Text(status)
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
             }
+        } header: {
+            Text("Agents")
+        } footer: {
+            Text("Installs a skill that lets local agents search, read, create, and edit documents while Lush is running. The bearer token changes whenever Lush starts and is readable only by this account.")
         }
-        .formStyle(.grouped)
-        .navigationTitle("Agents")
     }
 
     private func install(in agentDirectory: String) {
+        guard let picked = agentHome(agentDirectory) else { return }
+        let scoped = picked.startAccessingSecurityScopedResource()
+        defer { if scoped { picked.stopAccessingSecurityScopedResource() } }
         do {
             let resources = [
                 ("SKILL", "md", "SKILL.md"),
@@ -100,9 +111,10 @@ struct AgentSettingsPane: View {
                 status = "The bundled skill could not be found."
                 return
             }
-            let home = FileManager.default.homeDirectoryForCurrentUser
-            let skills = home.appendingPathComponent(agentDirectory, isDirectory: true)
-                .appendingPathComponent("skills", isDirectory: true)
+            let root = picked.lastPathComponent == agentDirectory
+                ? picked
+                : picked.appendingPathComponent(agentDirectory, isDirectory: true)
+            let skills = root.appendingPathComponent("skills", isDirectory: true)
             let destination = skills.appendingPathComponent("lush-docs", isDirectory: true)
             try FileManager.default.createDirectory(at: skills, withIntermediateDirectories: true)
             let staging = skills.appendingPathComponent(".lush-docs-\(UUID().uuidString)", isDirectory: true)
@@ -120,496 +132,50 @@ struct AgentSettingsPane: View {
             } else {
                 try FileManager.default.moveItem(at: staging, to: destination)
             }
-            status = "Installed lush-docs for \(agentDirectory == ".claude" ? "Claude" : "Codex")."
+            status = "Installed lush-docs in \(destination.path)."
         } catch {
             status = error.localizedDescription
         }
+    }
+
+    private func agentHome(_ agentDirectory: String) -> URL? {
+        let key = "agentSkillsHome\(agentDirectory)"
+        if let data = UserDefaults.standard.data(forKey: key) {
+            var stale = false
+            let url = try? URL(
+                resolvingBookmarkData: data,
+                options: .withSecurityScope,
+                bookmarkDataIsStale: &stale
+            )
+            if let url, !stale { return url }
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.showsHiddenFiles = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = realHome
+        panel.prompt = "Install"
+        panel.message = "Choose your \(agentDirectory) folder, or your home folder."
+        guard panel.runModal() == .OK, let picked = panel.url else { return nil }
+        let bookmark = try? picked.bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        )
+        if let bookmark { UserDefaults.standard.set(bookmark, forKey: key) }
+        return picked
+    }
+
+    private var realHome: URL {
+        guard let passwd = getpwuid(getuid()) else {
+            return FileManager.default.homeDirectoryForCurrentUser
+        }
+        return URL(fileURLWithFileSystemRepresentation: passwd.pointee.pw_dir, isDirectory: true, relativeTo: nil)
     }
 }
 #endif
-
-struct MachineLearningSettingsPane: View {
-    @State private var selectedOperation: LocalModelOperation = .attachmentSummary
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Picker("Operation", selection: $selectedOperation) {
-                ForEach(LocalModelOperation.allCases) { operation in
-                    Label(operation.shortLabel, systemImage: operation.symbolName)
-                        .tag(operation)
-                }
-            }
-            .pickerStyle(.segmented)
-            .padding([.horizontal, .top])
-
-            HStack(spacing: 8) {
-                Image(systemName: selectedOperation.symbolName)
-                    .foregroundStyle(.tint)
-                Text(selectedOperation.label)
-                    .font(.subheadline.weight(.medium))
-                Spacer()
-                Text("Configured separately")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal)
-            .padding(.top, 10)
-
-            Form {
-                LocalModelOperationSettingsView(operation: selectedOperation)
-                    .id(selectedOperation)
-            }
-            .formStyle(.grouped)
-        }
-        .navigationTitle("Machine Learning")
-    }
-}
-
-struct LocalModelOperationSettingsView: View {
-    let operation: LocalModelOperation
-    @State private var backend: LocalModelBackend
-    @State private var config: RemoteModelConfig
-    @State private var cloudConfig: CloudModelConfig
-    @State private var apiKey = ""
-    @State private var generationSettings: LocalGenerationSettings
-    @State private var systemPrompt: String
-    @State private var presetFilter = ""
-    @State private var status: String?
-    @State private var statusIsError = false
-    @State private var credentialStored: Bool
-    @State private var isSigningIn = false
-    @State private var promptExpanded = false
-    @State private var modelPickerPresented = false
-    @State private var modelFilter = ""
-    @State private var openRouterModels: [OpenRouterModel] = []
-    @State private var modelCatalogError: String?
-    @State private var isLoadingModels = false
-
-    init(operation: LocalModelOperation) {
-        self.operation = operation
-        let backend = LocalModelSettings.backend(for: operation)
-        _backend = State(initialValue: backend)
-        _config = State(initialValue: LocalModelSettings.remoteModelConfig(for: operation))
-        _cloudConfig = State(initialValue: LocalModelSettings.cloudModelConfig(for: operation, backend: backend))
-        _generationSettings = State(initialValue: LocalModelSettings.generationSettings(for: operation))
-        _systemPrompt = State(initialValue: LocalModelSettings.systemPrompt(for: operation))
-        _credentialStored = State(initialValue: !ModelCredentialStore.apiKey(for: backend).isEmpty)
-    }
-
-    var body: some View {
-        Section {
-            Picker("Provider", selection: $backend) {
-                ForEach(LocalModelBackend.allCases) { backend in
-                    Text(backend.label).tag(backend)
-                }
-            }
-            .onChange(of: backend) {
-                LocalModelSettings.setBackend(backend, for: operation)
-                cloudConfig = LocalModelSettings.cloudModelConfig(for: operation, backend: backend)
-                apiKey = ""
-                credentialStored = !ModelCredentialStore.apiKey(for: backend).isEmpty
-                status = nil
-                statusIsError = false
-            }
-
-            if backend.isCloud {
-                LabeledContent("Connection") {
-                    Label(
-                        connectionLabel,
-                        systemImage: credentialStored ? "checkmark.circle.fill" : "circle.dashed"
-                    )
-                    .foregroundStyle(credentialStored ? Color.green : Color.secondary)
-                }
-            }
-        } header: {
-            Text("Provider")
-        } footer: {
-            Text(providerDescription)
-        }
-
-        if backend == .mlx {
-            Section("Local model") {
-                DisclosureGroup("Suggested models") {
-                    TextField("Filter suggested models", text: $presetFilter)
-                        .autocorrectionDisabled()
-                    let presets = filteredPresets
-                    if presets.isEmpty {
-                        Text("No matching suggestions.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(presets) { preset in
-                            Button {
-                                config = preset.config
-                                status = preset.note
-                                statusIsError = false
-                                LocalModelSettings.setRemoteModelConfig(config, for: operation)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(preset.label)
-                                    Text(preset.note)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                }
-
-                TextField("Repository", text: $config.repo, prompt: Text("owner/model"))
-                    .autocorrectionDisabled()
-                    .onChange(of: config.repo) { saveConfig() }
-                TextField("Revision", text: $config.revision, prompt: Text("main"))
-                    .autocorrectionDisabled()
-                    .onChange(of: config.revision) { saveConfig() }
-                if let status {
-                    statusMessage(status)
-                }
-            }
-        }
-
-        if backend.isCloud {
-            Section("Model") {
-                HStack {
-                    TextField("Model ID", text: $cloudConfig.model, prompt: Text(modelPlaceholder))
-                        .autocorrectionDisabled()
-                        .onChange(of: cloudConfig.model) { saveCloudConfig() }
-                    if backend == .openRouter {
-                        Button {
-                            modelPickerPresented.toggle()
-                            if openRouterModels.isEmpty {
-                                refreshModels()
-                            }
-                        } label: {
-                            Image(systemName: "chevron.up.chevron.down")
-                        }
-                        .help("Choose an OpenRouter model")
-                        .popover(isPresented: $modelPickerPresented, arrowEdge: .trailing) {
-                            openRouterModelPicker
-                        }
-                    }
-                }
-
-                if backend == .compatible {
-                    TextField(
-                        "Endpoint",
-                        text: $cloudConfig.endpoint,
-                        prompt: Text("https://provider.example/v1/chat/completions")
-                    )
-                    .autocorrectionDisabled()
-                    .onChange(of: cloudConfig.endpoint) { saveCloudConfig() }
-                }
-            }
-
-            Section {
-                if backend == .openRouter {
-                    Button {
-                        signInWithOpenRouter()
-                    } label: {
-                        HStack {
-                            if isSigningIn {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Image(systemName: "person.crop.circle.badge.checkmark")
-                            }
-                            Text(isSigningIn ? "Waiting for OpenRouter…" : "Connect OpenRouter")
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isSigningIn)
-                }
-
-                HStack {
-                    SecureField(
-                        credentialStored ? "Enter a replacement key" : backend.credentialLabel,
-                        text: $apiKey
-                    )
-                    .textContentType(.password)
-                    .autocorrectionDisabled()
-                    Button(credentialStored ? "Replace" : "Save") { saveAPIKey() }
-                        .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-
-                if credentialStored {
-                    Button("Disconnect", role: .destructive) { removeAPIKey() }
-                }
-
-                if let status {
-                    statusMessage(status)
-                }
-            } header: {
-                Text("Credentials")
-            } footer: {
-                Text("Stored in Keychain and shared by every task using this provider.")
-            }
-        }
-
-        Section("Generation") {
-            LabeledContent("Temperature") {
-                HStack(spacing: 12) {
-                    Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
-                        .frame(minWidth: 180)
-                        .onChange(of: generationSettings.temperature) {
-                            saveGenerationSettings()
-                        }
-                    Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Stepper(
-                "Response limit: \(generationSettings.maximumResponseTokens) tokens",
-                value: $generationSettings.maximumResponseTokens,
-                in: 64...4096,
-                step: 64
-            )
-            .onChange(of: generationSettings.maximumResponseTokens) {
-                saveGenerationSettings()
-            }
-        }
-
-        Section {
-            DisclosureGroup("System prompt", isExpanded: $promptExpanded) {
-                TextEditor(text: $systemPrompt)
-                    .font(.caption.monospaced())
-                    .frame(minHeight: 140)
-                    .onChange(of: systemPrompt) {
-                        saveSystemPrompt()
-                    }
-                HStack {
-                    Spacer()
-                    Button("Restore Default") {
-                        systemPrompt = operation.defaultSystemPrompt
-                        LocalModelSettings.resetSystemPrompt(for: operation)
-                    }
-                }
-            }
-        } footer: {
-            Text("Advanced instructions sent with every request for this task.")
-        }
-    }
-
-    private var openRouterModelPicker: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Filter models", text: $modelFilter)
-                    .textFieldStyle(.plain)
-                Button {
-                    refreshModels()
-                } label: {
-                    if isLoadingModels {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                    }
-                }
-                .buttonStyle(.plain)
-                .disabled(isLoadingModels)
-                .help("Refresh models")
-            }
-            .padding(12)
-
-            Divider()
-
-            if let modelCatalogError, openRouterModels.isEmpty {
-                ContentUnavailableView(
-                    "Models unavailable",
-                    systemImage: "wifi.exclamationmark",
-                    description: Text(modelCatalogError)
-                )
-            } else if isLoadingModels && openRouterModels.isEmpty {
-                ProgressView("Loading models…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if filteredOpenRouterModels.isEmpty {
-                ContentUnavailableView.search(text: modelFilter)
-            } else {
-                List(filteredOpenRouterModels) { model in
-                    Button {
-                        cloudConfig.model = model.id
-                        saveCloudConfig()
-                        modelPickerPresented = false
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack {
-                                Text(model.name)
-                                    .lineLimit(1)
-                                Spacer()
-                                if cloudConfig.model == model.id {
-                                    Image(systemName: "checkmark")
-                                        .foregroundStyle(.tint)
-                                }
-                            }
-                            Text(model.id)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            if let contextLength = model.contextLength {
-                                Text("\(contextLength.formatted()) context")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-                .listStyle(.plain)
-            }
-
-            if let modelCatalogError, !openRouterModels.isEmpty {
-                Divider()
-                Label(modelCatalogError, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .padding(10)
-            }
-        }
-        .frame(width: 430, height: 430)
-    }
-
-    private var filteredOpenRouterModels: [OpenRouterModel] {
-        let models = operation == .imageCaption
-            ? openRouterModels.filter { $0.architecture?.inputModalities?.contains("image") != false }
-            : openRouterModels
-        let query = modelFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return models }
-        return models.filter {
-            $0.name.localizedCaseInsensitiveContains(query)
-                || $0.id.localizedCaseInsensitiveContains(query)
-                || ($0.description?.localizedCaseInsensitiveContains(query) ?? false)
-        }
-    }
-
-    private func refreshModels() {
-        guard !isLoadingModels else { return }
-        isLoadingModels = true
-        modelCatalogError = nil
-        Task {
-            do {
-                openRouterModels = try await OpenRouterModelCatalog.fetch()
-            } catch {
-                modelCatalogError = error.localizedDescription
-            }
-            isLoadingModels = false
-        }
-    }
-
-    @ViewBuilder
-    private func statusMessage(_ message: String) -> some View {
-        Label(message, systemImage: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-            .font(.caption)
-            .foregroundStyle(statusIsError ? Color.red : Color.secondary)
-    }
-
-    private var connectionLabel: String {
-        if isSigningIn { return "Connecting…" }
-        return credentialStored ? "Connected" : "Not connected"
-    }
-
-    private var modelPlaceholder: String {
-        switch backend {
-        case .openRouter: "openrouter/auto"
-        case .openAI: "gpt-5.6"
-        case .anthropic: "claude-sonnet-4"
-        case .compatible: "provider/model"
-        case .appleIntelligence, .mlx: ""
-        }
-    }
-
-    private var providerDescription: String {
-        switch backend {
-        case .appleIntelligence:
-            "Runs on this Mac using Apple Intelligence. No account or API key required."
-        case .mlx:
-            "Runs an MLX model locally. Models download from Hugging Face when first used."
-        case .openRouter:
-            "One OpenRouter connection provides Claude, OpenAI, Gemini, and other hosted models."
-        case .openAI:
-            "Uses OpenAI developer API billing. A ChatGPT subscription does not include API usage."
-        case .anthropic:
-            "Uses Anthropic developer API billing. A Claude subscription does not include API usage."
-        case .compatible:
-            "Uses an OpenAI-compatible chat-completions endpoint."
-        }
-    }
-
-    private var filteredPresets: [HuggingFaceModelPreset] {
-        let presets = HuggingFaceModelPreset.presets(for: operation)
-        let query = presetFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !query.isEmpty else { return presets }
-        return presets.filter { preset in
-            preset.label.lowercased().contains(query)
-                || preset.note.lowercased().contains(query)
-                || preset.config.repo.lowercased().contains(query)
-                || preset.config.filename.lowercased().contains(query)
-        }
-    }
-
-    private func saveConfig() {
-        LocalModelSettings.setRemoteModelConfig(config, for: operation)
-    }
-
-    private func saveGenerationSettings() {
-        LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
-    }
-
-    private func saveCloudConfig() {
-        LocalModelSettings.setCloudModelConfig(cloudConfig, for: operation, backend: backend)
-    }
-
-    private func saveAPIKey() {
-        do {
-            try ModelCredentialStore.setAPIKey(apiKey, for: backend)
-            apiKey = ""
-            credentialStored = true
-            status = "Connected with API key."
-            statusIsError = false
-        } catch {
-            status = error.localizedDescription
-            statusIsError = true
-        }
-    }
-
-    private func removeAPIKey() {
-        do {
-            try ModelCredentialStore.setAPIKey("", for: backend)
-            apiKey = ""
-            credentialStored = false
-            status = "Disconnected."
-            statusIsError = false
-        } catch {
-            status = error.localizedDescription
-            statusIsError = true
-        }
-    }
-
-    private func signInWithOpenRouter() {
-        isSigningIn = true
-        status = nil
-        statusIsError = false
-        Task {
-            do {
-                let key = try await OpenRouterAuthentication.shared.signIn()
-                try ModelCredentialStore.setAPIKey(key, for: .openRouter)
-                apiKey = ""
-                credentialStored = true
-                status = "OpenRouter connected."
-            } catch {
-                status = error.localizedDescription
-                statusIsError = true
-            }
-            isSigningIn = false
-        }
-    }
-
-    private func saveSystemPrompt() {
-        LocalModelSettings.setSystemPrompt(systemPrompt, for: operation)
-    }
-}
 
 struct SyncSettingsPane: View {
     @Environment(NotesModel.self) private var model
@@ -620,6 +186,8 @@ struct SyncSettingsPane: View {
     @State private var copiedNodeId = false
     @State private var copiedLocalPort = false
     @State private var showingClearConfirm = false
+    @State private var backgroundSync = LushShared.helperEnabled
+    @State private var backgroundMenuBar = LushShared.helperShowsMenuBar
 
     var body: some View {
         Form {
@@ -652,6 +220,29 @@ struct SyncSettingsPane: View {
                     }
                 }
             }
+            #if os(macOS)
+            Section("Background") {
+                Toggle("Keep syncing when Lush is closed", isOn: $backgroundSync)
+                    .onChange(of: backgroundSync) { _, enabled in
+                        HelperControl.setEnabled(enabled)
+                        if !enabled { backgroundMenuBar = false }
+                    }
+                Toggle("Show menu bar item when Lush is closed", isOn: $backgroundMenuBar)
+                    .onChange(of: backgroundMenuBar) { _, shown in
+                        LushShared.helperShowsMenuBar = shown
+                    }
+                    .disabled(!backgroundSync)
+                Text("A small helper keeps your notes syncing after you quit Lush. It hands the core back the moment Lush opens again.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            #else
+            Section("Background") {
+                Text("Lush syncs in the background when iOS grants it time — more often the more you use the app. Background App Refresh must be on in Settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            #endif
             Section {
                 if let nodeId = model.core?.irohNodeId() {
                     HStack {
@@ -690,7 +281,7 @@ struct SyncSettingsPane: View {
                     )
                     if let peerError {
                         Text(peerError)
-                            .font(.caption)
+                            .uiFont(.caption)
                             .foregroundStyle(.red)
                     }
                 } else {
@@ -753,45 +344,24 @@ struct SyncSettingsPane: View {
 }
 
 struct EditorSettingsPane: View {
-    @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
-    @State private var sansFamily = EditorSettings.family(for: "sans")
-    @State private var serifFamily = EditorSettings.family(for: "serif")
-    @State private var monoFamily = EditorSettings.family(for: "mono")
-    @State private var handFamily = EditorSettings.family(for: "hand")
     @State private var fontSize = EditorSettings.bodySize
+    @State private var limitWidth = EditorSettings.maxNoteWidth > 0
+    @State private var maxWidth = EditorSettings.maxNoteWidth > 0 ? EditorSettings.maxNoteWidth : 700
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
-    @State private var typewriterMode = EditorSettings.typewriterMode
-    @State private var minimapVisible = EditorSettings.minimapVisible
     @State private var places = SavedPlaces.all
     @State private var placeName = ""
+    @State private var contactPickerPresented = false
+    @State private var mapPickerPresented = false
+    @State private var importingMine = false
+    @State private var importStatus: String?
+    @AppStorage(NotesModel.importAsNotesKey) private var importTextFilesAsNotes = true
+    @AppStorage(Agenda.dayInIconKey) private var calendarIconShowsDay = false
 
     var body: some View {
         Form {
-            Section {
-                if let url = model.quickNoteUrl {
-                    HStack {
-                        Label(
-                            model.node(for: url)?.displayName ?? "Note",
-                            systemImage: "bolt.circle"
-                        )
-                        Spacer()
-                        Button("Clear") { model.setQuickNote(nil) }
-                    }
-                } else {
-                    Text("No Quick Note set.")
-                        .foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("Quick Note")
-            } footer: {
-                Text("The Quick Note opens from the widget and Shortcuts. Set one from a note's context menu.")
-            }
-            Section("Type") {
-                familyPicker("Sans", selection: $sansFamily, key: "sans")
-                familyPicker("Serif", selection: $serifFamily, key: "serif")
-                familyPicker("Mono", selection: $monoFamily, key: "mono")
-                familyPicker("Hand", selection: $handFamily, key: "hand")
+            FontSettingsSections()
+            Section("Base Size") {
                 HStack {
                     Text("Size")
                     Slider(value: $fontSize, in: 11...24, step: 1)
@@ -803,29 +373,52 @@ struct EditorSettingsPane: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Section("Logline") {
-                Toggle("Typewriter mode (center caret, dim other paragraphs)", isOn: $typewriterMode)
-                    .onChange(of: typewriterMode) {
-                        EditorSettings.setTypewriterMode(typewriterMode)
+            Section("Width") {
+                Toggle("Limit note width", isOn: $limitWidth)
+                    .onChange(of: limitWidth) {
+                        EditorSettings.setMaxNoteWidth(limitWidth ? maxWidth : 0)
                     }
-                Toggle("Show minimap", isOn: $minimapVisible)
-                    .onChange(of: minimapVisible) {
-                        EditorSettings.setMinimapVisible(minimapVisible)
+                if limitWidth {
+                    HStack {
+                        Text("Maximum")
+                        Slider(value: $maxWidth, in: 320...1200, step: 20)
+                            .onChange(of: maxWidth) {
+                                EditorSettings.setMaxNoteWidth(maxWidth)
+                            }
+                        Text("\(Int(maxWidth))pt")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
+                }
+            }
+            Section("Calendar") {
+                Toggle("Show today's date in the calendar icon", isOn: $calendarIconShowsDay)
+            }
+            Section("Import") {
+                Picker("Markdown, text and RTF files", selection: $importTextFilesAsNotes) {
+                    Text("Become Lush notes").tag(true)
+                    Text("Stay as files").tag(false)
+                }
+                Text("Applies to the share extension and shortcuts. Dragging a file in asks each time.")
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
                 Toggle("Add logline when context changes", isOn: $autoInsertLogline)
                     .onChange(of: autoInsertLogline) {
                         EditorSettings.setAutoInsertLogline(autoInsertLogline)
                     }
-            }
-            Section {
-                ForEach(places) { place in
+                ForEach($places) { $place in
                     HStack {
-                        Label(place.name, systemImage: "mappin.and.ellipse")
+                        Image(systemName: "mappin.and.ellipse")
+                            .foregroundStyle(.secondary)
+                        TextField("Name", text: $place.name)
+                            .textFieldStyle(.plain)
+                            .onSubmit { savePlaces() }
                         Spacer()
                         Button("Remove") {
                             places.removeAll { $0.id == place.id }
-                            SavedPlaces.save(places)
-                            contextTracker.refreshPlaceName()
+                            savePlaces()
                         }
                     }
                 }
@@ -835,40 +428,99 @@ struct EditorSettingsPane: View {
                         .disabled(placeName.trimmingCharacters(in: .whitespaces).isEmpty
                             || contextTracker.snapshot.latitude == nil)
                 }
+                HStack {
+                    #if os(macOS)
+                    Button("Import Home & Work") { importMyAddresses() }
+                        .disabled(importingMine)
+                    #endif
+                    Button("From Contacts…") { contactPickerPresented = true }
+                    Button("On a Map…") { mapPickerPresented = true }
+                    if importingMine {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                if let importStatus {
+                    Text(importStatus)
+                        .uiFont(.caption)
+                        .foregroundStyle(.secondary)
+                }
             } header: {
-                Text("Places")
+                Text("Logline")
             } footer: {
-                Text("A logline within 150m of a saved place uses its name — \"Home, London, England\" instead of the street.")
+                Text("A logline near a saved place uses its name — \"Home, London, England\" instead of the street. Addresses from Contacts are looked up once; only the coordinates are kept.")
             }
         }
         .formStyle(.grouped)
         .navigationTitle("Editor")
-    }
-
-    private func familyPicker(_ title: String, selection: Binding<String>, key: String) -> some View {
-        Picker(title, selection: selection) {
-            Text("System Default").tag(EditorSettings.systemFontFamily)
-            ForEach(EditorSettings.availableFontFamilies, id: \.self) { family in
-                Text(family).tag(family)
+        .sheet(isPresented: $contactPickerPresented) {
+            ContactPlacePicker { found in
+                add(found)
+                importStatus = found.isEmpty
+                    ? "None of those addresses could be found on the map."
+                    : "Added \(found.count) place\(found.count == 1 ? "" : "s") from Contacts."
             }
         }
-        .onChange(of: selection.wrappedValue) {
-            EditorSettings.setFamily(selection.wrappedValue, for: key)
+        .sheet(isPresented: $mapPickerPresented) {
+            MapPlacePicker(start: currentCoordinate) { place in
+                add([place])
+                importStatus = nil
+            }
         }
+    }
+
+    private var currentCoordinate: CLLocationCoordinate2D? {
+        let snap = contextTracker.snapshot
+        guard let lat = snap.latitude, let lon = snap.longitude else { return nil }
+        return CLLocationCoordinate2D(latitude: lat, longitude: lon)
     }
 
     private func addPlace() {
-        let snap = contextTracker.snapshot
-        guard let lat = snap.latitude, let lon = snap.longitude else { return }
-        places.append(SavedPlace(
+        guard let here = currentCoordinate else { return }
+        add([SavedPlace(
             name: placeName.trimmingCharacters(in: .whitespaces),
-            latitude: lat,
-            longitude: lon
-        ))
-        SavedPlaces.save(places)
+            latitude: here.latitude,
+            longitude: here.longitude
+        )])
         placeName = ""
+    }
+
+    private func add(_ found: [SavedPlace]) {
+        places.append(contentsOf: found)
+        savePlaces()
+    }
+
+    private func savePlaces() {
+        SavedPlaces.save(places)
         contextTracker.refreshPlaceName()
     }
+
+    #if os(macOS)
+    private func importMyAddresses() {
+        importingMine = true
+        importStatus = nil
+        Task {
+            guard await ContactPlaces.requestAccess() else {
+                importingMine = false
+                importStatus = "Lush has no access to your contacts. Turn it on in Permissions."
+                return
+            }
+            let mine = (try? ContactPlaces.mine()) ?? []
+            guard !mine.isEmpty else {
+                importingMine = false
+                importStatus = "Your own contact card has no home or work address."
+                return
+            }
+            let existing = Set(places.map(\.name))
+            let found = await ContactPlaces.geocode(mine.filter { !existing.contains($0.placeName) })
+            add(found)
+            importingMine = false
+            importStatus = found.isEmpty
+                ? "Nothing new to add."
+                : "Added \(found.map(\.name).joined(separator: " and "))."
+        }
+    }
+    #endif
 }
 
 struct PatchworkSettingsPane: View {
@@ -996,36 +648,93 @@ struct PatchworkSettingsPane: View {
             } footer: {
                 Text("Paste module settings doc URLs; their datatypes and tools show up when embedding Patchwork documents. Takes effect for newly opened embeds.")
             }
+            Section {
+                if let url = model.effectiveQuickNoteUrl {
+                    HStack {
+                        Label(
+                            model.node(for: url)?.displayName ?? "Note",
+                            systemImage: "bolt.circle"
+                        )
+                        Spacer()
+                        Button("Clear") { model.setQuickNote(nil) }
+                    }
+                } else {
+                    Text("No Quick Note set.")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Quick Note")
+            } footer: {
+                Text("The Quick Note opens from the widget and Shortcuts. Set one from a note's context menu.")
+            }
         }
         .formStyle(.grouped)
         .navigationTitle("Patchwork")
     }
 }
 
-#if os(macOS)
-struct ImportSettingsPane: View {
+
+struct FocusSettingsPane: View {
     @Environment(NotesModel.self) private var model
+
+    private var focus: FocusModes { model.focus }
 
     var body: some View {
         Form {
             Section {
-                Button("Import from Apple Notes…") {
-                    Task { await model.importAppleNotes() }
-                }
-                .disabled(model.folderUrl == nil)
-                if !model.importStatus.isEmpty {
-                    Text(model.importStatus)
-                        .font(.caption)
+                if let state = focus.state {
+                    if state.shownFolderUrls.isEmpty {
+                        LabeledContent("Folders", value: "All")
+                    } else {
+                        LabeledContent("Folders") {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                ForEach(state.shownFolderUrls, id: \.self) { url in
+                                    Text(model.node(for: url)?.displayName ?? "Folder")
+                                }
+                            }
+                        }
+                    }
+                    LabeledContent("Inbox", value: name(state.inboxUrl) ?? "Default")
+                    LabeledContent("Quick Note", value: name(state.quickNoteUrl) ?? "Default")
+                } else {
+                    Text("No Focus is filtering Lush.")
                         .foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Apple Notes")
+                Text("Current Focus")
             } footer: {
-                Text("Copies every note from Apple Notes into an “Apple Notes” folder here, keeping their folders and edit dates. Already-imported notes are skipped, so it's safe to run again. macOS will ask permission to control Notes the first time.")
+                Text("Set this up under \(Self.focusSettingsPath) › Focus Filters › Lush: pick the folders to show and, if you want, a different inbox and Quick Note. It applies while that Focus is on and stops when it ends. Anything left unset keeps the normal setting, and hidden folders stay searchable.")
+            }
+            Section {
+                switch focus.focusStatusAuthorization {
+                case .authorized:
+                    Label("Lush follows Focus changes as they happen.", systemImage: "checkmark.circle")
+                case .denied, .restricted:
+                    Text("Focus access is off, so a Focus that starts or ends while Lush is in the background is picked up next time Lush comes to the front.")
+                        .foregroundStyle(.secondary)
+                default:
+                    Button("Allow Focus Access") {
+                        Task { await focus.requestFocusStatusAuthorization() }
+                    }
+                }
+            } header: {
+                Text("Focus Access")
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Import")
+        .navigationTitle("Focus")
+    }
+
+    private static var focusSettingsPath: String {
+        #if os(macOS)
+        "System Settings › Focus › a Focus"
+        #else
+        "Settings › Focus › a Focus"
+        #endif
+    }
+
+    private func name(_ url: String?) -> String? {
+        guard let url else { return nil }
+        return model.node(for: url)?.displayName ?? "Untitled"
     }
 }
-#endif

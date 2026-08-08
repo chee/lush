@@ -96,13 +96,7 @@ actor SemanticSearchIndex {
     }
 
     private var legacyStoreURL: URL {
-        let support = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        )[0]
-        return support
-            .appendingPathComponent("LushCore", isDirectory: true)
-            .appendingPathComponent("semantic-search.json")
+        LushShared.coreDataDirectory().appendingPathComponent("semantic-search.json")
     }
 
     /// Move the old JSON store into the core once, so an upgrade doesn't have to
@@ -141,6 +135,9 @@ actor SemanticSearchIndex {
             case .block(let block):
                 if block.isEmbedBlock, let html = block.htmlSource {
                     parts.append(html)
+                }
+                if let title = block.calendarEventTitle {
+                    parts.append(title)
                 }
             case .text(let text, _):
                 parts.append(text)

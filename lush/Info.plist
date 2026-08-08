@@ -2,18 +2,86 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleIdentifier</key>
-	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-	<key>CFBundleExecutable</key>
-	<string>$(EXECUTABLE_NAME)</string>
-	<key>CFBundlePackageType</key>
-	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
-	<key>CFBundleVersion</key>
-	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>CFBundleShortVersionString</key>
-	<string>$(MARKETING_VERSION)</string>
-	<key>CFBundleDisplayName</key>
-	<string>Lush</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>MKDirectionsRequest</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.apple.maps.directionsrequest</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>party.chee.lush</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>lush</string>
+			</array>
+		</dict>
+	</array>
+	<key>MKDirectionsApplicationSupportedModes</key>
+	<array>
+		<string>MKDirectionsModeBike</string>
+		<string>MKDirectionsModeBus</string>
+		<string>MKDirectionsModeCar</string>
+		<string>MKDirectionsModeFerry</string>
+		<string>MKDirectionsModeOther</string>
+		<string>MKDirectionsModePedestrian</string>
+		<string>MKDirectionsModePlane</string>
+		<string>MKDirectionsModeRideShare</string>
+		<string>MKDirectionsModeStreetCar</string>
+		<string>MKDirectionsModeSubway</string>
+		<string>MKDirectionsModeTaxi</string>
+		<string>MKDirectionsModeTrain</string>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Add to Lush Quick Note</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>addSelectionToQuickNote</string>
+			<key>NSSendTypes</key>
+			<array>
+				<string>NSStringPboardType</string>
+				<string>public.utf8-plain-text</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Import into Lush</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>importSelectionIntoLush</string>
+			<key>NSSendTypes</key>
+			<array>
+				<string>NSStringPboardType</string>
+				<string>NSFilenamesPboardType</string>
+				<string>public.file-url</string>
+				<string>public.utf8-plain-text</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSUserActivityTypes</key>
+	<array>
+		<string>com.apple.corespotlightitem</string>
+		<string>party.chee.patchwork.lush.view</string>
+	</array>
 	<key>UIAppFonts</key>
 	<array>
 		<string>Caroni-Regular.otf</string>
@@ -25,58 +93,17 @@
 		<string>Merriweather-VariableFont_opsz,wdth,wght.ttf</string>
 		<string>Merriweather-Italic-VariableFont_opsz,wdth,wght.ttf</string>
 	</array>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Attaches your location to notes as context.</string>
-	<key>CFBundleURLTypes</key>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<dict>
-			<key>CFBundleURLName</key>
-			<string>party.chee.lush</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>lush</string>
-			</array>
-		</dict>
-		</array>
-		<key>NSUserActivityTypes</key>
-		<array>
-			<string>com.apple.corespotlightitem</string>
-			<string>party.chee.patchwork.lush.view</string>
-		</array>
-		<key>NSServices</key>
-		<array>
-			<dict>
-				<key>NSMenuItem</key>
-				<dict>
-					<key>default</key>
-					<string>Add to Lush Quick Note</string>
-				</dict>
-				<key>NSMessage</key>
-				<string>addSelectionToQuickNote</string>
-				<key>NSSendTypes</key>
-				<array>
-					<string>NSStringPboardType</string>
-					<string>public.utf8-plain-text</string>
-				</array>
-			</dict>
-			<dict>
-				<key>NSMenuItem</key>
-				<dict>
-					<key>default</key>
-					<string>Import into Lush</string>
-				</dict>
-				<key>NSMessage</key>
-				<string>importSelectionIntoLush</string>
-				<key>NSSendTypes</key>
-				<array>
-					<string>NSStringPboardType</string>
-					<string>NSFilenamesPboardType</string>
-					<string>public.file-url</string>
-					<string>public.utf8-plain-text</string>
-				</array>
-			</dict>
-		</array>
-		<key>UILaunchScreen</key>
-		<dict/>
+		<string>party.chee.patchwork.lush.sync.refresh</string>
+		<string>party.chee.patchwork.lush.sync.processing</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
 </dict>
 </plist>

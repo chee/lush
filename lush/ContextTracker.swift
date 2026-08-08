@@ -1,7 +1,7 @@
 import SwiftUI
 import CoreLocation
 import MapKit
-import MediaPlayer
+import WeatherKit
 
 struct SavedPlace: Codable, Identifiable, Equatable {
     var id = UUID()
@@ -41,7 +41,6 @@ struct ContextSnapshot: Equatable {
     var latitude: Double?
     var longitude: Double?
     var weatherDescription: String?
-    var nowPlaying: String?
     /// Values from registered providers, keyed by attribute name.
     var extras: [String: String] = [:]
 
@@ -55,7 +54,6 @@ struct ContextSnapshot: Equatable {
         }
         if locationName != previous.locationName { return true }
         if weatherDescription != previous.weatherDescription { return true }
-        if nowPlaying != previous.nowPlaying { return true }
         if extras != previous.extras { return true }
         return false
     }
@@ -66,7 +64,6 @@ struct ContextSnapshot: Equatable {
         latitude: Double? = nil,
         longitude: Double? = nil,
         weatherDescription: String? = nil,
-        nowPlaying: String? = nil,
         extras: [String: String] = [:]
     ) {
         self.timestamp = timestamp
@@ -74,7 +71,6 @@ struct ContextSnapshot: Equatable {
         self.latitude = latitude
         self.longitude = longitude
         self.weatherDescription = weatherDescription
-        self.nowPlaying = nowPlaying
         self.extras = extras
     }
 
@@ -89,9 +85,8 @@ struct ContextSnapshot: Equatable {
         latitude = block.attrs["lat"]?.doubleValue
         longitude = block.attrs["lon"]?.doubleValue
         weatherDescription = block.attrs["weather"]?.stringValue
-        nowPlaying = block.attrs["now_playing"]?.stringValue
         extras = block.attrs.reduce(into: [:]) { result, pair in
-            let reserved = ["created", "ts", "location", "lat", "lon", "weather", "now_playing"]
+            let reserved = ["created", "ts", "location", "lat", "lon", "weather"]
             guard !reserved.contains(pair.key), let value = pair.value.stringValue else { return }
             result[pair.key] = value
         }
@@ -107,7 +102,6 @@ extension BlockValue {
         if let lat = snap.latitude { attrs["lat"] = .number(lat) }
         if let lon = snap.longitude { attrs["lon"] = .number(lon) }
         if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
-        if let s = snap.nowPlaying { attrs["now_playing"] = .string(s) }
         for (key, value) in snap.extras { attrs[key] = .string(value) }
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
@@ -121,8 +115,7 @@ extension BlockValue {
             if let lat = snap.latitude { attrs["lat"] = .number(lat) }
             if let lon = snap.longitude { attrs["lon"] = .number(lon) }
             if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
-            if let s = snap.nowPlaying { attrs["now_playing"] = .string(s) }
-            for (key, value) in snap.extras { attrs[key] = .string(value) }
+                for (key, value) in snap.extras { attrs[key] = .string(value) }
         }
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
@@ -170,9 +163,6 @@ struct ContextInlineView: View {
                     Label(loc, systemImage: "location")
                 }
             }
-            if let song = block.attrs["now_playing"]?.stringValue {
-                Label(song, systemImage: "music.note")
-            }
             Spacer(minLength: 0)
         }
         .labelStyle(.titleAndIcon)
@@ -197,7 +187,6 @@ final class ContextTracker {
     private var lastWeatherFetch: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
     private var lastLocation: CLLocation?
-    private var updatingNowPlaying = false
 
     init() {
         locationDelegate.owner = self
@@ -239,7 +228,6 @@ final class ContextTracker {
     }
 
     private func tick() {
-        updateNowPlaying()
         var extras: [String: String] = [:]
         for (key, provide) in providers {
             if let value = provide() { extras[key] = value }
@@ -247,54 +235,6 @@ final class ContextTracker {
         snapshot.extras = extras
         snapshot.timestamp = Date()
     }
-
-    #if os(macOS)
-    /// MPNowPlayingInfoCenter only reports this app's own playback, so ask
-    /// the players themselves. `is running` doesn't launch them.
-    nonisolated(unsafe) private static let nowPlayingScript = NSAppleScript(source: """
-        tell application "System Events"
-            set musicRunning to (name of processes) contains "Music"
-            set spotifyRunning to (name of processes) contains "Spotify"
-        end tell
-        if musicRunning then
-            tell application "Music"
-                if player state is playing then
-                    return (get name of current track) & " – " & (get artist of current track)
-                end if
-            end tell
-        end if
-        if spotifyRunning then
-            tell application "Spotify"
-                if player state is playing then
-                    return (get name of current track) & " – " & (get artist of current track)
-                end if
-            end tell
-        end if
-        return ""
-        """)
-
-    private func updateNowPlaying() {
-        guard !updatingNowPlaying else { return }
-        updatingNowPlaying = true
-        Task { @MainActor [weak self] in
-            defer { self?.updatingNowPlaying = false }
-            var error: NSDictionary?
-            let result = ContextTracker.nowPlayingScript?.executeAndReturnError(&error)
-            let playing = result?.stringValue ?? ""
-            self?.snapshot.nowPlaying = playing.isEmpty ? nil : playing
-        }
-    }
-    #else
-    private func updateNowPlaying() {
-        let info = MPNowPlayingInfoCenter.default().nowPlayingInfo
-        if let title = info?[MPMediaItemPropertyTitle] as? String, !title.isEmpty {
-            let artist = info?[MPMediaItemPropertyArtist] as? String
-            snapshot.nowPlaying = artist.map { "\(title) – \($0)" } ?? title
-        } else {
-            snapshot.nowPlaying = nil
-        }
-    }
-    #endif
 
     func didUpdateLocation(_ loc: CLLocation) {
         lastLocation = loc
@@ -361,31 +301,14 @@ final class ContextTracker {
         }
         lastWeatherFetch = now
         lastWeatherLocation = (lat, lon)
-        guard let url = URL(string: "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(lon)&current_weather=true") else { return }
-        guard let (data, _) = try? await URLSession.shared.data(from: url),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let cw = json["current_weather"] as? [String: Any],
-              let temp = cw["temperature"] as? Double
+        let location = CLLocation(latitude: lat, longitude: lon)
+        guard let current = try? await WeatherService.shared.weather(for: location, including: .current)
         else { return }
-        let code = cw["weathercode"] as? Int ?? 0
-        let label = weatherLabel(code)
-        snapshot.weatherDescription = label.isEmpty ? "\(Int(temp))°C" : "\(Int(temp))°C \(label)"
-    }
-
-    private func weatherLabel(_ code: Int) -> String {
-        switch code {
-        case 0: return "Clear"
-        case 1, 2: return "Partly Cloudy"
-        case 3: return "Overcast"
-        case 45, 48: return "Fog"
-        case 51, 53, 55, 61, 63, 65: return "Rain"
-        case 66, 67: return "Freezing Rain"
-        case 71, 73, 75, 77: return "Snow"
-        case 80, 81, 82: return "Showers"
-        case 85, 86: return "Snow Showers"
-        case 95: return "Thunderstorm"
-        default: return ""
-        }
+        let formatter = MeasurementFormatter()
+        formatter.unitOptions = [.naturalScale, .temperatureWithoutUnit]
+        formatter.numberFormatter.maximumFractionDigits = 0
+        let temp = formatter.string(from: current.temperature)
+        snapshot.weatherDescription = "\(temp) \(current.condition.description)"
     }
 }
 

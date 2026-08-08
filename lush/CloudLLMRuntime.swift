@@ -154,16 +154,21 @@ enum CloudLLMRuntime {
         let message: String?
     }
 
-    static func generateText(prompt: String, operation: LocalModelOperation) async throws -> String {
-        let backend = LocalModelSettings.backend(for: operation)
-        let config = LocalModelSettings.cloudModelConfig(for: operation, backend: backend)
+    static func generateText(
+        prompt: String,
+        operation: LocalModelOperation,
+        choice: ModelChoice? = nil
+    ) async throws -> String {
+        let choice = choice ?? LocalModelSettings.choice(for: operation)
+        let backend = choice.backend
         let settings = LocalModelSettings.generationSettings(for: operation)
-        let model = config.model.trimmingCharacters(in: .whitespacesAndNewlines)
-        let endpoint = config.endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = choice.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpoint = LocalModelSettings.endpoint(for: backend)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let apiKey = ModelCredentialStore.apiKey(for: backend)
         guard !model.isEmpty else { throw RuntimeError.modelNotConfigured }
         guard let url = URL(string: endpoint), !endpoint.isEmpty else { throw RuntimeError.endpointNotConfigured }
-        guard !apiKey.isEmpty else { throw RuntimeError.credentialNotConfigured }
+        guard !apiKey.isEmpty || !backend.needsAPIKey else { throw RuntimeError.credentialNotConfigured }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -179,7 +184,9 @@ enum CloudLLMRuntime {
                 maxTokens: settings.maximumResponseTokens
             ))
         } else {
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            if !apiKey.isEmpty {
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            }
             if backend == .openRouter {
                 request.setValue("Lush", forHTTPHeaderField: "X-OpenRouter-Title")
             }

@@ -13,7 +13,7 @@ struct ScriptEditorView: View {
     var body: some View {
         VStack(spacing: 0) {
             TextField("Untitled Script", text: $titleText)
-                .font(.title2.bold())
+                .uiFont(.title2, weight: .bold)
                 .textFieldStyle(.plain)
                 .focused($titleFocused)
                 .padding(.horizontal, 16)

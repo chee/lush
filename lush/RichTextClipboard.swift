@@ -19,6 +19,27 @@ enum RichTextClipboard {
     static let webCustomMapIdentifier = "org.w3.web-custom-format.map"
     static let webCustomPayloadIdentifier = "org.w3.web-custom-format.type-0"
 
+    /// `[-]` and `[/]` are the Obsidian-flavoured marks for the two states
+    /// GitHub markdown has no spelling for.
+    static func markdownTodoMark(_ state: TodoState) -> String {
+        switch state {
+        case .open: return " "
+        case .checked: return "x"
+        case .canceled: return "-"
+        case .pending: return "/"
+        }
+    }
+
+    static func todoState(markdownMark mark: Character) -> TodoState? {
+        switch mark {
+        case " ": return .open
+        case "x", "X": return .checked
+        case "-": return .canceled
+        case "/": return .pending
+        default: return nil
+        }
+    }
+
     static func spansJSON(webCustomMap mapData: Data, payload: (String) -> Data?) -> String? {
         guard let map = try? JSONDecoder().decode([String: String].self, from: mapData),
               let type = map[webSpansTypeIdentifier],
@@ -40,8 +61,12 @@ enum RichTextClipboard {
         NoteExporter.htmlFragment(from: spans)
     }
 
-    static func markdown(from spans: [SpanNode]) -> String {
+    static func markdown(
+        from spans: [SpanNode],
+        attachmentLabel: (Int) -> String = { _ in "[attachment]" }
+    ) -> String {
         var lines: [String] = []
+        var attachments = 0
         var i = 0
         while i < spans.count {
             guard case .block(let block) = spans[i] else {
@@ -68,7 +93,7 @@ enum RichTextClipboard {
             case "ordered-list-item":
                 lines.append(indent + "1. " + content)
             case "todo-list-item":
-                lines.append(indent + "- [" + (block.isChecked ? "x" : " ") + "] " + content)
+                lines.append(indent + "- [" + markdownTodoMark(block.todoState) + "] " + content)
             case "blockquote":
                 lines.append("> " + content)
             case "code-block":
@@ -97,7 +122,8 @@ enum RichTextClipboard {
                 }
             default:
                 if block.isEmbedBlock {
-                    lines.append("[attachment]")
+                    lines.append(attachmentLabel(attachments))
+                    attachments += 1
                 } else {
                     lines.append(escapeLeadingMarker(content))
                 }
@@ -135,9 +161,8 @@ enum RichTextClipboard {
                 || line.hasPrefix("- ")
                 || line.hasPrefix("* ")
                 || line.hasPrefix("> ")
-                || line.hasPrefix("- [ ] ")
-                || line.hasPrefix("- [x] ")
-                || line.hasPrefix("- [X] ")
+                || (line.count >= 6 && line.hasPrefix("- [") && Array(line)[4...5] == ["]", " "]
+                    && todoState(markdownMark: Array(line)[3]) != nil)
                 || orderedListPrefixLength(in: line) != nil
                 || line.hasPrefix("```")
         }
@@ -211,11 +236,9 @@ enum RichTextClipboard {
             } else if line.hasPrefix("# ") {
                 block = .heading(level: 1)
                 content = String(line.dropFirst(2))
-            } else if line.hasPrefix("- [ ] ") {
-                block = .todo(checked: false)
-                content = String(line.dropFirst(6))
-            } else if line.hasPrefix("- [x] ") || line.hasPrefix("- [X] ") {
-                block = .todo(checked: true)
+            } else if line.count >= 6, line.hasPrefix("- ["), Array(line)[4...5] == ["]", " "],
+                      let state = todoState(markdownMark: Array(line)[3]) {
+                block = .todo(state: state)
                 content = String(line.dropFirst(6))
             } else if line.hasPrefix("- ") || line.hasPrefix("* ") {
                 block = BlockValue(type: "unordered-list-item")

@@ -43,6 +43,71 @@ enum NoteChatStore {
     }
 }
 
+/// What the chat knows about one embed in the note: the asset's name and kind,
+/// whatever Vision and the summarizer wrote about it (OCR for images, the
+/// transcript for audio), or — for a patchwork embed — the document it points
+/// at, which the model can ask to read.
+struct NoteAttachment: Equatable {
+    let number: Int
+    let url: String?
+    let kind: String
+    let name: String
+    let tool: String?
+    let description: String
+    let text: String
+    let summary: String
+    let isPatchworkDoc: Bool
+
+    var label: String {
+        let title = name.isEmpty ? kind : name
+        return "[attachment \(number)] \(title) — \(kind)"
+    }
+
+    @MainActor
+    static func all(in spans: [SpanNode], model: NotesModel) async -> [NoteAttachment] {
+        // html blocks carry their source into the markdown, so they take no
+        // attachment number — the numbering must match RichTextClipboard
+        let blocks = spans.compactMap { span -> BlockValue? in
+            guard case .block(let block) = span, block.isEmbedBlock, block.type != "html" else { return nil }
+            return block
+        }
+        var out: [NoteAttachment] = []
+        for (index, block) in blocks.enumerated() {
+            let tool = block.attrs["tool"]?.stringValue
+            guard let url = block.embedUrl else {
+                out.append(NoteAttachment(
+                    number: index + 1, url: nil, kind: block.type, name: "", tool: tool,
+                    description: "", text: "", summary: "", isPatchworkDoc: false
+                ))
+                continue
+            }
+            let info = await model.assetInfo(url)
+            guard let info, !info.mimeType.isEmpty else {
+                out.append(NoteAttachment(
+                    number: index + 1, url: url, kind: "patchwork document",
+                    name: model.node(for: url)?.displayName ?? "", tool: tool,
+                    description: "", text: "", summary: "", isPatchworkDoc: true
+                ))
+                continue
+            }
+            let vision = await model.assetVision(url)
+            let ml = await model.assetML(url)
+            out.append(NoteAttachment(
+                number: index + 1,
+                url: url,
+                kind: AssetCache.kind(forName: info.name),
+                name: info.name,
+                tool: tool,
+                description: vision?.description ?? "",
+                text: vision?.ocr ?? "",
+                summary: ml?.summary ?? "",
+                isPatchworkDoc: false
+            ))
+        }
+        return out
+    }
+}
+
 enum NoteChatAssistant {
     enum ChatError: LocalizedError {
         case emptyQuestion
@@ -70,154 +135,153 @@ enum NoteChatAssistant {
     private struct GeneratedReply: Decodable {
         let answer: String
         let editedMarkdown: String?
+        let readAttachments: [Int]?
     }
 
+    /// One round of generation, then — if the model asked to see inside a
+    /// patchwork embed — a second round with those documents in the prompt.
     static func respond(
         to question: String,
         noteTitle: String,
         noteMarkdown: String,
-        previousTurns: [NoteChatTurn]
+        attachments: [NoteAttachment],
+        previousTurns: [NoteChatTurn],
+        choice: ModelChoice? = nil
     ) async throws -> (answer: String, proposedMarkdown: String?) {
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else { throw ChatError.emptyQuestion }
+        let choice = choice ?? LocalModelSettings.choice(for: .noteChat)
 
-        switch LocalModelSettings.backend(for: .noteChat) {
-        case .appleIntelligence:
-            return try await respondWithFoundationModels(
-                to: trimmedQuestion,
+        var documents = ""
+        for _ in 0...1 {
+            let body = prompt(
+                question: trimmedQuestion,
                 noteTitle: noteTitle,
                 noteMarkdown: noteMarkdown,
+                attachments: attachments,
+                documents: documents,
                 previousTurns: previousTurns
             )
-        case .mlx:
-            return try await respondWithCoreMLModel(
-                to: trimmedQuestion,
-                noteTitle: noteTitle,
-                noteMarkdown: noteMarkdown,
-                previousTurns: previousTurns
-            )
-        case .openRouter, .openAI, .anthropic, .compatible:
-            return try await respondWithCloudModel(
-                to: trimmedQuestion,
-                noteTitle: noteTitle,
-                noteMarkdown: noteMarkdown,
-                previousTurns: previousTurns
-            )
+            let generated = try await generate(body, choice: choice)
+            if documents.isEmpty, let wanted = generated.readAttachments, !wanted.isEmpty {
+                documents = await documentsSection(attachments, numbers: wanted)
+                if !documents.isEmpty { continue }
+            }
+            return try reply(from: generated)
         }
+        throw ChatError.generationFailed
     }
 
-    private static func respondWithFoundationModels(
-        to trimmedQuestion: String,
+    private static func prompt(
+        question: String,
         noteTitle: String,
         noteMarkdown: String,
+        attachments: [NoteAttachment],
+        documents: String,
         previousTurns: [NoteChatTurn]
-    ) async throws -> (answer: String, proposedMarkdown: String?) {
-        let model = SystemLanguageModel.default
-        guard model.isAvailable else { throw ChatError.appleIntelligenceUnavailable }
-
-        let instructions = LocalModelSettings.systemPrompt(for: .noteChat)
-        let prompt = """
+    ) -> String {
+        """
         Note title: \(limited(noteTitle, to: 300))
 
         Current note in Markdown:
         \(limited(noteMarkdown, to: 12_000))
 
+        Attachments:
+        \(attachmentsSection(attachments))
+        \(documents.isEmpty ? "" : "\nAttachment document contents:\n\(documents)\n")
         Recent chat:
         \(historySummary(from: previousTurns))
 
         Person request:
-        \(trimmedQuestion)
+        \(question)
 
         Return one JSON object and no other text.
         Requirements for the JSON fields:
         - answer: your actual response to the person's request
-        - editedMarkdown: null unless you are proposing a note change; otherwise the complete revised note in Markdown
+        - editedMarkdown: null unless you are proposing a note change; otherwise \
+        the complete revised note in Markdown, keeping every [attachment n] line where it is
+        - readAttachments: an empty list, unless you need to read inside a patchwork \
+        document attachment before you can answer; then list its numbers, leave answer empty, \
+        and you will be asked again with those documents included
         """
-
-        let session = LanguageModelSession(instructions: instructions)
-        let settings = LocalModelSettings.generationSettings(for: .noteChat)
-        let options = GenerationOptions(
-            temperature: settings.temperature,
-            maximumResponseTokens: settings.maximumResponseTokens
-        )
-        let response = try await session.respond(to: prompt, options: options)
-        guard let generated = parse(response.content) else { throw ChatError.generationFailed }
-
-        let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let proposedMarkdown = generated.editedMarkdown?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-        guard !isPlaceholder(answer), !isPlaceholder(proposedMarkdown) else { throw ChatError.generationFailed }
-        guard !answer.isEmpty || proposedMarkdown != nil else { throw ChatError.generationFailed }
-        return (answer.isEmpty ? "I drafted a change for this note." : answer, proposedMarkdown)
     }
 
-    private static func respondWithCoreMLModel(
-        to trimmedQuestion: String,
-        noteTitle: String,
-        noteMarkdown: String,
-        previousTurns: [NoteChatTurn]
-    ) async throws -> (answer: String, proposedMarkdown: String?) {
-        let config = LocalModelSettings.remoteModelConfig(for: .noteChat)
-        guard !config.repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ChatError.customModelNotConfigured
+    private static func attachmentsSection(_ attachments: [NoteAttachment]) -> String {
+        guard !attachments.isEmpty else { return "None." }
+        return attachments.map { attachment in
+            var lines = [attachment.label]
+            if let tool = attachment.tool, !tool.isEmpty {
+                lines.append("  tool: \(tool)")
+            }
+            if !attachment.description.isEmpty {
+                lines.append("  description: \(limited(attachment.description, to: 600))")
+            }
+            if !attachment.text.isEmpty {
+                let field = attachment.kind == "audio" ? "transcript" : "text"
+                lines.append("  \(field): \(limited(attachment.text, to: 4_000))")
+            }
+            if !attachment.summary.isEmpty {
+                lines.append("  summary: \(limited(attachment.summary, to: 1_000))")
+            }
+            if attachment.isPatchworkDoc {
+                lines.append("  contents readable — put \(attachment.number) in readAttachments to see them")
+            }
+            return lines.joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
+
+    private static func documentsSection(_ attachments: [NoteAttachment], numbers: [Int]) async -> String {
+        var sections: [String] = []
+        for number in numbers.prefix(4) {
+            guard let attachment = attachments.first(where: { $0.number == number }),
+                  attachment.isPatchworkDoc,
+                  let url = attachment.url,
+                  let json = try? await PatchworkScripting.shared.documentJSON(url)
+            else { continue }
+            sections.append("[attachment \(number)] as JSON:\n\(limited(json, to: 8_000))")
         }
-
-        let prompt = """
-        \(LocalModelSettings.systemPrompt(for: .noteChat))
-
-        Note title: \(limited(noteTitle, to: 300))
-
-        Current note in Markdown:
-        \(limited(noteMarkdown, to: 12_000))
-
-        Recent chat:
-        \(historySummary(from: previousTurns))
-
-        Person request:
-        \(trimmedQuestion)
-        """
-        let settings = LocalModelSettings.generationSettings(for: .noteChat)
-        let response = try await LocalLLMRuntime.generateText(
-            prompt: prompt,
-            config: config,
-            maxTokens: settings.maximumResponseTokens,
-            temperature: settings.temperature
-        )
-        guard let generated = parse(response) else { throw ChatError.generationFailed }
-        let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        let proposedMarkdown = generated.editedMarkdown?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-        guard !isPlaceholder(answer), !isPlaceholder(proposedMarkdown) else { throw ChatError.generationFailed }
-        guard !answer.isEmpty || proposedMarkdown != nil else { throw ChatError.generationFailed }
-        return (answer.isEmpty ? "I drafted a change for this note." : answer, proposedMarkdown)
+        return sections.joined(separator: "\n\n")
     }
 
-    private static func respondWithCloudModel(
-        to trimmedQuestion: String,
-        noteTitle: String,
-        noteMarkdown: String,
-        previousTurns: [NoteChatTurn]
-    ) async throws -> (answer: String, proposedMarkdown: String?) {
-        let prompt = """
-        \(LocalModelSettings.systemPrompt(for: .noteChat))
+    private static func generate(_ body: String, choice: ModelChoice) async throws -> GeneratedReply {
+        let settings = LocalModelSettings.generationSettings(for: .noteChat)
+        let raw: String
+        switch choice.backend {
+        case .appleIntelligence:
+            guard SystemLanguageModel.default.isAvailable else {
+                throw ChatError.appleIntelligenceUnavailable
+            }
+            let session = LanguageModelSession(
+                instructions: LocalModelSettings.systemPrompt(for: .noteChat)
+            )
+            let options = GenerationOptions(
+                temperature: settings.temperature,
+                maximumResponseTokens: settings.maximumResponseTokens
+            )
+            raw = try await session.respond(to: body, options: options).content
+        case .mlx:
+            let config = LocalModelSettings.mlxConfig(for: .noteChat, choice: choice)
+            guard !config.repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ChatError.customModelNotConfigured
+            }
+            raw = try await LocalLLMRuntime.generateText(
+                prompt: "\(LocalModelSettings.systemPrompt(for: .noteChat))\n\n\(body)",
+                config: config,
+                maxTokens: settings.maximumResponseTokens,
+                temperature: settings.temperature
+            )
+        case .openRouter, .openAI, .anthropic, .compatible, .ollama:
+            raw = try await CloudLLMRuntime.generateText(
+                prompt: "\(LocalModelSettings.systemPrompt(for: .noteChat))\n\n\(body)",
+                operation: .noteChat,
+                choice: choice
+            )
+        }
+        guard let generated = parse(raw) else { throw ChatError.generationFailed }
+        return generated
+    }
 
-        Note title: \(limited(noteTitle, to: 300))
-
-        Current note in Markdown:
-        \(limited(noteMarkdown, to: 12_000))
-
-        Recent chat:
-        \(historySummary(from: previousTurns))
-
-        Person request:
-        \(trimmedQuestion)
-
-        Return one JSON object and no other text.
-        """
-        let response = try await CloudLLMRuntime.generateText(prompt: prompt, operation: .noteChat)
-        guard let generated = parse(response) else { throw ChatError.generationFailed }
+    private static func reply(from generated: GeneratedReply) throws -> (answer: String, proposedMarkdown: String?) {
         let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
         let proposedMarkdown = generated.editedMarkdown?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -276,6 +340,11 @@ enum NoteChatAssistant {
     /// reinserted after that many plain paragraphs of the draft (at a
     /// top-level block boundary). Edited drafts shift text around, so a
     /// region can land next to different neighbors — but it always survives.
+    static func isAttachmentPlaceholder(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasPrefix("[attachment") && trimmed.hasSuffix("]")
+    }
+
     static func mergingAtomicBlocks(from current: [SpanNode], into drafted: [SpanNode]) -> [SpanNode] {
         struct Region {
             let spans: [SpanNode]
@@ -332,7 +401,7 @@ enum NoteChatAssistant {
                !isAtomicRoot(block),
                k + 1 < drafted.count,
                case .text(let text, _) = drafted[k + 1],
-               text.trimmingCharacters(in: .whitespaces) == "[attachment]",
+               isAttachmentPlaceholder(text),
                k + 2 >= drafted.count || topLevelBlock(drafted[k + 2]) != nil {
                 k += 2
                 continue
@@ -372,13 +441,17 @@ struct NoteChatView: View {
     @State private var isGenerating = false
     @State private var applyingTurnId: UUID?
     @State private var chatTask: Task<Void, Never>?
+    @State private var modelChoice: ModelChoice?
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Label("Chat", systemImage: "bubble.left.and.text.bubble.right")
-                    .font(.headline)
+                    .uiFont(.headline)
                 Spacer()
+                ModelChoiceMenu(operation: .noteChat, selection: $modelChoice)
+                    .uiFont(.caption)
+                    .disabled(isGenerating)
                 Button {
                     clearChat()
                 } label: {
@@ -395,7 +468,7 @@ struct NoteChatView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 10) {
                         if turns.isEmpty {
                             ContentUnavailableView {
                                 Label("Ask About This Note", systemImage: "sparkles")
@@ -421,7 +494,7 @@ struct NoteChatView: View {
                                 ProgressView()
                                     .controlSize(.small)
                                 Text("Thinking")
-                                    .font(.caption)
+                                    .uiFont(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             .padding(.horizontal, 10)
@@ -431,17 +504,16 @@ struct NoteChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: turns.count) {
-                    if let last = turns.last?.id {
-                        withAnimation(.easeOut(duration: 0.18)) {
-                            proxy.scrollTo(last, anchor: .bottom)
-                        }
+                    guard let last = turns.last?.id else { return }
+                    Task { @MainActor in
+                        proxy.scrollTo(last, anchor: .bottom)
                     }
                 }
             }
 
             if let errorMessage {
                 Text(errorMessage)
-                    .font(.caption)
+                    .uiFont(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
@@ -451,7 +523,7 @@ struct NoteChatView: View {
             Divider()
             HStack(alignment: .bottom, spacing: 8) {
                 TextEditor(text: $draft)
-                    .font(.body)
+                    .uiFont(.body)
                     .scrollContentBackground(.hidden)
                     .frame(minHeight: 44, idealHeight: 54, maxHeight: 86)
                     .padding(5)
@@ -509,13 +581,16 @@ struct NoteChatView: View {
                 let json = await model.spansJSON(for: currentUrl)
                 let spans = SpanNode.decodeList(json)
                 let markdown = await MainActor.run {
-                    RichTextClipboard.markdown(from: spans)
+                    RichTextClipboard.markdown(from: spans) { "[attachment \($0 + 1)]" }
                 }
+                let attachments = await NoteAttachment.all(in: spans, model: model)
                 let reply = try await NoteChatAssistant.respond(
                     to: question,
                     noteTitle: noteName,
                     noteMarkdown: markdown,
-                    previousTurns: previousTurns
+                    attachments: attachments,
+                    previousTurns: previousTurns,
+                    choice: modelChoice
                 )
                 guard !Task.isCancelled else { return }
                 turns.append(NoteChatTurn(role: .assistant, text: reply.answer, proposedMarkdown: reply.proposedMarkdown))
@@ -568,7 +643,7 @@ private struct NoteChatBubble: View {
     var body: some View {
         VStack(alignment: turn.role == .user ? .trailing : .leading, spacing: 6) {
             Text(turn.text)
-                .font(.callout)
+                .uiFont(.callout)
                 .textSelection(.enabled)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
@@ -604,7 +679,7 @@ private struct NoteChatBubble: View {
                             Label("Copy", systemImage: "doc.on.doc")
                         }
                     }
-                    .font(.caption)
+                    .uiFont(.caption)
                 }
                 .padding(8)
                 .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))

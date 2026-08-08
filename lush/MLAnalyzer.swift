@@ -35,19 +35,21 @@ enum MLAnalyzer {
 
     static func analyze(
         _ evidence: AssetMLEvidence,
-        operation: LocalModelOperation = .attachmentSummary
+        operation: LocalModelOperation = .attachmentSummary,
+        choice: ModelChoice? = nil
     ) async throws -> AssetMl {
+        let choice = choice ?? LocalModelSettings.choice(for: operation)
         let text = evidence.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = evidence.description.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !description.isEmpty else { throw AnalyzerError.noEvidence }
 
-        switch LocalModelSettings.backend(for: operation) {
+        switch choice.backend {
         case .appleIntelligence:
             return try await analyzeWithFoundationModels(evidence, operation: operation)
         case .mlx:
-            return try await analyzeWithCoreMLModel(evidence, operation: operation)
-        case .openRouter, .openAI, .anthropic, .compatible:
-            return try await analyzeWithCloudModel(evidence, operation: operation)
+            return try await analyzeWithCoreMLModel(evidence, operation: operation, choice: choice)
+        case .openRouter, .openAI, .anthropic, .compatible, .ollama:
+            return try await analyzeWithCloudModel(evidence, operation: operation, choice: choice)
         }
     }
 
@@ -101,9 +103,10 @@ enum MLAnalyzer {
 
     private static func analyzeWithCoreMLModel(
         _ evidence: AssetMLEvidence,
-        operation: LocalModelOperation
+        operation: LocalModelOperation,
+        choice: ModelChoice
     ) async throws -> AssetMl {
-        let config = LocalModelSettings.remoteModelConfig(for: operation)
+        let config = LocalModelSettings.mlxConfig(for: operation, choice: choice)
         guard !config.repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AnalyzerError.customModelNotConfigured
         }
@@ -124,7 +127,13 @@ enum MLAnalyzer {
         - keywords: 3 to 8 short search keywords
         """
 
-        let response = try await LocalLLMRuntime.generateText(prompt: prompt, operation: operation)
+        let settings = LocalModelSettings.generationSettings(for: operation)
+        let response = try await LocalLLMRuntime.generateText(
+            prompt: prompt,
+            config: config,
+            maxTokens: settings.maximumResponseTokens,
+            temperature: settings.temperature
+        )
         guard let generated = parse(response) else { throw AnalyzerError.generationFailed }
         let summary = generated.summary.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         let caption = generated.caption.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
@@ -142,7 +151,8 @@ enum MLAnalyzer {
 
     private static func analyzeWithCloudModel(
         _ evidence: AssetMLEvidence,
-        operation: LocalModelOperation
+        operation: LocalModelOperation,
+        choice: ModelChoice
     ) async throws -> AssetMl {
         let text = evidence.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = evidence.description.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -160,7 +170,11 @@ enum MLAnalyzer {
         - keywords: 3 to 8 short search keywords
         """
 
-        let response = try await CloudLLMRuntime.generateText(prompt: prompt, operation: operation)
+        let response = try await CloudLLMRuntime.generateText(
+            prompt: prompt,
+            operation: operation,
+            choice: choice
+        )
         guard let generated = parse(response) else { throw AnalyzerError.generationFailed }
         let summary = generated.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         let caption = generated.caption.trimmingCharacters(in: .whitespacesAndNewlines)

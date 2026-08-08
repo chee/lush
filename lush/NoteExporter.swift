@@ -219,9 +219,13 @@ enum NoteExporter {
                 let listTag = b.type == "ordered-list-item" ? "ol" : "ul"
                 // A to-do exports as a disabled checkbox, so the list reads
                 // the same in a browser as it does in the app.
-                let item = b.type == "todo-list-item"
-                    ? "<input type=\"checkbox\" disabled\(b.isChecked ? " checked" : "")> " + content
-                    : content
+                var item = content
+                if b.type == "todo-list-item" {
+                    let state = b.todoState
+                    item = "<input type=\"checkbox\" disabled\(state == .checked ? " checked" : "")"
+                        + "\(state == .pending ? " indeterminate" : "")> "
+                        + (state == .canceled ? "<s>" + content + "</s>" : content)
+                }
                 if isList {
                     while let last = openLists.last, last.depth > depth {
                         out += "</li></\(last.tag)>\n"

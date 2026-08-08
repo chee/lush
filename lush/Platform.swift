@@ -153,6 +153,15 @@ extension PImage {
 }
 
 extension PFont {
+    /// `familyName` is optional on AppKit and not on UIKit.
+    var pFamilyName: String? {
+        #if os(macOS)
+        familyName
+        #else
+        familyName
+        #endif
+    }
+
     var hasBoldTrait: Bool {
         #if os(macOS)
         fontDescriptor.symbolicTraits.contains(.bold)
@@ -192,6 +201,32 @@ extension PFont {
             return self
         }
         return PFont(descriptor: descriptor, size: pointSize)
+        #endif
+    }
+}
+
+extension PFont.Weight {
+    var swiftUI: Font.Weight {
+        switch self {
+        case .ultraLight: .ultraLight
+        case .thin: .thin
+        case .light: .light
+        case .medium: .medium
+        case .semibold: .semibold
+        case .bold: .bold
+        case .heavy: .heavy
+        case .black: .black
+        default: .regular
+        }
+    }
+}
+
+extension Font {
+    init(pFont: PFont) {
+        #if os(macOS)
+        self.init(pFont as CTFont)
+        #else
+        self.init(pFont)
         #endif
     }
 }

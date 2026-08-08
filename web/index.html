@@ -1,0 +1,268 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Patchwork</title>
+  <link rel="icon" type="image/svg+xml" href="/patchwork.svg" />
+  <!-- patchwork_CONFIG -->
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #fafafa;
+      --fg: #1d1d1f;
+      --muted: #86868b;
+      --card: #ffffff;
+      --hairline: rgba(0, 0, 0, 0.08);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1c1c1e;
+        --fg: #f5f5f7;
+        --muted: #98989d;
+        --card: #2c2c2e;
+        --hairline: rgba(255, 255, 255, 0.1);
+      }
+    }
+
+    body {
+      margin: 0;
+      height: 100dvh;
+      display: grid;
+      place-items: center;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .boot {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 18px;
+      padding: 24px;
+    }
+
+    /* The app icon's shape arrangement: bars flanking, circle over triangle,
+       each bobbing on its own rhythm. */
+    .mark {
+      position: relative;
+      width: 78px;
+      height: 78px;
+    }
+
+    .mark>* {
+      position: absolute;
+      animation: bob 1.5s ease-in-out infinite;
+    }
+
+    .mark .bar {
+      width: 16px;
+      height: 64px;
+      border-radius: 6px;
+    }
+
+    .mark .teal {
+      background: #3ec4c4;
+      left: 0;
+      top: 10px;
+      rotate: -5deg;
+      animation-duration: 1.55s;
+    }
+
+    .mark .dot {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: #6ba1fc;
+      left: 24px;
+      top: 6px;
+      animation-duration: 1.85s;
+      animation-delay: 0.25s;
+    }
+
+    .mark .tri {
+      width: 0;
+      height: 0;
+      border-left: 15px solid transparent;
+      border-right: 15px solid transparent;
+      border-bottom: 27px solid #f0913d;
+      left: 24px;
+      top: 42px;
+      rotate: 14deg;
+      animation-duration: 1.35s;
+      animation-delay: 0.5s;
+    }
+
+    .mark .pink {
+      background: #f767a5;
+      right: 0;
+      top: 2px;
+      rotate: 4deg;
+      animation-duration: 1.7s;
+      animation-delay: 0.12s;
+    }
+
+    @keyframes bob {
+
+      0%,
+      100% {
+        translate: 0 0;
+      }
+
+      50% {
+        translate: 0 -6px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .mark>* {
+        animation: none;
+      }
+    }
+
+    h1 {
+      font-size: 17px;
+      font-weight: 600;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }
+
+    #status {
+      margin: 0;
+      min-width: 300px;
+      max-width: min(420px, 90vw);
+      background: var(--card);
+      border-radius: 12px;
+      box-shadow: 0 0 0 0.5px var(--hairline), 0 8px 24px rgba(0, 0, 0, 0.06);
+      padding: 6px 0;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      column-gap: 14px;
+      row-gap: 0;
+      font: 11px/1.6 ui-monospace, monospace;
+    }
+
+    #status dt {
+      color: var(--muted);
+      text-align: right;
+      padding: 5px 0 5px 16px;
+    }
+
+    #status dd {
+      margin: 0;
+      padding: 5px 16px 5px 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    #status dd::before {
+      content: "";
+      flex: none;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    #status dd.ok::before {
+      background: #30c452;
+      animation: none;
+    }
+
+    #status dd.bad::before {
+      background: crimson;
+      animation: none;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 0.25;
+      }
+
+      50% {
+        opacity: 1;
+      }
+    }
+
+    #account-gate p {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    #account-form {
+      display: flex;
+      gap: 8px;
+    }
+
+    #account-input {
+      font: 12px ui-monospace, monospace;
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 0.5px solid var(--hairline);
+      background: var(--card);
+      color: var(--fg);
+      width: 300px;
+    }
+
+    #account-form button {
+      font: 13px -apple-system, system-ui, sans-serif;
+      padding: 7px 14px;
+      border-radius: 8px;
+      border: none;
+      background: #0071e3;
+      color: white;
+    }
+
+    .bad {
+      color: crimson;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="boot">
+    <div class="mark">
+      <span class="bar teal"></span>
+      <span class="dot"></span>
+      <span class="tri"></span>
+      <span class="bar pink"></span>
+    </div>
+    <h1>Patchwork</h1>
+    <section id="account-gate" hidden>
+      <p>enter your account url</p>
+      <form id="account-form">
+        <input id="account-input" placeholder="account:you/YourAccountDocumentId" autofocus />
+        <button>save</button>
+      </form>
+      <p id="account-error" class="bad"></p>
+    </section>
+    <dl id="status">
+      <dt>subduction</dt>
+      <dd id="connection">connecting…</dd>
+      <dt>peers</dt>
+      <dd id="peers">—</dd>
+      <dt>repo</dt>
+      <dd id="repo-state">booting…</dd>
+      <dt>account</dt>
+      <dd id="account">—</dd>
+      <dt>frame</dt>
+      <dd id="frame">—</dd>
+    </dl>
+  </main>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+
+</html>

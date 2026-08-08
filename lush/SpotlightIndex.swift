@@ -53,6 +53,9 @@ actor SpotlightIndex {
                 if block.isEmbedBlock, let html = block.htmlSource {
                     parts.append(html)
                 }
+                if let title = block.calendarEventTitle {
+                    parts.append(title)
+                }
             case .text(let text, _):
                 parts.append(text)
             }

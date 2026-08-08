@@ -28,6 +28,7 @@ struct HeadingFoldKey: Hashable {
 /// round-trip — is untouched; only layout sees the substitution.
 final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
     var foldedHeadings: Set<HeadingFoldKey> = []
+    var hideCheckedTodos = false
     private(set) var hiddenRanges: [NSRange] = []
 
     func refresh(storage: NSAttributedString) {
@@ -42,6 +43,21 @@ final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
             else { continue }
             if box.value.attrs["stash"] != nil {
                 ranges.append(paragraph)
+                continue
+            }
+            if hideCheckedTodos, box.value.isChecked {
+                let depth = box.value.parents.count
+                var end = NSMaxRange(paragraph)
+                while end < storage.length {
+                    let next = str.paragraphRange(for: NSRange(location: end, length: 0))
+                    if next.length == 0 { break }
+                    guard let nextBox = storage.attribute(.amBlock, at: next.location, effectiveRange: nil) as? BlockBox,
+                          nextBox.value.parents.count > depth
+                    else { break }
+                    end = NSMaxRange(next)
+                }
+                ranges.append(NSRange(location: paragraph.location, length: end - paragraph.location))
+                location = end
                 continue
             }
             guard box.value.type == "heading", !foldedHeadings.isEmpty,

@@ -13,6 +13,7 @@ enum NavRoute: Hashable {
     case patchwork(String)
     case script(String)
     case recents
+    case calendar
 }
 
 struct MoveTarget: Identifiable {
@@ -139,6 +140,8 @@ struct ContentView: View {
                             .environment(model)
                     case .recents:
                         RecentsScreen(push: { path.append($0) })
+                    case .calendar:
+                        AgendaScreen { path = [.note($0)] }
                     }
                 }
         }
@@ -252,6 +255,8 @@ struct ContentView: View {
         case .folder(let url):
             Task { await model.selectFolder(url) }
             openFolder(url)
+        case .calendar:
+            openCalendar()
         case .search(let query):
             #if os(macOS)
             searchText = query
@@ -300,11 +305,20 @@ struct ContentView: View {
         #endif
     }
 
+    private func openCalendar() {
+        #if os(macOS)
+        selectedItemUrls = [Agenda.sidebarTag]
+        #else
+        path = [.calendar]
+        #endif
+    }
+
     #if os(macOS)
 
     private var sidebar: some View {
         List(selection: $selectedItemUrls) {
             if searchText.isEmpty {
+                calendarRow
                 if !model.pinnedNodes.isEmpty {
                     pinnedRootRow
                         .listRowInsets(sidebarRowInsets(depth: 0))
@@ -314,7 +328,7 @@ struct ContentView: View {
                         }
                     }
                 }
-                nodeRows(model.folderTree)
+                nodeRows(model.visibleFolderTree)
             } else {
                 ForEach(searchHits, id: \.url) { hit in
                     VStack(alignment: .leading, spacing: 2) {
@@ -430,6 +444,22 @@ struct ContentView: View {
         searchPresented = true
         searchFocused = true
         sidebarFocused = true
+    }
+
+    private var calendarRow: some View {
+        CalendarSidebarLabel()
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 12)
+            .padding(.top, 8)
+            .contentShape(Rectangle())
+            .onTapGesture { selectedItemUrls = [Agenda.sidebarTag] }
+            .tag(Agenda.sidebarTag)
+            .listRowInsets(sidebarRowInsets(depth: 0))
+    }
+
+    private var calendarSelected: Bool {
+        selectedItemUrls.count == 1 && selectedItemUrls.first == Agenda.sidebarTag
     }
 
     private func pinnedNoteRow(_ node: FolderNode) -> some View {
@@ -718,7 +748,9 @@ struct ContentView: View {
     private var detail: some View {
         HSplitView {
             Group {
-                if let url = model.selectedNoteUrl {
+                if calendarSelected {
+                    AgendaScreen { open($0) }
+                } else if let url = model.selectedNoteUrl {
                     if model.core == nil {
                         BootNoteSnapshotView(url: url)
                     } else {
@@ -1035,9 +1067,11 @@ struct FolderScreen: View {
 
     private var nodes: [FolderNode] {
         if let folderUrl {
-            return model.node(for: folderUrl)?.children ?? []
+            return model.node(for: folderUrl)?.children?.filter {
+                !($0.kind == "folder" && model.focus.hides($0.url))
+            } ?? []
         }
-        return model.folderTree
+        return model.visibleFolderTree
     }
 
     private var title: String {
@@ -1048,6 +1082,11 @@ struct FolderScreen: View {
     var body: some View {
         List {
             if searchText.isEmpty, folderUrl == nil {
+                Section {
+                    NavigationLink(value: NavRoute.calendar) {
+                        CalendarSidebarLabel()
+                    }
+                }
                 Section(isExpanded: pinnedExpansionBinding) {
                     NavigationLink(value: NavRoute.recents) {
                         Label("Recents", systemImage: "clock")
@@ -2332,7 +2371,7 @@ private extension DocHistoryEntry {
     }
 }
 
-private extension String {
+extension String {
     var shortHash: String {
         guard count > 10 else { return self }
         return String(prefix(10))
@@ -2534,43 +2573,10 @@ struct NoteDetail: View {
             }
         }
         ToolbarItem {
-            Menu {
-                ForEach(Highlight.names, id: \.self) { name in
-                    Button {
-                        editor.applyHighlight(name)
-                    } label: {
-                        if editor.highlightActive == name {
-                            Label(name.capitalized, systemImage: "checkmark")
-                        } else {
-                            Text(name.capitalized)
-                        }
-                    }
-                }
-                Divider()
-                Button("None") { editor.applyHighlight(nil) }
-            } label: {
-                Label("Highlight", systemImage: "highlighter")
-            }
+            FormatMenuButton(controller: editor)
         }
-        #endif
-        #if os(macOS)
         ToolbarItem {
-            Picker("Style", selection: styleBinding) {
-                ForEach(EditorController.styles, id: \.key) { style in
-                    Text(style.label).tag(style.key)
-                }
-            }
-            .pickerStyle(.menu)
-        }
-        if editor.isCodeBlockActive {
-            ToolbarItem {
-                Picker("Language", selection: languageBinding) {
-                    ForEach(CodeLanguage.all) { language in
-                        Text(language.name).tag(language.id)
-                    }
-                }
-                .pickerStyle(.menu)
-            }
+            PresenceFacesView(presence: model.presence)
         }
         #endif
         ToolbarItem {
@@ -2628,15 +2634,8 @@ struct NoteDetail: View {
             }
             .disabled(currentNode == nil)
         }
-        ToolbarItem(placement: .primaryAction) {
-            FocusModeControl(model: model)
-        }
         #if os(macOS)
         ToolbarSpacer(.flexible)
-        ToolbarItem(placement: .primaryAction) {
-            PresenceFacesView(presence: model.presence)
-        }
-        ToolbarSpacer(.fixed)
         ToolbarItem(placement: .primaryAction) {
             Button {
                 rightSidebarVisible?.wrappedValue.toggle()
@@ -2646,6 +2645,9 @@ struct NoteDetail: View {
             .disabled(rightSidebarVisible == nil)
         }
         #else
+        ToolbarItem(placement: .primaryAction) {
+            FocusModeControl(model: model)
+        }
         ToolbarItem(placement: .primaryAction) {
             Button {
                 showingInspector = true
@@ -2817,23 +2819,6 @@ struct NoteDetail: View {
             MoveSheet(urls: target.urls).environment(model)
         }
     }
-
-    #if os(macOS)
-    private var styleBinding: Binding<String> {
-        let validKeys = Set(EditorController.styles.map(\.key))
-        return Binding(
-            get: { validKeys.contains(editor.currentStyleKey) ? editor.currentStyleKey : "paragraph" },
-            set: { editor.applyStyle($0) }
-        )
-    }
-
-    private var languageBinding: Binding<String> {
-        Binding(
-            get: { CodeLanguage.named(editor.currentCodeLanguage).id },
-            set: { editor.applyCodeLanguage(CodeLanguage.named($0)) }
-        )
-    }
-    #endif
 }
 
 private struct FocusModeControl: View {
@@ -3602,6 +3587,7 @@ struct PatchworkDetail: View {
     @State private var appliedToolId: String?
     @State private var toolsLoaded = false
     @State private var mainScrubTask: Task<Void, Never>?
+    @State private var showingConsole = false
     #if os(iOS)
     @State private var showingInspector = false
     @State private var inspectorTab: RightSidebarTab = .info
@@ -3755,6 +3741,15 @@ struct PatchworkDetail: View {
                     }
                 }
             }
+            if PatchworkWeb.available {
+                ToolbarItem {
+                    Button {
+                        showingConsole = true
+                    } label: {
+                        Label("JavaScript", systemImage: "curlybraces")
+                    }
+                }
+            }
             #if os(macOS)
             ToolbarSpacer(.flexible)
             ToolbarItem(placement: .primaryAction) {
@@ -3777,6 +3772,13 @@ struct PatchworkDetail: View {
                 }
             }
             #endif
+        }
+        .sheet(isPresented: $showingConsole) {
+            PatchworkConsole(
+                target: .doc(docUrl),
+                docUrl: docUrl,
+                onDone: { showingConsole = false }
+            )
         }
         #if os(iOS)
         .sheet(isPresented: $showingInspector) {

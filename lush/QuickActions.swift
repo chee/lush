@@ -18,6 +18,7 @@ final class AppRouter {
         case search(String)
         case createPatchwork(preferredType: String?, toolId: String?, folderUrl: String?)
         case share(String)
+        case calendar
     }
 
     var pending: Action?
@@ -57,6 +58,8 @@ final class AppRouter {
                 ?? components?.queryItems?.first(where: { $0.name == "toolid" })?.value
             let folder = components?.queryItems?.first(where: { $0.name == "folder" })?.value
             pending = .createPatchwork(preferredType: type, toolId: toolId, folderUrl: folder)
+        case "calendar":
+            pending = .calendar
         case "share":
             if let id = components?.queryItems?.first(where: { $0.name == "id" })?.value {
                 pending = .share(id)
@@ -193,7 +196,7 @@ struct LushFolderQuery: EntityStringQuery {
     private static func entitiesFromModel() -> [LushFolderEntity] {
         let model = NotesModel.shared
         var entities: [LushFolderEntity] = [
-            LushFolderEntity(id: inboxIdentifier, name: "Inbox", url: model.inboxUrl ?? model.folderUrl)
+            LushFolderEntity(id: inboxIdentifier, name: "Inbox", url: model.effectiveInboxUrl ?? model.folderUrl)
         ]
         let choices = model.folderChoices()
         if choices.isEmpty {
@@ -223,7 +226,7 @@ struct LushFolderQuery: EntityStringQuery {
 private func resolvedFolderUrl(_ entity: LushFolderEntity?) -> String? {
     guard let entity else { return nil }
     if entity.isInbox {
-        return NotesModel.shared.inboxUrl ?? NotesModel.shared.folderUrl
+        return NotesModel.shared.effectiveInboxUrl ?? NotesModel.shared.folderUrl
     }
     return entity.url ?? entity.id
 }
@@ -396,30 +399,6 @@ struct LushShortcuts: AppShortcutsProvider {
             systemImageName: "square.and.pencil"
         )
         AppShortcut(
-            intent: AddFileIntent(),
-            phrases: ["Add file in \(.applicationName)"],
-            shortTitle: "Add File",
-            systemImageName: "doc.badge.plus"
-        )
-        AppShortcut(
-            intent: AddDictionaryIntent(),
-            phrases: ["Add dictionary in \(.applicationName)"],
-            shortTitle: "Add Dictionary",
-            systemImageName: "text.book.closed"
-        )
-        AppShortcut(
-            intent: AddAutomergeURLIntent(),
-            phrases: ["Add Automerge URL in \(.applicationName)"],
-            shortTitle: "Add URL",
-            systemImageName: "link.badge.plus"
-        )
-        AppShortcut(
-            intent: LogInAccountIntent(),
-            phrases: ["Log in to \(.applicationName)"],
-            shortTitle: "Log In",
-            systemImageName: "person.crop.circle.badge.checkmark"
-        )
-        AppShortcut(
             intent: OpenQuickNoteIntent(),
             phrases: ["Open my quick note in \(.applicationName)"],
             shortTitle: "Quick Note",
@@ -430,6 +409,15 @@ struct LushShortcuts: AppShortcutsProvider {
             phrases: ["Append to my quick note in \(.applicationName)"],
             shortTitle: "Append to Quick Note",
             systemImageName: "bolt.badge.plus"
+        )
+        AppShortcut(
+            intent: SearchNotesIntent(),
+            phrases: [
+                "Search \(.applicationName)",
+                "Search my notes in \(.applicationName)"
+            ],
+            shortTitle: "Search Notes",
+            systemImageName: "magnifyingglass"
         )
     }
 }

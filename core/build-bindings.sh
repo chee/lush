@@ -21,5 +21,5 @@ cp target/aarch64-apple-ios-sim/release/liblush_core.a lib/iphonesimulator/
 mkdir -p bindings/include
 cp bindings/lush_coreFFI.h bindings/include/lush_coreFFI.h
 cp bindings/lush_coreFFI.modulemap bindings/include/module.modulemap
-cp bindings/lush_core.swift ../lush/LushCore.swift
+cp bindings/lush_core.swift ../Shared/LushCore.swift
 echo "rust libs (macosx, iphoneos, iphonesimulator) + swift bindings in sync"

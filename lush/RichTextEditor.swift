@@ -50,6 +50,35 @@ struct StashedCard: Identifiable {
     var id: ObjectIdentifier { ObjectIdentifier(box) }
 }
 
+/// A stash card drag carries its source paragraph and where inside the card
+/// the pointer grabbed it, so a drop back on the canvas lands the card under
+/// the cursor instead of jumping its corner there.
+struct StashDrag {
+    static let prefix = "lush-stash:"
+    let location: Int
+    let grab: CGSize
+
+    var text: String {
+        "\(Self.prefix)\(location):\(Double(grab.width)):\(Double(grab.height))"
+    }
+
+    init(location: Int, grab: CGSize) {
+        self.location = location
+        self.grab = grab
+    }
+
+    init?(_ text: String) {
+        guard text.hasPrefix(Self.prefix) else { return nil }
+        let parts = text.dropFirst(Self.prefix.count).split(separator: ":")
+        guard let location = Int(parts.first ?? "") else { return nil }
+        self.location = location
+        grab = CGSize(
+            width: parts.count > 1 ? Double(parts[1]) ?? 0 : 0,
+            height: parts.count > 2 ? Double(parts[2]) ?? 0 : 0
+        )
+    }
+}
+
 enum MinimapKind {
     case heading, code, quote, embed, text
 }
@@ -73,8 +102,6 @@ final class EditorController {
         ("heading1", "Title"),
         ("heading2", "Heading"),
         ("heading3", "Subheading"),
-        ("serif", "Serif"),
-        ("hand", "Hand"),
         ("unordered-list-item", "Bulleted List"),
         ("ordered-list-item", "Numbered List"),
         ("todo-list-item", "To-do List"),
@@ -93,6 +120,8 @@ final class EditorController {
     var superscriptActive = false
     var subscriptActive = false
     var highlightActive: String?
+    var fontRoleActive: String?
+    var checkedItemsHidden = false
     var recorderVisible = false
     var sheet: EditorSheet?
     var findVisible = false
@@ -146,6 +175,12 @@ final class EditorController {
     func toggleSuperscript() { core?.toggleBaseline("superscript") }
     func toggleSubscript() { core?.toggleBaseline("subscript") }
     func applyHighlight(_ name: String?) { core?.setHighlight(name) }
+    func applyFontRole(_ role: String?) { core?.setFontRole(role) }
+    func moveItemUp() { core?.moveListItem(by: -1) }
+    func moveItemDown() { core?.moveListItem(by: 1) }
+    func moveCheckedToBottom() { core?.moveCheckedToBottom() }
+    func toggleHideChecked() { core?.toggleHideCheckedItems() }
+    func deleteChecked() { core?.deleteCheckedItems() }
     func indent() { _ = core?.nestListItem() }
     func outdent() { _ = core?.unnestListItem() }
     func indentBlock() { core?.indentBlock() }
@@ -233,9 +268,9 @@ final class EditorController {
         }
     }
 
-    func generateAssetML(assetUrl: String, name: String? = nil) async -> AssetMl? {
+    func generateAssetML(assetUrl: String, name: String? = nil, choice: ModelChoice? = nil) async -> AssetMl? {
         guard let core else { return nil }
-        return await core.model.generateAssetML(assetUrl, name: name)
+        return await core.model.generateAssetML(assetUrl, name: name, choice: choice)
     }
 
     func saveTranscript(assetUrl: String, transcript: String) {
@@ -267,6 +302,8 @@ protocol EditorTextViewLike: AnyObject {
     func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int?
     func pScrollRangeToVisible(_ range: NSRange)
     func pCenterCaretRect(_ containerRect: CGRect)
+    func pApplyTypewriterPadding(_ enabled: Bool)
+    func pApplyMaxWidth()
     var pVisibleRect: CGRect { get }
     func pScrollToY(_ y: CGFloat)
 }
@@ -282,6 +319,29 @@ extension ListMarkerLayoutDelegate {
             else { return nil }
             return view.pTypingAttributes
         }
+    }
+
+    @MainActor
+    func driveSelection(from view: any EditorTextViewLike) {
+        selectionProvider = { [weak view] in
+            guard let view, view.pSelectedRange.length > 0 else { return nil }
+            return (view.pSelectedRange, view.pSelectionColor)
+        }
+    }
+}
+
+extension EditorTextViewLike {
+    var pSelectionColor: PColor {
+        #if os(macOS)
+        guard let textView = pSelf as? NSTextView else { return .selectedTextBackgroundColor }
+        let focused = textView.window?.isKeyWindow == true
+            && textView.window?.firstResponder === textView
+        guard focused else { return .unemphasizedSelectedTextBackgroundColor }
+        return textView.selectedTextAttributes[.backgroundColor] as? PColor
+            ?? .selectedTextBackgroundColor
+        #else
+        return pSelf.tintColor.withAlphaComponent(0.25)
+        #endif
     }
 }
 
@@ -333,6 +393,7 @@ final class EditorCore {
     private static var presenceOwners: [String: ObjectIdentifier] = [:]
 
     weak var view: (any EditorTextViewLike)?
+    private var lastCodeSelection = NSRange(location: 0, length: 0)
     let model: NotesModel
     let controller: EditorController
     var noteUrl: String
@@ -373,6 +434,9 @@ final class EditorCore {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
+                self?.view?.pApplyMaxWidth()
+                self?.updateFocusDim()
+                self?.centerCaretIfTypewriter()
                 self?.load()
             }
         }
@@ -427,6 +491,8 @@ final class EditorCore {
         // fold state is per-note; recompute hidden ranges for the incoming
         // storage BEFORE the swap rebuilds its elements
         folding.foldedHeadings.removeAll()
+        folding.hideCheckedTodos = false
+        controller.checkedItemsHidden = false
         folding.refresh(storage: layoutStorage)
         inline.resetHosts()
         attachViewToSharedStorage()
@@ -1734,11 +1800,25 @@ final class EditorCore {
         guard let view, let storage = view.pStorage, storage.length > 0 else { return }
         let str = storage.string as NSString
         let source = str.paragraphRange(for: NSRange(location: min(sourceLocation, storage.length - 1), length: 0))
-        guard source.length > 0, !NSLocationInRange(dropIndex, source) else { return }
+        guard let landing = moveSpan(source, toDropIndex: dropIndex) else { return }
+        view.pSelectedRange = NSRange(location: landing, length: 0)
+    }
+
+    /// Lift a whole number of paragraphs out and reinsert them at a paragraph
+    /// boundary. Returns where the moved text now starts.
+    @discardableResult
+    private func moveSpan(
+        _ source: NSRange,
+        toDropIndex dropIndex: Int,
+        actionName: String = "Move Paragraph"
+    ) -> Int? {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return nil }
+        let str = storage.string as NSString
+        guard source.length > 0, !NSLocationInRange(dropIndex, source) else { return nil }
         // dropping past a final paragraph that has no trailing newline must
         // land after it, not at its paragraph start
         let droppingAtEnd = dropIndex >= storage.length && !str.hasSuffix("\n")
-        if droppingAtEnd, NSMaxRange(source) >= storage.length { return }
+        if droppingAtEnd, NSMaxRange(source) >= storage.length { return nil }
         let undo = undoSnapshot()
         let hiddenBefore = folding.hiddenRanges
         let slice = NSMutableAttributedString(attributedString: storage.attributedSubstring(from: source))
@@ -1749,8 +1829,10 @@ final class EditorCore {
             slice.append(NSAttributedString(string: "\n", attributes: tail))
         }
         var target: Int
+        var contentOffset = 0
         if droppingAtEnd {
             target = storage.length
+            contentOffset = 1
             slice.deleteCharacters(in: NSRange(location: slice.length - 1, length: 1))
             slice.insert(
                 NSAttributedString(string: "\n", attributes: endSeparatorAttributes(in: storage)),
@@ -1766,10 +1848,172 @@ final class EditorCore {
             storage.insert(slice, at: min(target, storage.length))
             storage.endEditing()
         }
-        view.pSelectedRange = NSRange(location: min(target, storage.length), length: 0)
         rebuildHiddenRanges(previous: hiddenBefore)
-        registerUndo(from: undo, actionName: "Move Paragraph")
+        registerUndo(from: undo, actionName: actionName)
         scheduleSave()
+        return min(target, storage.length) + contentOffset
+    }
+
+    struct ParagraphEntry {
+        let range: NSRange
+        let block: BlockValue
+    }
+
+    private func paragraphEntries(in storage: NSTextStorage) -> [ParagraphEntry] {
+        let str = storage.string as NSString
+        var out: [ParagraphEntry] = []
+        var location = 0
+        while location < storage.length {
+            let paragraph = str.paragraphRange(for: NSRange(location: location, length: 0))
+            if paragraph.length == 0 { break }
+            location = NSMaxRange(paragraph)
+            let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox
+            out.append(ParagraphEntry(range: paragraph, block: box?.value ?? .paragraph))
+        }
+        return out
+    }
+
+    /// ⌃⌘↑ / ⌃⌘↓: move the caret's item past its neighbouring sibling,
+    /// carrying anything nested under it.
+    func moveListItem(by delta: Int) {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return }
+        let entries = paragraphEntries(in: storage)
+        guard entries.count > 1 else { return }
+        let caret = min(view.pSelectedRange.location, storage.length)
+        guard let index = entries.lastIndex(where: { $0.range.location <= caret }) else { return }
+        let depth = entries[index].block.parents.count
+        var end = index + 1
+        while end < entries.count, entries[end].block.parents.count > depth { end += 1 }
+        let source = NSRange(
+            location: entries[index].range.location,
+            length: NSMaxRange(entries[end - 1].range) - entries[index].range.location
+        )
+        let caretOffset = caret - source.location
+        let drop: Int
+        if delta < 0 {
+            guard let previous = entries[..<index].lastIndex(where: { $0.block.parents.count <= depth })
+            else { return }
+            drop = entries[previous].range.location
+        } else {
+            guard end < entries.count else { return }
+            let siblingDepth = entries[end].block.parents.count
+            var after = end + 1
+            while after < entries.count, entries[after].block.parents.count > siblingDepth { after += 1 }
+            drop = after < entries.count ? entries[after].range.location : storage.length
+        }
+        guard let landing = moveSpan(source, toDropIndex: drop, actionName: "Move Item") else { return }
+        view.pSelectedRange = NSRange(location: min(landing + caretOffset, storage.length), length: 0)
+    }
+
+    private struct TodoUnit {
+        let range: NSRange
+        let checked: Bool
+    }
+
+    /// The run of to-do items the caret sits in, split into items at the run's
+    /// shallowest depth — each carrying whatever is nested under it.
+    private func todoRun(around caret: Int, in storage: NSTextStorage) -> (span: NSRange, units: [TodoUnit])? {
+        let entries = paragraphEntries(in: storage)
+        guard let index = entries.lastIndex(where: { $0.range.location <= caret }),
+              entries[index].block.type == "todo-list-item"
+        else { return nil }
+        var first = index
+        var last = index
+        while first > 0, entries[first - 1].block.type == "todo-list-item" { first -= 1 }
+        while last + 1 < entries.count, entries[last + 1].block.type == "todo-list-item" { last += 1 }
+        let base = entries[first...last].map { $0.block.parents.count }.min() ?? 0
+        var units: [TodoUnit] = []
+        var cursor = first
+        while cursor <= last {
+            var next = cursor + 1
+            while next <= last, entries[next].block.parents.count > base { next += 1 }
+            units.append(TodoUnit(
+                range: NSRange(
+                    location: entries[cursor].range.location,
+                    length: NSMaxRange(entries[next - 1].range) - entries[cursor].range.location
+                ),
+                checked: entries[cursor].block.isChecked
+            ))
+            cursor = next
+        }
+        let span = NSRange(
+            location: entries[first].range.location,
+            length: NSMaxRange(entries[last].range) - entries[first].range.location
+        )
+        return (span, units)
+    }
+
+    /// Stable partition of the caret's checklist: unticked items keep their
+    /// order at the top, ticked ones keep theirs at the bottom.
+    func moveCheckedToBottom() {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return }
+        let caret = min(view.pSelectedRange.location, storage.length)
+        guard let (span, units) = todoRun(around: caret, in: storage) else { return }
+        let sorted = units.filter { !$0.checked } + units.filter { $0.checked }
+        guard sorted.map({ $0.range.location }) != units.map({ $0.range.location }) else { return }
+        let undo = undoSnapshot()
+        let hiddenBefore = folding.hiddenRanges
+        let endsDocument = NSMaxRange(span) >= storage.length
+            && !(storage.string as NSString).hasSuffix("\n")
+        let rebuilt = NSMutableAttributedString()
+        for unit in sorted {
+            let piece = NSMutableAttributedString(attributedString: storage.attributedSubstring(from: unit.range))
+            if !piece.string.hasSuffix("\n"), piece.length > 0 {
+                let tail = piece.attributes(at: piece.length - 1, effectiveRange: nil)
+                piece.append(NSAttributedString(string: "\n", attributes: tail))
+            }
+            rebuilt.append(piece)
+        }
+        if endsDocument, rebuilt.length > 0 {
+            rebuilt.deleteCharacters(in: NSRange(location: rebuilt.length - 1, length: 1))
+        }
+        view.pPerformStorageEdit { storage in
+            storage.beginEditing()
+            storage.replaceCharacters(in: span, with: rebuilt)
+            storage.endEditing()
+        }
+        view.pSelectedRange = NSRange(location: min(span.location, storage.length), length: 0)
+        rebuildHiddenRanges(previous: hiddenBefore)
+        registerUndo(from: undo, actionName: "Move Checked to Bottom")
+        scheduleSave()
+    }
+
+    func deleteCheckedItems() {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return }
+        let caret = min(view.pSelectedRange.location, storage.length)
+        guard let (span, units) = todoRun(around: caret, in: storage) else { return }
+        let ticked = units.filter { $0.checked }
+        guard !ticked.isEmpty else { return }
+        let undo = undoSnapshot()
+        let hiddenBefore = folding.hiddenRanges
+        view.pPerformStorageEdit { storage in
+            storage.beginEditing()
+            for unit in ticked.reversed() {
+                var range = unit.range
+                // a final paragraph carries no newline of its own; deleting it
+                // must take the one that ended the paragraph before it
+                if NSMaxRange(range) >= storage.length, range.location > 0,
+                   !(storage.string as NSString).hasSuffix("\n") {
+                    range = NSRange(
+                        location: range.location - 1,
+                        length: storage.length - range.location + 1
+                    )
+                }
+                storage.replaceCharacters(in: range, with: NSAttributedString())
+            }
+            storage.endEditing()
+        }
+        view.pSelectedRange = NSRange(location: min(span.location, storage.length), length: 0)
+        rebuildHiddenRanges(previous: hiddenBefore)
+        registerUndo(from: undo, actionName: "Delete Checked Items")
+        scheduleSave()
+    }
+
+    /// Ticked items collapse to nothing in layout only — the doc keeps them.
+    func toggleHideCheckedItems() {
+        folding.hideCheckedTodos.toggle()
+        controller.checkedItemsHidden = folding.hideCheckedTodos
+        rebuildHiddenRanges()
     }
 
     private func endSeparatorAttributes(in storage: NSTextStorage) -> [NSAttributedString.Key: Any] {
@@ -1936,6 +2180,11 @@ final class EditorCore {
         for loc in paragraphLocations {
             setStash(stashValue, forParagraphAt: loc)
         }
+    }
+
+    func moveStash(fromParagraphAt location: Int, to point: CGPoint) {
+        guard let card = stashedCards().first(where: { $0.location == location }) else { return }
+        moveStash(card, to: point)
     }
 
     func moveStash(_ card: StashedCard, to point: CGPoint) {
@@ -2109,10 +2358,13 @@ final class EditorCore {
         }
         guard let view, let textLayoutManager = view.pTextLayoutManager else { return }
         var rows: [MinimapRow] = []
+        let documentRange = textLayoutManager.documentRange
         textLayoutManager.enumerateTextLayoutFragments(from: nil, options: [.estimatesSize]) { fragment in
             let frame = fragment.layoutFragmentFrame
             var kind = MinimapKind.text
             if let paragraph = fragment.textElement as? NSTextParagraph,
+               let elementRange = paragraph.elementRange,
+               documentRange.contains(elementRange),
                paragraph.attributedString.length > 0 {
                 let attrs = paragraph.attributedString.attributes(at: 0, effectiveRange: nil)
                 if let box = attrs[.amBlock] as? BlockBox {
@@ -2155,6 +2407,7 @@ final class EditorCore {
         let enabled = EditorSettings.typewriterMode
         let old = (rendering.focusDimEnabled, rendering.focusParagraph)
         rendering.focusDimEnabled = enabled
+        view?.pApplyTypewriterPadding(enabled)
         if enabled, let view, let storage = view.pStorage, storage.length > 0 {
             let caret = min(view.pSelectedRange.location, storage.length - 1)
             rendering.focusParagraph = (storage.string as NSString)
@@ -2169,7 +2422,7 @@ final class EditorCore {
         }
     }
 
-    func centerCaretIfTypewriter(editedAt editedLocation: Int) {
+    func centerCaretIfTypewriter(editedAt editedLocation: Int? = nil) {
         guard EditorSettings.typewriterMode,
               let view, let storage = view.pStorage, storage.length > 0,
               let textLayoutManager = view.pTextLayoutManager,
@@ -2177,7 +2430,7 @@ final class EditorCore {
         else { return }
         let caret = view.pSelectedRange.location
         // only chase local typing — remote patches land away from the caret
-        guard abs(caret - editedLocation) <= 2 else { return }
+        if let editedLocation, abs(caret - editedLocation) > 2 { return }
         guard let caretRange = contentManager.textRange(for: NSRange(location: caret, length: 0)) else { return }
         var rect: CGRect?
         textLayoutManager.enumerateTextSegments(
@@ -2350,10 +2603,29 @@ final class EditorCore {
         controller.superscriptActive = marks["superscript"] != nil
         controller.subscriptActive = marks["subscript"] != nil
         controller.highlightActive = marks["highlight"]?.stringValue
+        controller.fontRoleActive = marks["font"]?.stringValue
         refreshTrailingMarker()
         updateFocusDim()
+        centerCaretIfTypewriter()
         unfoldIfCaretHidden()
         broadcastCaret()
+        redrawCodeSelection()
+    }
+
+    /// Code cards paint over the selection, so the fragments redraw it —
+    /// which only happens if the run they cover is invalidated.
+    private func redrawCodeSelection() {
+        guard let view,
+              let textLayoutManager = view.pTextLayoutManager,
+              let storage = view.pStorage
+        else { return }
+        let selection = view.pSelectedRange
+        let previous = lastCodeSelection
+        lastCodeSelection = selection
+        guard previous.length > 0 || selection.length > 0 else { return }
+        for location in [previous.location, NSMaxRange(previous), selection.location, NSMaxRange(selection)] {
+            invalidateCodeRun(around: location, textLayoutManager: textLayoutManager, storage: storage)
+        }
     }
 
     private func marksAtSelection() -> [String: JSONValue] {
@@ -2503,6 +2775,23 @@ final class EditorCore {
     /// when that character isn't in one, so a click can fall through.
     @discardableResult
     func toggleTodo(at character: Int) -> Bool {
+        guard let state = todoState(at: character) else { return false }
+        return setTodoState(state == .open ? .checked : .open, at: character)
+    }
+
+    func todoState(at character: Int) -> TodoState? {
+        guard let storage = view?.pStorage, character >= 0, character < storage.length else { return nil }
+        let str = storage.string as NSString
+        let paragraph = str.paragraphRange(for: NSRange(location: character, length: 0))
+        guard paragraph.length > 0,
+              let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
+              box.value.type == "todo-list-item"
+        else { return nil }
+        return box.value.todoState
+    }
+
+    @discardableResult
+    func setTodoState(_ state: TodoState, at character: Int) -> Bool {
         guard let view, let storage = view.pStorage, character < storage.length else { return false }
         let str = storage.string as NSString
         let paragraph = str.paragraphRange(for: NSRange(location: character, length: 0))
@@ -2512,11 +2801,7 @@ final class EditorCore {
         else { return false }
         let undo = undoSnapshot()
         var block = box.value
-        if block.isChecked {
-            block.attrs.removeValue(forKey: "checked")
-        } else {
-            block.attrs["checked"] = .bool(true)
-        }
+        block.setTodoState(state)
         let selection = view.pSelectedRange
         view.pPerformStorageEdit { storage in
             storage.beginEditing()
@@ -2528,7 +2813,7 @@ final class EditorCore {
         }
         view.pSelectedRange = selection
         refreshFormattingState()
-        registerUndo(from: undo, actionName: "Toggle To-do")
+        registerUndo(from: undo, actionName: "Set To-do State")
         scheduleSave()
         return true
     }
@@ -2579,6 +2864,10 @@ final class EditorCore {
 
     func setHighlight(_ name: String?) {
         applyMark("highlight", value: name.map { .string($0) })
+    }
+
+    func setFontRole(_ role: String?) {
+        applyMark("font", value: role.map { .string($0) })
     }
 
     func setCodeLanguage(_ language: String) {
@@ -2969,8 +3258,10 @@ final class EditorCore {
         let newBlock: BlockValue
         switch prefix {
         case "-", "*": newBlock = BlockValue(type: "unordered-list-item")
-        case "[]", "[ ]": newBlock = .todo(checked: false)
-        case "[x]", "[X]": newBlock = .todo(checked: true)
+        case "[]", "[ ]": newBlock = .todo(state: .open)
+        case "[x]", "[X]": newBlock = .todo(state: .checked)
+        case "[-]": newBlock = .todo(state: .canceled)
+        case "[/]": newBlock = .todo(state: .pending)
         case ">": newBlock = BlockValue(type: "blockquote")
         case "#": newBlock = .heading(level: 1)
         case "##": newBlock = .heading(level: 2)
@@ -2990,7 +3281,9 @@ final class EditorCore {
         return true
     }
 
-    private static let nestableListTypes: Set<String> = ["unordered-list-item", "ordered-list-item"]
+    private static let nestableListTypes: Set<String> = [
+        "unordered-list-item", "ordered-list-item", "todo-list-item",
+    ]
 
     /// Tab in a list: increase indent by one level. Returns true when handled.
     @discardableResult
@@ -3007,7 +3300,7 @@ final class EditorCore {
     func indentBlock() {
         var block = blockAtSelection()
         switch block.type {
-        case "unordered-list-item", "ordered-list-item":
+        case "unordered-list-item", "ordered-list-item", "todo-list-item":
             nestListItem()
         default:
             let level = block.indentLevel + 1
@@ -3019,7 +3312,7 @@ final class EditorCore {
     func outdentBlock() {
         var block = blockAtSelection()
         switch block.type {
-        case "unordered-list-item", "ordered-list-item":
+        case "unordered-list-item", "ordered-list-item", "todo-list-item":
             if block.parents.isEmpty {
                 applyBlockStyle(.paragraph)
             } else {
@@ -3528,6 +3821,30 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         pScrollToY(containerRect.midY + textContainerOrigin.y - pVisibleRect.height / 2)
     }
 
+    /// Without half a screen of slack at each end the first and last lines can
+    /// never reach the middle, which is where most typing happens.
+    func pApplyTypewriterPadding(_ enabled: Bool) {
+        let visibleHeight = enclosingScrollView?.contentView.bounds.height ?? 0
+        let height = enabled ? max(16, visibleHeight / 2) : 16
+        guard abs(textContainerInset.height - height) > 1 else { return }
+        textContainerInset = NSSize(width: textContainerInset.width, height: height)
+    }
+
+    /// The container tracks the view's width, so a wide window is narrowed by
+    /// growing the side insets equally, which centres the text.
+    func pApplyMaxWidth() {
+        let limit = EditorSettings.maxNoteWidth
+        let width = enclosingScrollView?.contentSize.width ?? bounds.width
+        let inset = limit > 0 ? max(20, (width - limit) / 2) : 20
+        guard abs(textContainerInset.width - inset) > 0.5 else { return }
+        textContainerInset = NSSize(width: inset, height: textContainerInset.height)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        pApplyMaxWidth()
+    }
+
     var pVisibleRect: CGRect { visibleRect }
     var pUndoManager: UndoManager? { undoManager }
 
@@ -3723,11 +4040,10 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         let pasteboard = sender.draggingPasteboard
         if let core,
            let text = dragString(pasteboard),
-           text.hasPrefix("lush-stash:"),
-           let sourceLocation = Int(text.dropFirst("lush-stash:".count)) {
+           let drag = StashDrag(text) {
             let point = convert(sender.draggingLocation, from: nil)
             let dropIndex = characterIndexForInsertion(at: point)
-            core.unstash(fromParagraphAt: sourceLocation, toDropIndex: dropIndex)
+            core.unstash(fromParagraphAt: drag.location, toDropIndex: dropIndex)
             return true
         }
         if let core,
@@ -3809,8 +4125,25 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
             x: point.x - textContainerOrigin.x,
             y: point.y - textContainerOrigin.y
         )
-        guard let core,
-              let charIndex = core.attachmentIndex(at: containerPoint),
+        guard let core else { return standard }
+        if let todo = core.todoBoxHit(at: containerPoint),
+           let state = core.todoState(at: todo) {
+            let menu = NSMenu()
+            for candidate in TodoState.allCases {
+                let item = NSMenuItem(
+                    title: candidate.label,
+                    action: #selector(setTodoState(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.tag = todo
+                item.representedObject = candidate.rawValue
+                item.state = candidate == state ? .on : .off
+                menu.addItem(item)
+            }
+            return menu
+        }
+        guard let charIndex = core.attachmentIndex(at: containerPoint),
               core.isImageAttachment(at: charIndex)
         else { return standard }
         let menu = standard ?? NSMenu()
@@ -3828,6 +4161,13 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         return menu
     }
 
+    @objc private func setTodoState(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let state = TodoState(rawValue: raw)
+        else { return }
+        core?.setTodoState(state, at: sender.tag)
+    }
+
     @objc private func showAttachmentInfo(_ sender: NSMenuItem) {
         guard let charIndex = sender.representedObject as? Int else { return }
         core?.openAttachment(at: charIndex)
@@ -3837,12 +4177,24 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
     /// copied images; plain text still pastes as text.
     private func consumeAttachment(from pasteboard: NSPasteboard) -> Bool {
         guard let core else { return false }
-        if let urlData = pasteboard.data(forType: .fileURL),
-           let url = URL(dataRepresentation: urlData, relativeTo: nil),
-           url.isFileURL,
-           let data = try? Data(contentsOf: url) {
-            let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
-            return core.incomingData(data, fileExtension: ext, suggestedName: url.lastPathComponent)
+        let files = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+        if !files.isEmpty {
+            var embedded = false
+            for url in files {
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                guard let data = try? Data(contentsOf: url) else { continue }
+                let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
+                embedded = core.incomingData(
+                    data,
+                    fileExtension: ext,
+                    suggestedName: url.lastPathComponent
+                ) || embedded
+            }
+            if embedded { return true }
         }
         if let data = pasteboard.data(forType: .png) {
             return core.incomingData(data, fileExtension: "png", suggestedName: nil)
@@ -3899,7 +4251,9 @@ struct RichTextEditor: NSViewRepresentable {
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.core = context.coordinator.core
+        textView.registerForDraggedTypes(textView.registeredDraggedTypes + [.fileURL])
         context.coordinator.markers.driveTypingAttributes(from: textView)
+        context.coordinator.markers.driveSelection(from: textView)
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -4034,6 +4388,16 @@ struct RichTextEditor: NSViewRepresentable {
 
 // MARK: - iOS
 
+extension EditorTextView: UIEditMenuInteractionDelegate {
+    func editMenuInteraction(
+        _ interaction: UIEditMenuInteraction,
+        menuFor configuration: UIEditMenuConfiguration,
+        suggestedActions: [UIMenuElement]
+    ) -> UIMenu? {
+        takePendingTodoMenu()
+    }
+}
+
 final class EditorTextView: UITextView, EditorTextViewLike {
     weak var core: EditorCore?
 
@@ -4066,6 +4430,24 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         insertText(text)
     }
 
+    private lazy var todoMenu: UIEditMenuInteraction = {
+        let interaction = UIEditMenuInteraction(delegate: self)
+        addInteraction(interaction)
+        return interaction
+    }()
+
+    private var pendingTodoMenu: UIMenu?
+
+    func showTodoMenu(_ menu: UIMenu, at point: CGPoint) {
+        pendingTodoMenu = menu
+        todoMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+    }
+
+    func takePendingTodoMenu() -> UIMenu? {
+        defer { pendingTodoMenu = nil }
+        return pendingTodoMenu
+    }
+
     func pReplace(_ range: NSRange, with attributed: NSAttributedString) {
         core?.pReplaceRegisteringUndo(clampedRange(range), with: attributed)
     }
@@ -4088,6 +4470,40 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
         guard visibleHeight > 0 else { return }
         pScrollToY(caretMidY - adjustedContentInset.top - visibleHeight / 2)
+    }
+
+    /// Without half a screen of slack at each end the first and last lines can
+    /// never reach the middle, which is where most typing happens.
+    func pApplyTypewriterPadding(_ enabled: Bool) {
+        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
+        let inset = enabled ? max(16, visibleHeight / 2) : 16
+        guard abs(textContainerInset.top - inset) > 1 else { return }
+        textContainerInset = UIEdgeInsets(
+            top: inset,
+            left: textContainerInset.left,
+            bottom: inset,
+            right: textContainerInset.right
+        )
+    }
+
+    /// The container tracks the view's width, so a wide window is narrowed by
+    /// growing the side insets equally, which centres the text.
+    func pApplyMaxWidth() {
+        let limit = EditorSettings.maxNoteWidth
+        let width = bounds.width - adjustedContentInset.left - adjustedContentInset.right
+        let inset = limit > 0 ? max(16, (width - limit) / 2) : 16
+        guard abs(textContainerInset.left - inset) > 0.5 else { return }
+        textContainerInset = UIEdgeInsets(
+            top: textContainerInset.top,
+            left: inset,
+            bottom: textContainerInset.bottom,
+            right: inset
+        )
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        pApplyMaxWidth()
     }
 
     var pVisibleRect: CGRect {
@@ -4296,6 +4712,7 @@ struct RichTextEditor: UIViewRepresentable {
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
         context.coordinator.markers.driveTypingAttributes(from: textView)
+        context.coordinator.markers.driveSelection(from: textView)
 
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
@@ -4304,6 +4721,14 @@ struct RichTextEditor: UIViewRepresentable {
         tap.delegate = context.coordinator
         tap.cancelsTouchesInView = false
         textView.addGestureRecognizer(tap)
+
+        let press = UILongPressGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleTodoPress(_:))
+        )
+        press.delegate = context.coordinator
+        press.cancelsTouchesInView = false
+        textView.addGestureRecognizer(press)
 
         let accessory = UIHostingController(
             rootView: FormatAccessoryBar(controller: controller)
@@ -4360,6 +4785,32 @@ struct RichTextEditor: UIViewRepresentable {
             guard let charIndex = core.attachmentIndex(at: containerPoint) else { return }
             core.openAttachment(at: charIndex)
         }
+
+        /// The touch equivalent of right-clicking the box: hold it to pick a
+        /// state instead of just ticking it.
+        @objc func handleTodoPress(_ gesture: UILongPressGestureRecognizer) {
+            guard gesture.state == .began,
+                  let textView = gesture.view as? EditorTextView
+            else { return }
+            let point = gesture.location(in: textView)
+            let containerPoint = CGPoint(
+                x: point.x - textView.textContainerInset.left,
+                y: point.y - textView.textContainerInset.top
+            )
+            guard let todo = core.todoBoxHit(at: containerPoint),
+                  let state = core.todoState(at: todo)
+            else { return }
+            let menu = UIMenu(children: TodoState.allCases.map { candidate in
+                UIAction(
+                    title: candidate.label,
+                    state: candidate == state ? .on : .off
+                ) { [core] _ in
+                    core.setTodoState(candidate, at: todo)
+                }
+            })
+            textView.showTodoMenu(menu, at: point)
+        }
+
         var accessory: UIHostingController<FormatAccessoryBar>?
         private var lastScenePhase: ScenePhase?
 
@@ -4529,11 +4980,11 @@ struct FormatSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("Format").font(.headline)
+                Text("Format").uiFont(.headline)
                 Spacer()
                 Button { dismiss() } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.title3)
+                        .uiFont(.title3)
                         .foregroundStyle(Color.secondary, Color(.systemFill))
                 }
                 .buttonStyle(.plain)
@@ -4640,7 +5091,7 @@ struct FormatSheet: View {
                         Text("Language").foregroundStyle(Color.secondary)
                         Spacer()
                         Text(CodeLanguage.named(controller.currentCodeLanguage).name)
-                        Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                        Image(systemName: "chevron.up.chevron.down").uiFont(.caption2)
                     }
                     .font(.system(size: 15))
                     .padding(.horizontal, 14)

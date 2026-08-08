@@ -133,6 +133,14 @@ enum PatchworkWeb {
         UserDefaults.standard.set(tools, forKey: lastToolsKey)
     }
 
+    private static let lastContextToolKey = "patchworkLastContextTool"
+
+    @MainActor
+    static var lastContextTool: String? {
+        get { UserDefaults.standard.string(forKey: lastContextToolKey) }
+        set { UserDefaults.standard.set(newValue, forKey: lastContextToolKey) }
+    }
+
     private static let lastToolsByTypeKey = "patchworkLastToolsByType"
 
     @MainActor
@@ -210,6 +218,10 @@ enum PatchworkWeb {
     <style>
       html, body { margin: 0; height: 100%; background: var(--editor-fill); color: var(--editor-line); }
       body > repo-provider, body > repo-provider > patchwork-view {
+        display: block; height: 100%; overflow: auto;
+        background: var(--editor-fill); color: var(--editor-line);
+      }
+      body > .context-root, body > .context-root > repo-provider {
         display: block; height: 100%; overflow: auto;
         background: var(--editor-fill); color: var(--editor-line);
       }
@@ -649,6 +661,10 @@ enum PatchworkWeb {
       }
 
       const params = new URLSearchParams(location.search)
+      if (params.get("mode") === "context") {
+        installContextMode(params, toolsLoaded)
+        return repo
+      }
       if (params.get("mode") === "picker") {
         // Render with whatever has registered so far rather than waiting on
         // stragglers; the paste field works regardless.
@@ -747,6 +763,69 @@ enum PatchworkWeb {
         )
         if (datatype) createDatatype(datatype, null)
       }
+    }
+
+    // The context-tool sidebar: every `patchwork:component` tagged
+    // "context-tool" is offered to the native tab bar, and the chosen one is
+    // rendered bare — no bound doc — the way patchwork's own frame does it.
+    // Tools read the document they are about from a `patchwork:selected-doc`
+    // subscription, which a shim around the tree answers with the note the
+    // inspector is open on, standing in for patchwork's selected-doc provider.
+    function installContextMode(params, toolsLoaded) {
+      const accountUrl = params.get("account-url")
+      let docUrl = params.get("doc-url")
+      const registry = getRegistry("patchwork:component")
+      const publish = () => {
+        const tools = (registry.all?.() ?? [])
+          .filter((description) => (description.tags ?? []).includes("context-tool"))
+          .map((description) => ({
+            id: description.id,
+            name: description.name || description.id,
+          }))
+          .sort((a, b) => a.name.localeCompare(b.name))
+        window.webkit?.messageHandlers?.lush?.postMessage({ kind: "context-tools", tools })
+      }
+
+      window.setContextTool = (toolId, nextDocUrl) => {
+        if (nextDocUrl !== undefined) docUrl = nextDocUrl
+        if (!toolId) {
+          document.body.replaceChildren()
+          return
+        }
+        let root = document.createElement("patchwork-view")
+        root.setAttribute("component", toolId)
+        const wrap = (component, url) => {
+          const wrapper = document.createElement("patchwork-view")
+          wrapper.setAttribute("component", component)
+          if (url) wrapper.setAttribute("doc-url", url)
+          wrapper.appendChild(root)
+          root = wrapper
+        }
+        if (accountUrl) {
+          wrap("patchwork-tool-storage-provider", accountUrl)
+          wrap("patchwork-account-provider", accountUrl)
+        }
+        const provider = document.createElement("repo-provider")
+        provider.appendChild(root)
+        const shim = document.createElement("div")
+        shim.className = "context-root"
+        shim.addEventListener("patchwork:subscribe", (event) => {
+          if (event.detail?.selector?.type !== "patchwork:selected-doc") return
+          event.stopPropagation()
+          event.detail.port.postMessage({
+            type: "change",
+            value: docUrl ? [docUrl] : [],
+          })
+        })
+        shim.appendChild(provider)
+        document.body.replaceChildren(shim)
+      }
+
+      registry.on?.("changed", publish)
+      document.body.classList.remove("loading")
+      status("")
+      publish()
+      toolsLoaded.then(publish)
     }
 
     window.patchworkReady = boot().catch((error) => {
@@ -922,6 +1001,105 @@ final class PatchworkEmbedBridge: NSObject, WKScriptMessageHandler {
         }
     }
 }
+
+/// Owns the context-tool webview: it reports the registered context tools to
+/// the tab bar and switches the mounted tool without reloading the page.
+final class PatchworkContextBridge: NSObject, WKScriptMessageHandler {
+    @MainActor var onTools: (@MainActor @Sendable ([ToolChoice]) -> Void)?
+    @MainActor weak var webView: WKWebView?
+    @MainActor private var applied: String?
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "lush",
+              let body = message.body as? [String: Any],
+              body["kind"] as? String == "context-tools",
+              let rawTools = body["tools"] as? [[String: Any]]
+        else { return }
+        let tools = rawTools.compactMap { raw -> ToolChoice? in
+            guard let id = raw["id"] as? String else { return nil }
+            return ToolChoice(id: id, name: raw["name"] as? String ?? id)
+        }
+        Task { @MainActor in
+            self.onTools?(tools)
+        }
+    }
+
+    @MainActor
+    func mount(toolId: String?, docUrl: String) {
+        let key = "\(toolId ?? "")|\(docUrl)"
+        guard key != applied, let webView else { return }
+        applied = key
+        Task {
+            _ = try? await webView.callAsyncJavaScript(
+                """
+                await window.patchworkReady
+                window.setContextTool(toolId, docUrl)
+                """,
+                arguments: ["toolId": toolId ?? NSNull(), "docUrl": docUrl],
+                in: nil,
+                in: .page
+            )
+        }
+    }
+}
+
+struct PatchworkContextToolsView {
+    let docUrl: String
+    let accountUrl: String?
+    let toolId: String?
+    let onTools: @MainActor @Sendable ([ToolChoice]) -> Void
+
+    @MainActor
+    fileprivate func makeWebView(coordinator: PatchworkContextBridge) -> WKWebView {
+        coordinator.onTools = onTools
+        var query = [
+            URLQueryItem(name: "mode", value: "context"),
+            URLQueryItem(name: "doc-url", value: docUrl),
+        ]
+        if let accountUrl, !accountUrl.isEmpty {
+            query.append(URLQueryItem(name: "account-url", value: accountUrl))
+        }
+        let webView = makePatchworkWebView(query: query, messageHandler: coordinator)
+        coordinator.webView = webView
+        coordinator.mount(toolId: toolId, docUrl: docUrl)
+        return webView
+    }
+
+    @MainActor
+    fileprivate func update(coordinator: PatchworkContextBridge) {
+        coordinator.onTools = onTools
+        coordinator.mount(toolId: toolId, docUrl: docUrl)
+    }
+}
+
+#if os(macOS)
+extension PatchworkContextToolsView: NSViewRepresentable {
+    func makeCoordinator() -> PatchworkContextBridge { PatchworkContextBridge() }
+
+    func makeNSView(context: Context) -> WKWebView {
+        makeWebView(coordinator: context.coordinator)
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        update(coordinator: context.coordinator)
+    }
+}
+#else
+extension PatchworkContextToolsView: UIViewRepresentable {
+    func makeCoordinator() -> PatchworkContextBridge { PatchworkContextBridge() }
+
+    func makeUIView(context: Context) -> WKWebView {
+        makeWebView(coordinator: context.coordinator)
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        update(coordinator: context.coordinator)
+    }
+}
+#endif
 
 #if os(macOS)
 struct PatchworkWebView: NSViewRepresentable {
@@ -1244,7 +1422,9 @@ private func makePickerWebView(
         query.append(URLQueryItem(name: "type", value: preferredType))
         query.append(URLQueryItem(name: "tool-id", value: preferredToolId))
     }
-    return makePatchworkWebView(query: query, messageHandler: coordinator)
+    let webView = makePatchworkWebView(query: query, messageHandler: coordinator)
+    PatchworkScripting.shared.register(webView, for: .picker)
+    return webView
 }
 
 #if os(macOS)
@@ -1312,7 +1492,7 @@ struct PatchworkCreateSheet: View {
         VStack(spacing: 12) {
             HStack {
                 Text("Embed Patchwork Document")
-                    .font(.headline)
+                    .uiFont(.headline)
                 Spacer()
                 Button("Cancel") { dismiss() }
             }
@@ -1328,7 +1508,7 @@ struct PatchworkCreateSheet: View {
                 )
             } else {
                 Text("Add PatchworkWeb.bundle to the app to create Patchwork documents.")
-                    .font(.caption)
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -1346,6 +1526,7 @@ struct NewPatchworkDocSheet: View {
     var preferredToolId: String?
     let onPick: @MainActor @Sendable (String, String?) -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var showingConsole = false
 
     init(
         preferredType: String? = nil,
@@ -1361,9 +1542,18 @@ struct NewPatchworkDocSheet: View {
         VStack(spacing: 12) {
             HStack {
                 Text("New Patchwork Document")
-                    .font(.headline)
+                    .uiFont(.headline)
                 Spacer()
+                Button {
+                    showingConsole.toggle()
+                } label: {
+                    Label("JavaScript", systemImage: "curlybraces")
+                }
                 Button("Cancel") { dismiss() }
+            }
+            if showingConsole {
+                PatchworkConsole(target: .picker)
+                    .frame(maxHeight: 320)
             }
             if PatchworkWeb.available {
                 PatchworkPickerView(onPick: { url, tool in
@@ -1377,7 +1567,7 @@ struct NewPatchworkDocSheet: View {
                 )
             } else {
                 Text("Add PatchworkWeb.bundle to the app to create Patchwork documents.")
-                    .font(.caption)
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -1429,6 +1619,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         coord.lastDraftUrl = draftUrl
         coord.lastCheckoutUrl = checkoutUrl
         host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
+        PatchworkScripting.shared.register(host.webView, for: .doc(docUrl))
         configureActivation(host.webView)
         return host.webView
     }
@@ -1442,6 +1633,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
             || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
             coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
+            PatchworkScripting.shared.register(nsView, for: .doc(docUrl))
             coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
             coord.lastDraftUrl = draftUrl
@@ -1488,6 +1680,7 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         coord.lastDraftUrl = draftUrl
         coord.lastCheckoutUrl = checkoutUrl
         host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
+        PatchworkScripting.shared.register(host.webView, for: .doc(docUrl))
         configureActivation(host.webView)
         return host.webView
     }
@@ -1500,6 +1693,7 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
             || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
             coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
+            PatchworkScripting.shared.register(uiView, for: .doc(docUrl))
             coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
             coord.lastDraftUrl = draftUrl
@@ -1565,12 +1759,12 @@ struct PatchworkBoxView: View {
             } else {
                 VStack(spacing: 6) {
                     Image(systemName: "shippingbox")
-                        .font(.title2)
+                        .uiFont(.title2)
                         .foregroundStyle(.secondary)
                     Text("Patchwork embed")
-                        .font(.caption)
+                        .uiFont(.caption)
                     Text("Add PatchworkWeb.bundle to the app to render this document.")
-                        .font(.caption2)
+                        .uiFont(.caption2)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                 }
