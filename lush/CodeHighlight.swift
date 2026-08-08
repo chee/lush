@@ -211,14 +211,14 @@ extension CodeHighlight {
               let box = attributed.attribute(.amBlock, at: 0, effectiveRange: nil) as? BlockBox,
               box.value.type == "code-block"
         else { return }
-        let str = attributed.string as NSString
+        let storageStr = storage.string as NSString
         let language = box.value.codeLanguage
         let paragraphRange = NSRange(location: location, length: attributed.length)
-        for token in tokens(in: attributed.string, language: language) {
-            let absolute = NSRange(location: location + token.range.location, length: token.range.length)
+        let run = codeRun(containing: paragraphRange, language: language, in: storage, str: storageStr)
+        for token in tokens(in: storageStr.substring(with: run), language: language) {
+            let absolute = NSRange(location: run.location + token.range.location, length: token.range.length)
             let clipped = NSIntersectionRange(absolute, paragraphRange)
             guard token.range.length > 0,
-                  NSMaxRange(token.range) <= str.length,
                   NSMaxRange(absolute) <= storage.length,
                   clipped.length > 0,
                   let textRange = contentStorage.textRange(for: clipped)

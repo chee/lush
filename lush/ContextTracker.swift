@@ -197,12 +197,18 @@ final class ContextTracker {
     private var lastWeatherFetch: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
     private var lastLocation: CLLocation?
+    private var updatingNowPlaying = false
 
     init() {
         locationDelegate.owner = self
     }
 
     func start() {
+        // one window per scene calls this; monitors must not accumulate
+        guard locationManager == nil else {
+            requestLocation()
+            return
+        }
         let mgr = CLLocationManager()
         mgr.delegate = locationDelegate
         mgr.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
@@ -268,13 +274,14 @@ final class ContextTracker {
         """)
 
     private func updateNowPlaying() {
-        Task.detached { [weak self] in
+        guard !updatingNowPlaying else { return }
+        updatingNowPlaying = true
+        Task { @MainActor [weak self] in
+            defer { self?.updatingNowPlaying = false }
             var error: NSDictionary?
             let result = ContextTracker.nowPlayingScript?.executeAndReturnError(&error)
             let playing = result?.stringValue ?? ""
-            await MainActor.run { [weak self] in
-                self?.snapshot.nowPlaying = playing.isEmpty ? nil : playing
-            }
+            self?.snapshot.nowPlaying = playing.isEmpty ? nil : playing
         }
     }
     #else

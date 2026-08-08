@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use async_tungstenite::{
     tokio::TokioAdapter,
-    tungstenite::{handshake::server::NoCallback, protocol::WebSocketConfig},
+    tungstenite::protocol::WebSocketConfig,
 };
 use automerge::{Automerge, ChangeHash, Fragment as AutomergeFragment, ReadDoc};
 use future_form::Sendable;
@@ -87,6 +87,17 @@ const HEAL_MAX_ATTEMPTS: u32 = 12;
 const LOCAL_SERVER_PORT: u16 = 43219;
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
 const LOOSE_FRAGMENT_BATCH_SIZE: usize = 32;
+
+/// Requests reaching the loopback sync server must come from the app's own
+/// webview, which loads under the custom `lushweb://` scheme. Native peers send
+/// no Origin header; a browser page on another origin always does, so we accept
+/// a missing Origin but reject any that isn't ours.
+fn origin_allowed(origin: Option<&str>) -> bool {
+    match origin {
+        None => true,
+        Some(o) => o.starts_with("lushweb://"),
+    }
+}
 
 /// A local-peer WebSocket transport that intercepts incoming BatchSyncRequests
 /// and pre-fetches unknown docs from the remote server before letting the
@@ -315,11 +326,21 @@ async fn accept_local_http_peer(
         let node = node.clone();
         let ephemeral = ephemeral.clone();
         async move {
+            let allowed_origin = req
+                .headers()
+                .get(hyper::header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .filter(|o| origin_allowed(Some(o)))
+                .and_then(|o| HeaderValue::from_str(o).ok());
             if req.method() == hyper::Method::OPTIONS {
                 let mut resp = hyper::Response::new(Full::new(Bytes::new()));
                 *resp.status_mut() = hyper::StatusCode::NO_CONTENT;
-                resp.headers_mut()
-                    .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+                if let Some(origin) = allowed_origin.clone() {
+                    resp.headers_mut()
+                        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                    resp.headers_mut()
+                        .insert(hyper::header::VARY, HeaderValue::from_static("Origin"));
+                }
                 resp.headers_mut().insert(
                     ACCESS_CONTROL_ALLOW_METHODS,
                     HeaderValue::from_static("POST, OPTIONS"),
@@ -370,9 +391,14 @@ async fn accept_local_http_peer(
             }
 
             let (mut parts, body) = resp.into_parts();
-            parts
-                .headers
-                .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            if let Some(origin) = allowed_origin {
+                parts
+                    .headers
+                    .insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                parts
+                    .headers
+                    .insert(hyper::header::VARY, HeaderValue::from_static("Origin"));
+            }
             parts.headers.insert(
                 ACCESS_CONTROL_ALLOW_METHODS,
                 HeaderValue::from_static("POST, OPTIONS"),
@@ -410,7 +436,21 @@ async fn accept_local_peer(
 
     let ws_stream = match async_tungstenite::tokio::accept_hdr_async_with_config(
         tcp,
-        NoCallback,
+        |req: &tungstenite::handshake::server::Request,
+         resp: tungstenite::handshake::server::Response| {
+            let origin = req
+                .headers()
+                .get(tungstenite::http::header::ORIGIN)
+                .and_then(|v| v.to_str().ok());
+            if origin_allowed(origin) {
+                Ok(resp)
+            } else {
+                Err(tungstenite::http::Response::builder()
+                    .status(tungstenite::http::StatusCode::FORBIDDEN)
+                    .body(None)
+                    .unwrap())
+            }
+        },
         Some(ws_config),
     )
     .await
@@ -468,6 +508,10 @@ async fn accept_local_peer(
         while let Some((sid, done_tx)) = prefetch_rx.recv().await {
             let repo = repo.clone();
             tokio::spawn(async move {
+                if sid.as_bytes()[16..].iter().any(|byte| *byte != 0) {
+                    let _ = done_tx.send(());
+                    return;
+                }
                 let id = DocId::from_sedimentree_id(sid);
                 repo.prefetch_doc(id, Duration::from_secs(30)).await;
                 let _ = done_tx.send(());
@@ -547,7 +591,7 @@ impl DocId {
 }
 
 fn short(id: DocId) -> String {
-    id.to_url()[11..23].to_string()
+    id.to_url()[10..22].to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -575,6 +619,7 @@ struct DocState {
     stored_commits: HashSet<ChangeHash>,
     stored_fragments: HashSet<ChangeHash>,
     applied: HashSet<Digest<Blob>>,
+    failed: HashSet<Digest<Blob>>,
 }
 
 impl DocState {
@@ -588,6 +633,7 @@ impl DocState {
             stored_commits: HashSet::new(),
             stored_fragments: HashSet::new(),
             applied: HashSet::new(),
+            failed: HashSet::new(),
         }
     }
 }
@@ -611,6 +657,7 @@ pub struct Repo {
     signer: MemorySigner,
     ephemeral: EphHandler,
     server_url: String,
+    outbox_dir: PathBuf,
     /// The outer lock only guards the map. Each doc carries its own lock, so
     /// decoding blobs into one doc or building fragments for it does not stall
     /// reads of every other doc — which is what the UI does on every keystroke.
@@ -623,6 +670,8 @@ pub struct Repo {
     events: broadcast::Sender<RepoEvent>,
     connected: AtomicBool,
     connect_started: AtomicBool,
+    apply_incoming: AtomicBool,
+    send_changes: AtomicBool,
     local_port: Option<u16>,
     iroh_endpoint: Option<Arc<iroh::Endpoint>>,
 }
@@ -884,18 +933,16 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
         .commits
         .into_iter()
         .filter(|record| {
-            !state
-                .applied
-                .contains(&BlobMeta::new(&record.blob).digest())
+            let d = BlobMeta::new(&record.blob).digest();
+            !state.applied.contains(&d) && !state.failed.contains(&d)
         })
         .collect();
     let fragments: Vec<_> = batch
         .fragments
         .into_iter()
         .filter(|record| {
-            !state
-                .applied
-                .contains(&BlobMeta::new(&record.blob).digest())
+            let d = BlobMeta::new(&record.blob).digest();
+            !state.applied.contains(&d) && !state.failed.contains(&d)
         })
         .collect();
     if commits.is_empty() && fragments.is_empty() {
@@ -908,8 +955,27 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
             (state.doc.get_heads() != before, false)
         }
         Err(e) => {
-            tracing::warn!(doc = %id.to_url(), error = %e, "stored blobs failed to apply");
-            (false, true)
+            tracing::warn!(doc = %id.to_url(), error = %e, "stored blob batch failed to apply; isolating");
+            let mut any_failed = false;
+            for record in &commits {
+                match load_blob_batch(&mut state.doc, std::slice::from_ref(record), &[]) {
+                    Ok(applied) => state.applied.extend(applied),
+                    Err(_) => {
+                        state.failed.insert(BlobMeta::new(&record.blob).digest());
+                        any_failed = true;
+                    }
+                }
+            }
+            for record in &fragments {
+                match load_blob_batch(&mut state.doc, &[], std::slice::from_ref(record)) {
+                    Ok(applied) => state.applied.extend(applied),
+                    Err(_) => {
+                        state.failed.insert(BlobMeta::new(&record.blob).digest());
+                        any_failed = true;
+                    }
+                }
+            }
+            (state.doc.get_heads() != before, any_failed)
         }
     }
 }
@@ -962,6 +1028,86 @@ fn load_blob_batch(
 }
 
 impl Repo {
+    fn outbox_path(&self, id: DocId) -> PathBuf {
+        self.outbox_dir
+            .join(format!("{}.automerge", hex::encode(id.0)))
+    }
+
+    async fn stage_doc(&self, id: DocId) -> Result<()> {
+        let state = self.doc_state(id).await?;
+        let bytes = state.lock().await.doc.save();
+        let path = self.outbox_path(id);
+        let pending = path.with_extension("pending");
+        std::fs::write(&pending, bytes).context("writing staged doc")?;
+        std::fs::rename(pending, path).context("committing staged doc")?;
+        Ok(())
+    }
+
+    pub async fn set_apply_incoming(self: &Arc<Self>, enabled: bool) {
+        self.apply_incoming.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            return;
+        }
+        for id in self.tracked_doc_ids().await {
+            if let Err(e) = self.apply_new_blobs(id).await {
+                tracing::warn!(doc = %id.to_url(), error = %e, "future changes failed to apply");
+            }
+        }
+    }
+
+    pub async fn set_send_changes(self: &Arc<Self>, enabled: bool) {
+        self.send_changes.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            return;
+        }
+        for id in self.tracked_doc_ids().await {
+            match self.save_doc(id).await {
+                Ok(true) => self.request_sync_forced(id).await,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "staged changes failed to publish")
+                }
+            }
+        }
+    }
+
+    pub fn is_applying_incoming(&self) -> bool {
+        self.apply_incoming.load(Ordering::Relaxed)
+    }
+
+    pub fn is_sending_changes(&self) -> bool {
+        self.send_changes.load(Ordering::Relaxed)
+    }
+
+    pub async fn stored_doc(&self, id: DocId) -> Result<Automerge> {
+        let batch = self.stored_batch(id).await?;
+        let mut doc = Automerge::new();
+        load_blob_batch(&mut doc, &batch.commits, &batch.fragments)?;
+        Ok(doc)
+    }
+
+    pub async fn pending_change_count(&self, id: DocId) -> u32 {
+        let Ok(stored) = self.stored_doc(id).await else {
+            return 0;
+        };
+        let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+            return 0;
+        };
+        let current: HashSet<_> = state
+            .lock()
+            .await
+            .doc
+            .get_changes(&[])
+            .into_iter()
+            .map(|change| change.hash())
+            .collect();
+        stored
+            .get_changes(&[])
+            .into_iter()
+            .filter(|change| !current.contains(&change.hash()))
+            .count() as u32
+    }
+
     pub fn local_server_port(&self) -> Option<u16> {
         self.local_port
     }
@@ -1034,6 +1180,8 @@ impl Repo {
     pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
         let boot = std::time::Instant::now();
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
+        let outbox_dir = data_dir.join("outbox");
+        std::fs::create_dir_all(&outbox_dir).context("creating outbox dir")?;
         let iroh_key = load_or_create_iroh_key(&data_dir.join("iroh.key"))?;
         let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
         let storage =
@@ -1156,6 +1304,7 @@ impl Repo {
             signer,
             ephemeral,
             server_url,
+            outbox_dir,
             docs: Mutex::new(HashMap::new()),
             syncs: Mutex::new(HashMap::new()),
             pending_saves: Mutex::new(HashMap::new()),
@@ -1165,6 +1314,8 @@ impl Repo {
             events,
             connected: AtomicBool::new(false),
             connect_started: AtomicBool::new(false),
+            apply_incoming: AtomicBool::new(true),
+            send_changes: AtomicBool::new(true),
             local_port,
             iroh_endpoint,
         });
@@ -1240,6 +1391,14 @@ impl Repo {
             tokio::spawn(async move {
                 while let Some(batch) = stored_rx.recv().await {
                     let id = DocId::from_sedimentree_id(batch.sedimentree_id);
+                    if !repo.apply_incoming.load(Ordering::Relaxed) && repo.doc_has_heads(id).await
+                    {
+                        let _ = repo.events.send(RepoEvent::SyncEvent(format!(
+                            "{}: changes waiting in the future",
+                            short(id)
+                        )));
+                        continue;
+                    }
                     let result = repo.apply_stored_batch(batch).await;
                     if let Err(ref e) = result {
                         tracing::warn!(doc = %id.to_url(), error = %e, "stored blobs failed to apply");
@@ -1284,7 +1443,7 @@ impl Repo {
         true
     }
 
-    fn start_connect_loop_if_needed(self: &Arc<Self>) {
+    pub(crate) fn start_connect_loop_if_needed(self: &Arc<Self>) {
         if self.connect_started.swap(true, Ordering::Relaxed) {
             return;
         }
@@ -1320,12 +1479,16 @@ impl Repo {
         };
         let host = Self::service_name(&uri);
         let mut backoff = Duration::from_millis(500);
+        // Surface connect failures in the app's sync log, but only when the
+        // error changes — the retry loop would otherwise drown doc events.
+        let mut last_error: Option<String> = None;
         loop {
             let audience = Audience::discover(host.as_bytes());
             match TokioWebSocketClient::new(uri.clone(), self.signer.clone(), audience).await {
                 Ok((authenticated, listener_task, sender_task, keepalive_task)) => {
                     let peer_id = authenticated.peer_id();
                     tracing::info!(peer = %peer_id, "connected to sync server");
+                    last_error = None;
                     let connected_at = tokio::time::Instant::now();
                     let listener = tokio::spawn(listener_task.into_future());
                     let sender = tokio::spawn(sender_task.into_future());
@@ -1361,6 +1524,11 @@ impl Repo {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "connection failed");
+                    let message = format!("sync server unreachable: {e}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        last_error = Some(message.clone());
+                        let _ = self.events.send(RepoEvent::SyncEvent(message));
+                    }
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -1405,6 +1573,11 @@ impl Repo {
             self.last_server_heads.lock().await.insert(id, heads_set);
             return;
         }
+        if !self.apply_incoming.load(Ordering::Relaxed) && self.doc_has_heads(id).await {
+            self.last_server_heads.lock().await.insert(id, heads_set);
+            self.request_sync_forced(id).await;
+            return;
+        }
         let _ = self.apply_new_blobs(id).await;
         let still_missing = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
@@ -1413,10 +1586,9 @@ impl Repo {
             let state = state.lock().await;
             !state.doc.get_missing_deps(&hashes).is_empty()
         };
+        self.last_server_heads.lock().await.insert(id, heads_set);
         if still_missing {
             self.request_sync(id).await;
-        } else {
-            self.last_server_heads.lock().await.insert(id, heads_set);
         }
     }
 
@@ -1432,7 +1604,9 @@ impl Repo {
                 .values()
                 .map(|(succeeded, stats, _)| (*succeeded, stats.total_received() > 0)),
         );
-        if outcome.data_received() {
+        if outcome.data_received()
+            && (self.apply_incoming.load(Ordering::Relaxed) || !self.doc_has_heads(id).await)
+        {
             self.apply_new_blobs(id).await?;
         }
         Ok(outcome)
@@ -1531,6 +1705,12 @@ impl Repo {
                     return;
                 }
                 slot.again = false;
+                let exhausted = failures >= HEAL_MAX_ATTEMPTS;
+                drop(syncs);
+                if exhausted {
+                    tokio::time::sleep(HEAL_DELAY).await;
+                    failures = 0;
+                }
             }
         });
     }
@@ -1615,6 +1795,10 @@ impl Repo {
     }
 
     async fn save_doc_now(&self, id: DocId) -> Result<bool> {
+        if !self.send_changes.load(Ordering::Relaxed) {
+            self.stage_doc(id).await?;
+            return Ok(false);
+        }
         let sid = id.sedimentree_id();
         let shared = self.doc_state(id).await?;
         let ingested = {
@@ -1633,6 +1817,7 @@ impl Repo {
             return Ok(false);
         };
         if ingested.commits.is_empty() && ingested.fragments.is_empty() {
+            let _ = std::fs::remove_file(self.outbox_path(id));
             return Ok(false);
         }
 
@@ -1650,6 +1835,7 @@ impl Repo {
         let mut state = shared.lock().await;
         state.stored_commits.extend(commit_heads);
         state.stored_fragments.extend(fragment_heads);
+        let _ = std::fs::remove_file(self.outbox_path(id));
 
         Ok(true)
     }
@@ -1909,9 +2095,8 @@ impl Repo {
             .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))
     }
 
-    /// Track a doc and populate it from local storage before allowing the
-    /// sync-server connection loop to start. The fresh doc's lock is held
-    /// across the initial load, so concurrent reads wait for the loaded doc
+    /// Track a doc and populate it from local storage. The fresh doc's lock is
+    /// held across the initial load so concurrent reads wait for the loaded doc
     /// instead of observing an empty one.
     async fn open_local(self: &Arc<Self>, id: DocId) {
         let mut guard = {
@@ -1937,9 +2122,20 @@ impl Repo {
                 (0, false, false)
             }
         };
+        if let Ok(bytes) = std::fs::read(self.outbox_path(id)) {
+            match Automerge::load(&bytes) {
+                Ok(mut staged) => {
+                    if let Err(e) = guard.doc.merge(&mut staged) {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to merge")
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to load")
+                }
+            }
+        }
         drop(guard);
         self.emit_batch_events(id, count, advanced, failed);
-        self.start_connect_loop_if_needed();
         self.request_sync(id).await;
     }
 
@@ -1973,7 +2169,9 @@ impl Repo {
         };
         let verified = Signed::seal::<Sendable, _>(&self.signer, ep).await;
         self.ephemeral
-            .publish(EphemeralMessage::Ephemeral(Box::new(verified.into_signed())))
+            .publish(EphemeralMessage::Ephemeral(Box::new(
+                verified.into_signed(),
+            )))
             .await;
     }
 
@@ -2274,6 +2472,83 @@ mod tests {
         .unwrap();
         assert!(repeated.commits.is_empty());
         assert!(repeated.fragments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_changes_publish_when_sending_resumes() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "before");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let before = repo.stored_batch(id).await.unwrap();
+        let before_count = before.commits.len() + before.fragments.len();
+
+        repo.set_send_changes(false).await;
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_save(id, heads, |doc| {
+            put(doc, "value", "after");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let staged = repo.stored_batch(id).await.unwrap();
+        assert_eq!(staged.commits.len() + staged.fragments.len(), before_count);
+
+        repo.set_send_changes(true).await;
+
+        let published = repo.stored_batch(id).await.unwrap();
+        assert!(published.commits.len() + published.fragments.len() > before_count);
+        assert!(!repo.outbox_path(id).exists());
+    }
+
+    #[tokio::test]
+    async fn incoming_changes_wait_until_application_resumes() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "local", "here");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.set_apply_incoming(false).await;
+
+        let mut remote = repo.read_doc(id, |doc| Ok(doc.fork())).await.unwrap();
+        remote.set_actor(ActorId::from([31; 16].as_slice()));
+        put(&mut remote, "remote", "waiting");
+        let ingested = ingest(
+            &remote,
+            id.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        repo.core
+            .store_built_batch(id.sedimentree_id(), ingested.commits, ingested.fragments)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let has_remote = repo
+            .read_doc(id, |doc| Ok(doc.get(ROOT, "remote")?.is_some()))
+            .await
+            .unwrap();
+        assert!(!has_remote);
+        assert_eq!(repo.pending_change_count(id).await, 1);
+
+        repo.set_apply_incoming(true).await;
+
+        let has_remote = repo
+            .read_doc(id, |doc| Ok(doc.get(ROOT, "remote")?.is_some()))
+            .await
+            .unwrap();
+        assert!(has_remote);
+        assert_eq!(repo.pending_change_count(id).await, 0);
     }
 
     #[tokio::test]

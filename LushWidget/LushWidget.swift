@@ -427,6 +427,16 @@ struct OpenLushControlIntent: OpenIntent {
     init(target: LushControlDestination) {
         self.target = target
     }
+
+    // runs in the widget extension, so opening the app has to carry the
+    // destination through a routed url rather than AppRouter state
+    func perform() async throws -> some IntentResult & OpensIntent {
+        let destination: URL = switch target {
+        case .quickNote: LushWidgetURL.quickNote
+        case .newNote: LushWidgetURL.newNote
+        }
+        return .result(opensIntent: OpenURLIntent(destination))
+    }
 }
 
 @available(iOS 18.0, macOS 15.0, *)
@@ -492,3 +502,93 @@ struct NewNoteControlWidget: ControlWidget {
     )
 }
 #endif
+
+struct LaunchEntry: TimelineEntry {
+    let date = Date()
+}
+
+struct LaunchProvider: TimelineProvider {
+    func placeholder(in context: Context) -> LaunchEntry {
+        LaunchEntry()
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (LaunchEntry) -> Void) {
+        completion(LaunchEntry())
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<LaunchEntry>) -> Void) {
+        completion(Timeline(entries: [LaunchEntry()], policy: .never))
+    }
+}
+
+struct LaunchWidgetView: View {
+    let symbol: String
+    let title: String
+    let url: URL
+
+    @Environment(\.widgetFamily) private var family
+
+    private var fullLabel: some View {
+        VStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(.title)
+            Text(title)
+                .font(.caption.weight(.medium))
+        }
+    }
+
+    var body: some View {
+        Group {
+            #if os(iOS)
+            if family == .accessoryCircular {
+                Image(systemName: symbol)
+                    .font(.title2)
+            } else {
+                fullLabel
+            }
+            #else
+            fullLabel
+            #endif
+        }
+        .widgetURL(url)
+        .containerBackground(.fill.tertiary, for: .widget)
+    }
+}
+
+struct NewNoteWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "party.chee.lush.new-note", provider: LaunchProvider()) { _ in
+            LaunchWidgetView(
+                symbol: "square.and.pencil",
+                title: "New Note",
+                url: LushWidgetURL.newNote
+            )
+        }
+        .configurationDisplayName("New Note")
+        .description("Start a new note.")
+        #if os(iOS)
+        .supportedFamilies([.systemSmall, .accessoryCircular])
+        #else
+        .supportedFamilies([.systemSmall])
+        #endif
+    }
+}
+
+struct QuickNoteWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "party.chee.lush.quick-note", provider: LaunchProvider()) { _ in
+            LaunchWidgetView(
+                symbol: "bolt.circle",
+                title: "Quick Note",
+                url: LushWidgetURL.quickNote
+            )
+        }
+        .configurationDisplayName("Quick Note")
+        .description("Open your Quick Note.")
+        #if os(iOS)
+        .supportedFamilies([.systemSmall, .accessoryCircular])
+        #else
+        .supportedFamilies([.systemSmall])
+        #endif
+    }
+}

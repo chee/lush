@@ -6,6 +6,22 @@ final class LushDockTilePlugin: NSObject, NSDockTilePlugIn {
 
     func setDockTile(_ dockTile: NSDockTile?) {
         self.dockTile = dockTile
+        guard let dockTile else { return }
+        applyOverlay(to: dockTile)
+    }
+
+    private func applyOverlay(to dockTile: NSDockTile) {
+        guard let root = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.party.chee.patchwork.lush"
+        ) else { return }
+        let url = root.appendingPathComponent("DockTileImage.png")
+        guard let image = NSImage(contentsOf: url) else { return }
+        let view = NSImageView(frame: NSRect(origin: .zero, size: dockTile.size))
+        view.image = image
+        view.imageScaling = .scaleProportionallyUpOrDown
+        view.autoresizingMask = [.width, .height]
+        dockTile.contentView = view
+        dockTile.display()
     }
 
     func dockMenu() -> NSMenu? {

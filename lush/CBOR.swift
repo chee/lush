@@ -125,6 +125,17 @@ enum CBOR {
 
     // MARK: decode
 
+    private static func decodeHalfFloat(_ bits: UInt16) -> Double {
+        let exp = Int((bits >> 10) & 0x1F)
+        let mant = Double(bits & 0x3FF)
+        let sign: Double = (bits & 0x8000) != 0 ? -1 : 1
+        switch exp {
+        case 0:  return sign * scalbn(mant, -24)
+        case 31: return mant == 0 ? sign * Double.infinity : Double.nan
+        default: return sign * scalbn(mant + 1024, exp - 25)
+        }
+    }
+
     static func decode(_ data: Data) throws -> Value {
         var cursor = data.startIndex
         return try read(data, &cursor, depth: 0)
@@ -222,7 +233,7 @@ enum CBOR {
             case 25:
                 var bits: UInt16 = 0
                 for _ in 0..<2 { bits = bits << 8 | UInt16(try byte(data, &cursor)) }
-                return .double(Double(Float16(bitPattern: bits)))
+                return .double(decodeHalfFloat(bits))
             case 26:
                 var bits: UInt32 = 0
                 for _ in 0..<4 { bits = bits << 8 | UInt32(try byte(data, &cursor)) }

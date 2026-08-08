@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use automerge::{ChangeHash, ChangeMetadata};
+use automerge::{Change, ChangeHash};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -70,6 +70,8 @@ pub struct DocHistoryEntry {
     pub seq: u64,
     pub message: Option<String>,
     pub deps: Vec<String>,
+    pub additions: u64,
+    pub deletions: u64,
 }
 
 fn encode_heads(heads: Vec<ChangeHash>) -> Vec<String> {
@@ -85,6 +87,36 @@ fn decode_heads(heads: Vec<String>) -> Result<Vec<ChangeHash>, CoreError> {
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CloneResult {
+    pub clone_url: String,
+    pub cloned_at: Vec<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CheckpointPin {
+    pub original_url: String,
+    pub heads: Vec<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CloneEntryFfi {
+    pub original_url: String,
+    pub clone_url: String,
+    pub cloned_at: Vec<String>,
+    pub merged_at: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DraftState {
+    pub is_main: bool,
+    pub name: Option<String>,
+    pub parent: String,
+    pub drafts: Vec<String>,
+    pub clones: Vec<CloneEntryFfi>,
+    pub merged_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -188,27 +220,49 @@ fn normalized_heads(mut heads: Vec<ChangeHash>) -> Vec<ChangeHash> {
     heads
 }
 
-fn append_history_entries(history: &mut CachedDocHistory, changes: Vec<ChangeMetadata<'_>>) {
+fn append_history_entries(history: &mut CachedDocHistory, changes: Vec<Change>) {
     for change in changes {
-        if !history.known_hashes.insert(change.hash) {
+        let hash = change.hash();
+        if !history.known_hashes.insert(hash) {
             continue;
         }
-        for dep in &change.deps {
+        for dep in change.deps() {
             history.frontier.remove(dep);
         }
-        history.frontier.insert(change.hash);
+        history.frontier.insert(hash);
         let mut heads: Vec<String> = history.frontier.iter().map(ToString::to_string).collect();
         heads.sort();
+        let (additions, deletions) = edit_counts(&change);
         history.entries.push(DocHistoryEntry {
-            hash: change.hash.to_string(),
+            hash: hash.to_string(),
             heads,
-            time: change.timestamp,
-            actor: change.actor.to_string(),
-            seq: change.seq,
-            message: change.message.map(|message| message.into_owned()),
-            deps: change.deps.into_iter().map(|dep| dep.to_string()).collect(),
+            time: change.timestamp(),
+            actor: change.actor_id().to_string(),
+            seq: change.seq(),
+            message: change.message().map(ToOwned::to_owned),
+            deps: change.deps().iter().map(ToString::to_string).collect(),
+            additions,
+            deletions,
         });
     }
+}
+
+/// +/- counts for one change, read straight off its ops: inserted elements
+/// against deleted ones. Non-insert puts (titles, `@patchwork` metadata)
+/// count as neither, so a metadata-only change reads 0/0 and the timeline
+/// drops it — same intent as patchwork's diff-based computeEditCounts, but
+/// without a diff per change (~150× faster over a long history).
+fn edit_counts(change: &Change) -> (u64, u64) {
+    let mut additions = 0u64;
+    let mut deletions = 0u64;
+    for op in change.decode().operations {
+        if matches!(op.action, automerge::legacy::OpType::Delete) {
+            deletions += 1;
+        } else if op.insert {
+            additions += 1;
+        }
+    }
+    (additions, deletions)
 }
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -220,17 +274,18 @@ impl Core {
         let mut events = self.repo.subscribe();
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let slots: Arc<IndexSlots> = Arc::new(std::sync::Mutex::new(HashMap::new()));
         self.runtime.spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(RepoEvent::DocChanged(id)) => {
-                        tokio::spawn(index_doc(repo.clone(), index.clone(), id));
+                        schedule_index_doc(repo.clone(), index.clone(), slots.clone(), id);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("index missed {n} events; reindexing tracked docs");
                         for id in repo.tracked_doc_ids().await {
-                            tokio::spawn(index_doc(repo.clone(), index.clone(), id));
+                            schedule_index_doc(repo.clone(), index.clone(), slots.clone(), id);
                         }
                     }
                     Ok(_) => {}
@@ -262,6 +317,47 @@ impl Core {
                 msg: format!("core task failed: {e}"),
             })
     }
+}
+
+#[derive(Default)]
+struct IndexSlot {
+    running: bool,
+    again: bool,
+}
+
+type IndexSlots = std::sync::Mutex<HashMap<DocId, IndexSlot>>;
+
+/// Serialize index updates per doc: while one runs, a new DocChanged sets
+/// `again` instead of racing a second task. The rerun reads the doc's latest
+/// state, so the newest write always lands last and the index can't go stale.
+fn schedule_index_doc(
+    repo: Arc<Repo>,
+    index: Arc<SearchIndex>,
+    slots: Arc<IndexSlots>,
+    id: DocId,
+) {
+    {
+        let mut map = slots.lock().unwrap();
+        let slot = map.entry(id).or_default();
+        if slot.running {
+            slot.again = true;
+            return;
+        }
+        slot.running = true;
+    }
+    tokio::spawn(async move {
+        loop {
+            index_doc(repo.clone(), index.clone(), id).await;
+            let mut map = slots.lock().unwrap();
+            match map.get_mut(&id) {
+                Some(slot) if slot.again => slot.again = false,
+                _ => {
+                    map.remove(&id);
+                    return;
+                }
+            }
+        }
+    });
 }
 
 async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
@@ -389,7 +485,7 @@ impl Core {
                         return Ok(cached);
                     }
 
-                    let changes = doc.get_changes_meta(&cached.heads);
+                    let changes = doc.get_changes(&cached.heads);
                     if !cached.heads.is_empty() && !changes.is_empty() {
                         let mut next = (*cached).clone();
                         next.heads = current_heads;
@@ -404,7 +500,7 @@ impl Core {
                     known_hashes: HashSet::new(),
                     entries: Vec::new(),
                 };
-                append_history_entries(&mut next, doc.get_changes_meta(&[]));
+                append_history_entries(&mut next, doc.get_changes(&[]));
                 Ok(Arc::new(next))
             }))
             .ok();
@@ -425,8 +521,114 @@ impl Core {
         entries
     }
 
+    /// History restricted to changes not covered by `heads` — a draft
+    /// clone's activity since its fork point. Per-entry heads start from the
+    /// fork frontier so snapshots at any entry stay correct.
+    pub fn doc_history_since(&self, url: String, heads: Vec<String>) -> Vec<DocHistoryEntry> {
+        let Ok(id) = DocId::from_url(&url) else {
+            return Vec::new();
+        };
+        let Ok(since) = decode_heads(heads) else {
+            return Vec::new();
+        };
+        self.runtime
+            .block_on(self.repo.read_doc(id, move |doc| {
+                let mut history = CachedDocHistory {
+                    heads: Vec::new(),
+                    frontier: since.iter().copied().collect(),
+                    known_hashes: HashSet::new(),
+                    entries: Vec::new(),
+                };
+                append_history_entries(&mut history, doc.get_changes(&since));
+                Ok(history.entries)
+            }))
+            .unwrap_or_default()
+    }
+
     pub fn is_connected(&self) -> bool {
         self.repo.is_connected()
+    }
+
+    pub fn set_apply_incoming(&self, enabled: bool) {
+        let repo = self.repo.clone();
+        self.runtime
+            .block_on(async move { repo.set_apply_incoming(enabled).await });
+    }
+
+    pub fn set_send_changes(&self, enabled: bool) {
+        let repo = self.repo.clone();
+        self.runtime
+            .block_on(async move { repo.set_send_changes(enabled).await });
+    }
+
+    pub fn is_applying_incoming(&self) -> bool {
+        self.repo.is_applying_incoming()
+    }
+
+    pub fn is_sending_changes(&self) -> bool {
+        self.repo.is_sending_changes()
+    }
+
+    pub fn pending_change_count(&self, url: String) -> u32 {
+        let Ok(id) = DocId::from_url(&url) else {
+            return 0;
+        };
+        self.runtime.block_on(self.repo.pending_change_count(id))
+    }
+
+    pub fn pending_doc_history(&self, url: String) -> Vec<DocHistoryEntry> {
+        let Ok(id) = DocId::from_url(&url) else {
+            return Vec::new();
+        };
+        let repo = self.repo.clone();
+        self.runtime
+            .block_on(async move {
+                let current: HashSet<ChangeHash> = repo
+                    .read_doc(id, |doc| {
+                        Ok(doc
+                            .get_changes(&[])
+                            .into_iter()
+                            .map(|change| change.hash())
+                            .collect())
+                    })
+                    .await?;
+                let stored = repo.stored_doc(id).await?;
+                let mut frontier = HashSet::new();
+                let mut entries = Vec::new();
+                for change in stored.get_changes(&[]) {
+                    let hash = change.hash();
+                    for dep in change.deps() {
+                        frontier.remove(dep);
+                    }
+                    frontier.insert(hash);
+                    if current.contains(&hash) {
+                        continue;
+                    }
+                    let mut heads: Vec<String> = frontier.iter().map(ToString::to_string).collect();
+                    heads.sort();
+                    let (additions, deletions) = edit_counts(&change);
+                    entries.push(DocHistoryEntry {
+                        hash: hash.to_string(),
+                        heads,
+                        time: change.timestamp(),
+                        actor: change.actor_id().to_string(),
+                        seq: change.seq(),
+                        message: change.message().map(ToOwned::to_owned),
+                        deps: change.deps().iter().map(ToString::to_string).collect(),
+                        additions,
+                        deletions,
+                    });
+                }
+                Ok::<_, anyhow::Error>(entries)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Start the outbound sync-server connection loop. Idempotent — safe to
+    /// call multiple times; only the first call takes effect.
+    pub fn connect(self: &Arc<Self>) {
+        let _guard = self.runtime.enter();
+        self.repo.start_connect_loop_if_needed();
     }
 
     /// Port of the loopback subduction listener the core hosts, if it bound.
@@ -1297,22 +1499,42 @@ impl Core {
         let snapshot = self
             .run(async move {
                 let id = DocId::from_url(&url)?;
-                repo.read_doc(id, |doc| {
-                    let current_heads = doc.get_heads();
-                    let view;
-                    let doc = if heads.is_empty() || current_heads == heads {
-                        doc
-                    } else {
-                        view = doc.fork_at(&heads)?;
-                        &view
-                    };
-                    let spans = shapes::spans_to_json(doc)?;
-                    Ok::<_, anyhow::Error>(NoteSpansSnapshot {
-                        spans_json: serde_json::to_string(&spans)?,
-                        heads: encode_heads(doc.get_heads()),
+                let current = repo
+                    .read_doc(id, |doc| {
+                        let current_heads = doc.get_heads();
+                        let view;
+                        let doc = if heads.is_empty() || current_heads == heads {
+                            doc
+                        } else {
+                            view = doc.fork_at(&heads)?;
+                            &view
+                        };
+                        let spans = shapes::spans_to_json(doc)?;
+                        Ok::<_, anyhow::Error>(NoteSpansSnapshot {
+                            spans_json: serde_json::to_string(&spans)?,
+                            heads: encode_heads(doc.get_heads()),
+                        })
                     })
-                })
-                .await
+                    .await;
+                let result: anyhow::Result<NoteSpansSnapshot> = match current {
+                    Ok(snapshot) => Ok(snapshot),
+                    Err(_) => {
+                        let stored = repo.stored_doc(id).await?;
+                        let view;
+                        let doc = if heads.is_empty() || stored.get_heads() == heads {
+                            &stored
+                        } else {
+                            view = stored.fork_at(&heads)?;
+                            &view
+                        };
+                        let spans = shapes::spans_to_json(doc)?;
+                        Ok(NoteSpansSnapshot {
+                            spans_json: serde_json::to_string(&spans)?,
+                            heads: encode_heads(doc.get_heads()),
+                        })
+                    }
+                };
+                result
             })
             .await??;
         Ok(snapshot)
@@ -1651,6 +1873,253 @@ impl Core {
         self.runtime.block_on(async move { repo.shutdown().await });
     }
 
+    /// Full-history fork of a doc installed as a new repo doc. `cloned_at`
+    /// is the source's heads at fork time.
+    pub fn clone_doc(&self, url: String) -> Result<CloneResult, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let result = self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                repo.ensure_doc(id).await?;
+                if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
+                    anyhow::bail!("doc not found locally or on the server");
+                }
+                let (fork, cloned_at) = repo
+                    .read_doc(id, |doc| Ok((doc.fork(), encode_heads(doc.get_heads()))))
+                    .await?;
+                let clone = repo
+                    .create_doc(move |doc| {
+                        *doc = fork;
+                        Ok(())
+                    })
+                    .await?;
+                Ok::<_, anyhow::Error>(CloneResult {
+                    clone_url: clone.to_url(),
+                    cloned_at,
+                })
+            })?;
+            Ok(result)
+        })
+    }
+
+    /// Plain automerge merge of `from` into `into`; returns the target's
+    /// heads after the merge.
+    pub fn merge_doc(&self, into_url: String, from_url: String) -> Result<Vec<String>, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let reindex_url = into_url.clone();
+            let heads = self.runtime.block_on(async move {
+                let into = DocId::from_url(&into_url)?;
+                let from = DocId::from_url(&from_url)?;
+                repo.ensure_doc(from).await?;
+                if !repo.wait_for_doc(from, OPEN_TIMEOUT).await {
+                    anyhow::bail!("source doc not found locally or on the server");
+                }
+                repo.ensure_doc(into).await?;
+                if !repo.wait_for_doc(into, OPEN_TIMEOUT).await {
+                    anyhow::bail!("target doc not found locally or on the server");
+                }
+                let mut source = repo.read_doc(from, |doc| Ok(doc.fork())).await?;
+                repo.change_doc(into, move |doc| {
+                    doc.merge(&mut source)?;
+                    Ok(())
+                })
+                .await?;
+                repo.read_doc(into, |doc| Ok(encode_heads(doc.get_heads())))
+                    .await
+            })?;
+            self.reindex_doc(DocId::from_url(&reindex_url)?);
+            Ok(heads)
+        })
+    }
+
+    pub fn create_draft_doc(&self, parent_url: String, is_main: bool) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let draft = repo
+                    .create_doc(|doc| shapes::init_draft(doc, &parent_url, is_main))
+                    .await?;
+                Ok::<_, anyhow::Error>(draft.to_url())
+            })?;
+            Ok(url)
+        })
+    }
+
+    pub fn create_checkout_doc(&self) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let doc = repo.create_doc(shapes::init_checkout).await?;
+                Ok::<_, anyhow::Error>(doc.to_url())
+            })?;
+            Ok(url)
+        })
+    }
+
+    pub fn set_checkout_state(
+        &self,
+        url: String,
+        checked_out: Option<String>,
+        pins: Option<Vec<CheckpointPin>>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                let pins = pins.map(|pins| {
+                    pins.into_iter()
+                        .map(|pin| (pin.original_url, pin.heads))
+                        .collect::<Vec<_>>()
+                });
+                repo.change_doc(id, move |doc| {
+                    shapes::set_checkout_state(doc, checked_out.as_deref(), pins.as_deref())
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn draft_add_child(&self, draft_url: String, child_url: String) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&draft_url)?;
+                repo.change_doc(id, move |doc| shapes::draft_add_child(doc, &child_url))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    /// A heads-pinned automerge url (`automerge:<id>#<head>|<head>`,
+    /// bs58check heads, sorted) — automerge-repo's read-only view format.
+    pub fn pinned_doc_url(&self, url: String, heads: Vec<String>) -> Result<String, CoreError> {
+        let id = DocId::from_url(&url)?;
+        let mut wire: Vec<String> = heads.iter().map(|h| shapes::head_to_wire(h)).collect();
+        wire.sort();
+        Ok(format!("{}#{}", id.to_url(), wire.join("|")))
+    }
+
+    pub fn draft_set_name(&self, draft_url: String, name: Option<String>) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&draft_url)?;
+                repo.change_doc(id, move |doc| shapes::draft_set_name(doc, name.as_deref()))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn draft_record_clone(
+        &self,
+        draft_url: String,
+        original_url: String,
+        clone_url: String,
+        cloned_at: Vec<String>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&draft_url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::draft_record_clone(doc, &original_url, &clone_url, &cloned_at)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn draft_record_merge(
+        &self,
+        draft_url: String,
+        original_url: String,
+        merged_at: Vec<String>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&draft_url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::draft_record_merge(doc, &original_url, &merged_at)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn draft_mark_merged(&self, draft_url: String, timestamp_ms: i64) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&draft_url)?;
+                repo.change_doc(id, move |doc| shapes::draft_mark_merged(doc, timestamp_ms))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    /// None when the doc is not a draft (`@patchwork.type != "draft"`).
+    pub fn draft_state(&self, url: String) -> Result<Option<DraftState>, CoreError> {
+        let repo = self.repo.clone();
+        let shape = self.runtime.block_on(async move {
+            let id = DocId::from_url(&url)?;
+            repo.read_doc(id, |doc| Ok(shapes::draft_shape(doc))).await
+        })?;
+        Ok(shape.map(|shape| DraftState {
+            is_main: shape.is_main,
+            name: shape.name,
+            parent: shape.parent,
+            drafts: shape.drafts,
+            clones: shape
+                .clones
+                .into_iter()
+                .map(|entry| CloneEntryFfi {
+                    original_url: entry.original_url,
+                    clone_url: entry.clone_url,
+                    cloned_at: entry.cloned_at,
+                    merged_at: entry.merged_at,
+                })
+                .collect(),
+            merged_at: shape.merged_at,
+        }))
+    }
+
+    pub fn main_draft_url(&self, doc_url: String) -> Result<Option<String>, CoreError> {
+        let repo = self.repo.clone();
+        let url = self.runtime.block_on(async move {
+            let id = DocId::from_url(&doc_url)?;
+            repo.read_doc(id, |doc| Ok(shapes::main_draft_url(doc)))
+                .await
+        })?;
+        Ok(url)
+    }
+
+    pub fn set_main_draft_url(&self, doc_url: String, draft_url: String) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&doc_url)?;
+                repo.change_doc(id, move |doc| shapes::set_main_draft_url(doc, &draft_url))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
     /// Create a folder doc inside a specific folder doc.
     pub fn create_subfolder_in(
         &self,
@@ -1682,3 +2151,149 @@ impl Core {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_core() -> (tempfile::TempDir, Arc<Core>) {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::new(
+            dir.path().to_string_lossy().into_owned(),
+            Some("http://[".into()),
+        )
+        .unwrap();
+        (dir, core)
+    }
+
+    fn heads(core: &Core, url: &str) -> Vec<String> {
+        core.runtime.block_on(core.doc_heads(url.to_string()))
+    }
+
+    fn full_text(core: &Core, url: &str) -> String {
+        let id = DocId::from_url(url).unwrap();
+        core.runtime
+            .block_on(core.repo.read_doc(id, |doc| Ok(shapes::full_text(doc))))
+            .unwrap()
+    }
+
+    #[test]
+    fn create_draft_doc_round_trips_through_draft_state() {
+        let (_dir, core) = test_core();
+        let note = core.create_note_doc("host".into()).unwrap();
+        let main = core.create_draft_doc(note.clone(), true).unwrap();
+        let child = core.create_draft_doc(main.clone(), false).unwrap();
+        core.draft_add_child(main.clone(), child.clone()).unwrap();
+        core.draft_set_name(child.clone(), Some("my draft".into()))
+            .unwrap();
+        let note_heads = heads(&core, &note);
+        assert!(!note_heads.is_empty());
+        core.draft_record_clone(
+            child.clone(),
+            note.clone(),
+            "automerge:clone".into(),
+            note_heads.clone(),
+        )
+        .unwrap();
+        core.draft_record_merge(child.clone(), note.clone(), note_heads.clone())
+            .unwrap();
+        core.draft_mark_merged(child.clone(), 1_720_000_000_123)
+            .unwrap();
+
+        let state = core.draft_state(child.clone()).unwrap().unwrap();
+        assert!(!state.is_main);
+        assert_eq!(state.name.as_deref(), Some("my draft"));
+        assert_eq!(state.parent, main);
+        assert!(state.drafts.is_empty());
+        assert_eq!(state.merged_at, Some(1_720_000_000_123));
+        assert_eq!(state.clones.len(), 1);
+        assert_eq!(state.clones[0].original_url, note);
+        assert_eq!(state.clones[0].clone_url, "automerge:clone");
+        assert_eq!(state.clones[0].cloned_at, note_heads);
+        assert_eq!(state.clones[0].merged_at, Some(note_heads));
+
+        let main_state = core.draft_state(main.clone()).unwrap().unwrap();
+        assert!(main_state.is_main);
+        assert_eq!(main_state.name, None);
+        assert_eq!(main_state.parent, note);
+        assert_eq!(main_state.drafts, vec![child.clone()]);
+        assert_eq!(main_state.merged_at, None);
+        assert!(main_state.clones.is_empty());
+
+        core.draft_set_name(child.clone(), None).unwrap();
+        assert_eq!(core.draft_state(child).unwrap().unwrap().name, None);
+
+        assert!(core.draft_state(note).unwrap().is_none());
+    }
+
+    #[test]
+    fn clone_doc_copies_content_and_captures_fork_heads() {
+        let (_dir, core) = test_core();
+        let note = core.create_note_doc("original".into()).unwrap();
+        core.splice_note_text(
+            note.clone(),
+            1,
+            0,
+            "hello drafts".into(),
+            "hello drafts".into(),
+            heads(&core, &note),
+        )
+        .unwrap();
+        let source_heads = heads(&core, &note);
+        let result = core.clone_doc(note.clone()).unwrap();
+        assert_ne!(result.clone_url, note);
+        assert_eq!(result.cloned_at, source_heads);
+        assert_eq!(full_text(&core, &result.clone_url), full_text(&core, &note));
+        assert!(full_text(&core, &result.clone_url).contains("hello drafts"));
+    }
+
+    #[test]
+    fn merge_doc_carries_clone_edits_back_to_the_source() {
+        let (_dir, core) = test_core();
+        let note = core.create_note_doc("note".into()).unwrap();
+        core.splice_note_text(
+            note.clone(),
+            1,
+            0,
+            "hello".into(),
+            "hello".into(),
+            heads(&core, &note),
+        )
+        .unwrap();
+        let clone = core.clone_doc(note.clone()).unwrap().clone_url;
+        core.splice_note_text(
+            clone.clone(),
+            6,
+            0,
+            " from the draft".into(),
+            "hello from the draft".into(),
+            heads(&core, &clone),
+        )
+        .unwrap();
+        let merged_heads = core.merge_doc(note.clone(), clone).unwrap();
+        assert_eq!(full_text(&core, &note), "hello from the draft");
+        assert_eq!(merged_heads, heads(&core, &note));
+    }
+
+    #[test]
+    fn main_draft_url_round_trips_without_disturbing_the_doc() {
+        let (_dir, core) = test_core();
+        let note = core.create_note_doc("host".into()).unwrap();
+        assert_eq!(core.main_draft_url(note.clone()).unwrap(), None);
+        let draft = core.create_draft_doc(note.clone(), true).unwrap();
+        core.set_main_draft_url(note.clone(), draft.clone())
+            .unwrap();
+        assert_eq!(core.main_draft_url(note.clone()).unwrap(), Some(draft));
+        let id = DocId::from_url(&note).unwrap();
+        let (kind, title) = core
+            .runtime
+            .block_on(core.repo.read_doc(id, |doc| {
+                Ok((shapes::doc_patchwork_type(doc), shapes::doc_title(doc)))
+            }))
+            .unwrap();
+        assert_eq!(kind.as_deref(), Some("rich"));
+        assert_eq!(title, "host");
+    }
+}
+
+

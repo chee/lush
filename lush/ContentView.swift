@@ -99,6 +99,8 @@ struct ContentView: View {
             }
         }
         .task { await model.drainSharedIntake() }
+        // actions queued while no window existed
+        .task { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url else { return }
             selectedHistoryEntry = nil
@@ -128,7 +130,7 @@ struct ContentView: View {
                     case .folder(let url):
                         FolderScreen(folderUrl: url) { path.append($0) }
                     case .note(let url):
-                        NoteDetail(noteUrl: url)
+                        NoteDetail(noteUrl: model.resolvedNoteUrl(url))
                             .onAppear { model.selectedNoteUrl = url }
                     case .patchwork(let url):
                         PatchworkDetail(docUrl: url)
@@ -147,6 +149,13 @@ struct ContentView: View {
                 model.pendingIncoming = IncomingContent(payload: .file(url))
             }
         }
+        #if canImport(CoreSpotlight)
+        .onContinueUserActivity(CSSearchableItemActionType) { activity in
+            if let url = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String {
+                router.pending = .note(url)
+            }
+        }
+        #endif
         .onContinueUserActivity(LushHandoff.activityType) { activity in
             _ = LushHandoff.handle(activity)
         }
@@ -158,6 +167,8 @@ struct ContentView: View {
             }
         }
         .task { await model.drainSharedIntake() }
+        // actions queued while no window existed
+        .task { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url, path.isEmpty else { return }
             path = [.note(url)]
@@ -206,18 +217,22 @@ struct ContentView: View {
         router.pending = nil
         switch action {
         case .newNote:
-            model.createNoteInInbox(snap: contextTracker.snapshot)
-            if let url = model.selectedNoteUrl {
-                open(url)
+            Task {
+                if let url = await model.createNoteInInbox(snap: contextTracker.snapshot) {
+                    open(url)
+                }
             }
         case .quickNote:
             if let url = model.quickNoteUrl {
                 model.pendingFocusUrl = url
                 open(url)
             } else {
-                model.createNoteInInbox(snap: contextTracker.snapshot)
-                if let url = model.selectedNoteUrl {
+                // create once and remember it; every later invocation reuses it
+                Task {
+                    guard let url = await model.ensureQuickNote() else { return }
+                    model.pendingFocusUrl = url
                     open(url)
+                    model.refreshNotes()
                 }
             }
         case .capture:
@@ -247,8 +262,15 @@ struct ContentView: View {
                 searchHits = []
             } else {
                 searchTask?.cancel()
-                searchTask = Task { searchHits = await model.search(query) }
+                searchTask = Task {
+                    let hits = await model.search(query)
+                    guard !Task.isCancelled else { return }
+                    searchHits = hits
+                }
             }
+            #else
+            path = []
+            model.searchQuery = query
             #endif
         case .createPatchwork(let preferredType, let toolId, let folderUrl):
             patchworkCreateRequest = PatchworkCreateRequest(
@@ -337,43 +359,33 @@ struct ContentView: View {
         }
         .searchable(text: $searchText, isPresented: $searchPresented, placement: .sidebar, prompt: "Search notes")
         .searchFocused($searchFocused)
-        .toolbar {
-            ToolbarItem {
-                Menu {
-                    Button("Note") { model.createNote(snap: contextTracker.snapshot) }
-                    Button("Folder") { model.createFolder() }
-                    if PatchworkWeb.available {
-                        Button("Patchwork Doc…") {
-                            patchworkCreateRequest = PatchworkCreateRequest(
-                                preferredType: nil,
-                                toolId: nil,
-                                folderUrl: model.folderUrl
-                            )
-                        }
-                    }
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                } primaryAction: {
-                    model.createNote(snap: contextTracker.snapshot)
-                }
-                .disabled(model.folderUrl == nil)
-            }
-        }
         .onChange(of: searchText) {
             model.searchQuery = searchText
             searchTask?.cancel()
-            searchTask = Task { searchHits = await model.search(searchText) }
+            searchTask = Task {
+                let hits = await model.search(searchText)
+                guard !Task.isCancelled else { return }
+                searchHits = hits
+            }
         }
         .onChange(of: model.notes) {
             if !searchText.isEmpty {
                 searchTask?.cancel()
-                searchTask = Task { searchHits = await model.search(searchText) }
+                searchTask = Task {
+                    let hits = await model.search(searchText)
+                    guard !Task.isCancelled else { return }
+                    searchHits = hits
+                }
             }
         }
         .onChange(of: model.folderTree) {
             if !searchText.isEmpty {
                 searchTask?.cancel()
-                searchTask = Task { searchHits = await model.search(searchText) }
+                searchTask = Task {
+                    let hits = await model.search(searchText)
+                    guard !Task.isCancelled else { return }
+                    searchHits = hits
+                }
             }
         }
         .onKeyPress(.return) {
@@ -408,34 +420,6 @@ struct ContentView: View {
         }
         .focused($sidebarFocused)
         .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 6) {
-                if model.loggedIn {
-                    if let data = model.contactAvatarData, let image = PImage(data: data) {
-                        Image(pImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 16, height: 16)
-                            .clipShape(Circle())
-                    }
-                    if let name = model.contactName, !name.isEmpty {
-                        Text(name)
-                            .font(.caption)
-                            .fontWeight(.medium)
-                    }
-                }
-                Circle()
-                    .fill(model.connected ? Color.green : Color.orange)
-                    .frame(width: 8, height: 8)
-                Text(model.connected ? "Connected to Sync Server" : "Offline")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(.bar)
-        }
     }
 
     private func focusCurrentNoteSearch() {
@@ -635,7 +619,9 @@ struct ContentView: View {
     @ViewBuilder
     private func folderContextMenu(for node: FolderNode) -> some View {
         Menu("New") {
-            Button("Note") { model.createNote(inFolder: node.url) }
+            Button("Note") {
+                Task { if let url = await model.createNote(inFolder: node.url) { open(url) } }
+            }
             Button("Folder") { model.createSubfolder(in: node.url) }
         }
         if !model.rootFolderUrls.contains(node.url) {
@@ -733,12 +719,10 @@ struct ContentView: View {
         HSplitView {
             Group {
                 if let url = model.selectedNoteUrl {
-                    detailContent(for: url)
-                } else if !model.status.isEmpty {
-                    ContentUnavailableView {
-                        Label("Note", systemImage: "doc.richtext")
-                    } description: {
-                        Text(model.status)
+                    if model.core == nil {
+                        BootNoteSnapshotView(url: url)
+                    } else {
+                        detailContent(for: url)
                     }
                 } else {
                     ContentUnavailableView(
@@ -765,7 +749,9 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Menu {
-                    Button("Note") { model.createNote(snap: contextTracker.snapshot) }
+                    Button("Note") {
+                        Task { if let url = await model.createNote(snap: contextTracker.snapshot) { open(url) } }
+                    }
                     Button("Folder") { model.createFolder() }
                     if PatchworkWeb.available {
                         Button("Patchwork Doc…") {
@@ -779,7 +765,7 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "square.and.pencil")
                 } primaryAction: {
-                    model.createNote(snap: contextTracker.snapshot)
+                    Task { if let url = await model.createNote(snap: contextTracker.snapshot) { open(url) } }
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -790,14 +776,17 @@ struct ContentView: View {
     private func detailContent(for url: String) -> some View {
         let node = model.node(for: url)
         let isPatchwork = model.patchworkDocUrls.contains(url)
+        // Checked-out drafts redirect the editor to the draft's clone; the
+        // sidebar, node and title all keep speaking about the origin url.
+        let resolved = model.resolvedNoteUrl(url)
         if node == nil, isPatchwork {
             // Known patchwork doc: open directly, no need to wait for the tree.
-            PatchworkDetail(docUrl: url)
+            PatchworkDetail(docUrl: url, historyVersion: selectedHistoryEntry, rightSidebarVisible: $rightSidebarVisible)
                 .id(url)
         } else if node == nil, url.hasPrefix("automerge:") {
             // A doc url is enough to load the editor; the tree catches up.
             NoteDetail(
-                noteUrl: url,
+                noteUrl: resolved,
                 historyVersion: selectedHistoryEntry,
                 rightSidebarVisible: $rightSidebarVisible
             )
@@ -811,12 +800,12 @@ struct ContentView: View {
             // No .id here: the editor swaps documents through EditorCore.switchTo,
             // which keeps the text view, its layout manager and the asset cache.
             NoteDetail(
-                noteUrl: url,
+                noteUrl: resolved,
                 historyVersion: selectedHistoryEntry,
                 rightSidebarVisible: $rightSidebarVisible
             )
         } else {
-            PatchworkDetail(docUrl: url)
+            PatchworkDetail(docUrl: url, historyVersion: selectedHistoryEntry, rightSidebarVisible: $rightSidebarVisible)
                 .id(url)
         }
     }
@@ -1132,11 +1121,17 @@ struct FolderScreen: View {
         ) { item, activity in
             LushHandoff.configure(activity, item: item)
         }
-        .searchable(text: $searchText, prompt: "Search notes")
         .onChange(of: searchText) {
             model.searchQuery = searchText
             searchTask?.cancel()
-            searchTask = Task { searchHits = await model.search(searchText) }
+            searchTask = Task {
+                let hits = await model.search(searchText)
+                guard !Task.isCancelled else { return }
+                searchHits = hits
+            }
+        }
+        .onChange(of: model.searchQuery) {
+            if searchText != model.searchQuery { searchText = model.searchQuery }
         }
         .onAppear {
             if UserDefaults.standard.object(forKey: Self.pinnedExpandedKey) != nil {
@@ -1166,12 +1161,33 @@ struct FolderScreen: View {
             }
         }
         .safeAreaInset(edge: .bottom) {
-            HStack {
-                Spacer()
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                        .font(.system(size: 15))
+                    TextField("Search notes", text: $searchText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if !searchText.isEmpty {
+                        Button { searchText = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+
                 Menu {
                     Button {
-                        model.createNote(snap: contextTracker.snapshot)
-                        if let url = model.selectedNoteUrl { push(.note(url)) }
+                        Task {
+                            if let url = await model.createNote(snap: contextTracker.snapshot) {
+                                push(.note(url))
+                            }
+                        }
                     } label: {
                         Label("Note", systemImage: "square.and.pencil")
                     }
@@ -1185,16 +1201,18 @@ struct FolderScreen: View {
                 } label: {
                     Image(systemName: "square.and.pencil")
                         .font(.title2)
-                        .padding(16)
-                        .background(.regularMaterial, in: Circle())
                 } primaryAction: {
-                    model.createNote(snap: contextTracker.snapshot)
-                    if let url = model.selectedNoteUrl { push(.note(url)) }
+                    Task {
+                        if let url = await model.createNote(snap: contextTracker.snapshot) {
+                            push(.note(url))
+                        }
+                    }
                 }
                 .disabled(model.folderUrl == nil)
-                .padding(.trailing)
             }
-            .padding(.bottom, 8)
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            .background(.bar)
         }
         .sheet(isPresented: $showingNewPatchwork) {
             NewPatchworkDocSheet { url, _ in
@@ -1252,7 +1270,9 @@ struct FolderScreen: View {
         }
         if node.kind == "folder" {
             Menu("New") {
-                Button("Note") { model.createNote(inFolder: node.url) }
+                Button("Note") {
+                    Task { if let url = await model.createNote(inFolder: node.url) { push(.note(url)) } }
+                }
                 Button("Folder") { model.createSubfolder(in: node.url) }
             }
         }
@@ -1411,6 +1431,17 @@ private struct ResolvingDocumentView: View {
         }
     }
 }
+#endif
+
+private extension Color {
+    static var controlCard: Color {
+        #if os(macOS)
+        Color(nsColor: .controlBackgroundColor)
+        #else
+        Color(uiColor: .secondarySystemBackground)
+        #endif
+    }
+}
 
 struct RightSidebarView: View {
     let url: String
@@ -1419,18 +1450,28 @@ struct RightSidebarView: View {
     @Binding var selectedEntry: DocHistoryEntry?
 
     @Environment(NotesModel.self) private var model
-    @State private var history = DocumentHistorySummary(changeCount: 0, heads: [], modified: nil, entries: [])
+    @State private var history = DocumentHistorySummary(changeCount: 0, heads: [], modified: nil, entries: [], pendingEntries: [])
     @State private var revertingHash: String?
     @State private var historyRefreshTask: Task<Void, Never>?
+    @State private var mainExpanded = true
 
     private var selectedHistoryHash: String? {
         selectedEntry?.hash
     }
 
+    private var availableTabs: [RightSidebarTab] {
+        RightSidebarTab.allCases.filter { tab in
+            switch tab {
+            case .outline, .canvas: model.activeEditor != nil
+            case .history, .info, .chat: node != nil
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             Picker("", selection: $selectedTab) {
-                ForEach(RightSidebarTab.allCases) { tab in
+                ForEach(availableTabs) { tab in
                     Image(systemName: tab.icon)
                         .help(tab.rawValue)
                         .tag(tab)
@@ -1439,6 +1480,11 @@ struct RightSidebarView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .padding(10)
+            .onChange(of: availableTabs) {
+                if !availableTabs.contains(selectedTab) {
+                    selectedTab = availableTabs.first ?? .info
+                }
+            }
 
             Divider()
 
@@ -1452,7 +1498,7 @@ struct RightSidebarView: View {
             case .info:
                 infoView
             case .chat:
-                NoteChatView(url: url, node: node)
+                NoteChatView(url: model.resolvedNoteUrl(url), node: node)
             }
         }
         .background(.regularMaterial)
@@ -1461,6 +1507,12 @@ struct RightSidebarView: View {
             await refreshHistory()
         }
         .onChange(of: model.previews[url]) {
+            scheduleHistoryRefresh()
+        }
+        .onChange(of: model.syncLog.count) {
+            scheduleHistoryRefresh()
+        }
+        .onChange(of: model.docVersions[url]) {
             scheduleHistoryRefresh()
         }
         .onChange(of: selectedTab) { _, tab in
@@ -1476,31 +1528,110 @@ struct RightSidebarView: View {
     }
 
     private var historyView: some View {
-        ScrollView {
+        let checkedOut = model.checkedOutDrafts[url]
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 10) {
+                if !history.pendingEntries.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Label("Future", systemImage: "clock.badge")
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            Text("\(history.pendingChangeCount) \(history.pendingChangeCount == 1 ? "change" : "changes")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 9)
+
+                        ChangesListView(
+                            entries: history.pendingEntries,
+                            selectedHash: selectedHistoryHash,
+                            onScrub: { entry in selectedEntry = entry }
+                        )
+                    }
+                    .padding(.vertical, 9)
+                    .background(Color.controlCard)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                    }
+                }
+
                 HistoryCurrentRow(
                     changeCount: history.changeCount,
                     modified: history.modified,
-                    isSelected: selectedHistoryHash == nil
-                ) {
-                    selectedEntry = nil
+                    isSelected: selectedHistoryHash == nil && checkedOut == nil,
+                    action: {
+                        selectedEntry = nil
+                        if checkedOut != nil {
+                            Task { await model.checkOutDraft(nil, for: url) }
+                        }
+                    },
+                    isExpanded: mainExpanded,
+                    onToggle: { withAnimation(.easeOut(duration: 0.15)) { mainExpanded.toggle() } }
+                )
+
+                if mainExpanded, checkedOut == nil {
+                    ChangesListView(
+                        entries: history.entries,
+                        selectedHash: selectedHistoryHash,
+                        revertingHash: revertingHash,
+                        onScrub: { entry in selectedEntry = entry },
+                        onRevert: { entry in
+                            revertingHash = entry.hash
+                            Task {
+                                await model.revertNote(url, to: entry.heads)
+                                await refreshHistory()
+                                selectedEntry = nil
+                                revertingHash = nil
+                            }
+                        },
+                        onCreateDraft: { entry in
+                            Task {
+                                if let draft = await model.createDraftAt(for: url, heads: entry.heads) {
+                                    selectedEntry = nil
+                                    await model.checkOutDraft(draft, for: url)
+                                }
+                            }
+                        }
+                    )
                 }
 
-                HistoryTimelineView(
-                    entries: history.entries,
-                    selectedHash: selectedHistoryHash,
-                    revertingHash: revertingHash,
-                    onSelect: { entry in selectedEntry = entry },
-                    onRevert: { entry in
-                        revertingHash = entry.hash
+                ForEach(model.draftLists[url]?.drafts ?? []) { draft in
+                    DraftCardView(
+                        host: url,
+                        draft: draft,
+                        isCheckedOut: checkedOut == draft.url,
+                        selectedEntry: $selectedEntry
+                    )
+                }
+
+                if let checkedOut {
+                    Button {
                         Task {
-                            await model.revertNote(url, to: entry.heads)
-                            await refreshHistory()
                             selectedEntry = nil
-                            revertingHash = nil
+                            await model.mergeDraft(checkedOut, for: url)
+                            await refreshHistory()
                         }
+                    } label: {
+                        Label("Merge into Main", systemImage: "arrow.triangle.merge")
+                            .frame(maxWidth: .infinity)
                     }
-                )
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    Button {
+                        Task {
+                            if let draft = await model.createDraft(for: url) {
+                                selectedEntry = nil
+                                await model.checkOutDraft(draft, for: url)
+                            }
+                        }
+                    } label: {
+                        Label("New Draft", systemImage: "arrow.branch")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1538,12 +1669,224 @@ struct RightSidebarView: View {
     }
 
     private func refreshHistory() async {
+        await model.refreshDrafts(for: url)
         let summary = await model.documentHistorySummary(url: url)
         guard !Task.isCancelled else { return }
         history = summary
-        if let selectedHistoryHash, !summary.entries.contains(where: { $0.hash == selectedHistoryHash }) {
+        if model.checkedOutDrafts[url] == nil, let selectedHistoryHash,
+           !summary.entries.contains(where: { $0.hash == selectedHistoryHash }),
+           !summary.pendingEntries.contains(where: { $0.hash == selectedHistoryHash }) {
             selectedEntry = nil
         }
+    }
+}
+
+private struct DraftCardView: View {
+    let host: String
+    let draft: DraftInfo
+    let isCheckedOut: Bool
+    @Binding var selectedEntry: DocHistoryEntry?
+
+    @Environment(NotesModel.self) private var model
+    @State private var entries: [DocHistoryEntry] = []
+    @State private var memberEntries: [String: [DocHistoryEntry]] = [:]
+    @State private var scrubHash: String?
+    @State private var checkpointTask: Task<Void, Never>?
+    @State private var renaming = false
+    @State private var renameText = ""
+    @State private var expanded = false
+    @State private var revertingHash: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 0) {
+                Button {
+                    selectedEntry = nil
+                    if !isCheckedOut {
+                        Task { await model.checkOutDraft(draft.url, for: host) }
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text(draft.displayName)
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            if isCheckedOut {
+                                Text("checked out")
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.tint.opacity(0.16), in: Capsule())
+                            }
+                        }
+                        Text(draft.cloneUrl == nil ? "No changes yet" : "\(entries.count) changes")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .padding(10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(expanded ? "Collapse changes" : "Show changes")
+            }
+            .background(isCheckedOut ? Color.accentColor.opacity(0.14) : .controlCard)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isCheckedOut ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: 1)
+            }
+            .contextMenu {
+                Button("Rename…") {
+                    renameText = draft.name ?? ""
+                    renaming = true
+                }
+            }
+
+            if expanded {
+                ScrollView {
+                    ChangesListView(
+                        entries: entries,
+                        selectedHash: isCheckedOut ? scrubHash : nil,
+                        interactive: isCheckedOut,
+                        revertingHash: revertingHash,
+                        onScrub: { entry in
+                            scrubHash = entry?.hash
+                            selectedEntry = entry.flatMap(hostPin)
+                            scheduleCheckpoint(entry)
+                        },
+                        onActivate: {
+                            selectedEntry = nil
+                            Task { await model.checkOutDraft(draft.url, for: host) }
+                        },
+                        onRevert: { entry in
+                            guard let clone = draft.cloneUrl, let pin = hostPin(entry) else { return }
+                            revertingHash = entry.hash
+                            Task {
+                                await model.revertNote(clone, to: pin.heads)
+                                await refreshEntries()
+                                selectedEntry = nil
+                                scrubHash = nil
+                                revertingHash = nil
+                            }
+                        }
+                    )
+                }
+                .frame(maxHeight: 220)
+                .padding(.leading, 4)
+            }
+        }
+        .onChange(of: selectedEntry == nil) { _, cleared in
+            if cleared, scrubHash != nil {
+                scrubHash = nil
+                if isCheckedOut { scheduleCheckpoint(nil) }
+            }
+        }
+        .alert("Rename Draft", isPresented: $renaming) {
+            TextField("Name", text: $renameText)
+            Button("Rename") {
+                Task { await model.renameDraft(draft.url, name: renameText) }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .task(id: refreshKey) { await refreshEntries() }
+        .onChange(of: draft.members.map { model.docVersions[$0.cloneUrl] ?? 0 }) {
+            Task { await refreshEntries() }
+        }
+        .onChange(of: isCheckedOut) { _, checkedOut in
+            if checkedOut { withAnimation(.easeOut(duration: 0.15)) { expanded = true } }
+        }
+        .onAppear {
+            if isCheckedOut { expanded = true }
+        }
+    }
+
+    private var refreshKey: String {
+        let clones = draft.members.map(\.cloneUrl).joined(separator: ",")
+        return "\(draft.url)|\(clones)|\(isCheckedOut)"
+    }
+
+    /// All member docs' changes since their fork points, interleaved newest
+    /// first (time, then per-doc seq as the same-second tiebreak) — mimi's
+    /// collectInterleavedChanges ordering.
+    private func refreshEntries() async {
+        func newestFirst(_ a: DocHistoryEntry, _ b: DocHistoryEntry) -> Bool {
+            a.time == b.time ? a.seq > b.seq : a.time > b.time
+        }
+        var perMember: [String: [DocHistoryEntry]] = [:]
+        for member in draft.members {
+            perMember[member.cloneUrl] = await model
+                .draftEntries(cloneUrl: member.cloneUrl, since: member.clonedAt)
+                .sorted(by: newestFirst)
+        }
+        guard !Task.isCancelled else { return }
+        entries = perMember.values.flatMap { $0 }.sorted { a, b in
+            a.time == b.time ? a.seq < b.seq : a.time < b.time
+        }
+        memberEntries = perMember
+    }
+
+    /// One member's version at a scrub position (patchwork's
+    /// computeCheckpoint): the change itself when that member owns it,
+    /// otherwise its latest change at or before it. nil when it has nothing
+    /// that early — it didn't exist yet, so it renders live.
+    private func pin(_ entry: DocHistoryEntry, in list: [DocHistoryEntry]) -> DocHistoryEntry? {
+        if list.contains(where: { $0.hash == entry.hash }) { return entry }
+        return list.first { $0.time <= entry.time }
+    }
+
+    private func checkpointPins(for entry: DocHistoryEntry) -> [CheckpointPin] {
+        draft.members.compactMap { member in
+            pin(entry, in: memberEntries[member.cloneUrl] ?? []).map {
+                CheckpointPin(originalUrl: member.originalUrl, heads: [$0.hash])
+            }
+        }
+    }
+
+    /// Debounced so a scrub drag writes the checkout doc at a sane rate;
+    /// the model chains writes per host so they land in order.
+    private func scheduleCheckpoint(_ entry: DocHistoryEntry?) {
+        let pins = entry.map(checkpointPins)
+        checkpointTask?.cancel()
+        checkpointTask = Task {
+            try? await Task.sleep(for: .milliseconds(80))
+            guard !Task.isCancelled else { return }
+            await model.setDraftCheckpoint(host: host, pins: pins)
+        }
+    }
+
+    /// The version of the *displayed* doc (the host's clone) a scrub position
+    /// means, falling back to the fork point when the scrub sits before the
+    /// host clone's first change.
+    private func hostPin(_ entry: DocHistoryEntry) -> DocHistoryEntry? {
+        if let clone = draft.cloneUrl,
+           let pinned = pin(entry, in: memberEntries[clone] ?? []) {
+            return pinned
+        }
+        guard let clonedAt = draft.clonedAt, !clonedAt.isEmpty else { return nil }
+        return DocHistoryEntry(
+            hash: "fork:" + clonedAt.joined(separator: ","),
+            heads: clonedAt,
+            time: entry.time,
+            actor: "",
+            seq: 0,
+            message: nil,
+            deps: clonedAt,
+            additions: 0,
+            deletions: 0
+        )
     }
 }
 
@@ -1552,167 +1895,311 @@ private struct HistoryCurrentRow: View {
     let modified: Date?
     let isSelected: Bool
     let action: () -> Void
+    var isExpanded: Bool? = nil
+    var onToggle: (() -> Void)? = nil
 
     var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text("Main")
-                        .font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Text("live")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.tint.opacity(0.16), in: Capsule())
-                }
-                HStack(spacing: 8) {
-                    Text("\(changeCount) changes")
-                    if let modified {
-                        Text("Updated \(modified, style: .relative)")
+        HStack(spacing: 0) {
+            Button(action: action) {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack {
+                        Text("Main")
+                            .font(.system(size: 13, weight: .semibold))
+                        Spacer()
+                        Text("live")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(.tint.opacity(0.16), in: Capsule())
                     }
+                    HStack(spacing: 8) {
+                        Text("\(changeCount) changes")
+                        if let modified {
+                            Text("Updated \(modified, style: .relative)")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .padding(9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(9)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(isSelected ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: 1)
+            .buttonStyle(.plain)
+
+            if let isExpanded, let onToggle {
+                Button(action: onToggle) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .padding(10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse changes" : "Show changes")
             }
         }
-        .buttonStyle(.plain)
+        .background(isSelected ? Color.accentColor.opacity(0.14) : .controlCard)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isSelected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: 1)
+        }
     }
 }
 
-private struct HistoryTimelineView: View {
+/// Patchwork's draft-changes timeline: activity bursts (≤60 s apart) as
+/// single rows — author dots, time, +/− counts — with a scrubber token in
+/// the left gutter. The token's line marks the version being looked at;
+/// dragging it snaps per individual change, interpolated across each
+/// group's row, so mid-group versions are reachable. Above the top = live.
+private struct ChangesListView: View {
     let entries: [DocHistoryEntry]
     let selectedHash: String?
-    let revertingHash: String?
-    let onSelect: (DocHistoryEntry) -> Void
-    let onRevert: (DocHistoryEntry) -> Void
+    var interactive = true
+    var revertingHash: String? = nil
+    let onScrub: (DocHistoryEntry?) -> Void
+    var onActivate: (() -> Void)? = nil
+    var onRevert: ((DocHistoryEntry) -> Void)? = nil
+    var onCreateDraft: ((DocHistoryEntry) -> Void)? = nil
 
-    private var groups: [HistoryGroup] {
-        HistoryGroup.groups(from: entries)
+    private static let rowHeight: CGFloat = 30
+    private static let rowSpacing: CGFloat = 4
+    private static let gutterWidth: CGFloat = 16
+
+    private var groups: [ChangeGroup] {
+        ChangeGroup.groups(from: entries).filter { $0.additions > 0 || $0.deletions > 0 }
     }
 
     var body: some View {
-        if entries.isEmpty {
-            Text("No local history yet.")
+        let groups = groups
+        let visible = groups.flatMap(\.entries)
+        let headIndex = interactive
+            ? selectedHash.flatMap { hash in visible.firstIndex { $0.hash == hash } }
+            : nil
+        if groups.isEmpty {
+            Text("No changes yet.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.vertical, 8)
         } else {
-            HStack(alignment: .top, spacing: 7) {
-                HistoryScrubber(count: entries.count)
-                    .padding(.top, 9)
-                LazyVStack(alignment: .leading, spacing: 5) {
-                    ForEach(groups) { group in
-                        HistoryGroupRow(
-                            group: group,
-                            selectedHash: selectedHash,
-                            revertingHash: revertingHash,
-                            onSelect: onSelect,
-                            onRevert: onRevert
-                        )
-                    }
+            let tokenY = Self.yForIndex(headIndex ?? 0, groups: groups)
+            ZStack(alignment: .topLeading) {
+                if interactive, headIndex != nil {
+                    Rectangle()
+                        .fill(Color.accentColor.opacity(0.7))
+                        .frame(height: 1.5)
+                        .offset(y: tokenY)
                 }
-            }
-        }
-    }
-}
-
-private struct HistoryScrubber: View {
-    let count: Int
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Circle()
-                .fill(.secondary)
-                .frame(width: 8, height: 8)
-            Rectangle()
-                .fill(.secondary.opacity(0.25))
-                .frame(width: 2)
-            Circle()
-                .fill(.secondary.opacity(0.55))
-                .frame(width: 6, height: 6)
-        }
-        .frame(width: 14)
-        .frame(minHeight: CGFloat(max(count, 1)) * 20)
-    }
-}
-
-private struct HistoryGroupRow: View {
-    let group: HistoryGroup
-    let selectedHash: String?
-    let revertingHash: String?
-    let onSelect: (DocHistoryEntry) -> Void
-    let onRevert: (DocHistoryEntry) -> Void
-
-    var body: some View {
-        LazyVStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text(group.title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text("\(group.entries.count)")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-            }
-
-            ForEach(group.entries, id: \.hash) { entry in
-                Button {
-                    onSelect(entry)
-                } label: {
-                    HStack(spacing: 7) {
-                        Circle()
-                            .fill(entry.hash == selectedHash ? Color.accentColor : Color.secondary.opacity(0.35))
-                            .frame(width: 7, height: 7)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text(entry.message?.isEmpty == false ? entry.message! : "Change \(entry.seq)")
-                                    .lineLimit(1)
-                                Spacer()
-                                Text(entry.date, style: .time)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(entry.hash.shortHash)
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
-                        if entry.hash == selectedHash {
-                            Button {
-                                onRevert(entry)
-                            } label: {
-                                if revertingHash == entry.hash {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                } else {
-                                    Image(systemName: "arrow.uturn.backward.circle")
+                HStack(alignment: .top, spacing: 5) {
+                    Color.clear
+                        .frame(width: Self.gutterWidth)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0, coordinateSpace: .named("changesTrack"))
+                                .onChanged { value in
+                                    guard interactive else { return }
+                                    let index = Self.indexForY(value.location.y, groups: groups, count: visible.count)
+                                    if let index { onScrub(visible[index]) } else { onScrub(nil) }
                                 }
-                            }
-                            .buttonStyle(.borderless)
-                            .help("Revert document to this point")
+                        )
+                    VStack(spacing: Self.rowSpacing) {
+                        ForEach(groups) { group in
+                            row(group)
                         }
                     }
-                    .font(.caption)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 6)
-                    .background(entry.hash == selectedHash ? Color.accentColor.opacity(0.12) : Color.clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                .buttonStyle(.plain)
+                if interactive {
+                    scrubToken(headIndex: headIndex, visible: visible, groups: groups, tokenY: tokenY)
+                }
+                if interactive, let headIndex, let head = visible[safe: headIndex] {
+                    sticker(for: head)
+                        .offset(y: tokenY + 3)
+                }
+            }
+            .coordinateSpace(name: "changesTrack")
+        }
+    }
+
+    private func row(_ group: ChangeGroup) -> some View {
+        let isSelected = interactive && group.entries.contains { $0.hash == selectedHash }
+        return Button {
+            if interactive {
+                onScrub(group.newest)
+            } else {
+                onActivate?()
+            }
+        } label: {
+            HStack(spacing: 6) {
+                ActorDots(actors: group.actors)
+                Text(group.endDate, format: .dateTime.month(.abbreviated).day().hour().minute())
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                if group.additions > 0 {
+                    Text("+\(group.additions)")
+                        .foregroundStyle(.green)
+                }
+                if group.deletions > 0 {
+                    Text("−\(group.deletions)")
+                        .foregroundStyle(.red)
+                }
+            }
+            .font(.caption)
+            .monospacedDigit()
+            .lineLimit(1)
+            .padding(.horizontal, 7)
+            .frame(height: Self.rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isSelected ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            if let onCreateDraft {
+                let entry = group.entries.first { $0.hash == selectedHash } ?? group.newest
+                Button {
+                    onCreateDraft(entry)
+                } label: {
+                    Label("New Draft from Here", systemImage: "arrow.branch")
+                }
             }
         }
+    }
+
+    private func scrubToken(
+        headIndex: Int?,
+        visible: [DocHistoryEntry],
+        groups: [ChangeGroup],
+        tokenY: CGFloat
+    ) -> some View {
+        Circle()
+            .fill(headIndex == nil ? Color.secondary.opacity(0.6) : Color.accentColor)
+            .frame(width: 9, height: 9)
+            .padding(6)
+            .contentShape(Rectangle())
+            .offset(x: (Self.gutterWidth - 21) / 2, y: tokenY - 10.5)
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .named("changesTrack"))
+                    .onChanged { value in
+                        let index = Self.indexForY(value.location.y, groups: groups, count: visible.count)
+                        guard index != headIndex else { return }
+                        if let index {
+                            onScrub(visible[index])
+                        } else {
+                            onScrub(nil)
+                        }
+                    }
+            )
+            .help("Drag to scrub through history")
+    }
+
+    /// The exact version the token line sits on, floated at the line's right
+    /// end, with the way back into the doc (revert).
+    private func sticker(for head: DocHistoryEntry) -> some View {
+        HStack(spacing: 5) {
+            Text(head.date, format: .dateTime.hour().minute().second())
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+            if let onRevert {
+                Button {
+                    onRevert(head)
+                } label: {
+                    if revertingHash == head.hash {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.uturn.backward.circle")
+                            .font(.system(size: 11))
+                    }
+                }
+                .buttonStyle(.borderless)
+                .help("Revert document to this point")
+            }
+        }
+        .padding(.horizontal, 6)
         .padding(.vertical, 3)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.accentColor.opacity(0.4), lineWidth: 1))
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .allowsHitTesting(onRevert != nil)
+    }
+
+    private static func yForIndex(_ index: Int, groups: [ChangeGroup]) -> CGFloat {
+        var start = 0
+        var top: CGFloat = 0
+        for group in groups {
+            if index < start + group.entries.count {
+                let offset = CGFloat(index - start) / CGFloat(group.entries.count)
+                return top + offset * rowHeight
+            }
+            start += group.entries.count
+            top += rowHeight + rowSpacing
+        }
+        return max(0, top - rowSpacing)
+    }
+
+    /// nil = dragged above the top: back to live.
+    private static func indexForY(_ y: CGFloat, groups: [ChangeGroup], count: Int) -> Int? {
+        if y < -10 { return nil }
+        var start = 0
+        var top: CGFloat = 0
+        for group in groups {
+            if y < top + rowHeight {
+                let slot = ((y - top) / rowHeight * CGFloat(group.entries.count)).rounded(.down)
+                return min(max(start, start + Int(slot)), start + group.entries.count - 1)
+            }
+            top += rowHeight + rowSpacing
+            start += group.entries.count
+        }
+        return max(0, count - 1)
+    }
+}
+
+/// Deduped author dots, newest contributor first, patchwork-style overlap.
+private struct ActorDots: View {
+    let actors: [String]
+
+    var body: some View {
+        HStack(spacing: -4) {
+            ForEach(Array(actors.prefix(3).enumerated()), id: \.offset) { index, actor in
+                Circle()
+                    .fill(PresenceManager.swatch(PresenceManager.stableColor(for: actor)))
+                    .frame(width: 13, height: 13)
+                    .overlay(Circle().stroke(Color.controlCard, lineWidth: 1.5))
+                    .zIndex(Double(3 - index))
+            }
+            if actors.count > 3 {
+                Text("+\(actors.count - 3)")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 6)
+            }
+        }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 
 #if os(macOS)
+private struct BootNoteSnapshotView: View {
+    let url: String
+    @Environment(NotesModel.self) private var model
+    @State private var attributed = NSAttributedString(string: "")
+
+    var body: some View {
+        HistorySnapshotTextView(attributed: attributed)
+            .opacity(0.5)
+            .task(id: url) {
+                attributed = await model.renderedCurrentSnapshot(for: url)
+            }
+    }
+}
+
 private struct HistoricalNoteSnapshotView: View {
     let noteUrl: String
     let entry: DocHistoryEntry
@@ -1750,6 +2237,7 @@ private struct HistoricalNoteSnapshotView: View {
     }
 }
 
+#if os(macOS)
 private struct HistorySnapshotTextView: NSViewRepresentable {
     let attributed: NSAttributedString
 
@@ -1789,33 +2277,51 @@ private struct HistorySnapshotTextView: NSViewRepresentable {
     }
 }
 #endif
+#endif
 
-private struct HistoryGroup: Identifiable {
-    let id = UUID()
+/// One burst of activity: consecutive changes no more than 60 s apart,
+/// regardless of author. Entries are newest-first, matching patchwork's
+/// DraftsSidebar grouping.
+private struct ChangeGroup: Identifiable {
     let entries: [DocHistoryEntry]
+    let actors: [String]
+    let additions: Int
+    let deletions: Int
 
-    var title: String {
-        guard let first = entries.first else { return "Changes" }
-        return first.date.formatted(.dateTime.month(.abbreviated).day().hour().minute())
-    }
+    var newest: DocHistoryEntry { entries[0] }
+    var id: String { newest.hash }
+    var endDate: Date { newest.date }
 
-    static func groups(from entries: [DocHistoryEntry]) -> [HistoryGroup] {
-        let newestFirst = entries.reversed()
-        var groups: [HistoryGroup] = []
-        var current: [DocHistoryEntry] = []
+    static func groups(from entries: [DocHistoryEntry]) -> [ChangeGroup] {
+        var groups: [ChangeGroup] = []
+        var window: [DocHistoryEntry] = []
         var previous: Date?
-        for entry in newestFirst {
-            let date = entry.date
-            if let previous, abs(previous.timeIntervalSince(date)) > 60, !current.isEmpty {
-                groups.append(HistoryGroup(entries: current))
-                current = []
+
+        func flush() {
+            guard !window.isEmpty else { return }
+            var actors: [String] = []
+            var additions = 0
+            var deletions = 0
+            for entry in window {
+                if !actors.contains(entry.actor) { actors.append(entry.actor) }
+                additions += Int(entry.additions)
+                deletions += Int(entry.deletions)
             }
-            current.append(entry)
-            previous = date
+            groups.append(ChangeGroup(
+                entries: window,
+                actors: actors,
+                additions: additions,
+                deletions: deletions
+            ))
+            window = []
         }
-        if !current.isEmpty {
-            groups.append(HistoryGroup(entries: current))
+
+        for entry in entries.reversed() {
+            if let previous, previous.timeIntervalSince(entry.date) > 60 { flush() }
+            window.append(entry)
+            previous = entry.date
         }
+        flush()
         return groups
     }
 }
@@ -1832,7 +2338,6 @@ private extension String {
         return String(prefix(10))
     }
 }
-#endif
 
 /// Pick a destination folder by name — the tap-friendly stand-in for
 /// drag and drop.
@@ -1894,6 +2399,9 @@ struct NoteDetail: View {
     @State private var editorDropTargeted = false
     #if os(iOS)
     @State private var photoItems: [PhotosPickerItem] = []
+    @State private var showingInspector = false
+    @State private var inspectorTab: RightSidebarTab = .info
+    @State private var inspectorHistoryEntry: DocHistoryEntry?
     #endif
 
     private var currentNode: FolderNode? { model.node(for: noteUrl) }
@@ -1920,10 +2428,232 @@ struct NoteDetail: View {
     }
 
 
+    @ViewBuilder
+    private var draftBadge: some View {
+        if historyVersion == nil, let name = model.checkedOutDraftName(forClone: noteUrl) {
+            EditorStatusBadges(draftName: name, readOnly: false)
+        }
+    }
+
     private func joinPresence() {
         if historyVersion == nil {
             model.presence.join(noteUrl)
         }
+    }
+
+    private func leavePresence() {
+        if model.presence.docUrl == noteUrl {
+            model.presence.leave()
+        }
+    }
+
+    #if os(iOS)
+    private func handlePickedPhotos() {
+        guard !photoItems.isEmpty else { return }
+        let items = photoItems
+        photoItems = []
+        Task {
+            for (offset, item) in items.enumerated() {
+                guard let data = try? await item.loadTransferable(type: Data.self) else {
+                    continue
+                }
+                let ext = item.supportedContentTypes.first?
+                    .preferredFilenameExtension ?? "png"
+                let stamp = Int(Date().timeIntervalSince1970)
+                editor.insertData(data, name: "photo-\(stamp)-\(offset).\(ext)")
+            }
+        }
+    }
+
+    private func handlePickedFile(_ result: Result<URL, Error>) {
+        guard case .success(let url) = result else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer {
+            if scoped { url.stopAccessingSecurityScopedResource() }
+        }
+        if let data = try? Data(contentsOf: url) {
+            editor.insertData(data, name: url.lastPathComponent)
+        }
+    }
+
+    private func handleCapturedImage(_ image: UIImage) {
+        guard let data = image.jpegData(compressionQuality: 0.85) else { return }
+        let stamp = Int(Date().timeIntervalSince1970)
+        editor.insertData(data, name: "photo-\(stamp).jpg")
+    }
+    #endif
+
+    @ToolbarContentBuilder
+    private var noteToolbar: some ToolbarContent {
+        #if os(macOS)
+        ToolbarItem {
+            Menu {
+                Button {
+                    editor.attachImageFromPanel()
+                } label: {
+                    Label("Choose Photo…", systemImage: "photo.on.rectangle")
+                }
+                Button {
+                    editor.recorderVisible.toggle()
+                } label: {
+                    Label("Record Audio", systemImage: "waveform")
+                }
+                Button {
+                    editor.attachFileFromPanel()
+                } label: {
+                    Label("Attach File…", systemImage: "doc")
+                }
+                Divider()
+                Button {
+                    editor.insertLogline()
+                } label: {
+                    Label("Logline", systemImage: "clock")
+                }
+                Button {
+                    editor.insertTable()
+                } label: {
+                    Label("Table", systemImage: "tablecells")
+                }
+                Button {
+                    editor.insertColumns()
+                } label: {
+                    Label("Columns", systemImage: "rectangle.split.2x1")
+                }
+                Button {
+                    editor.insertHtmlBlock()
+                } label: {
+                    Label("HTML Block", systemImage: "chevron.left.forwardslash.chevron.right")
+                }
+                Button {
+                    editor.insertPatchworkDoc()
+                } label: {
+                    Label("Patchwork Doc…", systemImage: "shippingbox")
+                }
+            } label: {
+                Label("Attach", systemImage: "paperclip")
+            }
+        }
+        ToolbarItem {
+            Menu {
+                ForEach(Highlight.names, id: \.self) { name in
+                    Button {
+                        editor.applyHighlight(name)
+                    } label: {
+                        if editor.highlightActive == name {
+                            Label(name.capitalized, systemImage: "checkmark")
+                        } else {
+                            Text(name.capitalized)
+                        }
+                    }
+                }
+                Divider()
+                Button("None") { editor.applyHighlight(nil) }
+            } label: {
+                Label("Highlight", systemImage: "highlighter")
+            }
+        }
+        #endif
+        #if os(macOS)
+        ToolbarItem {
+            Picker("Style", selection: styleBinding) {
+                ForEach(EditorController.styles, id: \.key) { style in
+                    Text(style.label).tag(style.key)
+                }
+            }
+            .pickerStyle(.menu)
+        }
+        if editor.isCodeBlockActive {
+            ToolbarItem {
+                Picker("Language", selection: languageBinding) {
+                    ForEach(CodeLanguage.all) { language in
+                        Text(language.name).tag(language.id)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+        }
+        #endif
+        ToolbarItem {
+            Menu {
+                if let node = currentNode {
+                    if node.kind == "lush" || node.kind == "rich" {
+                        Button(model.isPinned(noteUrl) ? "Unpin" : "Pin") {
+                            model.togglePin(noteUrl)
+                        }
+                        Button(model.quickNoteUrl == noteUrl ? "Unset Quick Note" : "Set as Quick Note") {
+                            model.setQuickNote(model.quickNoteUrl == noteUrl ? nil : noteUrl)
+                        }
+                        Divider()
+                    }
+                    if node.parentUrl != nil {
+                        Button("Move…") { moveTarget = MoveTarget(urls: [noteUrl]) }
+                    }
+                    Button("Rename") {
+                        renameText = node.name
+                        showingRename = true
+                    }
+                    Button("Copy Note URL") { Clipboard.copy(noteUrl) }
+                    if model.patchworkDocUrls.contains(noteUrl) || node.isPatchworkDoc {
+                        Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: noteUrl) }
+                        Button("Open in Patchwork") { model.openInPatchwork(noteUrl) }
+                    }
+                    #if os(macOS)
+                    Menu("Export") {
+                        Button("Export as HTML…") {
+                            let title = node.name
+                            Task {
+                                await NoteExporter.exportAndSave(
+                                    noteUrl: noteUrl,
+                                    title: title,
+                                    model: model
+                                )
+                            }
+                        }
+                    }
+                    #endif
+                    if node.parentUrl != nil {
+                        Divider()
+                        Button("Delete", role: .destructive) {
+                            model.removeEntry(parentUrl: node.parentUrl, url: noteUrl)
+                            #if os(macOS)
+                            model.selectedNoteUrl = nil
+                            #else
+                            dismiss()
+                            #endif
+                        }
+                    }
+                }
+            } label: {
+                Label("More", systemImage: "ellipsis")
+            }
+            .disabled(currentNode == nil)
+        }
+        ToolbarItem(placement: .primaryAction) {
+            FocusModeControl(model: model)
+        }
+        #if os(macOS)
+        ToolbarSpacer(.flexible)
+        ToolbarItem(placement: .primaryAction) {
+            PresenceFacesView(presence: model.presence)
+        }
+        ToolbarSpacer(.fixed)
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                rightSidebarVisible?.wrappedValue.toggle()
+            } label: {
+                Label("Info", systemImage: "info.circle")
+            }
+            .disabled(rightSidebarVisible == nil)
+        }
+        #else
+        ToolbarItem(placement: .primaryAction) {
+            Button {
+                showingInspector = true
+            } label: {
+                Label("Info", systemImage: "info.circle")
+            }
+        }
+        #endif
     }
 
     private func handleEditorDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -1952,7 +2682,7 @@ struct NoteDetail: View {
         return true
     }
 
-    var body: some View {
+    private var editorStack: some View {
         VStack(spacing: 0) {
             if editor.recorderVisible, historyVersion == nil {
                 RecorderBar(recorder: recorder) { data in
@@ -1982,6 +2712,7 @@ struct NoteDetail: View {
         .focusedSceneValue(\.editorController, editor)
         .overlay(alignment: .topTrailing) { findOverlay }
         .overlay(alignment: .trailing) { minimapOverlay }
+        .overlay(alignment: .topLeading) { draftBadge }
         .onChange(of: model.searchQuery) {
             editor.core?.updateGlobalMatches()
         }
@@ -2008,173 +2739,63 @@ struct NoteDetail: View {
             of: [UTType.plainText.identifier, UTType.fileURL.identifier],
             isTargeted: $editorDropTargeted
         ) { handleEditorDrop($0) }
-        .toolbar {
-            ToolbarItem {
-                Menu {
-                    Button {
-                        editor.attachImageFromPanel()
-                    } label: {
-                        Label("Choose Photo…", systemImage: "photo.on.rectangle")
-                    }
-                    #if os(iOS)
-                    if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                        Button {
-                            editor.cameraPickerVisible = true
-                        } label: {
-                            Label("Take Photo", systemImage: "camera")
-                        }
-                    }
-                    #endif
-                    Button {
-                        editor.recorderVisible.toggle()
-                    } label: {
-                        Label("Record Audio", systemImage: "waveform")
-                    }
-                    Button {
-                        editor.attachFileFromPanel()
-                    } label: {
-                        Label("Attach File…", systemImage: "doc")
-                    }
-                    Divider()
-                    Button {
-                        editor.insertLogline()
-                    } label: {
-                        Label("Logline", systemImage: "clock")
-                    }
-                    Button {
-                        editor.insertTable()
-                    } label: {
-                        Label("Table", systemImage: "tablecells")
-                    }
-                    Button {
-                        editor.insertColumns()
-                    } label: {
-                        Label("Columns", systemImage: "rectangle.split.2x1")
-                    }
-                    Button {
-                        editor.insertHtmlBlock()
-                    } label: {
-                        Label("HTML Block", systemImage: "chevron.left.forwardslash.chevron.right")
-                    }
-                    Button {
-                        editor.insertPatchworkDoc()
-                    } label: {
-                        Label("Patchwork Doc…", systemImage: "shippingbox")
-                    }
-                } label: {
-                    Label("Attach", systemImage: "paperclip")
-                }
-            }
-            ToolbarItem {
-                Menu {
-                    ForEach(Highlight.names, id: \.self) { name in
-                        Button {
-                            editor.applyHighlight(name)
-                        } label: {
-                            if editor.highlightActive == name {
-                                Label(name.capitalized, systemImage: "checkmark")
-                            } else {
-                                Text(name.capitalized)
-                            }
-                        }
-                    }
-                    Divider()
-                    Button("None") { editor.applyHighlight(nil) }
-                } label: {
-                    Label("Highlight", systemImage: "highlighter")
-                }
-            }
-            #if os(macOS)
-            ToolbarItem {
-                Picker("Style", selection: styleBinding) {
-                    ForEach(EditorController.styles, id: \.key) { style in
-                        Text(style.label).tag(style.key)
-                    }
-                }
-                .pickerStyle(.menu)
-            }
-            if editor.isCodeBlockActive {
-                ToolbarItem {
-                    Picker("Language", selection: languageBinding) {
-                        ForEach(CodeLanguage.all) { language in
-                            Text(language.name).tag(language.id)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                }
-            }
-            #endif
-            ToolbarItem {
-                Menu {
-                    if let node = currentNode {
-                        if node.kind == "lush" || node.kind == "rich" {
-                            Button(model.isPinned(noteUrl) ? "Unpin" : "Pin") {
-                                model.togglePin(noteUrl)
-                            }
-                            Button(model.quickNoteUrl == noteUrl ? "Unset Quick Note" : "Set as Quick Note") {
-                                model.setQuickNote(model.quickNoteUrl == noteUrl ? nil : noteUrl)
-                            }
-                            Divider()
-                        }
-                        if node.parentUrl != nil {
-                            Button("Move…") { moveTarget = MoveTarget(urls: [noteUrl]) }
-                        }
-                        Button("Rename") {
-                            renameText = node.name
-                            showingRename = true
-                        }
-                        Button("Copy Note URL") { Clipboard.copy(noteUrl) }
-                        if model.patchworkDocUrls.contains(noteUrl) || node.isPatchworkDoc {
-                            Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: noteUrl) }
-                            Button("Open in Patchwork") { model.openInPatchwork(noteUrl) }
-                        }
-                        #if os(macOS)
-                        Menu("Export") {
-                            Button("Export as HTML…") {
-                                let title = node.name
-                                Task {
-                                    await NoteExporter.exportAndSave(
-                                        noteUrl: noteUrl,
-                                        title: title,
-                                        model: model
-                                    )
-                                }
-                            }
-                        }
-                        #endif
-                        if node.parentUrl != nil {
-                            Divider()
-                            Button("Delete", role: .destructive) {
-                                model.removeEntry(parentUrl: node.parentUrl, url: noteUrl)
-                                #if os(macOS)
-                                model.selectedNoteUrl = nil
-                                #else
-                                dismiss()
-                                #endif
-                            }
-                        }
-                    }
-                } label: {
-                    Label("More", systemImage: "ellipsis.circle")
-                }
-                .disabled(currentNode == nil)
-            }
-            #if os(macOS)
-            ToolbarSpacer(.flexible)
-            ToolbarItem(placement: .primaryAction) {
-                PresenceFacesView(presence: model.presence)
-            }
-            ToolbarSpacer(.fixed)
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    rightSidebarVisible?.wrappedValue.toggle()
-                } label: {
-                    Label("Info", systemImage: "info.circle")
-                }
-            }
-            #endif
+    }
+
+    var body: some View {
+        #if os(iOS)
+        noteEditorBase
+        .photosPicker(
+            isPresented: Binding(
+                get: { editor.photoPickerVisible },
+                set: { editor.photoPickerVisible = $0 }
+            ),
+            selection: $photoItems,
+            maxSelectionCount: 12,
+            matching: .any(of: [.images, .videos])
+        )
+        .onChange(of: photoItems) {
+            handlePickedPhotos()
         }
+        .fileImporter(
+            isPresented: Binding(
+                get: { editor.filePickerVisible },
+                set: { editor.filePickerVisible = $0 }
+            ),
+            allowedContentTypes: [.item],
+            onCompletion: handlePickedFile
+        )
+        .sheet(isPresented: Binding(
+            get: { editor.cameraPickerVisible },
+            set: { editor.cameraPickerVisible = $0 }
+        )) {
+            CameraPicker(onCapture: handleCapturedImage)
+        }
+        .sheet(isPresented: $showingInspector) {
+            RightSidebarView(
+                url: noteUrl,
+                node: currentNode,
+                selectedTab: $inspectorTab,
+                selectedEntry: $inspectorHistoryEntry
+            )
+            .environment(model)
+        }
+        #else
+        noteEditorBase
+        #endif
+    }
+
+    private var noteEditorBase: some View {
+        editorStack
+        .toolbar { noteToolbar }
         .task(id: noteUrl) { joinPresence() }
+        .onChange(of: model.sharingPresence) { _, enabled in
+            if enabled {
+                joinPresence()
+            } else {
+                leavePresence()
+            }
+        }
+        .onDisappear(perform: leavePresence)
         .sheet(item: Binding(
             get: { editor.sheet },
             set: { editor.sheet = $0 }
@@ -2195,59 +2816,6 @@ struct NoteDetail: View {
         .sheet(item: $moveTarget) { target in
             MoveSheet(urls: target.urls).environment(model)
         }
-        #if os(iOS)
-        .photosPicker(
-            isPresented: Binding(
-                get: { editor.photoPickerVisible },
-                set: { editor.photoPickerVisible = $0 }
-            ),
-            selection: $photoItems,
-            maxSelectionCount: 12,
-            matching: .any(of: [.images, .videos])
-        )
-        .onChange(of: photoItems) {
-            guard !photoItems.isEmpty else { return }
-            let items = photoItems
-            photoItems = []
-            Task {
-                for (offset, item) in items.enumerated() {
-                    guard let data = try? await item.loadTransferable(type: Data.self) else {
-                        continue
-                    }
-                    let ext = item.supportedContentTypes.first?
-                        .preferredFilenameExtension ?? "png"
-                    let stamp = Int(Date().timeIntervalSince1970)
-                    editor.insertData(data, name: "photo-\(stamp)-\(offset).\(ext)")
-                }
-            }
-        }
-        .fileImporter(
-            isPresented: Binding(
-                get: { editor.filePickerVisible },
-                set: { editor.filePickerVisible = $0 }
-            ),
-            allowedContentTypes: [.item]
-        ) { result in
-            guard case .success(let url) = result else { return }
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer {
-                if scoped { url.stopAccessingSecurityScopedResource() }
-            }
-            if let data = try? Data(contentsOf: url) {
-                editor.insertData(data, name: url.lastPathComponent)
-            }
-        }
-        .sheet(isPresented: Binding(
-            get: { editor.cameraPickerVisible },
-            set: { editor.cameraPickerVisible = $0 }
-        )) {
-            CameraPicker { image in
-                guard let data = image.jpegData(compressionQuality: 0.85) else { return }
-                let stamp = Int(Date().timeIntervalSince1970)
-                editor.insertData(data, name: "photo-\(stamp).jpg")
-            }
-        }
-        #endif
     }
 
     #if os(macOS)
@@ -2266,6 +2834,81 @@ struct NoteDetail: View {
         )
     }
     #endif
+}
+
+private struct FocusModeControl: View {
+    @Bindable var model: NotesModel
+    @State private var showingOptions = false
+
+    private var partial: Bool {
+        !model.focusModeEnabled && (!model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence)
+    }
+
+    private var focusOptions: some View {
+        Group {
+            Toggle("Apply incoming changes", isOn: Binding(
+                get: { model.applyingIncomingChanges },
+                set: model.setApplyingIncomingChanges
+            ))
+            .disabled(model.changingIncomingChanges)
+            Toggle("Send my changes", isOn: Binding(
+                get: { model.sendingChanges },
+                set: model.setSendingChanges
+            ))
+            .disabled(model.changingSendingChanges)
+            Toggle("Share presence", isOn: Binding(
+                get: { model.sharingPresence },
+                set: model.setSharingPresence
+            ))
+        }
+    }
+
+    var body: some View {
+        #if os(macOS)
+        Button {
+            model.setFocusMode(!model.focusModeEnabled)
+        } label: {
+            Label("Focus", systemImage: model.focusModeEnabled ? "moon.fill" : "moon")
+                .overlay(alignment: .topTrailing) {
+                    if partial {
+                        Circle()
+                            .fill(Color.accentColor)
+                            .frame(width: 5, height: 5)
+                            .offset(x: 2, y: -2)
+                    }
+                }
+        }
+        .disabled(model.changingIncomingChanges || model.changingSendingChanges)
+        .help(model.focusModeEnabled ? "Leave Focus Mode" : "Enter Focus Mode")
+        .contextMenu { focusOptions }
+        #else
+        HStack(spacing: 2) {
+            Button {
+                model.setFocusMode(!model.focusModeEnabled)
+            } label: {
+                Label("Focus", systemImage: model.focusModeEnabled ? "moon.fill" : "moon")
+            }
+            .disabled(model.changingIncomingChanges || model.changingSendingChanges)
+            .help(model.focusModeEnabled ? "Leave Focus Mode" : "Enter Focus Mode")
+
+            Button {
+                showingOptions.toggle()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .help("Focus Options")
+            .popover(isPresented: $showingOptions, arrowEdge: .bottom) {
+                VStack(alignment: .leading, spacing: 12) {
+                    focusOptions
+                }
+                .toggleStyle(.switch)
+                .padding(14)
+                .frame(width: 250)
+            }
+        }
+        #endif
+    }
 }
 
 /// The Notes-style treatment behind the floating toolbar: the editor extends
@@ -2400,6 +3043,13 @@ private struct CanvasStashView: View {
                                 width: max(400, (cards.map(\.x).max() ?? 0) + 240),
                                 height: max(400, (cards.map(\.y).max() ?? 0) + 220)
                             )
+                            .contentShape(Rectangle())
+                            .gesture(
+                                SpatialTapGesture(count: 2)
+                                    .onEnded { value in
+                                        core.addBlankCardToCanvas(at: value.location)
+                                    }
+                            )
                         ForEach(cards) { card in
                             StashCardView(card: card, core: core)
                         }
@@ -2493,13 +3143,10 @@ private struct StashCardView: View {
                 .allowsHitTesting(false)
                 .clipped()
             HStack {
-                // dragging the grip carries the card into the note; dragging
-                // the body just repositions it on the canvas
-                Image(systemName: "arrow.up.left.square")
-                    .foregroundStyle(.tertiary)
-                    .imageScale(.small)
-                    .help("Drag into the note to return this paragraph")
-                    .onDrag { NSItemProvider(object: "lush-stash:\(card.location)" as NSString) }
+                Button("Return to Note") { core.unstashInPlace(at: card.location) }
+                    .font(.caption)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
                 Spacer()
             }
         }
@@ -2510,19 +3157,20 @@ private struct StashCardView: View {
         .shadow(color: .black.opacity(0.16), radius: 5, y: 3)
         .rotationEffect(tilt)
         .offset(x: card.x + dragOffset.width, y: card.y + dragOffset.height)
-        .gesture(
+        .simultaneousGesture(
             DragGesture()
                 .onChanged { dragOffset = $0.translation }
                 .onEnded { value in
-                    core.moveStash(card.box, to: CGPoint(
+                    core.moveStash(card, to: CGPoint(
                         x: card.x + value.translation.width,
                         y: card.y + value.translation.height
                     ))
                     dragOffset = .zero
                 }
         )
+        .onDrag { NSItemProvider(object: "lush-stash:\(card.location)" as NSString) }
         .contextMenu {
-            Button("Return to Note") { core.unstashInPlace(card.box) }
+            Button("Return to Note") { core.unstashInPlace(at: card.location) }
         }
     }
 }
@@ -2913,19 +3561,82 @@ struct FolderColumnBrowser: View {
     }
 }
 
+/// Floating "you are not looking at live Main" markers over an editor.
+private struct EditorStatusBadges: View {
+    var draftName: String?
+    var readOnly: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let draftName {
+                badge(draftName, icon: "arrow.branch", stroke: Color.accentColor)
+            }
+            if readOnly {
+                badge("Read Only", icon: "clock.arrow.circlepath", stroke: .secondary)
+            }
+        }
+        .padding(.top, 10)
+        .padding(.leading, 16)
+        .allowsHitTesting(false)
+    }
+
+    private func badge(_ text: String, icon: String, stroke: Color) -> some View {
+        Label(text, systemImage: icon)
+            .font(.system(size: 11, weight: .medium))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().stroke(stroke.opacity(0.4), lineWidth: 1))
+    }
+}
+
 struct PatchworkDetail: View {
     let docUrl: String
+    var historyVersion: DocHistoryEntry? = nil
+    #if os(macOS)
+    var rightSidebarVisible: Binding<Bool>? = nil
+    #endif
     @Environment(NotesModel.self) private var model
     @State private var tools: [ToolChoice] = []
     @State private var toolInput: String
     @State private var appliedToolId: String?
     @State private var toolsLoaded = false
+    @State private var mainScrubTask: Task<Void, Never>?
+    #if os(iOS)
+    @State private var showingInspector = false
+    @State private var inspectorTab: RightSidebarTab = .info
+    @State private var inspectorHistoryEntry: DocHistoryEntry?
+    #endif
 
-    init(docUrl: String) {
+    #if os(macOS)
+    init(docUrl: String, historyVersion: DocHistoryEntry? = nil, rightSidebarVisible: Binding<Bool>? = nil) {
         self.docUrl = docUrl
+        self.historyVersion = historyVersion
+        self.rightSidebarVisible = rightSidebarVisible
         let remembered = PatchworkWeb.lastTool(for: docUrl)
         _appliedToolId = State(initialValue: remembered)
         _toolInput = State(initialValue: remembered ?? "")
+    }
+    #else
+    init(docUrl: String, historyVersion: DocHistoryEntry? = nil) {
+        self.docUrl = docUrl
+        self.historyVersion = historyVersion
+        let remembered = PatchworkWeb.lastTool(for: docUrl)
+        _appliedToolId = State(initialValue: remembered)
+        _toolInput = State(initialValue: remembered ?? "")
+    }
+    #endif
+
+    private func joinPresence() {
+        if historyVersion == nil {
+            model.presence.join(docUrl)
+        }
+    }
+
+    private func leavePresence() {
+        if model.presence.docUrl == docUrl {
+            model.presence.leave()
+        }
     }
 
     private func applyTool(_ tool: String?) {
@@ -2955,11 +3666,20 @@ struct PatchworkDetail: View {
     }
 
     var body: some View {
+        // The draft overlay provider streams freshly-pinned repo:handle-descriptor
+        // answers whenever the checkout doc's checkpoint changes, so OverlayRepo
+        // swaps handle backings in place — no remount on scrub. The docUrl is
+        // always the plain origin URL; heads ride inside the checkout doc's `at`
+        // map, not on the URL itself.
+        let draftUrl = model.checkedOutDrafts[docUrl]
+        let scrubbed = historyVersion != nil
         Group {
             if PatchworkWeb.available {
                 PatchworkBoxWebViewWrapper(
                     docUrl: docUrl,
                     toolId: appliedToolId,
+                    draftUrl: draftUrl,
+                    checkoutUrl: model.checkoutDocs[docUrl],
                     onTools: { newTools, current in
                         tools = newTools
                         toolsLoaded = true
@@ -2976,6 +3696,12 @@ struct PatchworkDetail: View {
                 )
             }
         }
+        .overlay(alignment: .topLeading) {
+            EditorStatusBadges(
+                draftName: draftUrl.flatMap { model.draftName($0, in: docUrl) },
+                readOnly: scrubbed
+            )
+        }
         .navigationTitle(model.node(for: docUrl)?.displayName ?? "")
         .onAppear {
             if appliedToolId == nil, let remembered = rememberedTool() {
@@ -2990,6 +3716,21 @@ struct PatchworkDetail: View {
             toolInput = remembered ?? ""
             appliedToolId = remembered
         }
+        .onChange(of: historyVersion?.hash) { _, hash in
+            guard model.checkedOutDrafts[docUrl] == nil else { return }
+            let pins: [CheckpointPin]? = historyVersion.map { [CheckpointPin(originalUrl: docUrl, heads: $0.heads)] }
+            mainScrubTask?.cancel()
+            mainScrubTask = Task {
+                try? await Task.sleep(for: .milliseconds(80))
+                guard !Task.isCancelled else { return }
+                await model.setDraftCheckpoint(host: docUrl, pins: pins)
+            }
+        }
+        .task(id: docUrl) { joinPresence() }
+        .onChange(of: model.sharingPresence) { _, enabled in
+            if enabled { joinPresence() } else { leavePresence() }
+        }
+        .onDisappear(perform: leavePresence)
         .toolbar {
             if shouldShowToolPicker {
                 ToolbarItem {
@@ -3014,7 +3755,40 @@ struct PatchworkDetail: View {
                     }
                 }
             }
+            #if os(macOS)
+            ToolbarSpacer(.flexible)
+            ToolbarItem(placement: .primaryAction) {
+                PresenceFacesView(presence: model.presence)
+            }
+            ToolbarSpacer(.fixed)
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    rightSidebarVisible?.wrappedValue.toggle()
+                } label: {
+                    Label("Info", systemImage: "info.circle")
+                }
+            }
+            #else
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showingInspector = true
+                } label: {
+                    Label("Info", systemImage: "info.circle")
+                }
+            }
+            #endif
         }
+        #if os(iOS)
+        .sheet(isPresented: $showingInspector) {
+            RightSidebarView(
+                url: docUrl,
+                node: model.node(for: docUrl),
+                selectedTab: $inspectorTab,
+                selectedEntry: $inspectorHistoryEntry
+            )
+            .environment(model)
+        }
+        #endif
     }
 }
 
@@ -3064,8 +3838,9 @@ struct IncomingContentSheet: View {
                                 if case .text(let text) = content.flattenedPayloads.first,
                                    content.flattenedPayloads.count == 1 {
                                     Clipboard.copy(text)
+                                    model.status = "Copied to clipboard — paste into the note"
                                 }
-                                model.selectedNoteUrl = note.url
+                                AppRouter.shared.pending = .note(note.url)
                                 dismiss()
                             } label: {
                                 Text(note.displayName.isEmpty ? "Untitled" : note.displayName)

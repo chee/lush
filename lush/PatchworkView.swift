@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import Security
 #if canImport(PatchworkServerKit)
 import PatchworkServerKit
 #endif
@@ -12,12 +13,18 @@ import PatchworkServerKit
 enum LocalSyncServer {
     #if canImport(PatchworkServerKit)
     static let controller = ServerController()
-    private static var started = false
+    private static var startTask: Task<Void, Never>?
 
     static func startIfNeeded() async {
-        guard !started else { return }
-        started = true
-        await controller.start()
+        if let startTask {
+            await startTask.value
+        }
+        guard controller.port == nil else { return }
+        let task = Task { await controller.start() }
+        startTask = task
+        await task.value
+        // failed starts leave port nil; clear so a later caller can retry
+        if controller.port == nil { startTask = nil }
     }
 
     static var wsPort: UInt16? { controller.port }
@@ -44,6 +51,8 @@ enum LocalSyncServer {
 enum PatchworkWeb {
     static let endpoint = "wss://subduction.sync.inkandswitch.com"
     private static let seedKey = "patchworkSignerSeedHex"
+    private static let seedService = Bundle.main.bundleIdentifier ?? "party.chee.patchwork.lush"
+    private static let seedAccount = "patchworkSignerSeed"
 
     static var webRoot: URL? {
         Bundle.main.url(forResource: "PatchworkWeb", withExtension: "bundle")
@@ -52,14 +61,48 @@ enum PatchworkWeb {
     static var available: Bool { webRoot != nil }
 
     static var signerSeedHex: String {
-        if let saved = UserDefaults.standard.string(forKey: seedKey) {
+        if let saved = keychainSeed() {
             return saved
         }
+        if let legacy = UserDefaults.standard.string(forKey: seedKey) {
+            setKeychainSeed(legacy)
+            UserDefaults.standard.removeObject(forKey: seedKey)
+            return legacy
+        }
         var bytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+        }
         let hex = bytes.map { String(format: "%02x", $0) }.joined()
-        UserDefaults.standard.set(hex, forKey: seedKey)
+        setKeychainSeed(hex)
         return hex
+    }
+
+    private static func keychainSeed() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: seedService,
+            kSecAttrAccount as String: seedAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func setKeychainSeed(_ hex: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: seedService,
+            kSecAttrAccount as String: seedAccount,
+        ]
+        SecItemDelete(query as CFDictionary)
+        var attributes = query
+        attributes[kSecValueData as String] = Data(hex.utf8)
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        SecItemAdd(attributes as CFDictionary, nil)
     }
 
     private static let moduleUrlsKey = "patchworkModuleUrls"
@@ -534,7 +577,15 @@ enum PatchworkWeb {
 
       // Expose setDoc so native code can switch docs without reloading the
       // page. The view mounts immediately; nothing waits on module loading.
-      window.setDoc = async (docUrl, toolId) => {
+      // A draftUrl wraps the view in the draft overlay provider (inside
+      // repo-provider, so descriptor requests reach the overlay first):
+      // every doc resolved beneath it — the doc, its tool source, sub-docs —
+      // lazily forks into that draft's clones, patchwork-identically.
+      // checkoutUrl is the native-maintained CheckedOutDraft doc; a shim
+      // around the tree answers the overlay's `draft:checked-out`
+      // subscription with it, standing in for patchwork's draft-list
+      // provider, so per-member checkpoint pins apply while scrubbing.
+      window.setDoc = async (docUrl, toolId, draftUrl, checkoutUrl) => {
         if (!docUrl) {
           document.body.classList.remove("loading")
           document.body.replaceChildren()
@@ -546,8 +597,27 @@ enum PatchworkWeb {
         if (toolId) view.setAttribute("tool-id", toolId)
         view.setAttribute("doc-url", docUrl)
         const provider = document.createElement("repo-provider")
-        provider.appendChild(view)
-        document.body.replaceChildren(provider)
+        if (draftUrl || checkoutUrl) {
+          const overlay = document.createElement("patchwork-view")
+          overlay.setAttribute("component", "patchwork-draft-overlay-provider")
+          if (draftUrl) overlay.setAttribute("url", draftUrl)
+          overlay.appendChild(view)
+          provider.appendChild(overlay)
+        } else {
+          provider.appendChild(view)
+        }
+        let mountRoot = provider
+        if (checkoutUrl) {
+          const shim = document.createElement("div")
+          shim.addEventListener("patchwork:subscribe", (event) => {
+            if (event.detail?.selector?.type !== "draft:checked-out") return
+            event.stopPropagation()
+            event.detail.port.postMessage({ type: "change", value: checkoutUrl })
+          })
+          shim.appendChild(provider)
+          mountRoot = shim
+        }
+        document.body.replaceChildren(mountRoot)
         // Pulse until the tool actually renders something (content may live in
         // a shadow root, so poll rather than observe). A superseded view stops
         // its timers without touching the class — the newer setDoc owns it.
@@ -731,9 +801,9 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
         case "embed.js":
             return respond(url: url, data: Data(PatchworkWeb.shellJS.utf8), mime: "text/javascript")
         case "app.css":
-            return try serveBundleCSS(url: url)
+            return try await serveBundleCSS(url: url)
         default:
-            return try serveBundleFile(path: path, url: url)
+            return try await serveBundleFile(path: path, url: url)
         }
     }
 
@@ -775,29 +845,35 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     /// The bundle's stylesheet carries a content hash in its name, so it's
-    /// looked up rather than hardcoded.
-    private func serveBundleCSS(url: URL) throws -> (Data, URLResponse) {
-        guard let base = PatchworkWeb.webRoot else { throw URLError(.fileDoesNotExist) }
-        let assets = base.appendingPathComponent("assets")
-        let css = (try? FileManager.default.contentsOfDirectory(
-            at: assets,
-            includingPropertiesForKeys: nil
-        ))?.first { $0.pathExtension == "css" }
-        guard let css, let data = try? Data(contentsOf: css) else {
-            throw URLError(.fileDoesNotExist)
-        }
+    /// looked up rather than hardcoded. The read runs off the main actor —
+    /// bundle files reach multiple megabytes (wasm).
+    private func serveBundleCSS(url: URL) async throws -> (Data, URLResponse) {
+        let data = try await Task.detached(priority: .userInitiated) { () -> Data in
+            guard let base = PatchworkWeb.webRoot else { throw URLError(.fileDoesNotExist) }
+            let assets = base.appendingPathComponent("assets")
+            let css = (try? FileManager.default.contentsOfDirectory(
+                at: assets,
+                includingPropertiesForKeys: nil
+            ))?.first { $0.pathExtension == "css" }
+            guard let css, let data = try? Data(contentsOf: css) else {
+                throw URLError(.fileDoesNotExist)
+            }
+            return data
+        }.value
         return respond(url: url, data: data, mime: "text/css")
     }
 
-    private func serveBundleFile(path: String, url: URL) throws -> (Data, URLResponse) {
-        guard let base = PatchworkWeb.webRoot else { throw URLError(.fileDoesNotExist) }
-        let fileURL = base.appendingPathComponent(path)
-        guard fileURL.standardizedFileURL.path.hasPrefix(base.standardizedFileURL.path),
-              FileManager.default.fileExists(atPath: fileURL.path) else {
-            throw URLError(.fileDoesNotExist)
-        }
-        let data = try Data(contentsOf: fileURL)
-        return respond(url: url, data: data, mime: Self.mimeType(for: fileURL.pathExtension))
+    private func serveBundleFile(path: String, url: URL) async throws -> (Data, URLResponse) {
+        let (data, mime) = try await Task.detached(priority: .userInitiated) { () -> (Data, String) in
+            guard let base = PatchworkWeb.webRoot else { throw URLError(.fileDoesNotExist) }
+            let fileURL = base.appendingPathComponent(path)
+            guard fileURL.standardizedFileURL.path.hasPrefix(base.standardizedFileURL.path + "/"),
+                  FileManager.default.fileExists(atPath: fileURL.path) else {
+                throw URLError(.fileDoesNotExist)
+            }
+            return (try Data(contentsOf: fileURL), Self.mimeType(for: fileURL.pathExtension))
+        }.value
+        return respond(url: url, data: data, mime: mime)
     }
 
     private static func mimeType(for pathExtension: String) -> String {
@@ -888,7 +964,7 @@ struct PatchworkWebView: UIViewRepresentable {
 /// with no network sync.
 final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
     static let shared = NativeWebStorage()
-    nonisolated(unsafe) var core: Core?
+    @MainActor var core: Core?
 
     private let root = FileManager.default.urls(
         for: .applicationSupportDirectory,
@@ -923,47 +999,64 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
             return
         }
         let key = body["key"] as? [String] ?? []
-        let core = self.core
+        // WebKit delivers script messages on the main thread
+        let core = MainActor.assumeIsolated { self.core }
         Task.detached { [self] in
-            let reply = handle(op: op, key: key, body: body, core: core)
-            await MainActor.run { replyHandler(reply, nil) }
+            let (reply, error) = handle(op: op, key: key, body: body, core: core)
+            await MainActor.run { replyHandler(reply, error) }
         }
     }
 
+    /// Failed writes must reject the JS promise — acking a save that never
+    /// landed silently corrupts the webview repo's storage.
     private nonisolated func handle(
         op: String,
         key: [String],
         body: [String: Any],
         core: Core?
-    ) -> [String: Any] {
+    ) -> ([String: Any]?, String?) {
         let fm = FileManager.default
         switch op {
         case "load":
-            guard let url = path(for: key), let data = try? Data(contentsOf: url) else { return [:] }
-            return ["binary": data.base64EncodedString()]
+            guard let url = path(for: key) else { return (nil, "bad storage key") }
+            guard let data = try? Data(contentsOf: url) else { return ([:], nil) }
+            return (["binary": data.base64EncodedString()], nil)
         case "save":
             guard let base64 = body["binary"] as? String,
                   let data = Data(base64Encoded: base64),
-                  let url = path(for: key) else { return [:] }
-            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: url)
-            return [:]
+                  let url = path(for: key) else { return (nil, "bad save request") }
+            do {
+                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: url)
+                return ([:], nil)
+            } catch {
+                return (nil, "save failed: \(error.localizedDescription)")
+            }
         case "saveBatch":
             for entry in body["entries"] as? [[String: Any]] ?? [] {
                 guard let entryKey = entry["key"] as? [String],
                       let base64 = entry["binary"] as? String,
                       let data = Data(base64Encoded: base64),
-                      let url = path(for: entryKey) else { continue }
-                try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try? data.write(to: url)
+                      let url = path(for: entryKey) else { return (nil, "bad saveBatch entry") }
+                do {
+                    try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try data.write(to: url)
+                } catch {
+                    return (nil, "saveBatch failed: \(error.localizedDescription)")
+                }
             }
-            return [:]
-        case "remove":
-            if let url = path(for: key) { try? fm.removeItem(at: url) }
-            return [:]
-        case "removeRange":
-            if let url = path(for: key) { try? fm.removeItem(at: url) }
-            return [:]
+            return ([:], nil)
+        case "remove", "removeRange":
+            guard let url = path(for: key) else { return (nil, "bad storage key") }
+            do {
+                try fm.removeItem(at: url)
+            } catch let error as NSError
+                where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+                // already gone
+            } catch {
+                return (nil, "remove failed: \(error.localizedDescription)")
+            }
+            return ([:], nil)
         case "loadRange":
             var chunks = loadRange(prefix: key)
             if chunks.isEmpty, key.count == 1, let core {
@@ -972,9 +1065,9 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
                      "binary": Data(chunk.bytes).base64EncodedString()]
                 }
             }
-            return ["chunks": chunks]
+            return (["chunks": chunks], nil)
         default:
-            return [:]
+            return (nil, "unknown storage op \(op)")
         }
     }
 
@@ -1141,24 +1234,17 @@ final class MutablePickerBridge: NSObject, WKScriptMessageHandler {
 }
 
 @MainActor
-final class SharedPatchworkPickerView {
-    static let shared = SharedPatchworkPickerView()
-    private let host: PatchworkWebViewHost
-    private let bridge = MutablePickerBridge()
-
-    var webView: WKWebView { host.webView }
-
-    var onPick: (@MainActor @Sendable (String, String?) -> Void)? {
-        get { bridge.onPick }
-        set { bridge.onPick = newValue }
+private func makePickerWebView(
+    preferredType: String?,
+    preferredToolId: String?,
+    coordinator: MutablePickerBridge
+) -> WKWebView {
+    var query = [URLQueryItem(name: "mode", value: "picker")]
+    if let preferredType {
+        query.append(URLQueryItem(name: "type", value: preferredType))
+        query.append(URLQueryItem(name: "tool-id", value: preferredToolId))
     }
-
-    private init() {
-        host = PatchworkWebViewHost(
-            query: [URLQueryItem(name: "mode", value: "picker")],
-            messageHandler: bridge
-        )
-    }
+    return makePatchworkWebView(query: query, messageHandler: coordinator)
 }
 
 #if os(macOS)
@@ -1174,27 +1260,20 @@ struct PatchworkPickerView: NSViewRepresentable {
 
     @MainActor
     func makeNSView(context: Context) -> WKWebView {
-        if let preferredType {
-            return makePatchworkWebView(
-                query: [
-                    URLQueryItem(name: "mode", value: "picker"),
-                    URLQueryItem(name: "type", value: preferredType),
-                    URLQueryItem(name: "tool-id", value: preferredToolId),
-                ],
-                messageHandler: context.coordinator
-            )
-        }
-        SharedPatchworkPickerView.shared.onPick = onPick
-        return SharedPatchworkPickerView.shared.webView
+        makePickerWebView(
+            preferredType: preferredType,
+            preferredToolId: preferredToolId,
+            coordinator: context.coordinator
+        )
     }
 
     @MainActor
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        if preferredType == nil {
-            SharedPatchworkPickerView.shared.onPick = onPick
-        } else {
-            context.coordinator.onPick = onPick
-        }
+        context.coordinator.onPick = onPick
+    }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: MutablePickerBridge) {
+        coordinator.onPick = nil
     }
 }
 #else
@@ -1208,26 +1287,19 @@ struct PatchworkPickerView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> WKWebView {
-        if let preferredType {
-            return makePatchworkWebView(
-                query: [
-                    URLQueryItem(name: "mode", value: "picker"),
-                    URLQueryItem(name: "type", value: preferredType),
-                    URLQueryItem(name: "tool-id", value: preferredToolId),
-                ],
-                messageHandler: context.coordinator
-            )
-        }
-        SharedPatchworkPickerView.shared.onPick = onPick
-        return SharedPatchworkPickerView.shared.webView
+        makePickerWebView(
+            preferredType: preferredType,
+            preferredToolId: preferredToolId,
+            coordinator: context.coordinator
+        )
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        if preferredType == nil {
-            SharedPatchworkPickerView.shared.onPick = onPick
-        } else {
-            context.coordinator.onPick = onPick
-        }
+        context.coordinator.onPick = onPick
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: MutablePickerBridge) {
+        coordinator.onPick = nil
     }
 }
 #endif
@@ -1326,12 +1398,16 @@ final class PatchworkBoxCoordinator {
     var host: PatchworkWebViewHost?
     var lastDocUrl: String?
     var lastToolId: String? = "__unset__"
+    var lastDraftUrl: String?
+    var lastCheckoutUrl: String?
 }
 
 #if os(macOS)
 struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
     let docUrl: String
     let toolId: String?
+    var draftUrl: String? = nil
+    var checkoutUrl: String? = nil
     var activatable = false
     var toolCapturesPointer = false
     var active: Binding<Bool>? = nil
@@ -1350,7 +1426,9 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         coord.bridge.onTraits = onTraits
         coord.lastDocUrl = docUrl
         coord.lastToolId = toolId
-        host.setPatchworkDoc(url: docUrl, toolId: toolId)
+        coord.lastDraftUrl = draftUrl
+        coord.lastCheckoutUrl = checkoutUrl
+        host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
         configureActivation(host.webView)
         return host.webView
     }
@@ -1361,10 +1439,13 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         coord.bridge.onTools = onTools
         coord.bridge.onTraits = onTraits
         configureActivation(nsView)
-        if coord.lastDocUrl != docUrl || coord.lastToolId != toolId {
-            coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId)
+        if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
+            || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
+            coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
             coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
+            coord.lastDraftUrl = draftUrl
+            coord.lastCheckoutUrl = checkoutUrl
         }
     }
 
@@ -1386,6 +1467,8 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
 struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
     let docUrl: String
     let toolId: String?
+    var draftUrl: String? = nil
+    var checkoutUrl: String? = nil
     var activatable = false
     var toolCapturesPointer = false
     var active: Binding<Bool>? = nil
@@ -1402,7 +1485,9 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         coord.bridge.onTraits = onTraits
         coord.lastDocUrl = docUrl
         coord.lastToolId = toolId
-        host.setPatchworkDoc(url: docUrl, toolId: toolId)
+        coord.lastDraftUrl = draftUrl
+        coord.lastCheckoutUrl = checkoutUrl
+        host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
         configureActivation(host.webView)
         return host.webView
     }
@@ -1412,10 +1497,13 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         coord.bridge.onTools = onTools
         coord.bridge.onTraits = onTraits
         configureActivation(uiView)
-        if coord.lastDocUrl != docUrl || coord.lastToolId != toolId {
-            coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId)
+        if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
+            || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
+            coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
             coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
+            coord.lastDraftUrl = draftUrl
+            coord.lastCheckoutUrl = checkoutUrl
         }
     }
 
@@ -1592,7 +1680,7 @@ private extension WKWebView {
     // leave the previous doc on screen. Concurrent calls race on their poll
     // timers, so each takes a generation and only the newest may mount —
     // otherwise a stale call can win and show the previous doc.
-    func callSetDoc(url: String?, toolId: String?) {
+    func callSetDoc(url: String?, toolId: String?, draftUrl: String? = nil, checkoutUrl: String? = nil) {
         callAsyncJavaScript(
             """
             window.__lushSetDocGen = (window.__lushSetDocGen ?? 0) + 1
@@ -1608,9 +1696,14 @@ private extension WKWebView {
                 waited += 50
             }
             if (gen !== window.__lushSetDocGen) return
-            await window.setDoc(docUrl, toolId)
+            await window.setDoc(docUrl, toolId, draftUrl, checkoutUrl)
             """,
-            arguments: ["docUrl": url as Any, "toolId": toolId as Any],
+            arguments: [
+                "docUrl": url as Any,
+                "toolId": toolId as Any,
+                "draftUrl": draftUrl as Any,
+                "checkoutUrl": checkoutUrl as Any,
+            ],
             in: nil,
             in: .page,
             completionHandler: nil
@@ -1621,7 +1714,8 @@ private extension WKWebView {
 @MainActor
 final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     let webView: WKWebView
-    private var pending: (url: String?, toolId: String?)?
+    private var pending: (url: String?, toolId: String?, draftUrl: String?, checkoutUrl: String?)?
+    private var current: (url: String?, toolId: String?, draftUrl: String?, checkoutUrl: String?)?
     private var loaded = false
 
     init(query: [URLQueryItem] = [], messageHandler: (any WKScriptMessageHandler)? = nil) {
@@ -1630,11 +1724,12 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
         webView.navigationDelegate = self
     }
 
-    func setPatchworkDoc(url: String?, toolId: String?) {
+    func setPatchworkDoc(url: String?, toolId: String?, draftUrl: String? = nil, checkoutUrl: String? = nil) {
+        current = (url, toolId, draftUrl, checkoutUrl)
         if loaded {
-            webView.callSetDoc(url: url, toolId: toolId)
+            webView.callSetDoc(url: url, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
         } else {
-            pending = (url, toolId)
+            pending = (url, toolId, draftUrl, checkoutUrl)
         }
     }
 
@@ -1642,13 +1737,16 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
         loaded = true
         if let p = pending {
             pending = nil
-            webView.callSetDoc(url: p.url, toolId: p.toolId)
+            webView.callSetDoc(url: p.url, toolId: p.toolId, draftUrl: p.draftUrl, checkoutUrl: p.checkoutUrl)
         }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         NSLog("lush patchwork webview process died, reloading")
         loaded = false
+        // replay the doc once the reloaded page finishes, or the embed
+        // comes back blank
+        if let current { pending = current }
         webView.reload()
     }
 }

@@ -89,7 +89,8 @@ final class InlineViewManager {
     private func makeTableHost(for box: TableBox) -> Host? {
         guard let core else { return nil }
         let cache = core.cache
-        let root = TableInlineView(box: box, cache: cache) { [weak self] in
+        let getManager: () -> InlineViewManager? = { [weak self] in self }
+        let root = TableInlineView(box: box, cache: cache, getManager: getManager) { [weak self] in
             self?.core?.tableChanged(box)
         }
         let (view, _, retained) = makeHosting(root)
@@ -162,7 +163,14 @@ final class InlineViewManager {
                 retained: retained
             )
         }
-        guard let url = block.embedUrl else { return nil }
+        guard let url = block.embedUrl else {
+            let (view, _, retained) = makeHosting(EmbedLoadingView())
+            return Host(
+                view: view,
+                preferredSize: { width in CGSize(width: min(460, width), height: 140) },
+                retained: retained
+            )
+        }
         if core.isPatchworkDoc(url) {
             let (view, _, retained) = makeHosting(PatchworkBoxView(
                 docUrl: url,
@@ -224,7 +232,12 @@ final class InlineViewManager {
                 retained: retained
             )
         }
-        return nil
+        let (view, _, retained) = makeHosting(EmbedLoadingView())
+        return Host(
+            view: view,
+            preferredSize: { width in CGSize(width: min(460, width), height: 140) },
+            retained: retained
+        )
     }
 
     private func makeHosting(_ root: some View) -> (PView, () -> CGSize, AnyObject?) {
@@ -247,6 +260,22 @@ final class InlineViewManager {
         #endif
     }
 }
+
+protocol InlineViewManaging: PView {
+    var inlineManager: InlineViewManager? { get }
+}
+
+#if os(macOS)
+final class CellTextView: NSTextView, InlineViewManaging {
+    var getManager: (() -> InlineViewManager?)?
+    var inlineManager: InlineViewManager? { getManager?() }
+}
+#else
+final class CellTextView: UITextView, InlineViewManaging {
+    var getManager: (() -> InlineViewManager?)?
+    var inlineManager: InlineViewManager? { getManager?() }
+}
+#endif
 
 final class EmbedViewProvider: NSTextAttachmentViewProvider {
     var host: InlineViewManager.Host?
@@ -276,12 +305,14 @@ final class EmbedViewProvider: NSTextAttachmentViewProvider {
 struct TableInlineView: View {
     let box: TableBox
     let cache: AssetCache
+    let getManager: (() -> InlineViewManager?)?
     let onEdit: () -> Void
     @State private var grid: TableGrid
 
-    init(box: TableBox, cache: AssetCache, onEdit: @escaping () -> Void) {
+    init(box: TableBox, cache: AssetCache, getManager: (() -> InlineViewManager?)? = nil, onEdit: @escaping () -> Void) {
         self.box = box
         self.cache = cache
+        self.getManager = getManager
         self.onEdit = onEdit
         _grid = State(initialValue: box.grid)
     }
@@ -303,7 +334,7 @@ struct TableInlineView: View {
                 ForEach(0..<grid.rows.count, id: \.self) { r in
                     GridRow {
                         ForEach(0..<max(grid.columnCount, 1), id: \.self) { c in
-                            SpanCellEditor(spans: cellSpans(r, c), cache: cache) { spans in
+                            SpanCellEditor(spans: cellSpans(r, c), cache: cache, getManager: getManager) { spans in
                                 setCell(r, c, spans)
                             }
                             .frame(
@@ -383,6 +414,7 @@ struct TableInlineView: View {
 private struct SpanCellEditor {
     let spans: [SpanNode]
     let cache: AssetCache
+    let getManager: (() -> InlineViewManager?)?
     let onEdit: ([SpanNode]) -> Void
 
     @MainActor
@@ -411,7 +443,8 @@ private struct SpanCellEditor {
 #if os(macOS)
 extension SpanCellEditor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView(usingTextLayoutManager: true)
+        let textView = CellTextView(usingTextLayoutManager: true)
+        textView.getManager = getManager
         textView.textLayoutManager?.delegate = context.coordinator.markers
         textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.textContainer?.widthTracksTextView = true
@@ -449,7 +482,8 @@ extension SpanCellEditor.Coordinator: NSTextViewDelegate {
 #else
 extension SpanCellEditor: UIViewRepresentable {
     func makeUIView(context: Context) -> UITextView {
-        let textView = UITextView(usingTextLayoutManager: true)
+        let textView = CellTextView(usingTextLayoutManager: true)
+        textView.getManager = getManager
         textView.textLayoutManager?.delegate = context.coordinator.markers
         textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
         textView.isScrollEnabled = false
@@ -503,5 +537,16 @@ struct UnknownBlockView: View {
         .background(.background)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator))
+    }
+}
+
+struct EmbedLoadingView: View {
+    @State private var phase = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(Color.secondary.opacity(phase ? 0.07 : 0.16))
+            .animation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true), value: phase)
+            .onAppear { phase = true }
     }
 }

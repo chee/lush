@@ -96,6 +96,13 @@ enum NoteChatAssistant {
                 noteMarkdown: noteMarkdown,
                 previousTurns: previousTurns
             )
+        case .openRouter, .openAI, .anthropic, .compatible:
+            return try await respondWithCloudModel(
+                to: trimmedQuestion,
+                noteTitle: noteTitle,
+                noteMarkdown: noteMarkdown,
+                previousTurns: previousTurns
+            )
         }
     }
 
@@ -170,11 +177,46 @@ enum NoteChatAssistant {
         Person request:
         \(trimmedQuestion)
         """
+        let settings = LocalModelSettings.generationSettings(for: .noteChat)
         let response = try await LocalLLMRuntime.generateText(
             prompt: prompt,
             config: config,
-            maxTokens: LocalModelSettings.generationSettings(for: .noteChat).maximumResponseTokens
+            maxTokens: settings.maximumResponseTokens,
+            temperature: settings.temperature
         )
+        guard let generated = parse(response) else { throw ChatError.generationFailed }
+        let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proposedMarkdown = generated.editedMarkdown?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        guard !isPlaceholder(answer), !isPlaceholder(proposedMarkdown) else { throw ChatError.generationFailed }
+        guard !answer.isEmpty || proposedMarkdown != nil else { throw ChatError.generationFailed }
+        return (answer.isEmpty ? "I drafted a change for this note." : answer, proposedMarkdown)
+    }
+
+    private static func respondWithCloudModel(
+        to trimmedQuestion: String,
+        noteTitle: String,
+        noteMarkdown: String,
+        previousTurns: [NoteChatTurn]
+    ) async throws -> (answer: String, proposedMarkdown: String?) {
+        let prompt = """
+        \(LocalModelSettings.systemPrompt(for: .noteChat))
+
+        Note title: \(limited(noteTitle, to: 300))
+
+        Current note in Markdown:
+        \(limited(noteMarkdown, to: 12_000))
+
+        Recent chat:
+        \(historySummary(from: previousTurns))
+
+        Person request:
+        \(trimmedQuestion)
+
+        Return one JSON object and no other text.
+        """
+        let response = try await CloudLLMRuntime.generateText(prompt: prompt, operation: .noteChat)
         guard let generated = parse(response) else { throw ChatError.generationFailed }
         let answer = generated.answer.trimmingCharacters(in: .whitespacesAndNewlines)
         let proposedMarkdown = generated.editedMarkdown?
@@ -222,9 +264,103 @@ enum NoteChatAssistant {
         guard let data = json.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(GeneratedReply.self, from: data)
     }
+
+    /// The chat pipeline round-trips the note through markdown, which cannot
+    /// represent atomic blocks: embeds/images/audio flatten to "[attachment]"
+    /// and tables/columns/context blocks to bare lines. Before an applied
+    /// draft replaces the document, reinsert every atomic region from the
+    /// current spans into the drafted ones.
+    ///
+    /// Anchoring is a nearest-anchor heuristic: each region remembers how many
+    /// plain top-level paragraphs preceded it in the current document and is
+    /// reinserted after that many plain paragraphs of the draft (at a
+    /// top-level block boundary). Edited drafts shift text around, so a
+    /// region can land next to different neighbors — but it always survives.
+    static func mergingAtomicBlocks(from current: [SpanNode], into drafted: [SpanNode]) -> [SpanNode] {
+        struct Region {
+            let spans: [SpanNode]
+            let anchor: Int
+        }
+
+        func topLevelBlock(_ span: SpanNode) -> BlockValue? {
+            if case .block(let b) = span, b.parents.isEmpty { return b }
+            return nil
+        }
+        func isAtomicRoot(_ b: BlockValue) -> Bool {
+            b.isAtomic || b.type == "context"
+        }
+
+        var regions: [Region] = []
+        var plainCount = 0
+        var i = 0
+        while i < current.count {
+            guard let block = topLevelBlock(current[i]) else {
+                i += 1
+                continue
+            }
+            if isAtomicRoot(block) {
+                // tables/columns own every following span until the next
+                // top-level block (nested blocks carry parents, cell text
+                // follows its cell block); single-attachment blocks own
+                // just themselves
+                var j = i + 1
+                if block.type == "table" || block.type == "columns" {
+                    while j < current.count, topLevelBlock(current[j]) == nil { j += 1 }
+                }
+                regions.append(Region(spans: Array(current[i..<j]), anchor: plainCount))
+                i = j
+            } else {
+                plainCount += 1
+                i += 1
+            }
+        }
+        guard !regions.isEmpty else { return drafted }
+
+        // a draft that somehow kept atomic blocks knows better than we do
+        let draftHasAtomic = drafted.contains {
+            if case .block(let b) = $0 { return isAtomicRoot(b) }
+            return false
+        }
+        guard !draftHasAtomic else { return drafted }
+
+        // drop "[attachment]" placeholder paragraphs the model echoed back;
+        // the real embeds are being reinserted
+        var cleaned: [SpanNode] = []
+        var k = 0
+        while k < drafted.count {
+            if let block = topLevelBlock(drafted[k]),
+               !isAtomicRoot(block),
+               k + 1 < drafted.count,
+               case .text(let text, _) = drafted[k + 1],
+               text.trimmingCharacters(in: .whitespaces) == "[attachment]",
+               k + 2 >= drafted.count || topLevelBlock(drafted[k + 2]) != nil {
+                k += 2
+                continue
+            }
+            cleaned.append(drafted[k])
+            k += 1
+        }
+
+        var out: [SpanNode] = []
+        var pending = regions[...]
+        var seenPlain = 0
+        for span in cleaned {
+            if let block = topLevelBlock(span) {
+                while let region = pending.first, region.anchor <= seenPlain {
+                    out.append(contentsOf: region.spans)
+                    pending.removeFirst()
+                }
+                if !isAtomicRoot(block) { seenPlain += 1 }
+            }
+            out.append(span)
+        }
+        for region in pending {
+            out.append(contentsOf: region.spans)
+        }
+        return out
+    }
 }
 
-#if os(macOS)
 struct NoteChatView: View {
     let url: String
     let node: FolderNode?
@@ -342,6 +478,9 @@ struct NoteChatView: View {
             .padding(10)
         }
         .task(id: url) {
+            chatTask?.cancel()
+            chatTask = nil
+            isGenerating = false
             turns = NoteChatStore.turns(for: url)
             draft = ""
             errorMessage = nil
@@ -358,9 +497,9 @@ struct NoteChatView: View {
         errorMessage = nil
         draft = ""
         isGenerating = true
+        let previousTurns = turns
         turns.append(NoteChatTurn(role: .user, text: question, proposedMarkdown: nil))
         NoteChatStore.save(turns, for: url)
-        let previousTurns = turns
         let noteName = node?.displayName ?? "Untitled"
         let currentUrl = url
 
@@ -402,14 +541,18 @@ struct NoteChatView: View {
         applyingTurnId = turnId
         errorMessage = nil
         Task {
-            let spans = await MainActor.run {
+            let drafted = await MainActor.run {
                 RichTextClipboard.spans(fromMarkdown: markdown)
             }
-            guard !spans.isEmpty else {
+            guard !drafted.isEmpty else {
                 errorMessage = "The draft did not contain note content to apply."
                 applyingTurnId = nil
                 return
             }
+            // the markdown round trip loses embeds/tables/columns/context —
+            // carry them over from the live document before replacing it
+            let current = SpanNode.decodeList(await model.spansJSON(for: url))
+            let spans = NoteChatAssistant.mergingAtomicBlocks(from: current, into: drafted)
             let title = RichText.title(from: spans)
             await model.updateDocument(url, json: SpanNode.encodeList(spans), title: title)
             applyingTurnId = nil
@@ -474,7 +617,6 @@ private struct NoteChatBubble: View {
         turn.role == .user ? AnyShapeStyle(.tint.opacity(0.18)) : AnyShapeStyle(.quaternary.opacity(0.7))
     }
 }
-#endif
 
 private extension String {
     var nilIfEmpty: String? {

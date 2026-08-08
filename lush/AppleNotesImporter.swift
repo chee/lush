@@ -20,12 +20,14 @@ enum AppleNotesImporter {
         tell application "Notes"
             repeat with f in folders
                 set fName to name of f
-                repeat with n in notes of f
-                    try
-                        set agoSecs to (current date) - (modification date of n)
-                        set out to out & fName & fieldSep & (name of n) & fieldSep & agoSecs & fieldSep & (body of n) & noteSep
-                    end try
-                end repeat
+                if fName is not "Recently Deleted" then
+                    repeat with n in notes of f
+                        try
+                            set agoSecs to (current date) - (modification date of n)
+                            set out to out & fName & fieldSep & (name of n) & fieldSep & agoSecs & fieldSep & (body of n) & noteSep
+                        end try
+                    end repeat
+                end if
             end repeat
         end tell
         return out

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lush Docs"
+  short_description: "Read and edit documents in the running Lush app"
+  default_prompt: "Use $lush-docs to find and update my Lush documents."

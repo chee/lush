@@ -13,7 +13,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Lush Notes</string>
+	<string>Lush</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>Caroni-Regular.otf</string>
@@ -25,8 +25,6 @@
 		<string>Merriweather-VariableFont_opsz,wdth,wght.ttf</string>
 		<string>Merriweather-Italic-VariableFont_opsz,wdth,wght.ttf</string>
 	</array>
-	<key>NSDockTilePlugIn</key>
-	<string>LushDockTile</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Attaches your location to notes as context.</string>
 	<key>CFBundleURLTypes</key>

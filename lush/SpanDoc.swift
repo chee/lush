@@ -110,6 +110,10 @@ struct BlockValue: Codable, Equatable {
         return attrs["level"]?.intValue ?? 1
     }
 
+    var indentLevel: Int {
+        attrs["indent"]?.intValue ?? 0
+    }
+
     var isEmbedBlock: Bool {
         isEmbed || type == "embed" || type == "image" || type == "html"
     }
@@ -229,6 +233,9 @@ extension NSAttributedString.Key {
     /// history viewer; drawn as a margin change bar.
     static let amChanged = NSAttributedString.Key("io.lush.changed")
     static let amColumnsBox = NSAttributedString.Key("io.lush.columnsBox")
+    /// Inline code, set by the editor. Read back independently of the font so a
+    /// monospaced body font never reads as code.
+    static let amCode = NSAttributedString.Key("io.lush.code")
 }
 
 /// A columns layout behind one attachment character: per-column span lists
@@ -381,6 +388,15 @@ final class EmbedAttachment: NSTextAttachment {
             while let view = candidate {
                 if let editor = view as? EditorTextView {
                     provider = editor.core?.inline.viewProvider(
+                        for: self,
+                        location: location,
+                        textContainer: textContainer
+                    )
+                    break
+                }
+                if let host = view as? InlineViewManaging,
+                   let manager = host.inlineManager {
+                    provider = manager.viewProvider(
                         for: self,
                         location: location,
                         textContainer: textContainer
@@ -712,12 +728,13 @@ enum RichText {
     private struct ParagraphKey: Hashable {
         let type: String
         let depth: Int
+        let indentLevel: Int
     }
 
     private static var paragraphStyleCache: [ParagraphKey: NSParagraphStyle] = [:]
 
     static func paragraphStyle(for block: BlockValue) -> NSParagraphStyle {
-        let key = ParagraphKey(type: block.type, depth: block.parents.count)
+        let key = ParagraphKey(type: block.type, depth: block.parents.count, indentLevel: block.indentLevel)
         if let hit = paragraphStyleCache[key] { return hit }
         let style = buildParagraphStyle(for: block)
         paragraphStyleCache[key] = style
@@ -730,6 +747,7 @@ enum RichText {
         var indent: CGFloat = 0
         // nested structures (list nesting, columns, table cells) indent by depth
         indent += CGFloat(block.parents.count) * 20
+        indent += CGFloat(block.indentLevel) * 20
         switch block.type {
         case "heading":
             ps.paragraphSpacingBefore = 10
@@ -774,7 +792,8 @@ enum RichText {
             .amBlock: BlockBox(block),
         ]
         if case .bool(true)? = marks["code"] {
-            out[.backgroundColor] = PColor.pLabel.withAlphaComponent(0.08)
+            out[.backgroundColor] = CodeHighlight.cardBackground
+            out[.amCode] = true
         }
         if let name = marks["highlight"]?.stringValue {
             out[.amHighlight] = name
@@ -815,9 +834,9 @@ enum RichText {
             if font.hasItalicTrait {
                 marks["em"] = .bool(true)
             }
-            if block.type != "code-block", font.hasMonoSpaceTrait {
-                marks["code"] = .bool(true)
-            }
+        }
+        if block.type != "code-block", attrs[.amCode] != nil {
+            marks["code"] = .bool(true)
         }
         if let link = attrs[.link] {
             if let url = link as? URL {
@@ -1038,7 +1057,7 @@ enum RichText {
             // unknown block types render as the live chip, never as blank space
             attachment = liveBox(width: 320, height: 44)
         } else {
-            attachment = imageBox(PImage.symbol("photo"), bounds: CGRect(x: 0, y: 0, width: 48, height: 36))
+            attachment = liveBox(width: 460, height: 140)
         }
         let string = NSMutableAttributedString(attachment: attachment)
         string.addAttributes(attrs, range: NSRange(location: 0, length: string.length))
@@ -1223,6 +1242,18 @@ enum RichText {
             paragraphRanges.append(NSRange(location: str.length, length: 0))
         }
 
+        // text typed on an attachment's line survives as its own paragraph
+        func strayParagraph(in range: NSRange) -> [SpanNode] {
+            var stray = ""
+            attr.enumerateAttributes(in: range) { runAttrs, runRange, _ in
+                guard runAttrs[.amDisplayOnly] == nil else { return }
+                stray += str.substring(with: runRange)
+                    .replacingOccurrences(of: "\u{FFFC}", with: "")
+            }
+            stray = stray.trimmingCharacters(in: .newlines)
+            return stray.isEmpty ? [] : [.block(.paragraph), .text(stray, [:])]
+        }
+
         var previousBlock = BlockValue.paragraph
         for range in paragraphRanges {
             var contentLength = range.length
@@ -1230,36 +1261,23 @@ enum RichText {
                 contentLength -= 1
             }
             if range.length > 0 {
-                var boxSpans: [SpanNode]?
-                attr.enumerateAttribute(.amTableBox, in: range) { value, _, stop in
+                var boxes: [(location: Int, spans: [SpanNode])] = []
+                attr.enumerateAttribute(.amTableBox, in: range) { value, runRange, _ in
                     if let box = value as? TableBox {
-                        boxSpans = box.spans
-                        stop.pointee = true
+                        boxes.append((runRange.location, box.spans))
                     }
                 }
-                if boxSpans == nil {
-                    attr.enumerateAttribute(.amColumnsBox, in: range) { value, _, stop in
-                        if let box = value as? ColumnsBox {
-                            boxSpans = box.spans
-                            stop.pointee = true
-                        }
+                attr.enumerateAttribute(.amColumnsBox, in: range) { value, runRange, _ in
+                    if let box = value as? ColumnsBox {
+                        boxes.append((runRange.location, box.spans))
                     }
                 }
-                if let boxSpans {
-                    spans.append(contentsOf: boxSpans)
-                    // text typed on the attachment's line survives as its own
-                    // paragraph after the table
-                    var stray = ""
-                    attr.enumerateAttributes(in: range) { runAttrs, runRange, _ in
-                        guard runAttrs[.amDisplayOnly] == nil else { return }
-                        stray += str.substring(with: runRange)
-                            .replacingOccurrences(of: "\u{FFFC}", with: "")
+                if !boxes.isEmpty {
+                    boxes.sort { $0.location < $1.location }
+                    for box in boxes {
+                        spans.append(contentsOf: box.spans)
                     }
-                    stray = stray.trimmingCharacters(in: .newlines)
-                    if !stray.isEmpty {
-                        spans.append(.block(.paragraph))
-                        spans.append(.text(stray, [:]))
-                    }
+                    spans.append(contentsOf: strayParagraph(in: range))
                     previousBlock = .paragraph
                     continue
                 }
@@ -1284,6 +1302,7 @@ enum RichText {
                     : ""
                 if content.contains("\u{FFFC}") {
                     spans.append(.block(block))
+                    spans.append(contentsOf: strayParagraph(in: range))
                     previousBlock = block
                     continue
                 }

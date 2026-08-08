@@ -295,7 +295,10 @@ enum RichTextClipboard {
         guard range.length > 0 else { return }
         let text = str.substring(with: range)
         let markerCharacters: Int
-        if text.hasPrefix("- ") || text.hasPrefix("* ") {
+        if text.hasPrefix("\t"), let secondTab = text.dropFirst().firstIndex(of: "\t") {
+            // HTML import emits "\t•\t" / "\t1.\t"
+            markerCharacters = text.distance(from: text.startIndex, to: secondTab) + 1
+        } else if text.hasPrefix("- ") || text.hasPrefix("* ") {
             markerCharacters = 2
         } else {
             markerCharacters = orderedListPrefixLength(in: text) ?? 0

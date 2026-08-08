@@ -589,7 +589,19 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func assetsWithoutVision(limit: UInt32)  -> [String]
     
+    /**
+     * Full-history fork of a doc installed as a new repo doc. `cloned_at`
+     * is the source's heads at fork time.
+     */
+    func cloneDoc(url: String) throws  -> CloneResult
+    
     func configState(configUrl: String)  -> ConfigState?
+    
+    /**
+     * Start the outbound sync-server connection loop. Idempotent — safe to
+     * call multiple times; only the first call takes effect.
+     */
+    func connect() 
     
     func contactInfo(url: String)  -> ContactInfo?
     
@@ -603,6 +615,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * specific folder doc; returns the file doc's URL.
      */
     func createAssetIn(folderUrl: String, name: String, `extension`: String, mimeType: String, data: Data) throws  -> String
+    
+    func createCheckoutDoc() throws  -> String
+    
+    func createDraftDoc(parentUrl: String, isMain: Bool) throws  -> String
     
     func createNote(title: String) throws  -> String
     
@@ -647,7 +663,29 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func docHistory(url: String)  -> [DocHistoryEntry]
     
+    /**
+     * History restricted to changes not covered by `heads` — a draft
+     * clone's activity since its fork point. Per-entry heads start from the
+     * fork frontier so snapshots at any entry stay correct.
+     */
+    func docHistorySince(url: String, heads: [String])  -> [DocHistoryEntry]
+    
     func docStorageChunks(url: String)  -> [StorageChunk]
+    
+    func draftAddChild(draftUrl: String, childUrl: String) throws 
+    
+    func draftMarkMerged(draftUrl: String, timestampMs: Int64) throws 
+    
+    func draftRecordClone(draftUrl: String, originalUrl: String, cloneUrl: String, clonedAt: [String]) throws 
+    
+    func draftRecordMerge(draftUrl: String, originalUrl: String, mergedAt: [String]) throws 
+    
+    func draftSetName(draftUrl: String, name: String?) throws 
+    
+    /**
+     * None when the doc is not a draft (`@patchwork.type != "draft"`).
+     */
+    func draftState(url: String) throws  -> DraftState?
     
     /**
      * Open an existing folder doc (waiting for it to arrive if needed) or
@@ -666,7 +704,11 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func irohNodeId()  -> String?
     
+    func isApplyingIncoming()  -> Bool
+    
     func isConnected()  -> Bool
+    
+    func isSendingChanges()  -> Bool
     
     /**
      * Link a note into the current folder. The folder doc is loaded from
@@ -696,11 +738,19 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func loginAccount(accountUrl: String) throws  -> AccountState
     
+    func mainDraftUrl(docUrl: String) throws  -> String?
+    
     /**
      * Record that the analyzer has looked at this asset, so a fruitless one
      * (audio, a blank image) is not retried on every backfill.
      */
     func markVisionAttempted(url: String) 
+    
+    /**
+     * Plain automerge merge of `from` into `into`; returns the target's
+     * heads after the merge.
+     */
+    func mergeDoc(intoUrl: String, fromUrl: String) throws  -> [String]
     
     /**
      * Move an entry from one folder doc to another, refusing cycles.
@@ -744,6 +794,16 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * locally (immediately for docs we already have).
      */
     func openNote(url: String) async throws 
+    
+    func pendingChangeCount(url: String)  -> UInt32
+    
+    func pendingDocHistory(url: String)  -> [DocHistoryEntry]
+    
+    /**
+     * A heads-pinned automerge url (`automerge:<id>#<head>|<head>`,
+     * bs58check heads, sorted) — automerge-repo's read-only view format.
+     */
+    func pinnedDocUrl(url: String, heads: [String]) throws  -> String
     
     /**
      * Start tracking + syncing docs without waiting for them to arrive,
@@ -794,16 +854,24 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func semanticSearch(vector: [Float], limit: UInt32, excluding: [String])  -> [SearchHit]
     
+    func setApplyIncoming(enabled: Bool) 
+    
+    func setCheckoutState(url: String, checkedOut: String?, pins: [CheckpointPin]?) throws 
+    
     func setConfigFolders(configUrl: String, urls: [String]) throws 
     
     func setConfigInbox(configUrl: String, url: String) throws 
     
     func setDelegate(delegate: CoreDelegate) 
     
+    func setMainDraftUrl(docUrl: String, draftUrl: String) throws 
+    
     /**
      * Store a note's embedded passages, replacing any it already had.
      */
     func setNoteEmbeddings(url: String, name: String, digest: String, chunks: [EmbeddingChunk]) throws 
+    
+    func setSendChanges(enabled: Bool) 
     
     /**
      * Flush all pending saves and do a best-effort final sync before the app
@@ -989,12 +1057,34 @@ open func assetsWithoutVision(limit: UInt32) -> [String]  {
 })
 }
     
+    /**
+     * Full-history fork of a doc installed as a new repo doc. `cloned_at`
+     * is the source's heads at fork time.
+     */
+open func cloneDoc(url: String)throws  -> CloneResult  {
+    return try  FfiConverterTypeCloneResult_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_clone_doc(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
 open func configState(configUrl: String) -> ConfigState?  {
     return try!  FfiConverterOptionTypeConfigState.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_config_state(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),$0
     )
 })
+}
+    
+    /**
+     * Start the outbound sync-server connection loop. Idempotent — safe to
+     * call multiple times; only the first call takes effect.
+     */
+open func connect()  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_connect(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func contactInfo(url: String) -> ContactInfo?  {
@@ -1031,6 +1121,22 @@ open func createAssetIn(folderUrl: String, name: String, `extension`: String, mi
         FfiConverterString.lower(`extension`),
         FfiConverterString.lower(mimeType),
         FfiConverterData.lower(data),$0
+    )
+})
+}
+    
+open func createCheckoutDoc()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_create_checkout_doc(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func createDraftDoc(parentUrl: String, isMain: Bool)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_create_draft_doc(self.uniffiClonePointer(),
+        FfiConverterString.lower(parentUrl),
+        FfiConverterBool.lower(isMain),$0
     )
 })
 }
@@ -1157,9 +1263,77 @@ open func docHistory(url: String) -> [DocHistoryEntry]  {
 })
 }
     
+    /**
+     * History restricted to changes not covered by `heads` — a draft
+     * clone's activity since its fork point. Per-entry heads start from the
+     * fork frontier so snapshots at any entry stay correct.
+     */
+open func docHistorySince(url: String, heads: [String]) -> [DocHistoryEntry]  {
+    return try!  FfiConverterSequenceTypeDocHistoryEntry.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_doc_history_since(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterSequenceString.lower(heads),$0
+    )
+})
+}
+    
 open func docStorageChunks(url: String) -> [StorageChunk]  {
     return try!  FfiConverterSequenceTypeStorageChunk.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_doc_storage_chunks(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+open func draftAddChild(draftUrl: String, childUrl: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_draft_add_child(self.uniffiClonePointer(),
+        FfiConverterString.lower(draftUrl),
+        FfiConverterString.lower(childUrl),$0
+    )
+}
+}
+    
+open func draftMarkMerged(draftUrl: String, timestampMs: Int64)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_draft_mark_merged(self.uniffiClonePointer(),
+        FfiConverterString.lower(draftUrl),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+}
+}
+    
+open func draftRecordClone(draftUrl: String, originalUrl: String, cloneUrl: String, clonedAt: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_draft_record_clone(self.uniffiClonePointer(),
+        FfiConverterString.lower(draftUrl),
+        FfiConverterString.lower(originalUrl),
+        FfiConverterString.lower(cloneUrl),
+        FfiConverterSequenceString.lower(clonedAt),$0
+    )
+}
+}
+    
+open func draftRecordMerge(draftUrl: String, originalUrl: String, mergedAt: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_draft_record_merge(self.uniffiClonePointer(),
+        FfiConverterString.lower(draftUrl),
+        FfiConverterString.lower(originalUrl),
+        FfiConverterSequenceString.lower(mergedAt),$0
+    )
+}
+}
+    
+open func draftSetName(draftUrl: String, name: String?)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_draft_set_name(self.uniffiClonePointer(),
+        FfiConverterString.lower(draftUrl),
+        FfiConverterOptionString.lower(name),$0
+    )
+}
+}
+    
+    /**
+     * None when the doc is not a draft (`@patchwork.type != "draft"`).
+     */
+open func draftState(url: String)throws  -> DraftState?  {
+    return try  FfiConverterOptionTypeDraftState.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_draft_state(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
     )
 })
@@ -1230,9 +1404,23 @@ open func irohNodeId() -> String?  {
 })
 }
     
+open func isApplyingIncoming() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_is_applying_incoming(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func isConnected() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_is_connected(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func isSendingChanges() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_is_sending_changes(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1303,6 +1491,14 @@ open func loginAccount(accountUrl: String)throws  -> AccountState  {
 })
 }
     
+open func mainDraftUrl(docUrl: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_main_draft_url(self.uniffiClonePointer(),
+        FfiConverterString.lower(docUrl),$0
+    )
+})
+}
+    
     /**
      * Record that the analyzer has looked at this asset, so a fruitless one
      * (audio, a blank image) is not retried on every backfill.
@@ -1312,6 +1508,19 @@ open func markVisionAttempted(url: String)  {try! rustCall() {
         FfiConverterString.lower(url),$0
     )
 }
+}
+    
+    /**
+     * Plain automerge merge of `from` into `into`; returns the target's
+     * heads after the merge.
+     */
+open func mergeDoc(intoUrl: String, fromUrl: String)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_merge_doc(self.uniffiClonePointer(),
+        FfiConverterString.lower(intoUrl),
+        FfiConverterString.lower(fromUrl),$0
+    )
+})
 }
     
     /**
@@ -1489,6 +1698,35 @@ open func openNote(url: String)async throws   {
         )
 }
     
+open func pendingChangeCount(url: String) -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_pending_change_count(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+open func pendingDocHistory(url: String) -> [DocHistoryEntry]  {
+    return try!  FfiConverterSequenceTypeDocHistoryEntry.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_pending_doc_history(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+    /**
+     * A heads-pinned automerge url (`automerge:<id>#<head>|<head>`,
+     * bs58check heads, sorted) — automerge-repo's read-only view format.
+     */
+open func pinnedDocUrl(url: String, heads: [String])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_pinned_doc_url(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterSequenceString.lower(heads),$0
+    )
+})
+}
+    
     /**
      * Start tracking + syncing docs without waiting for them to arrive,
      * recursing into subfolders. Once a doc lands, its legacy scalar
@@ -1604,6 +1842,22 @@ open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String]) ->
 })
 }
     
+open func setApplyIncoming(enabled: Bool)  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_set_apply_incoming(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+    
+open func setCheckoutState(url: String, checkedOut: String?, pins: [CheckpointPin]?)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_checkout_state(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterOptionString.lower(checkedOut),
+        FfiConverterOptionSequenceTypeCheckpointPin.lower(pins),$0
+    )
+}
+}
+    
 open func setConfigFolders(configUrl: String, urls: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_set_config_folders(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),
@@ -1627,6 +1881,14 @@ open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
 }
 }
     
+open func setMainDraftUrl(docUrl: String, draftUrl: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_main_draft_url(self.uniffiClonePointer(),
+        FfiConverterString.lower(docUrl),
+        FfiConverterString.lower(draftUrl),$0
+    )
+}
+}
+    
     /**
      * Store a note's embedded passages, replacing any it already had.
      */
@@ -1636,6 +1898,13 @@ open func setNoteEmbeddings(url: String, name: String, digest: String, chunks: [
         FfiConverterString.lower(name),
         FfiConverterString.lower(digest),
         FfiConverterSequenceTypeEmbeddingChunk.lower(chunks),$0
+    )
+}
+}
+    
+open func setSendChanges(enabled: Bool)  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_set_send_changes(self.uniffiClonePointer(),
+        FfiConverterBool.lower(enabled),$0
     )
 }
 }
@@ -2129,6 +2398,232 @@ public func FfiConverterTypeAssetVision_lower(_ value: AssetVision) -> RustBuffe
 }
 
 
+public struct CheckpointPin {
+    public var originalUrl: String
+    public var heads: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(originalUrl: String, heads: [String]) {
+        self.originalUrl = originalUrl
+        self.heads = heads
+    }
+}
+
+#if compiler(>=6)
+extension CheckpointPin: Sendable {}
+#endif
+
+
+extension CheckpointPin: Equatable, Hashable {
+    public static func ==(lhs: CheckpointPin, rhs: CheckpointPin) -> Bool {
+        if lhs.originalUrl != rhs.originalUrl {
+            return false
+        }
+        if lhs.heads != rhs.heads {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(originalUrl)
+        hasher.combine(heads)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCheckpointPin: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CheckpointPin {
+        return
+            try CheckpointPin(
+                originalUrl: FfiConverterString.read(from: &buf), 
+                heads: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CheckpointPin, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.originalUrl, into: &buf)
+        FfiConverterSequenceString.write(value.heads, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCheckpointPin_lift(_ buf: RustBuffer) throws -> CheckpointPin {
+    return try FfiConverterTypeCheckpointPin.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCheckpointPin_lower(_ value: CheckpointPin) -> RustBuffer {
+    return FfiConverterTypeCheckpointPin.lower(value)
+}
+
+
+public struct CloneEntryFfi {
+    public var originalUrl: String
+    public var cloneUrl: String
+    public var clonedAt: [String]
+    public var mergedAt: [String]?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(originalUrl: String, cloneUrl: String, clonedAt: [String], mergedAt: [String]?) {
+        self.originalUrl = originalUrl
+        self.cloneUrl = cloneUrl
+        self.clonedAt = clonedAt
+        self.mergedAt = mergedAt
+    }
+}
+
+#if compiler(>=6)
+extension CloneEntryFfi: Sendable {}
+#endif
+
+
+extension CloneEntryFfi: Equatable, Hashable {
+    public static func ==(lhs: CloneEntryFfi, rhs: CloneEntryFfi) -> Bool {
+        if lhs.originalUrl != rhs.originalUrl {
+            return false
+        }
+        if lhs.cloneUrl != rhs.cloneUrl {
+            return false
+        }
+        if lhs.clonedAt != rhs.clonedAt {
+            return false
+        }
+        if lhs.mergedAt != rhs.mergedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(originalUrl)
+        hasher.combine(cloneUrl)
+        hasher.combine(clonedAt)
+        hasher.combine(mergedAt)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloneEntryFfi: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloneEntryFfi {
+        return
+            try CloneEntryFfi(
+                originalUrl: FfiConverterString.read(from: &buf), 
+                cloneUrl: FfiConverterString.read(from: &buf), 
+                clonedAt: FfiConverterSequenceString.read(from: &buf), 
+                mergedAt: FfiConverterOptionSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloneEntryFfi, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.originalUrl, into: &buf)
+        FfiConverterString.write(value.cloneUrl, into: &buf)
+        FfiConverterSequenceString.write(value.clonedAt, into: &buf)
+        FfiConverterOptionSequenceString.write(value.mergedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloneEntryFfi_lift(_ buf: RustBuffer) throws -> CloneEntryFfi {
+    return try FfiConverterTypeCloneEntryFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloneEntryFfi_lower(_ value: CloneEntryFfi) -> RustBuffer {
+    return FfiConverterTypeCloneEntryFfi.lower(value)
+}
+
+
+public struct CloneResult {
+    public var cloneUrl: String
+    public var clonedAt: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(cloneUrl: String, clonedAt: [String]) {
+        self.cloneUrl = cloneUrl
+        self.clonedAt = clonedAt
+    }
+}
+
+#if compiler(>=6)
+extension CloneResult: Sendable {}
+#endif
+
+
+extension CloneResult: Equatable, Hashable {
+    public static func ==(lhs: CloneResult, rhs: CloneResult) -> Bool {
+        if lhs.cloneUrl != rhs.cloneUrl {
+            return false
+        }
+        if lhs.clonedAt != rhs.clonedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(cloneUrl)
+        hasher.combine(clonedAt)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCloneResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CloneResult {
+        return
+            try CloneResult(
+                cloneUrl: FfiConverterString.read(from: &buf), 
+                clonedAt: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CloneResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.cloneUrl, into: &buf)
+        FfiConverterSequenceString.write(value.clonedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloneResult_lift(_ buf: RustBuffer) throws -> CloneResult {
+    return try FfiConverterTypeCloneResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCloneResult_lower(_ value: CloneResult) -> RustBuffer {
+    return FfiConverterTypeCloneResult.lower(value)
+}
+
+
 public struct ConfigState {
     public var folders: [String]
     public var inbox: String?
@@ -2277,10 +2772,12 @@ public struct DocHistoryEntry {
     public var seq: UInt64
     public var message: String?
     public var deps: [String]
+    public var additions: UInt64
+    public var deletions: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hash: String, heads: [String], time: Int64, actor: String, seq: UInt64, message: String?, deps: [String]) {
+    public init(hash: String, heads: [String], time: Int64, actor: String, seq: UInt64, message: String?, deps: [String], additions: UInt64, deletions: UInt64) {
         self.hash = hash
         self.heads = heads
         self.time = time
@@ -2288,6 +2785,8 @@ public struct DocHistoryEntry {
         self.seq = seq
         self.message = message
         self.deps = deps
+        self.additions = additions
+        self.deletions = deletions
     }
 }
 
@@ -2319,6 +2818,12 @@ extension DocHistoryEntry: Equatable, Hashable {
         if lhs.deps != rhs.deps {
             return false
         }
+        if lhs.additions != rhs.additions {
+            return false
+        }
+        if lhs.deletions != rhs.deletions {
+            return false
+        }
         return true
     }
 
@@ -2330,6 +2835,8 @@ extension DocHistoryEntry: Equatable, Hashable {
         hasher.combine(seq)
         hasher.combine(message)
         hasher.combine(deps)
+        hasher.combine(additions)
+        hasher.combine(deletions)
     }
 }
 
@@ -2348,7 +2855,9 @@ public struct FfiConverterTypeDocHistoryEntry: FfiConverterRustBuffer {
                 actor: FfiConverterString.read(from: &buf), 
                 seq: FfiConverterUInt64.read(from: &buf), 
                 message: FfiConverterOptionString.read(from: &buf), 
-                deps: FfiConverterSequenceString.read(from: &buf)
+                deps: FfiConverterSequenceString.read(from: &buf), 
+                additions: FfiConverterUInt64.read(from: &buf), 
+                deletions: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2360,6 +2869,8 @@ public struct FfiConverterTypeDocHistoryEntry: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.seq, into: &buf)
         FfiConverterOptionString.write(value.message, into: &buf)
         FfiConverterSequenceString.write(value.deps, into: &buf)
+        FfiConverterUInt64.write(value.additions, into: &buf)
+        FfiConverterUInt64.write(value.deletions, into: &buf)
     }
 }
 
@@ -2376,6 +2887,108 @@ public func FfiConverterTypeDocHistoryEntry_lift(_ buf: RustBuffer) throws -> Do
 #endif
 public func FfiConverterTypeDocHistoryEntry_lower(_ value: DocHistoryEntry) -> RustBuffer {
     return FfiConverterTypeDocHistoryEntry.lower(value)
+}
+
+
+public struct DraftState {
+    public var isMain: Bool
+    public var name: String?
+    public var parent: String
+    public var drafts: [String]
+    public var clones: [CloneEntryFfi]
+    public var mergedAt: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(isMain: Bool, name: String?, parent: String, drafts: [String], clones: [CloneEntryFfi], mergedAt: Int64?) {
+        self.isMain = isMain
+        self.name = name
+        self.parent = parent
+        self.drafts = drafts
+        self.clones = clones
+        self.mergedAt = mergedAt
+    }
+}
+
+#if compiler(>=6)
+extension DraftState: Sendable {}
+#endif
+
+
+extension DraftState: Equatable, Hashable {
+    public static func ==(lhs: DraftState, rhs: DraftState) -> Bool {
+        if lhs.isMain != rhs.isMain {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.parent != rhs.parent {
+            return false
+        }
+        if lhs.drafts != rhs.drafts {
+            return false
+        }
+        if lhs.clones != rhs.clones {
+            return false
+        }
+        if lhs.mergedAt != rhs.mergedAt {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(isMain)
+        hasher.combine(name)
+        hasher.combine(parent)
+        hasher.combine(drafts)
+        hasher.combine(clones)
+        hasher.combine(mergedAt)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDraftState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DraftState {
+        return
+            try DraftState(
+                isMain: FfiConverterBool.read(from: &buf), 
+                name: FfiConverterOptionString.read(from: &buf), 
+                parent: FfiConverterString.read(from: &buf), 
+                drafts: FfiConverterSequenceString.read(from: &buf), 
+                clones: FfiConverterSequenceTypeCloneEntryFfi.read(from: &buf), 
+                mergedAt: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DraftState, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.isMain, into: &buf)
+        FfiConverterOptionString.write(value.name, into: &buf)
+        FfiConverterString.write(value.parent, into: &buf)
+        FfiConverterSequenceString.write(value.drafts, into: &buf)
+        FfiConverterSequenceTypeCloneEntryFfi.write(value.clones, into: &buf)
+        FfiConverterOptionInt64.write(value.mergedAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDraftState_lift(_ buf: RustBuffer) throws -> DraftState {
+    return try FfiConverterTypeDraftState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDraftState_lower(_ value: DraftState) -> RustBuffer {
+    return FfiConverterTypeDraftState.lower(value)
 }
 
 
@@ -3131,6 +3744,30 @@ fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -3299,6 +3936,30 @@ fileprivate struct FfiConverterOptionTypeContactInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeDraftState: FfiConverterRustBuffer {
+    typealias SwiftType = DraftState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeDraftState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeDraftState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]?
 
@@ -3315,6 +3976,30 @@ fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterSequenceString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceTypeCheckpointPin: FfiConverterRustBuffer {
+    typealias SwiftType = [CheckpointPin]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceTypeCheckpointPin.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceTypeCheckpointPin.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3365,6 +4050,56 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCheckpointPin: FfiConverterRustBuffer {
+    typealias SwiftType = [CheckpointPin]
+
+    public static func write(_ value: [CheckpointPin], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCheckpointPin.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CheckpointPin] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CheckpointPin]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCheckpointPin.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCloneEntryFfi: FfiConverterRustBuffer {
+    typealias SwiftType = [CloneEntryFfi]
+
+    public static func write(_ value: [CloneEntryFfi], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCloneEntryFfi.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CloneEntryFfi] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CloneEntryFfi]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCloneEntryFfi.read(from: &buf))
         }
         return seq
     }
@@ -3628,7 +4363,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_assets_without_vision() != 63793) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_clone_doc() != 61323) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_config_state() != 45575) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_connect() != 33521) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_contact_info() != 36844) {
@@ -3638,6 +4379,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_asset_in() != 48583) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_create_checkout_doc() != 24043) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_create_draft_doc() != 25147) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_note() != 43728) {
@@ -3673,7 +4420,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_doc_history() != 37101) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_doc_history_since() != 44313) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_doc_storage_chunks() != 51003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_draft_add_child() != 12925) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_draft_mark_merged() != 47932) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_draft_record_clone() != 36773) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_draft_record_merge() != 40659) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_draft_set_name() != 41226) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_draft_state() != 36908) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_ensure_folder() != 6376) {
@@ -3691,7 +4459,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_iroh_node_id() != 63944) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_is_applying_incoming() != 54539) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_is_connected() != 16465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_is_sending_changes() != 41426) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 60899) {
@@ -3709,7 +4483,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_login_account() != 1192) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_main_draft_url() != 27513) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_mark_vision_attempted() != 8028) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_merge_doc() != 19105) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_move_entry() != 40698) {
@@ -3745,6 +4525,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_open_note() != 44259) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_pending_change_count() != 1569) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pending_doc_history() != 55870) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pinned_doc_url() != 53180) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 23856) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3778,6 +4567,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_semantic_search() != 9002) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_set_apply_incoming() != 65158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_checkout_state() != 43074) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_set_config_folders() != 33231) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3787,7 +4582,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_set_main_draft_url() != 11311) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_set_note_embeddings() != 49168) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_send_changes() != 21542) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_shutdown() != 44681) {

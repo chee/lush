@@ -44,15 +44,36 @@ pub struct IndexedDoc {
     pub has_vision: bool,
 }
 
+/// Open the db and touch its schema so a corrupt file surfaces here rather
+/// than lazily on the first real query. Setting WAL and reading `sqlite_master`
+/// both force SQLite to validate the file header.
+fn open_verified(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
+    Ok(conn)
+}
+
+fn remove_db_files(db_path: &Path) {
+    let _ = std::fs::remove_file(db_path);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
+
 impl SearchIndex {
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("search.sqlite3");
-        let conn = Connection::open(&db_path).or_else(|_| {
-            let _ = std::fs::remove_file(&db_path);
-            Connection::open(&db_path)
-        })?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        let conn = match open_verified(&db_path) {
+            Ok(conn) => conn,
+            Err(_) => {
+                remove_db_files(&db_path);
+                open_verified(&db_path)?
+            }
+        };
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             r#"
@@ -369,6 +390,13 @@ impl SearchIndex {
                     });
                 }
             } else if kind == "file" {
+                if seen_notes.insert(url.clone()) {
+                    hits.push(SearchHit {
+                        url: url.clone(),
+                        name: title.clone(),
+                        snippet: snippet(&body, &title, query),
+                    });
+                }
                 let mut links = conn.prepare(
                     "SELECT note_url, note_name
                      FROM search_links
@@ -426,7 +454,7 @@ fn fts_query(query: &str) -> Option<String> {
             if cleaned.is_empty() {
                 None
             } else {
-                Some(format!("{}*", cleaned))
+                Some(format!("\"{}\"*", cleaned))
             }
         })
         .collect();

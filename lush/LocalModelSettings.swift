@@ -52,6 +52,10 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
 enum LocalModelBackend: String, CaseIterable, Identifiable {
     case appleIntelligence
     case mlx
+    case openRouter
+    case openAI
+    case anthropic
+    case compatible
 
     var id: String { rawValue }
 
@@ -59,6 +63,46 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
         switch self {
         case .appleIntelligence: "Apple Intelligence"
         case .mlx: "MLX model"
+        case .openRouter: "OpenRouter"
+        case .openAI: "OpenAI API"
+        case .anthropic: "Anthropic API"
+        case .compatible: "OpenAI-compatible API"
+        }
+    }
+
+    var isCloud: Bool {
+        switch self {
+        case .openRouter, .openAI, .anthropic, .compatible: true
+        case .appleIntelligence, .mlx: false
+        }
+    }
+
+    var credentialLabel: String {
+        switch self {
+        case .openRouter: "OpenRouter key"
+        case .openAI: "OpenAI API key"
+        case .anthropic: "Anthropic API key"
+        case .compatible: "API key"
+        case .appleIntelligence, .mlx: ""
+        }
+    }
+
+    var defaultEndpoint: String {
+        switch self {
+        case .openRouter: "https://openrouter.ai/api/v1/chat/completions"
+        case .openAI: "https://api.openai.com/v1/chat/completions"
+        case .anthropic: "https://api.anthropic.com/v1/messages"
+        case .compatible: ""
+        case .appleIntelligence, .mlx: ""
+        }
+    }
+
+    var defaultModel: String {
+        switch self {
+        case .openRouter: "openrouter/auto"
+        case .openAI: "gpt-5.6"
+        case .anthropic: "claude-sonnet-5"
+        case .compatible, .appleIntelligence, .mlx: ""
         }
     }
 }
@@ -76,6 +120,16 @@ struct RemoteModelConfig: Codable, Equatable {
 
     var isConfigured: Bool {
         !repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+struct CloudModelConfig: Codable, Equatable {
+    var model: String
+    var endpoint: String
+
+    init(model: String = "", endpoint: String = "") {
+        self.model = model
+        self.endpoint = endpoint
     }
 }
 
@@ -175,6 +229,7 @@ enum LocalModelSettings {
     private static let remoteModelPrefix = "ml.remoteModel."
     private static let generationPrefix = "ml.generation."
     private static let systemPromptPrefix = "ml.systemPrompt."
+    private static let cloudConfigPrefix = "ml.cloudConfig."
 
     static func backend(for operation: LocalModelOperation) -> LocalModelBackend {
         guard let raw = UserDefaults.standard.string(forKey: backendPrefix + operation.rawValue) else {
@@ -203,6 +258,28 @@ enum LocalModelSettings {
             try? JSONEncoder().encode(config),
             forKey: remoteModelPrefix + operation.rawValue
         )
+    }
+
+    static func cloudModelConfig(
+        for operation: LocalModelOperation,
+        backend: LocalModelBackend
+    ) -> CloudModelConfig {
+        let key = cloudConfigPrefix + backend.rawValue + "." + operation.rawValue
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let config = try? JSONDecoder().decode(CloudModelConfig.self, from: data)
+        else {
+            return CloudModelConfig(model: backend.defaultModel, endpoint: backend.defaultEndpoint)
+        }
+        return config
+    }
+
+    static func setCloudModelConfig(
+        _ config: CloudModelConfig,
+        for operation: LocalModelOperation,
+        backend: LocalModelBackend
+    ) {
+        let key = cloudConfigPrefix + backend.rawValue + "." + operation.rawValue
+        UserDefaults.standard.set(try? JSONEncoder().encode(config), forKey: key)
     }
 
     static func generationSettings(for operation: LocalModelOperation) -> LocalGenerationSettings {

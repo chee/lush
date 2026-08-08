@@ -31,6 +31,7 @@ final class PresenceManager {
 
     private(set) var docUrl: String?
     private(set) var peers: [String: Peer] = [:]
+    private(set) var enabled = true
 
     @ObservationIgnored private let senderId: String = {
         let key = "lushPresenceSenderId"
@@ -83,6 +84,10 @@ final class PresenceManager {
     // MARK: session
 
     func join(_ url: String) {
+        guard enabled else {
+            docUrl = url
+            return
+        }
         guard docUrl != url else { return }
         leave()
         docUrl = url
@@ -108,6 +113,21 @@ final class PresenceManager {
         docUrl = nil
         peers = [:]
         notifyPeersChanged()
+    }
+
+    func setEnabled(_ enabled: Bool, url: String?) {
+        guard self.enabled != enabled else { return }
+        if !enabled {
+            leave()
+            self.enabled = false
+            docUrl = url
+            return
+        }
+        self.enabled = true
+        docUrl = nil
+        if let url {
+            join(url)
+        }
     }
 
     func focusChanged(_ isFocused: Bool) {
@@ -175,7 +195,7 @@ final class PresenceManager {
     }
 
     private func send(_ presenceMessage: CBOR.Value) {
-        guard let docUrl, let core = model?.core else { return }
+        guard enabled, let docUrl, let core = model?.core else { return }
         let inner = CBOR.encode(.map([("__presence", presenceMessage)]))
         count += 1
         let envelope = CBOR.encode(.map([
@@ -202,7 +222,8 @@ final class PresenceManager {
     // MARK: inbound
 
     func receive(url: String, payload: Data) {
-        guard url == docUrl,
+        guard enabled,
+              url == docUrl,
               let envelope = try? CBOR.decode(payload),
               envelope["type"]?.stringValue == "ephemeral",
               let sender = envelope["senderId"]?.stringValue,
@@ -217,7 +238,7 @@ final class PresenceManager {
         switch message["type"]?.stringValue {
         case "snapshot":
             if case .map(let pairs)? = message["state"] {
-                peer.channels = Dictionary(uniqueKeysWithValues: pairs.map { ($0.0, $0.1) })
+                peer.channels = Dictionary(pairs.map { ($0.0, $0.1) }, uniquingKeysWith: { first, _ in first })
             }
             peer.lastActiveAt = now
             peer.lastUpdateAt = now

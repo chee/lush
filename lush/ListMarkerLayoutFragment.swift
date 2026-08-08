@@ -281,12 +281,19 @@ func listOrdinal(of location: Int, in storage: NSTextStorage) -> Int {
         guard previous.length > 0,
               previous.location >= 0,
               previous.location < storage.length,
-              let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox,
-              prevBox.value.type == "ordered-list-item",
-              prevBox.value.parents == parents
+              let prevBox = storage.attribute(.amBlock, at: previous.location, effectiveRange: nil) as? BlockBox
         else { break }
-        count += 1
-        cursor = previous.location
+        let prevParents = prevBox.value.parents
+        if prevBox.value.type == "ordered-list-item", prevParents == parents {
+            count += 1
+            cursor = previous.location
+        } else if prevParents.count > parents.count,
+                  prevParents.prefix(parents.count).elementsEqual(parents),
+                  MarkerDrawing.decoratedTypes.contains(prevParents[parents.count]) {
+            cursor = previous.location
+        } else {
+            break
+        }
     }
     return count
 }

@@ -12,10 +12,12 @@
 		F07316C03022831400FFA544 /* LushWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F07316B03022831200FFA544 /* LushWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		F073171B30241ABC00FFA544 /* LushShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F073170F30241ABC00FFA544 /* LushShareExtension.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		F073173330241AD500FFA544 /* LushFinderAction.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F073172530241AD500FFA544 /* LushFinderAction.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		F073187D30253E5800FFA544 /* CoreMLLLM in Frameworks */ = {isa = PBXBuildFile; productRef = F073187C30253E5800FFA544 /* CoreMLLLM */; };
+		F07318773025000000FFA544 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = F07318753025000000FFA544 /* MLXLLM */; };
+		F07318783025000000FFA544 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = F07318763025000000FFA544 /* MLXLMCommon */; };
 		F0872FA4301F62AD003F9B3B /* PatchworkWeb.bundle in Resources */ = {isa = PBXBuildFile; fileRef = F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */; };
 		F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA6301F718C003F9B3B /* PatchworkServerKit */; };
 		F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA9301F756A003F9B3B /* PatchworkServerKit */; };
+		F0DC71D0000000000000000B /* LushDockTile.docktileplugin in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F0DC71D0000000000000000A /* LushDockTile.docktileplugin */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -40,6 +42,13 @@
 			remoteGlobalIDString = F073172430241AD500FFA544;
 			remoteInfo = LushFinderAction;
 		};
+		F0DC71D0000000000000000C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F001D300301E8AA900E154BD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F0DC71D00000000000000001;
+			remoteInfo = LushDockTile;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -52,6 +61,7 @@
 				F073171B30241ABC00FFA544 /* LushShareExtension.appex in Embed Foundation Extensions */,
 				F07316C03022831400FFA544 /* LushWidgetExtension.appex in Embed Foundation Extensions */,
 				F073173330241AD500FFA544 /* LushFinderAction.appex in Embed Foundation Extensions */,
+				F0DC71D0000000000000000B /* LushDockTile.docktileplugin in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -66,6 +76,7 @@
 		F073170F30241ABC00FFA544 /* LushShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F073172530241AD500FFA544 /* LushFinderAction.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushFinderAction.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
+		F0DC71D0000000000000000A /* LushDockTile.docktileplugin */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LushDockTile.docktileplugin; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -96,6 +107,13 @@
 				Info.plist,
 			);
 			target = F001D307301E8AA900E154BD /* Lush */;
+		};
+		F0DC71D00000000000000009 /* Exceptions for "LushDockTile" folder in "LushDockTile" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = F0DC71D00000000000000001 /* LushDockTile */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -137,6 +155,14 @@
 			path = lush;
 			sourceTree = "<group>";
 		};
+		F0DC71D00000000000000008 /* LushDockTile */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				F0DC71D00000000000000009 /* Exceptions for "LushDockTile" folder in "LushDockTile" target */,
+			);
+			path = LushDockTile;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -145,8 +171,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */,
-				F073187D30253E5800FFA544 /* CoreMLLLM in Frameworks */,
 				F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */,
+				F07318773025000000FFA544 /* MLXLLM in Frameworks */,
+				F07318783025000000FFA544 /* MLXLMCommon in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -173,6 +200,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0DC71D00000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -183,6 +217,7 @@
 				F07316B63022831200FFA544 /* LushWidget */,
 				F073171030241ABC00FFA544 /* LushShareExtension */,
 				F073172630241AD500FFA544 /* LushFinderAction */,
+				F0DC71D00000000000000008 /* LushDockTile */,
 				F07316B13022831200FFA544 /* Frameworks */,
 				F001D309301E8AA900E154BD /* Products */,
 				F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */,
@@ -197,6 +232,7 @@
 				F07316B03022831200FFA544 /* LushWidgetExtension.appex */,
 				F073170F30241ABC00FFA544 /* LushShareExtension.appex */,
 				F073172530241AD500FFA544 /* LushFinderAction.appex */,
+				F0DC71D0000000000000000A /* LushDockTile.docktileplugin */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -228,6 +264,7 @@
 				F07316BF3022831400FFA544 /* PBXTargetDependency */,
 				F073171A30241ABC00FFA544 /* PBXTargetDependency */,
 				F073173230241AD500FFA544 /* PBXTargetDependency */,
+				F0DC71D0000000000000000D /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				F07318543024EBD200FFA544 /* fonts */,
@@ -237,7 +274,8 @@
 			packageProductDependencies = (
 				F0872FA6301F718C003F9B3B /* PatchworkServerKit */,
 				F0872FA9301F756A003F9B3B /* PatchworkServerKit */,
-				F073187C30253E5800FFA544 /* CoreMLLLM */,
+				F07318753025000000FFA544 /* MLXLLM */,
+				F07318763025000000FFA544 /* MLXLMCommon */,
 			);
 			productName = richtext;
 			productReference = F001D308301E8AA900E154BD /* Lush.app */;
@@ -309,6 +347,28 @@
 			productReference = F073172530241AD500FFA544 /* LushFinderAction.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		F0DC71D00000000000000001 /* LushDockTile */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F0DC71D00000000000000002 /* Build configuration list for PBXNativeTarget "LushDockTile" */;
+			buildPhases = (
+				F0DC71D00000000000000005 /* Sources */,
+				F0DC71D00000000000000006 /* Frameworks */,
+				F0DC71D00000000000000007 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				F0DC71D00000000000000008 /* LushDockTile */,
+			);
+			name = LushDockTile;
+			packageProductDependencies = (
+			);
+			productName = LushDockTile;
+			productReference = F0DC71D0000000000000000A /* LushDockTile.docktileplugin */;
+			productType = "com.apple.product-type.bundle";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -331,6 +391,9 @@
 					F073172430241AD500FFA544 = {
 						CreatedOnToolsVersion = 26.6;
 					};
+					F0DC71D00000000000000001 = {
+						CreatedOnToolsVersion = 26.6;
+					};
 				};
 			};
 			buildConfigurationList = F001D303301E8AA900E154BD /* Build configuration list for PBXProject "Lush" */;
@@ -346,8 +409,6 @@
 				F0872FA8301F756A003F9B3B /* XCLocalSwiftPackageReference "PatchworkServerKit" */,
 				F0E8D900301FC271002F3622 /* XCRemoteSwiftPackageReference "Runestone" */,
 				F0E8D901301FC4C4002F3622 /* XCRemoteSwiftPackageReference "TreeSitterLanguages" */,
-				F0731873302523D900FFA544 /* XCRemoteSwiftPackageReference "CoreML-LLM" */,
-				F073187A3025356F00FFA544 /* XCRemoteSwiftPackageReference "mlx-swift" */,
 				F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -359,6 +420,7 @@
 				F07316AF3022831200FFA544 /* LushWidgetExtension */,
 				F073170E30241ABC00FFA544 /* LushShareExtension */,
 				F073172430241AD500FFA544 /* LushFinderAction */,
+				F0DC71D00000000000000001 /* LushDockTile */,
 			);
 		};
 /* End PBXProject section */
@@ -387,6 +449,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		F073172330241AD500FFA544 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F0DC71D00000000000000007 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -424,6 +493,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0DC71D00000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -441,6 +517,11 @@
 			isa = PBXTargetDependency;
 			target = F073172430241AD500FFA544 /* LushFinderAction */;
 			targetProxy = F073173130241AD500FFA544 /* PBXContainerItemProxy */;
+		};
+		F0DC71D0000000000000000D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F0DC71D00000000000000001 /* LushDockTile */;
+			targetProxy = F0DC71D0000000000000000C /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -940,6 +1021,74 @@
 			};
 			name = Release;
 		};
+		F0DC71D00000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LushDockTile/LushDockTile.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LushDockTile/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Lush Dock Tile";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushDockTile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				WRAPPER_EXTENSION = docktileplugin;
+			};
+			name = Debug;
+		};
+		F0DC71D00000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LushDockTile/LushDockTile.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LushDockTile/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Lush Dock Tile";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushDockTile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				WRAPPER_EXTENSION = docktileplugin;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -988,6 +1137,15 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		F0DC71D00000000000000002 /* Build configuration list for PBXNativeTarget "LushDockTile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F0DC71D00000000000000003 /* Debug */,
+				F0DC71D00000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
@@ -998,22 +1156,6 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		F0731873302523D900FFA544 /* XCRemoteSwiftPackageReference "CoreML-LLM" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/john-rocky/CoreML-LLM";
-			requirement = {
-				branch = main;
-				kind = branch;
-			};
-		};
-		F073187A3025356F00FFA544 /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/ml-explore/mlx-swift";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.31.6;
-			};
-		};
 		F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/ml-explore/mlx-swift-examples";
@@ -1041,10 +1183,15 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		F073187C30253E5800FFA544 /* CoreMLLLM */ = {
+		F07318753025000000FFA544 /* MLXLLM */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = F0731873302523D900FFA544 /* XCRemoteSwiftPackageReference "CoreML-LLM" */;
-			productName = CoreMLLLM;
+			package = F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXLLM;
+		};
+		F07318763025000000FFA544 /* MLXLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXLMCommon;
 		};
 		F0872FA6301F718C003F9B3B /* PatchworkServerKit */ = {
 			isa = XCSwiftPackageProductDependency;

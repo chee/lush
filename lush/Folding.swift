@@ -44,7 +44,7 @@ final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
                 ranges.append(paragraph)
                 continue
             }
-            guard box.value.type == "heading",
+            guard box.value.type == "heading", !foldedHeadings.isEmpty,
                   foldedHeadings.contains(HeadingFoldKey(paragraph: paragraph, in: storage, box: box))
             else { continue }
             let level = box.value.headingLevel ?? 1
@@ -71,6 +71,12 @@ final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
         hiddenRanges.contains { NSLocationInRange(location, $0) }
     }
 
+    /// The substituted paragraph must keep the backing range's exact length:
+    /// UITextInput and accessibility read `attributedString(in:)` across the
+    /// whole document, and any presentation/backing length divergence sends
+    /// TextKit's offset mapping out of bounds (boot NSRangeException on iOS
+    /// when the open note has stashed paragraphs). Hiding is purely
+    /// stylistic — same characters, ~zero size.
     func textContentStorage(
         _ textContentStorage: NSTextContentStorage,
         textParagraphWith range: NSRange
@@ -78,9 +84,23 @@ final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
         guard hiddenRanges.contains(where: { NSIntersectionRange($0, range).length > 0 }) else {
             return nil
         }
+        guard let backing = textContentStorage.textStorage,
+              NSMaxRange(range) <= backing.length
+        else { return nil }
+        let text = (backing.string as NSString).substring(with: range)
+        let style = NSMutableParagraphStyle()
+        style.minimumLineHeight = 0.01
+        style.maximumLineHeight = 0.01
+        style.lineSpacing = 0
+        style.paragraphSpacing = 0
+        style.paragraphSpacingBefore = 0
         return NSTextParagraph(attributedString: NSAttributedString(
-            string: "\u{200B}",
-            attributes: [.font: PFont.systemFont(ofSize: 0.01)]
+            string: text,
+            attributes: [
+                .font: PFont.systemFont(ofSize: 0.01),
+                .foregroundColor: PColor.clear,
+                .paragraphStyle: style,
+            ]
         ))
     }
 }

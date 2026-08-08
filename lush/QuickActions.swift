@@ -328,6 +328,22 @@ struct OpenQuickNoteIntent: AppIntent {
     }
 }
 
+struct AppendToQuickNoteIntent: AppIntent {
+    static let title: LocalizedStringResource = "Append to Quick Note"
+    static let description = IntentDescription("Append text to your Quick Note.")
+    static let openAppWhenRun = false
+
+    @Parameter(title: "Text")
+    var text: String
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        await NotesModel.shared.start()
+        _ = await NotesModel.shared.appendToQuickNote(text)
+        return .result()
+    }
+}
+
 @available(iOS 18.0, macOS 15.0, *)
 enum LushControlDestination: String, AppEnum {
     case quickNote
@@ -408,6 +424,12 @@ struct LushShortcuts: AppShortcutsProvider {
             phrases: ["Open my quick note in \(.applicationName)"],
             shortTitle: "Quick Note",
             systemImageName: "bolt.circle"
+        )
+        AppShortcut(
+            intent: AppendToQuickNoteIntent(),
+            phrases: ["Append to my quick note in \(.applicationName)"],
+            shortTitle: "Append to Quick Note",
+            systemImageName: "bolt.badge.plus"
         )
     }
 }

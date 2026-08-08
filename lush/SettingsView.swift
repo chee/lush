@@ -13,6 +13,9 @@ struct SettingsView: View {
             Tab("Machine Learning", systemImage: "sparkles.tv") {
                 MachineLearningSettingsPane()
             }
+            Tab("Agents", systemImage: "terminal") {
+                AgentSettingsPane()
+            }
             Tab("Patchwork", systemImage: "shippingbox") {
                 PatchworkSettingsPane()
             }
@@ -20,7 +23,7 @@ struct SettingsView: View {
                 ImportSettingsPane()
             }
         }
-        .frame(width: 540, height: 480)
+        .frame(width: 620, height: 620)
         #else
         List {
             NavigationLink {
@@ -49,6 +52,82 @@ struct SettingsView: View {
     }
 }
 
+#if os(macOS)
+struct AgentSettingsPane: View {
+    @State private var status: String?
+
+    var body: some View {
+        Form {
+            Section("Lush Documents") {
+                Text("Local agents can search, read, create, and edit documents while Lush is running.")
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Install for Claude") { install(in: ".claude") }
+                    Button("Install for Codex") { install(in: ".codex") }
+                }
+                if let status {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Section("Connection") {
+                Text("~/Library/Application Support/Lush/agent.json")
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                Text("The bearer token changes whenever Lush starts and is readable only by this account.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Agents")
+    }
+
+    private func install(in agentDirectory: String) {
+        do {
+            let resources = [
+                ("SKILL", "md", "SKILL.md"),
+                ("openai", "yaml", "agents/openai.yaml"),
+                ("lush_docs", "py", "scripts/lush_docs.py"),
+                ("api", "md", "references/api.md"),
+            ]
+            let sources = resources.compactMap { resource in
+                Bundle.main.url(forResource: resource.0, withExtension: resource.1)
+                    .map { ($0, resource.2) }
+            }
+            guard sources.count == resources.count else {
+                status = "The bundled skill could not be found."
+                return
+            }
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let skills = home.appendingPathComponent(agentDirectory, isDirectory: true)
+                .appendingPathComponent("skills", isDirectory: true)
+            let destination = skills.appendingPathComponent("lush-docs", isDirectory: true)
+            try FileManager.default.createDirectory(at: skills, withIntermediateDirectories: true)
+            let staging = skills.appendingPathComponent(".lush-docs-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: staging) }
+            for (source, relativePath) in sources {
+                let target = staging.appendingPathComponent(relativePath)
+                try FileManager.default.createDirectory(
+                    at: target.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try FileManager.default.copyItem(at: source, to: target)
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
+            } else {
+                try FileManager.default.moveItem(at: staging, to: destination)
+            }
+            status = "Installed lush-docs for \(agentDirectory == ".claude" ? "Claude" : "Codex")."
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+}
+#endif
+
 struct MachineLearningSettingsPane: View {
     @State private var selectedOperation: LocalModelOperation = .attachmentSummary
 
@@ -62,6 +141,19 @@ struct MachineLearningSettingsPane: View {
             }
             .pickerStyle(.segmented)
             .padding([.horizontal, .top])
+
+            HStack(spacing: 8) {
+                Image(systemName: selectedOperation.symbolName)
+                    .foregroundStyle(.tint)
+                Text(selectedOperation.label)
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Text("Configured separately")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal)
+            .padding(.top, 10)
 
             Form {
                 LocalModelOperationSettingsView(operation: selectedOperation)
@@ -77,32 +169,67 @@ struct LocalModelOperationSettingsView: View {
     let operation: LocalModelOperation
     @State private var backend: LocalModelBackend
     @State private var config: RemoteModelConfig
+    @State private var cloudConfig: CloudModelConfig
+    @State private var apiKey = ""
     @State private var generationSettings: LocalGenerationSettings
     @State private var systemPrompt: String
     @State private var presetFilter = ""
     @State private var status: String?
+    @State private var statusIsError = false
+    @State private var credentialStored: Bool
+    @State private var isSigningIn = false
+    @State private var promptExpanded = false
+    @State private var modelPickerPresented = false
+    @State private var modelFilter = ""
+    @State private var openRouterModels: [OpenRouterModel] = []
+    @State private var modelCatalogError: String?
+    @State private var isLoadingModels = false
 
     init(operation: LocalModelOperation) {
         self.operation = operation
-        _backend = State(initialValue: LocalModelSettings.backend(for: operation))
+        let backend = LocalModelSettings.backend(for: operation)
+        _backend = State(initialValue: backend)
         _config = State(initialValue: LocalModelSettings.remoteModelConfig(for: operation))
+        _cloudConfig = State(initialValue: LocalModelSettings.cloudModelConfig(for: operation, backend: backend))
         _generationSettings = State(initialValue: LocalModelSettings.generationSettings(for: operation))
         _systemPrompt = State(initialValue: LocalModelSettings.systemPrompt(for: operation))
+        _credentialStored = State(initialValue: !ModelCredentialStore.apiKey(for: backend).isEmpty)
     }
 
     var body: some View {
-        Section(header: Text("Model"), footer: Text(footer)) {
-            Picker("Model", selection: $backend) {
+        Section {
+            Picker("Provider", selection: $backend) {
                 ForEach(LocalModelBackend.allCases) { backend in
                     Text(backend.label).tag(backend)
                 }
             }
             .onChange(of: backend) {
                 LocalModelSettings.setBackend(backend, for: operation)
+                cloudConfig = LocalModelSettings.cloudModelConfig(for: operation, backend: backend)
+                apiKey = ""
+                credentialStored = !ModelCredentialStore.apiKey(for: backend).isEmpty
+                status = nil
+                statusIsError = false
             }
 
-            if backend == .mlx {
-                DisclosureGroup("Suggested Models") {
+            if backend.isCloud {
+                LabeledContent("Connection") {
+                    Label(
+                        connectionLabel,
+                        systemImage: credentialStored ? "checkmark.circle.fill" : "circle.dashed"
+                    )
+                    .foregroundStyle(credentialStored ? Color.green : Color.secondary)
+                }
+            }
+        } header: {
+            Text("Provider")
+        } footer: {
+            Text(providerDescription)
+        }
+
+        if backend == .mlx {
+            Section("Local model") {
+                DisclosureGroup("Suggested models") {
                     TextField("Filter suggested models", text: $presetFilter)
                         .autocorrectionDisabled()
                     let presets = filteredPresets
@@ -115,6 +242,7 @@ struct LocalModelOperationSettingsView: View {
                             Button {
                                 config = preset.config
                                 status = preset.note
+                                statusIsError = false
                                 LocalModelSettings.setRemoteModelConfig(config, for: operation)
                             } label: {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -128,33 +256,110 @@ struct LocalModelOperationSettingsView: View {
                     }
                 }
 
-                TextField("owner/model", text: $config.repo)
+                TextField("Repository", text: $config.repo, prompt: Text("owner/model"))
                     .autocorrectionDisabled()
                     .onChange(of: config.repo) { saveConfig() }
-                TextField("revision", text: $config.revision)
+                TextField("Revision", text: $config.revision, prompt: Text("main"))
                     .autocorrectionDisabled()
                     .onChange(of: config.revision) { saveConfig() }
                 if let status {
-                    Text(status)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    statusMessage(status)
                 }
             }
         }
 
-        Section(header: Text("Generation")) {
-            HStack {
-                Text("Temperature")
-                Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
-                    .onChange(of: generationSettings.temperature) {
-                        saveGenerationSettings()
+        if backend.isCloud {
+            Section("Model") {
+                HStack {
+                    TextField("Model ID", text: $cloudConfig.model, prompt: Text(modelPlaceholder))
+                        .autocorrectionDisabled()
+                        .onChange(of: cloudConfig.model) { saveCloudConfig() }
+                    if backend == .openRouter {
+                        Button {
+                            modelPickerPresented.toggle()
+                            if openRouterModels.isEmpty {
+                                refreshModels()
+                            }
+                        } label: {
+                            Image(systemName: "chevron.up.chevron.down")
+                        }
+                        .help("Choose an OpenRouter model")
+                        .popover(isPresented: $modelPickerPresented, arrowEdge: .trailing) {
+                            openRouterModelPicker
+                        }
                     }
-                Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                }
+
+                if backend == .compatible {
+                    TextField(
+                        "Endpoint",
+                        text: $cloudConfig.endpoint,
+                        prompt: Text("https://provider.example/v1/chat/completions")
+                    )
+                    .autocorrectionDisabled()
+                    .onChange(of: cloudConfig.endpoint) { saveCloudConfig() }
+                }
+            }
+
+            Section {
+                if backend == .openRouter {
+                    Button {
+                        signInWithOpenRouter()
+                    } label: {
+                        HStack {
+                            if isSigningIn {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "person.crop.circle.badge.checkmark")
+                            }
+                            Text(isSigningIn ? "Waiting for OpenRouter…" : "Connect OpenRouter")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isSigningIn)
+                }
+
+                HStack {
+                    SecureField(
+                        credentialStored ? "Enter a replacement key" : backend.credentialLabel,
+                        text: $apiKey
+                    )
+                    .textContentType(.password)
+                    .autocorrectionDisabled()
+                    Button(credentialStored ? "Replace" : "Save") { saveAPIKey() }
+                        .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                if credentialStored {
+                    Button("Disconnect", role: .destructive) { removeAPIKey() }
+                }
+
+                if let status {
+                    statusMessage(status)
+                }
+            } header: {
+                Text("Credentials")
+            } footer: {
+                Text("Stored in Keychain and shared by every task using this provider.")
+            }
+        }
+
+        Section("Generation") {
+            LabeledContent("Temperature") {
+                HStack(spacing: 12) {
+                    Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
+                        .frame(minWidth: 180)
+                        .onChange(of: generationSettings.temperature) {
+                            saveGenerationSettings()
+                        }
+                    Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
             }
             Stepper(
-                "Max response tokens: \(generationSettings.maximumResponseTokens)",
+                "Response limit: \(generationSettings.maximumResponseTokens) tokens",
                 value: $generationSettings.maximumResponseTokens,
                 in: 64...4096,
                 step: 64
@@ -164,17 +369,171 @@ struct LocalModelOperationSettingsView: View {
             }
         }
 
-        Section(header: Text("System Prompt")) {
-            TextEditor(text: $systemPrompt)
-                .font(.caption.monospaced())
-                .frame(minHeight: 150)
-                .onChange(of: systemPrompt) {
-                    saveSystemPrompt()
+        Section {
+            DisclosureGroup("System prompt", isExpanded: $promptExpanded) {
+                TextEditor(text: $systemPrompt)
+                    .font(.caption.monospaced())
+                    .frame(minHeight: 140)
+                    .onChange(of: systemPrompt) {
+                        saveSystemPrompt()
+                    }
+                HStack {
+                    Spacer()
+                    Button("Restore Default") {
+                        systemPrompt = operation.defaultSystemPrompt
+                        LocalModelSettings.resetSystemPrompt(for: operation)
+                    }
                 }
-            Button("Reset System Prompt") {
-                systemPrompt = operation.defaultSystemPrompt
-                LocalModelSettings.resetSystemPrompt(for: operation)
             }
+        } footer: {
+            Text("Advanced instructions sent with every request for this task.")
+        }
+    }
+
+    private var openRouterModelPicker: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Filter models", text: $modelFilter)
+                    .textFieldStyle(.plain)
+                Button {
+                    refreshModels()
+                } label: {
+                    if isLoadingModels {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(isLoadingModels)
+                .help("Refresh models")
+            }
+            .padding(12)
+
+            Divider()
+
+            if let modelCatalogError, openRouterModels.isEmpty {
+                ContentUnavailableView(
+                    "Models unavailable",
+                    systemImage: "wifi.exclamationmark",
+                    description: Text(modelCatalogError)
+                )
+            } else if isLoadingModels && openRouterModels.isEmpty {
+                ProgressView("Loading models…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if filteredOpenRouterModels.isEmpty {
+                ContentUnavailableView.search(text: modelFilter)
+            } else {
+                List(filteredOpenRouterModels) { model in
+                    Button {
+                        cloudConfig.model = model.id
+                        saveCloudConfig()
+                        modelPickerPresented = false
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(model.name)
+                                    .lineLimit(1)
+                                Spacer()
+                                if cloudConfig.model == model.id {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(.tint)
+                                }
+                            }
+                            Text(model.id)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            if let contextLength = model.contextLength {
+                                Text("\(contextLength.formatted()) context")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .listStyle(.plain)
+            }
+
+            if let modelCatalogError, !openRouterModels.isEmpty {
+                Divider()
+                Label(modelCatalogError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(10)
+            }
+        }
+        .frame(width: 430, height: 430)
+    }
+
+    private var filteredOpenRouterModels: [OpenRouterModel] {
+        let models = operation == .imageCaption
+            ? openRouterModels.filter { $0.architecture?.inputModalities?.contains("image") != false }
+            : openRouterModels
+        let query = modelFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return models }
+        return models.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.id.localizedCaseInsensitiveContains(query)
+                || ($0.description?.localizedCaseInsensitiveContains(query) ?? false)
+        }
+    }
+
+    private func refreshModels() {
+        guard !isLoadingModels else { return }
+        isLoadingModels = true
+        modelCatalogError = nil
+        Task {
+            do {
+                openRouterModels = try await OpenRouterModelCatalog.fetch()
+            } catch {
+                modelCatalogError = error.localizedDescription
+            }
+            isLoadingModels = false
+        }
+    }
+
+    @ViewBuilder
+    private func statusMessage(_ message: String) -> some View {
+        Label(message, systemImage: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+            .font(.caption)
+            .foregroundStyle(statusIsError ? Color.red : Color.secondary)
+    }
+
+    private var connectionLabel: String {
+        if isSigningIn { return "Connecting…" }
+        return credentialStored ? "Connected" : "Not connected"
+    }
+
+    private var modelPlaceholder: String {
+        switch backend {
+        case .openRouter: "openrouter/auto"
+        case .openAI: "gpt-5.6"
+        case .anthropic: "claude-sonnet-4"
+        case .compatible: "provider/model"
+        case .appleIntelligence, .mlx: ""
+        }
+    }
+
+    private var providerDescription: String {
+        switch backend {
+        case .appleIntelligence:
+            "Runs on this Mac using Apple Intelligence. No account or API key required."
+        case .mlx:
+            "Runs an MLX model locally. Models download from Hugging Face when first used."
+        case .openRouter:
+            "One OpenRouter connection provides Claude, OpenAI, Gemini, and other hosted models."
+        case .openAI:
+            "Uses OpenAI developer API billing. A ChatGPT subscription does not include API usage."
+        case .anthropic:
+            "Uses Anthropic developer API billing. A Claude subscription does not include API usage."
+        case .compatible:
+            "Uses an OpenAI-compatible chat-completions endpoint."
         }
     }
 
@@ -190,15 +549,6 @@ struct LocalModelOperationSettingsView: View {
         }
     }
 
-    private var footer: String {
-        switch backend {
-        case .appleIntelligence:
-            "Uses Apple's on-device Foundation Models when Apple Intelligence is available. Advanced settings apply immediately."
-        case .mlx:
-            "MLX models download from HuggingFace automatically on first use. Enter any mlx-community repo ID."
-        }
-    }
-
     private func saveConfig() {
         LocalModelSettings.setRemoteModelConfig(config, for: operation)
     }
@@ -207,10 +557,58 @@ struct LocalModelOperationSettingsView: View {
         LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
     }
 
+    private func saveCloudConfig() {
+        LocalModelSettings.setCloudModelConfig(cloudConfig, for: operation, backend: backend)
+    }
+
+    private func saveAPIKey() {
+        do {
+            try ModelCredentialStore.setAPIKey(apiKey, for: backend)
+            apiKey = ""
+            credentialStored = true
+            status = "Connected with API key."
+            statusIsError = false
+        } catch {
+            status = error.localizedDescription
+            statusIsError = true
+        }
+    }
+
+    private func removeAPIKey() {
+        do {
+            try ModelCredentialStore.setAPIKey("", for: backend)
+            apiKey = ""
+            credentialStored = false
+            status = "Disconnected."
+            statusIsError = false
+        } catch {
+            status = error.localizedDescription
+            statusIsError = true
+        }
+    }
+
+    private func signInWithOpenRouter() {
+        isSigningIn = true
+        status = nil
+        statusIsError = false
+        Task {
+            do {
+                let key = try await OpenRouterAuthentication.shared.signIn()
+                try ModelCredentialStore.setAPIKey(key, for: .openRouter)
+                apiKey = ""
+                credentialStored = true
+                status = "OpenRouter connected."
+            } catch {
+                status = error.localizedDescription
+                statusIsError = true
+            }
+            isSigningIn = false
+        }
+    }
+
     private func saveSystemPrompt() {
         LocalModelSettings.setSystemPrompt(systemPrompt, for: operation)
     }
-
 }
 
 struct SyncSettingsPane: View {

@@ -1,5 +1,8 @@
 import SwiftUI
 import AppIntents
+#if canImport(UIKit)
+import UIKit
+#endif
 #if os(macOS)
 import AppKit
 #if canImport(CoreSpotlight)
@@ -56,25 +59,38 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
+    /// With a main window up, set the pending action and activate. With none,
+    /// pending would sit unprocessed — open the app's own lush:// url instead,
+    /// which makes SwiftUI create a window to deliver it.
+    private func route(_ action: AppRouter.Action, fallback url: URL?) {
+        let hasMainWindow = NSApp.windows.contains {
+            $0.isVisible && $0.identifier?.rawValue.hasPrefix("main") == true
+        }
+        if hasMainWindow || url == nil {
+            AppRouter.shared.pending = action
+            NSApp.activate()
+        } else if let url {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     @objc private func newDockNote(_ sender: Any?) {
-        AppRouter.shared.pending = .newNote
-        NSApp.activate()
+        route(.newNote, fallback: URL(string: "lush://new"))
     }
 
     @objc private func openDockQuickNote(_ sender: Any?) {
-        AppRouter.shared.pending = .quickNote
-        NSApp.activate()
+        route(.quickNote, fallback: URL(string: "lush://show?doc=quick"))
     }
 
     @objc private func openDockQuickCapture(_ sender: Any?) {
-        AppRouter.shared.pending = .capture
-        NSApp.activate()
+        route(.capture, fallback: URL(string: "lush://capture"))
     }
 
     @objc private func openDockRecent(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? String else { return }
-        AppRouter.shared.pending = .note(url)
-        NSApp.activate()
+        var components = URLComponents(string: "lush://show")
+        components?.queryItems = [URLQueryItem(name: "doc", value: url)]
+        route(.note(url), fallback: components?.url)
     }
 
     func application(
@@ -130,7 +146,7 @@ struct FolderCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New Note") { model.createNote() }
+            Button("New Note") { Task { await model.createNote() } }
                 .keyboardShortcut("n", modifiers: .command)
             Button("New Script") { model.createScript() }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
@@ -351,6 +367,13 @@ struct LushApp: App {
                     await model.start()
                     await server
                     contextTracker.start()
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)
+                ) { _ in
+                    NotesModel.shared.activeEditor?.core?.pushNow()
+                    NotesModel.shared.presence.leave()
+                    NotesModel.shared.core?.shutdown()
                 }
         }
         .commands {

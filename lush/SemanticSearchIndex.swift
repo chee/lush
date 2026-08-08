@@ -20,13 +20,25 @@ actor SemanticSearchIndex {
         return Set(core.noteEmbeddingDigests().keys)
     }
 
+    func indexFile(url: String, name: String, text: String) {
+        guard let core else { return }
+        let digest = Self.digest(of: name + "\n" + text)
+        if core.noteEmbeddingDigest(url: url) == digest { return }
+        guard !text.isEmpty, let embedding = embeddingModel() else { return }
+        let chunks = Self.chunks(for: text).compactMap { chunk -> EmbeddingChunk? in
+            guard let vector = embedding.vector(for: chunk) else { return nil }
+            return EmbeddingChunk(text: Self.snippet(from: chunk), vector: Self.unit(vector))
+        }
+        try? core.setNoteEmbeddings(url: url, name: name, digest: digest, chunks: chunks)
+    }
+
     func index(url: String, name: String, spansJson: String) {
         guard let core else { return }
         let spans = SpanNode.decodeList(spansJson)
         let title = RichText.title(from: spans)
         let displayName = title.isEmpty ? (name.isEmpty ? "Untitled" : name) : title
         let text = Self.plainText(from: spans)
-        let digest = Self.digest(of: text)
+        let digest = Self.digest(of: displayName + "\n" + text)
         // Unchanged text still needs the row rewritten if the note was renamed,
         // but not re-embedded — inference is the expensive half.
         if core.noteEmbeddingDigest(url: url) == digest {

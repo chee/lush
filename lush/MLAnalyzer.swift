@@ -46,6 +46,8 @@ enum MLAnalyzer {
             return try await analyzeWithFoundationModels(evidence, operation: operation)
         case .mlx:
             return try await analyzeWithCoreMLModel(evidence, operation: operation)
+        case .openRouter, .openAI, .anthropic, .compatible:
+            return try await analyzeWithCloudModel(evidence, operation: operation)
         }
     }
 
@@ -133,6 +135,41 @@ enum MLAnalyzer {
             .joined(separator: ", ")
 
         if summary.isEmpty && caption.isEmpty && keywords.isEmpty {
+            throw AnalyzerError.generationFailed
+        }
+        return AssetMl(summary: summary, caption: caption, keywords: keywords)
+    }
+
+    private static func analyzeWithCloudModel(
+        _ evidence: AssetMLEvidence,
+        operation: LocalModelOperation
+    ) async throws -> AssetMl {
+        let text = evidence.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let description = evidence.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = """
+        \(LocalModelSettings.systemPrompt(for: operation))
+
+        Attachment name: \(evidence.name)
+        Attachment kind: \(evidence.kind)
+        Existing visual/audio description: \(limited(description, to: 1_500))
+        Extracted text or transcript: \(limited(text, to: 6_000))
+
+        JSON requirements:
+        - summary: one sentence, empty if there is not enough evidence
+        - caption: short phrase for visual content or audio subject, empty if not useful
+        - keywords: 3 to 8 short search keywords
+        """
+
+        let response = try await CloudLLMRuntime.generateText(prompt: prompt, operation: operation)
+        guard let generated = parse(response) else { throw AnalyzerError.generationFailed }
+        let summary = generated.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let caption = generated.caption.trimmingCharacters(in: .whitespacesAndNewlines)
+        let keywords = generated.keywords
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .prefix(8)
+            .joined(separator: ", ")
+        guard !summary.isEmpty || !caption.isEmpty || !keywords.isEmpty else {
             throw AnalyzerError.generationFailed
         }
         return AssetMl(summary: summary, caption: caption, keywords: keywords)

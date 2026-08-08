@@ -129,33 +129,52 @@ pub struct DocLink {
     pub lush: Option<String>,
 }
 
+/// Scalar types JSON can't represent faithfully are wrapped in a tagged object
+/// so the read → JSON → write round-trip preserves them. Without this, saving a
+/// note rewrites other peers' block attrs (Bytes, Timestamp, Counter, wide
+/// Uint) as the wrong scalar type. Str/Int/F64/Bool/Null stay bare JSON.
 fn scalar_to_json(s: &ScalarValue) -> Json {
     match s {
         ScalarValue::Str(v) => json!(v.as_str()),
         ScalarValue::Int(v) => json!(v),
-        ScalarValue::Uint(v) => json!(v),
         ScalarValue::F64(v) => json!(v),
         ScalarValue::Boolean(v) => json!(v),
-        ScalarValue::Counter(c) => json!(i64::from(c)),
-        ScalarValue::Timestamp(v) => json!(v),
-        ScalarValue::Bytes(b) => json!(hex::encode(b)),
+        ScalarValue::Uint(v) => json!({ "__am": "uint", "v": v.to_string() }),
+        ScalarValue::Counter(c) => json!({ "__am": "counter", "v": i64::from(c) }),
+        ScalarValue::Timestamp(v) => json!({ "__am": "timestamp", "v": v }),
+        ScalarValue::Bytes(b) => json!({ "__am": "bytes", "v": hex::encode(b) }),
         ScalarValue::Null | ScalarValue::Unknown { .. } => Json::Null,
     }
 }
 
-fn json_to_scalar(v: &Json) -> ScalarValue {
-    match v {
-        Json::String(s) => ScalarValue::Str(s.as_str().into()),
-        Json::Bool(b) => ScalarValue::Boolean(*b),
-        Json::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                ScalarValue::Int(i)
-            } else {
-                ScalarValue::F64(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        _ => ScalarValue::Null,
+fn decode_scalar_wrapper(o: &serde_json::Map<String, Json>) -> Option<ScalarValue> {
+    let v = o.get("v")?;
+    match o.get("__am")?.as_str()? {
+        "uint" => v.as_str()?.parse::<u64>().ok().map(ScalarValue::Uint),
+        "counter" => v.as_i64().map(|i| ScalarValue::Counter(i.into())),
+        "timestamp" => v.as_i64().map(ScalarValue::Timestamp),
+        "bytes" => hex::decode(v.as_str()?).ok().map(ScalarValue::Bytes),
+        _ => None,
     }
+}
+
+fn scalar_from_json(v: &Json) -> Option<ScalarValue> {
+    match v {
+        Json::String(s) => Some(ScalarValue::Str(s.as_str().into())),
+        Json::Bool(b) => Some(ScalarValue::Boolean(*b)),
+        Json::Number(n) => Some(if let Some(i) = n.as_i64() {
+            ScalarValue::Int(i)
+        } else {
+            ScalarValue::F64(n.as_f64().unwrap_or(0.0))
+        }),
+        Json::Null => Some(ScalarValue::Null),
+        Json::Object(o) => decode_scalar_wrapper(o),
+        Json::Array(_) => None,
+    }
+}
+
+fn json_to_scalar(v: &Json) -> ScalarValue {
+    scalar_from_json(v).unwrap_or(ScalarValue::Null)
 }
 
 /// Both conversions recurse over structures a remote peer controls, so
@@ -199,6 +218,9 @@ fn json_to_hydrate_at(v: &Json, depth: usize) -> hydrate::Value {
     }
     match v {
         Json::Object(o) => {
+            if let Some(s) = decode_scalar_wrapper(o) {
+                return hydrate::Value::Scalar(s);
+            }
             let m: std::collections::HashMap<String, hydrate::Value> = o
                 .iter()
                 .map(|(k, val)| (k.clone(), json_to_hydrate_at(val, depth + 1)))
@@ -540,7 +562,7 @@ pub fn add_folder_entry(doc: &mut Automerge, link: &DocLink) -> anyhow::Result<(
                 Some((_, id)) => id,
                 None => t.put_object(ROOT, "docs", ObjType::List)?,
             };
-            let entry = t.insert_object(&docs, t.length(&docs), ObjType::Map)?;
+            let entry = t.insert_object(&docs, 0, ObjType::Map)?;
             put_text(t, &entry, "name", &link.name)?;
             put_text(t, &entry, "type", &link.kind)?;
             put_text(t, &entry, "url", &link.url)?;
@@ -976,6 +998,306 @@ pub fn asset_search_text(doc: &Automerge) -> String {
     parts.join("\n")
 }
 
+// ---- patchwork drafts ----
+
+pub struct CloneShape {
+    pub original_url: String,
+    pub clone_url: String,
+    pub cloned_at: Vec<String>,
+    pub merged_at: Option<Vec<String>>,
+}
+
+pub struct DraftShape {
+    pub is_main: bool,
+    pub name: Option<String>,
+    pub parent: String,
+    pub drafts: Vec<String>,
+    pub clones: Vec<CloneShape>,
+    pub merged_at: Option<i64>,
+}
+
+/// Heads cross the FFI as hex change hashes but live in draft docs as
+/// bs58check strings — automerge-repo's `encodeHeads` wire format.
+pub(crate) fn head_to_wire(hex: &str) -> String {
+    hex::decode(hex)
+        .map(|bytes| bs58::encode(bytes).with_check().into_string())
+        .unwrap_or_else(|_| hex.to_string())
+}
+
+fn head_from_wire(wire: &str) -> String {
+    bs58::decode(wire)
+        .with_check(None)
+        .into_vec()
+        .map(hex::encode)
+        .unwrap_or_else(|_| wire.to_string())
+}
+
+fn put_heads<T: Transactable>(
+    t: &mut T,
+    obj: &automerge::ObjId,
+    key: &str,
+    heads: &[String],
+) -> Result<(), automerge::AutomergeError> {
+    let list = t.put_object(obj, key, ObjType::List)?;
+    for (i, head) in heads.iter().enumerate() {
+        let item = t.insert_object(&list, i, ObjType::Text)?;
+        t.splice_text(&item, 0, 0, &head_to_wire(head))?;
+    }
+    Ok(())
+}
+
+fn string_item(doc: &Automerge, obj: &automerge::ObjId, index: usize) -> Option<String> {
+    let (v, id) = doc.get(obj, index).ok().flatten()?;
+    match v {
+        automerge::Value::Object(ObjType::Text) => doc.text(&id).ok(),
+        automerge::Value::Scalar(s) => s.to_str().map(|x| x.to_string()),
+        _ => None,
+    }
+}
+
+fn heads_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<Vec<String>> {
+    let (v, list) = doc.get(obj, key).ok().flatten()?;
+    if !matches!(v, automerge::Value::Object(ObjType::List)) {
+        return None;
+    }
+    Some(
+        (0..doc.length(&list))
+            .filter_map(|i| string_item(doc, &list, i))
+            .map(|wire| head_from_wire(&wire))
+            .collect(),
+    )
+}
+
+fn int_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<i64> {
+    let (v, _) = doc.get(obj, key).ok().flatten()?;
+    match v {
+        automerge::Value::Scalar(s) => match s.as_ref() {
+            ScalarValue::Int(i) => Some(*i),
+            ScalarValue::Uint(u) => Some(*u as i64),
+            ScalarValue::F64(f) => Some(*f as i64),
+            ScalarValue::Timestamp(ts) => Some(*ts),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub fn init_draft(doc: &mut Automerge, parent_url: &str, is_main: bool) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+            put_text(t, &pw, "type", "draft")?;
+            if is_main {
+                t.put(ROOT, "isMain", true)?;
+            }
+            put_text(t, &ROOT, "parent", parent_url)?;
+            t.put_object(ROOT, "drafts", ObjType::List)?;
+            t.put_object(ROOT, "clones", ObjType::Map)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn draft_add_child(doc: &mut Automerge, child_url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let drafts = match t.get(ROOT, "drafts")? {
+                Some((automerge::Value::Object(ObjType::List), id)) => id,
+                _ => t.put_object(ROOT, "drafts", ObjType::List)?,
+            };
+            let entry = t.insert_object(&drafts, t.length(&drafts), ObjType::Text)?;
+            t.splice_text(&entry, 0, 0, child_url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn draft_set_name(doc: &mut Automerge, name: Option<&str>) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            match name {
+                Some(name) => set_text(t, &ROOT, "name", name)?,
+                None => {
+                    if t.get(ROOT, "name")?.is_some() {
+                        t.delete(&ROOT, "name")?;
+                    }
+                }
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn draft_record_clone(
+    doc: &mut Automerge,
+    original_url: &str,
+    clone_url: &str,
+    cloned_at: &[String],
+) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let clones = match t.get(ROOT, "clones")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "clones", ObjType::Map)?,
+            };
+            let entry = t.put_object(&clones, original_url, ObjType::Map)?;
+            put_text(t, &entry, "cloneUrl", clone_url)?;
+            put_heads(t, &entry, "clonedAt", cloned_at)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn draft_record_merge(
+    doc: &mut Automerge,
+    original_url: &str,
+    merged_at: &[String],
+) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let Some((automerge::Value::Object(ObjType::Map), clones)) = t.get(ROOT, "clones")?
+            else {
+                return Ok(());
+            };
+            let Some((automerge::Value::Object(ObjType::Map), entry)) =
+                t.get(&clones, original_url)?
+            else {
+                return Ok(());
+            };
+            put_heads(t, &entry, "mergedAt", merged_at)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn draft_mark_merged(doc: &mut Automerge, timestamp_ms: i64) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            t.put(ROOT, "mergedAt", ScalarValue::Int(timestamp_ms))?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+/// Patchwork's ephemeral `CheckedOutDraft`: `{checkedOut: url|null,
+/// at?: {originalUrl: {from, to}}|null}`. The draft overlay provider reads
+/// `at[original].to` to pin nested docs while scrubbing.
+pub fn init_checkout(doc: &mut Automerge) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            t.put(ROOT, "checkedOut", ScalarValue::Null)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn set_checkout_state(
+    doc: &mut Automerge,
+    checked_out: Option<&str>,
+    pins: Option<&[(String, Vec<String>)]>,
+) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            match checked_out {
+                Some(url) => set_text(t, &ROOT, "checkedOut", url)?,
+                None => t.put(ROOT, "checkedOut", ScalarValue::Null)?,
+            }
+            match pins {
+                Some(pins) => {
+                    let at = t.put_object(ROOT, "at", ObjType::Map)?;
+                    for (original_url, heads) in pins {
+                        let entry = t.put_object(&at, original_url, ObjType::Map)?;
+                        put_heads(t, &entry, "from", heads)?;
+                        put_heads(t, &entry, "to", heads)?;
+                    }
+                }
+                None => t.put(ROOT, "at", ScalarValue::Null)?,
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn draft_shape(doc: &Automerge) -> Option<DraftShape> {
+    if doc_patchwork_type(doc).as_deref() != Some("draft") {
+        return None;
+    }
+    let is_main = match doc.get(ROOT, "isMain") {
+        Ok(Some((automerge::Value::Scalar(s), _))) => {
+            matches!(s.as_ref(), ScalarValue::Boolean(true))
+        }
+        _ => false,
+    };
+    let mut drafts = Vec::new();
+    if let Ok(Some((automerge::Value::Object(ObjType::List), list))) = doc.get(ROOT, "drafts") {
+        for i in 0..doc.length(&list) {
+            if let Some(url) = string_item(doc, &list, i) {
+                drafts.push(url);
+            }
+        }
+    }
+    let mut clones = Vec::new();
+    if let Ok(Some((automerge::Value::Object(ObjType::Map), map))) = doc.get(ROOT, "clones") {
+        for key in doc.keys(&map) {
+            let Ok(Some((automerge::Value::Object(ObjType::Map), entry))) =
+                doc.get(&map, key.as_str())
+            else {
+                continue;
+            };
+            clones.push(CloneShape {
+                original_url: key,
+                clone_url: string_at(doc, &entry, "cloneUrl").unwrap_or_default(),
+                cloned_at: heads_at(doc, &entry, "clonedAt").unwrap_or_default(),
+                merged_at: heads_at(doc, &entry, "mergedAt"),
+            });
+        }
+    }
+    Some(DraftShape {
+        is_main,
+        name: read_str(doc, &ROOT, "name"),
+        parent: string_at(doc, &ROOT, "parent").unwrap_or_default(),
+        drafts,
+        clones,
+        merged_at: int_at(doc, &ROOT, "mergedAt"),
+    })
+}
+
+pub fn main_draft_url(doc: &Automerge) -> Option<String> {
+    let (_, pw) = doc.get(ROOT, "@patchwork").ok()??;
+    read_str(doc, &pw, "mainDraftUrl")
+}
+
+pub fn set_main_draft_url(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = match t.get(ROOT, "@patchwork")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "@patchwork", ObjType::Map)?,
+            };
+            set_text(t, &pw, "mainDraftUrl", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
 /// Second-line preview for the notes list: the text after the title line.
 pub fn note_preview(doc: &Automerge) -> String {
     let Ok(spans) = spans_to_json(doc) else {
@@ -1067,6 +1389,54 @@ mod tests {
         }
         let hydrated = json_to_hydrate(&v);
         let _ = hydrate_to_json(&hydrated);
+    }
+
+    #[test]
+    fn draft_doc_shape_and_wire_heads() {
+        let mut doc = Automerge::new();
+        init_draft(&mut doc, "automerge:parent", false).unwrap();
+        assert_eq!(doc_patchwork_type(&doc).as_deref(), Some("draft"));
+        assert!(doc.get(ROOT, "isMain").unwrap().is_none());
+        let shape = draft_shape(&doc).unwrap();
+        assert!(!shape.is_main);
+        assert_eq!(shape.parent, "automerge:parent");
+        assert!(shape.name.is_none());
+        assert!(shape.drafts.is_empty());
+        assert!(shape.clones.is_empty());
+        assert!(shape.merged_at.is_none());
+
+        let head = "ab".repeat(32);
+        draft_record_clone(
+            &mut doc,
+            "automerge:orig",
+            "automerge:clone",
+            &[head.clone()],
+        )
+        .unwrap();
+        let (_, clones) = doc.get(ROOT, "clones").unwrap().unwrap();
+        let (_, entry) = doc.get(&clones, "automerge:orig").unwrap().unwrap();
+        let (v, list) = doc.get(&entry, "clonedAt").unwrap().unwrap();
+        assert!(matches!(v, automerge::Value::Object(ObjType::List)));
+        let (v, item) = doc.get(&list, 0).unwrap().unwrap();
+        assert!(matches!(v, automerge::Value::Object(ObjType::Text)));
+        let stored = doc.text(&item).unwrap();
+        assert_eq!(
+            hex::encode(bs58::decode(&stored).with_check(None).into_vec().unwrap()),
+            head
+        );
+
+        draft_record_merge(&mut doc, "automerge:orig", &[head.clone()]).unwrap();
+        draft_record_merge(&mut doc, "automerge:missing", &[head.clone()]).unwrap();
+        let shape = draft_shape(&doc).unwrap();
+        assert_eq!(shape.clones.len(), 1);
+        assert_eq!(shape.clones[0].original_url, "automerge:orig");
+        assert_eq!(shape.clones[0].clone_url, "automerge:clone");
+        assert_eq!(shape.clones[0].cloned_at, vec![head.clone()]);
+        assert_eq!(shape.clones[0].merged_at, Some(vec![head]));
+
+        let mut note = Automerge::new();
+        init_rich_note(&mut note, "hi").unwrap();
+        assert!(draft_shape(&note).is_none());
     }
 
     #[test]

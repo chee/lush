@@ -44,7 +44,17 @@ enum LocalLLMRuntime {
         guard !repo.isEmpty else { throw RuntimeError.modelNotConfigured }
 
         #if canImport(MLXLLM)
-        let modelConfig = ModelConfiguration(id: repo)
+        let localPath = config.localPath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var isDirectory: ObjCBool = false
+        let modelConfig: ModelConfiguration
+        if !localPath.isEmpty,
+           FileManager.default.fileExists(atPath: localPath, isDirectory: &isDirectory),
+           isDirectory.boolValue {
+            modelConfig = ModelConfiguration(directory: URL(fileURLWithPath: localPath))
+        } else {
+            let revision = config.revision.trimmingCharacters(in: .whitespacesAndNewlines)
+            modelConfig = ModelConfiguration(id: repo, revision: revision.isEmpty ? "main" : revision)
+        }
         let container = try await LLMModelFactory.shared.loadContainer(configuration: modelConfig)
         return try await container.perform { context in
             let input = try await context.processor.prepare(
@@ -55,7 +65,7 @@ enum LocalLLMRuntime {
                 input: input,
                 parameters: GenerateParameters(temperature: Float(temperature)),
                 context: context
-            ) { _ in
+            ) { (_: [Int]) in
                 tokenCount += 1
                 return tokenCount < maxTokens ? .more : .stop
             }

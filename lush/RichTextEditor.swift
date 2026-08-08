@@ -41,6 +41,7 @@ struct OutlineItem: Identifiable {
 
 struct StashedCard: Identifiable {
     let location: Int
+    let locations: [Int]
     let box: BlockBox
     let attributed: NSAttributedString
     let contentHeight: CGFloat
@@ -147,6 +148,8 @@ final class EditorController {
     func applyHighlight(_ name: String?) { core?.setHighlight(name) }
     func indent() { _ = core?.nestListItem() }
     func outdent() { _ = core?.unnestListItem() }
+    func indentBlock() { core?.indentBlock() }
+    func outdentBlock() { core?.outdentBlock() }
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
@@ -324,6 +327,10 @@ private enum EditorDocumentSessions {
 @MainActor
 final class EditorCore {
     private static let softLineBreak = "\u{2028}"
+    /// The core that most recently attached for each note. Presence has one
+    /// shared session, so a departing core must not leave it out from under a
+    /// successor that already claimed the same note.
+    private static var presenceOwners: [String: ObjectIdentifier] = [:]
 
     weak var view: (any EditorTextViewLike)?
     let model: NotesModel
@@ -376,6 +383,7 @@ final class EditorCore {
         textSpliceFlushTask?.cancel()
         saveTask?.cancel()
         caretBroadcastTask?.cancel()
+        let identity = ObjectIdentifier(self)
         Task { @MainActor [model, noteObserverId, peersObserverId, noteUrl] in
             if let noteObserverId {
                 model.removeNoteObserver(noteObserverId)
@@ -383,6 +391,10 @@ final class EditorCore {
             if let peersObserverId {
                 model.presence.removePeersObserver(peersObserverId)
             }
+            // a successor core for this note may have already claimed the
+            // shared presence session; only the still-current owner leaves
+            guard EditorCore.presenceOwners[noteUrl] == identity else { return }
+            EditorCore.presenceOwners[noteUrl] = nil
             if model.presence.docUrl == noteUrl {
                 model.presence.leave()
             }
@@ -415,15 +427,39 @@ final class EditorCore {
         // fold state is per-note; recompute hidden ranges for the incoming
         // storage BEFORE the swap rebuilds its elements
         folding.foldedHeadings.removeAll()
-        folding.refresh(storage: session.storage)
+        folding.refresh(storage: layoutStorage)
         inline.resetHosts()
         attachViewToSharedStorage()
         autoLoglineCheckedNoteUrl = nil
         load()
     }
 
+    /// The storage TextKit actually lays out for this view.
+    ///
+    /// macOS shares one NSTextStorage per note across windows (see the
+    /// reclaim dance below). iOS cannot: UITextView caches its `textStorage`
+    /// in an ivar at init, so pointing the content storage at a different
+    /// storage leaves UIKit's hit-testing reading character indices from the
+    /// laid-out storage but attributes from its own stale (empty) one, which
+    /// throws NSRangeException on the first tap anywhere in the text. There
+    /// the view's own storage is the live one; sessions still cache
+    /// `lastKnownJSON`, so switching notes stays a local refill.
+    private var layoutStorage: NSTextStorage {
+        #if os(macOS)
+        session.storage
+        #else
+        view?.pStorage ?? session.storage
+        #endif
+    }
+
     func attachViewToSharedStorage() {
         guard let contentStorage = view?.pContentStorage else { return }
+        EditorCore.presenceOwners[noteUrl] = ObjectIdentifier(self)
+        #if !os(macOS)
+        observeStorageEdits()
+        registerPresenceObserver()
+        return
+        #endif
         if contentStorage.textStorage !== session.storage {
             contentStorage.textStorage = session.storage
         } else if session.storage.textStorageObserver !== contentStorage {
@@ -440,6 +476,10 @@ final class EditorCore {
             contentStorage.textStorage = session.storage
         }
         observeStorageEdits()
+        registerPresenceObserver()
+    }
+
+    private func registerPresenceObserver() {
         if let peersObserverId {
             model.presence.removePeersObserver(peersObserverId)
         }
@@ -449,13 +489,16 @@ final class EditorCore {
     }
 
     func windowBecameKey() {
-        guard let contentStorage = view?.pContentStorage else { return }
-        let wasStale = contentStorage.textStorage === session.storage
-            && session.storage.textStorageObserver !== contentStorage
-        attachViewToSharedStorage()
-        if wasStale {
-            apply(spans: SpanNode.decodeList(session.lastKnownJSON))
+        #if os(macOS)
+        if let contentStorage = view?.pContentStorage {
+            let wasStale = contentStorage.textStorage === session.storage
+                && session.storage.textStorageObserver !== contentStorage
+            attachViewToSharedStorage()
+            if wasStale {
+                apply(spans: SpanNode.decodeList(session.lastKnownJSON))
+            }
         }
+        #endif
         if model.presence.docUrl != noteUrl {
             model.presence.join(noteUrl)
         }
@@ -473,10 +516,12 @@ final class EditorCore {
         if model.presence.docUrl == noteUrl {
             model.presence.leave()
         }
+        #if os(macOS)
         guard let contentStorage = view?.pContentStorage,
               contentStorage.textStorage === session.storage
         else { return }
         contentStorage.textStorage = NSTextStorage()
+        #endif
     }
 
     /// The TextKit 1 pump was `didCompleteLayoutFor`; in TextKit 2 the
@@ -490,12 +535,18 @@ final class EditorCore {
         }
         storageEditObserver = NotificationCenter.default.addObserver(
             forName: NSTextStorage.didProcessEditingNotification,
-            object: session.storage,
+            object: layoutStorage,
             queue: nil
         ) { [weak self] note in
             MainActor.assumeIsolated {
                 guard let self, let storage = note.object as? NSTextStorage else { return }
+                // setAttributedString (from apply()) already invalidates the
+                // full layout; stale NSTextLocation objects from pre-replace
+                // element state would crash background layout if we called
+                // invalidateLayout here.
+                guard !self.isApplyingDocumentState else { return }
                 let editedLocation = storage.editedRange.location
+                let editTouchedStash = self.editedRangeHasStash(storage, storage.editedRange)
                 guard let textLayoutManager = self.view?.pTextLayoutManager else { return }
                 Task { @MainActor in
                     invalidateOrderedListRun(
@@ -517,16 +568,37 @@ final class EditorCore {
                     self.controller.docVersion &+= 1
                     self.centerCaretIfTypewriter(editedAt: editedLocation)
                     self.scheduleMinimapUpdate()
-                    let hiddenBefore = self.folding.hiddenRanges
-                    self.folding.refresh(storage: storage)
-                    if hiddenBefore != self.folding.hiddenRanges {
-                        // element substitution has gone stale; rebuild the
-                        // affected paragraphs (terminates: second pass no-ops)
-                        self.rebuildHiddenRanges(previous: hiddenBefore)
+                    // Only typing inside a folded heading can change the
+                    // hidden set from here (its key stops matching, so the
+                    // section reappears); stash edits rebuild explicitly and
+                    // remote reloads refresh in apply(). With nothing folded
+                    // and nothing hidden there is nothing to recompute, so
+                    // the common keystroke skips the whole-document walk —
+                    // unless the edit itself introduced a stashed block (undo
+                    // of an unstash, paste of stashed text).
+                    if !self.folding.foldedHeadings.isEmpty || !self.folding.hiddenRanges.isEmpty || editTouchedStash {
+                        let hiddenBefore = self.folding.hiddenRanges
+                        self.folding.refresh(storage: storage)
+                        if hiddenBefore != self.folding.hiddenRanges {
+                            self.rebuildHiddenRanges(previous: hiddenBefore)
+                        }
                     }
                 }
             }
         }
+    }
+
+    private func editedRangeHasStash(_ storage: NSTextStorage, _ range: NSRange) -> Bool {
+        let clamped = NSIntersectionRange(range, NSRange(location: 0, length: storage.length))
+        guard clamped.length > 0 else { return false }
+        var found = false
+        storage.enumerateAttribute(.amBlock, in: clamped) { value, _, stop in
+            if let box = value as? BlockBox, box.value.attrs["stash"] != nil {
+                found = true
+                stop.pointee = true
+            }
+        }
+        return found
     }
 
     private weak var contextTracker: ContextTracker?
@@ -584,6 +656,12 @@ final class EditorCore {
                 let spans = SpanNode.decodeList(session.lastKnownJSON)
                 guard self.noteUrl == url, self.session === session else { return }
                 self.syncFromSession()
+                #if !os(macOS)
+                // No storage was swapped in (see layoutStorage), so the
+                // incoming note's text has to be filled in before the awaits
+                // below — otherwise the previous note stays on screen.
+                self.apply(spans: spans)
+                #endif
                 self.checkContextChangeOnOpen(in: spans)
                 await self.fetchMissingAssets(in: spans)
                 guard self.noteUrl == url,
@@ -635,7 +713,7 @@ final class EditorCore {
     private func syncFromSession() {
         attachViewToSharedStorage()
         guard let view else { return }
-        let location = min(view.pSelectedRange.location, session.storage.length)
+        let location = min(view.pSelectedRange.location, layoutStorage.length)
         view.pSelectedRange = NSRange(location: location, length: 0)
         refreshFormattingState()
     }
@@ -802,6 +880,9 @@ final class EditorCore {
             updateFindMatches(resetIndex: false)
         }
         scheduleMinimapUpdate()
+        // the edit observer skips its bump while applying document state, so
+        // canvas/outline inspectors would otherwise render the old doc
+        controller.docVersion &+= 1
         if location == attributed.length, location > 0,
            let lastNonEmbed = spans.reversed().compactMap({ (s: SpanNode) -> BlockValue? in guard case .block(let b) = s, !b.isEmbedBlock else { return nil }; return b }).first {
             view.pTypingAttributes = RichText.attributes(block: lastNonEmbed, marks: [:])
@@ -1064,21 +1145,26 @@ final class EditorCore {
 
     private func titleFromStorage(_ storage: NSAttributedString) -> String {
         let string = storage.string as NSString
-        var title = ""
+        // accumulate a whole line across formatting runs; a bold word or a
+        // link at the start of the title otherwise clipped it at the run edge
+        var line = ""
         storage.enumerateAttributes(in: NSRange(location: 0, length: storage.length)) { attrs, range, stop in
             guard attrs[.amDisplayOnly] == nil else { return }
             let text = string.substring(with: range)
                 .replacingOccurrences(of: "\u{FFFC}", with: "")
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                let trimmed = String(line).trimmingCharacters(in: .whitespaces)
-                if !trimmed.isEmpty {
-                    title = String(trimmed.prefix(60))
-                    stop.pointee = true
-                    return
+            for char in text {
+                if char == "\n" {
+                    if !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        stop.pointee = true
+                        return
+                    }
+                    line = ""
+                } else {
+                    line.append(char)
                 }
             }
         }
-        return title
+        return String(line.trimmingCharacters(in: .whitespaces).prefix(60))
     }
 
     func scheduleSave() {
@@ -1116,15 +1202,27 @@ final class EditorCore {
         let url = noteUrl
         let title = RichText.title(from: spans)
         session.title = title
+        let heads = session.heads
+        let previousHeadsTask = localWriteHeadsTask
         beginLocalWrite()
-        Task { [weak self] in
-            guard let self else { return }
+        let task = Task { [weak self] () -> [String]? in
+            let chainedHeads = await previousHeadsTask?.value
+            guard let self else { return nil }
             defer { self.finishLocalWrite(for: url) }
-            let heads = await self.model.updateDocument(url, json: json, title: title, origin: self.noteObserverId)
-            if let heads {
-                EditorDocumentSessions.session(for: url).heads = heads
+            let writeHeads = chainedHeads ?? (heads.isEmpty ? nil : heads)
+            let newHeads = await self.model.updateDocument(
+                url,
+                json: json,
+                title: title,
+                heads: writeHeads,
+                origin: self.noteObserverId
+            )
+            if let newHeads {
+                EditorDocumentSessions.session(for: url).heads = newHeads
             }
+            return newHeads
         }
+        localWriteHeadsTask = task
     }
 
     private func automergeTextPosition(in storage: NSAttributedString, at location: Int) -> Int? {
@@ -1339,11 +1437,9 @@ final class EditorCore {
     // MARK: folding
 
     /// Rebuild the substituted elements after fold state or stash attrs
-    /// change; the attribute-edit no-op makes the content storage re-ask its
-    /// delegate for those paragraphs. Pass `previous` when the storage was
-    /// already edited on the way here — the edit observer refreshes
-    /// `folding.hiddenRanges` eagerly, which would otherwise lose the ranges
-    /// that need un-substituting.
+    /// change. Pass `previous` when the storage was already edited on the way
+    /// here — the edit observer refreshes `folding.hiddenRanges` eagerly,
+    /// which would otherwise lose the ranges that need un-substituting.
     func rebuildHiddenRanges(previous: [NSRange]? = nil) {
         guard let view, let storage = view.pStorage else { return }
         let before = previous ?? folding.hiddenRanges
@@ -1534,10 +1630,44 @@ final class EditorCore {
     func updateRemoteCarets() {
         guard let view, let storage = view.pStorage,
               model.presence.docUrl == noteUrl,
-              let textLayoutManager = view.pTextLayoutManager,
-              let contentManager = textLayoutManager.textContentManager,
+              view.pTextLayoutManager != nil,
               let core = model.core,
               !storageHasAtomicLayout(in: storage, before: storage.length)
+        else {
+            removeRemoteCaretViews()
+            return
+        }
+        let peersWithCursors = model.presence.peers.values.filter { $0.cursor != nil }
+        if peersWithCursors.isEmpty {
+            removeRemoteCaretViews()
+            return
+        }
+        let url = noteUrl
+        let heads: [(String, String)] = peersWithCursors.compactMap {
+            guard let cursor = $0.cursor else { return nil }
+            return ($0.senderId, cursor.head)
+        }
+        // cursorIndex FFI can block on the doc lock — keep it off main
+        Task { @MainActor [weak self] in
+            let indices = await Task.detached { () -> [String: UInt64] in
+                var out: [String: UInt64] = [:]
+                for (senderId, head) in heads {
+                    if let index = try? core.cursorIndex(url: url, cursor: head) {
+                        out[senderId] = index
+                    }
+                }
+                return out
+            }.value
+            guard let self, self.noteUrl == url else { return }
+            self.layoutRemoteCarets(automergeIndices: indices)
+        }
+    }
+
+    private func layoutRemoteCarets(automergeIndices: [String: UInt64]) {
+        guard let view, let storage = view.pStorage,
+              model.presence.docUrl == noteUrl,
+              let textLayoutManager = view.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager
         else {
             removeRemoteCaretViews()
             return
@@ -1550,8 +1680,7 @@ final class EditorCore {
         let origin = view.pTextOrigin
         var seen = Set<String>()
         for peer in peersWithCursors {
-            guard let cursor = peer.cursor,
-                  let headIndex = try? core.cursorIndex(url: noteUrl, cursor: cursor.head),
+            guard let headIndex = automergeIndices[peer.senderId],
                   let headOffset = utf16Position(forAutomergeIndex: Int(headIndex), in: storage),
                   let textRange = contentManager.textRange(
                       for: NSRange(location: min(headOffset, storage.length), length: 0)
@@ -1610,6 +1739,7 @@ final class EditorCore {
         // land after it, not at its paragraph start
         let droppingAtEnd = dropIndex >= storage.length && !str.hasSuffix("\n")
         if droppingAtEnd, NSMaxRange(source) >= storage.length { return }
+        let undo = undoSnapshot()
         let hiddenBefore = folding.hiddenRanges
         let slice = NSMutableAttributedString(attributedString: storage.attributedSubstring(from: source))
         // the last paragraph carries no trailing newline; without one the
@@ -1638,6 +1768,7 @@ final class EditorCore {
         }
         view.pSelectedRange = NSRange(location: min(target, storage.length), length: 0)
         rebuildHiddenRanges(previous: hiddenBefore)
+        registerUndo(from: undo, actionName: "Move Paragraph")
         scheduleSave()
     }
 
@@ -1714,7 +1845,15 @@ final class EditorCore {
     func stashedCards() -> [StashedCard] {
         guard let storage = view?.pStorage, storage.length > 0 else { return [] }
         let str = storage.string as NSString
-        var cards: [StashedCard] = []
+        struct Item {
+            let paragraphEnd: Int
+            let location: Int
+            let box: BlockBox
+            let attributed: NSAttributedString
+            let x: CGFloat
+            let y: CGFloat
+        }
+        var items: [Item] = []
         var location = 0
         while location < storage.length {
             let paragraph = str.paragraphRange(for: NSRange(location: location, length: 0))
@@ -1723,63 +1862,122 @@ final class EditorCore {
             guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
                   case .object(let stash)? = box.value.attrs["stash"]
             else { continue }
-            let attributed = storage.attributedSubstring(from: paragraph)
-            let measured = attributed.boundingRect(
+            items.append(Item(
+                paragraphEnd: NSMaxRange(paragraph),
+                location: paragraph.location,
+                box: box,
+                attributed: storage.attributedSubstring(from: paragraph),
+                x: CGFloat(stash["x"]?.doubleValue ?? 20),
+                y: CGFloat(stash["y"]?.doubleValue ?? 20)
+            ))
+        }
+        var cards: [StashedCard] = []
+        var i = 0
+        while i < items.count {
+            let first = items[i]
+            var group = [items[i]]
+            var j = i + 1
+            while j < items.count {
+                let prev = group.last!
+                let curr = items[j]
+                guard curr.x == first.x, curr.y == first.y,
+                      curr.location == prev.paragraphEnd else { break }
+                group.append(curr)
+                j += 1
+            }
+            let merged = NSMutableAttributedString()
+            for item in group { merged.append(item.attributed) }
+            let measured = merged.boundingRect(
                 with: CGSize(width: 156, height: 400),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 context: nil
             ).height
             cards.append(StashedCard(
-                location: paragraph.location,
-                box: box,
-                attributed: attributed,
+                location: first.location,
+                locations: group.map(\.location),
+                box: first.box,
+                attributed: merged,
                 contentHeight: ceil(measured),
-                x: CGFloat(stash["x"]?.doubleValue ?? 20),
-                y: CGFloat(stash["y"]?.doubleValue ?? 20)
+                x: first.x,
+                y: first.y
             ))
+            i = j
         }
         return cards
     }
 
-    /// Hide the caret's paragraph from the note and give it a spot on the
-    /// canvas. The text never leaves the doc, so concurrent edits keep
-    /// merging while it's stashed.
+    /// Hide the selected paragraphs from the note and place them on the canvas.
+    /// Multiple selected paragraphs land at the same position and appear as one card.
+    /// The text never leaves the doc, so concurrent edits keep merging while stashed.
     func stashSelection() {
         guard let view, let storage = view.pStorage, storage.length > 0 else { return }
-        let location = view.pSelectedRange.location
-        // a caret on the empty trailing line has no paragraph of its own;
-        // clamping would stash the previous paragraph instead
-        if location >= storage.length, (storage.string as NSString).hasSuffix("\n") { return }
-        let caret = min(location, storage.length - 1)
-        let paragraph = (storage.string as NSString).paragraphRange(for: NSRange(location: max(0, caret), length: 0))
-        guard paragraph.length > 0,
-              let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
-              !box.value.isAtomic,
-              box.value.attrs["stash"] == nil
-        else { return }
+        let selection = view.pSelectedRange
+        let str = storage.string as NSString
+        if selection.location >= storage.length, str.hasSuffix("\n") { return }
+        var paragraphLocations: [Int] = []
+        let rangeEnd = selection.length > 0 ? NSMaxRange(selection) : selection.location + 1
+        var cursor = min(selection.location, storage.length - 1)
+        while cursor < storage.length {
+            let paragraph = str.paragraphRange(for: NSRange(location: max(0, cursor), length: 0))
+            if paragraph.length == 0 { break }
+            if let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
+               !box.value.isAtomic,
+               box.value.attrs["stash"] == nil {
+                paragraphLocations.append(paragraph.location)
+            }
+            let next = NSMaxRange(paragraph)
+            if next >= rangeEnd { break }
+            if next <= cursor { break }
+            cursor = next
+        }
+        guard !paragraphLocations.isEmpty else { return }
         let nextY = (stashedCards().map { $0.y + 90 }.max() ?? 16)
-        setStash(.object(["x": .number(16), "y": .number(Double(nextY))]), forParagraphAt: paragraph.location)
+        let stashValue = JSONValue.object(["x": .number(16), "y": .number(Double(nextY))])
+        for loc in paragraphLocations {
+            setStash(stashValue, forParagraphAt: loc)
+        }
     }
 
-    func moveStash(_ box: BlockBox, to point: CGPoint) {
-        box.value.attrs["stash"] = .object([
+    func moveStash(_ card: StashedCard, to point: CGPoint) {
+        let newStash = JSONValue.object([
             "x": .number(Double(max(0, point.x))),
             "y": .number(Double(max(0, point.y))),
         ])
+        guard let storage = view?.pStorage else { return }
+        // a remote reload mid-drag rebuilds every block, so the cached
+        // locations would now point at whatever paragraph sits there. Bail
+        // unless the anchor block is still this exact card.
+        guard card.location < storage.length,
+              (storage.attribute(.amBlock, at: card.location, effectiveRange: nil) as? BlockBox) === card.box
+        else { return }
+        for loc in card.locations {
+            guard loc < storage.length,
+                  let box = storage.attribute(.amBlock, at: loc, effectiveRange: nil) as? BlockBox,
+                  box.value.attrs["stash"] != nil
+            else { continue }
+            box.value.attrs["stash"] = newStash
+        }
         controller.docVersion &+= 1
         scheduleSave()
     }
 
-    /// Return a stashed paragraph to the note in place.
-    func unstashInPlace(_ box: BlockBox) {
-        guard let location = stashedCards().first(where: { $0.box === box })?.location else { return }
-        setStash(nil, forParagraphAt: location)
+    /// Return stashed paragraph(s) to the note in place.
+    func unstashInPlace(at location: Int) {
+        let card = stashedCards().first(where: { $0.location == location })
+        for loc in card?.locations ?? [location] {
+            setStash(nil, forParagraphAt: loc)
+        }
     }
 
-    /// Return a stashed paragraph at a drop point: a splice move, which chee
-    /// chose knowing it breaks automerge identity for that text.
+    /// Return a stashed paragraph at a drop point: a splice move.
+    /// For multi-paragraph cards, unstashes all in place instead of moving.
     func unstash(fromParagraphAt sourceLocation: Int, toDropIndex dropIndex: Int) {
         guard let view, let storage = view.pStorage, storage.length > 0 else { return }
+        let card = stashedCards().first(where: { $0.location == sourceLocation })
+        if let card, card.locations.count > 1 {
+            for loc in card.locations { setStash(nil, forParagraphAt: loc) }
+            return
+        }
         let str = storage.string as NSString
         let source = str.paragraphRange(for: NSRange(location: min(sourceLocation, storage.length - 1), length: 0))
         guard source.length > 0,
@@ -1795,6 +1993,7 @@ final class EditorCore {
             setStash(nil, forParagraphAt: source.location)
             return
         }
+        let undo = undoSnapshot()
         let hiddenBefore = folding.hiddenRanges
         let slice = NSMutableAttributedString(
             attributedString: storage.attributedSubstring(from: source)
@@ -1826,6 +2025,7 @@ final class EditorCore {
         }
         view.pSelectedRange = NSRange(location: min(target, storage.length), length: 0)
         rebuildHiddenRanges(previous: hiddenBefore)
+        registerUndo(from: undo, actionName: "Unstash")
         scheduleSave()
     }
 
@@ -1841,6 +2041,7 @@ final class EditorCore {
         } else {
             block.attrs.removeValue(forKey: "stash")
         }
+        let undo = undoSnapshot()
         let hiddenBefore = folding.hiddenRanges
         let selection = view.pSelectedRange
         view.pPerformStorageEdit { storage in
@@ -1856,6 +2057,34 @@ final class EditorCore {
             length: 0
         )
         rebuildHiddenRanges(previous: hiddenBefore)
+        registerUndo(from: undo, actionName: value == nil ? "Unstash" : "Stash")
+        scheduleSave()
+    }
+
+    /// Insert a new blank paragraph at the end of the doc, pre-stashed at the given canvas point.
+    func addBlankCardToCanvas(at canvasPoint: CGPoint) {
+        guard let view, let storage = view.pStorage else { return }
+        var block = BlockValue.paragraph
+        block.attrs["stash"] = .object([
+            "x": .number(Double(canvasPoint.x)),
+            "y": .number(Double(canvasPoint.y))
+        ])
+        let attrs = RichText.attributes(block: block, marks: [:])
+        let insertAt = storage.length
+        let savedSelection = view.pSelectedRange
+        let str = storage.string as NSString
+        view.pPerformStorageEdit { storage in
+            let prefix = (insertAt > 0 && str.character(at: insertAt - 1) != 0x0A)
+                ? NSAttributedString(string: "\n", attributes: attrs)
+                : nil
+            let line = NSAttributedString(string: "\n", attributes: attrs)
+            let insertion = NSMutableAttributedString()
+            if let prefix { insertion.append(prefix) }
+            insertion.append(line)
+            storage.insert(insertion, at: insertAt)
+        }
+        view.pSelectedRange = NSRange(location: min(savedSelection.location, storage.length), length: 0)
+        rebuildHiddenRanges()
         scheduleSave()
     }
 
@@ -2644,29 +2873,6 @@ final class EditorCore {
         return true
     }
 
-    private func promoteSoftLineBreakToParagraph(currentBlock: BlockValue, nextBlock: BlockValue) -> Bool {
-        guard let view, let storage = view.pStorage, view.pSelectedRange.length == 0 else { return false }
-        let caret = view.pSelectedRange.location
-        guard caret > 0, caret <= storage.length else { return false }
-        let str = storage.string as NSString
-        guard str.character(at: caret - 1) == 0x2028 else { return false }
-
-        let currentAttributes = RichText.attributes(block: currentBlock, marks: [:])
-        let nextAttributes = RichText.attributes(block: nextBlock, marks: [:])
-        view.pPerformStorageEdit { storage in
-            storage.replaceCharacters(
-                in: NSRange(location: caret - 1, length: 1),
-                with: NSAttributedString(string: "\n", attributes: currentAttributes)
-            )
-        }
-        view.pSelectedRange = NSRange(location: caret, length: 0)
-        view.pTypingAttributes = nextAttributes
-        restyleCaretParagraph(as: nextBlock)
-        refreshFormattingState()
-        scheduleSave()
-        return true
-    }
-
     private func leaveBlockquoteFromEmptySoftLine(block: BlockValue) -> Bool {
         guard let view, let storage = view.pStorage, view.pSelectedRange.length == 0 else { return false }
         let caret = view.pSelectedRange.location
@@ -2798,6 +3004,38 @@ final class EditorCore {
         adjustListNesting(deeper: false)
     }
 
+    func indentBlock() {
+        var block = blockAtSelection()
+        switch block.type {
+        case "unordered-list-item", "ordered-list-item":
+            nestListItem()
+        default:
+            let level = block.indentLevel + 1
+            block.attrs["indent"] = .int(Int64(level))
+            applyBlockStyle(block)
+        }
+    }
+
+    func outdentBlock() {
+        var block = blockAtSelection()
+        switch block.type {
+        case "unordered-list-item", "ordered-list-item":
+            if block.parents.isEmpty {
+                applyBlockStyle(.paragraph)
+            } else {
+                unnestListItem()
+            }
+        default:
+            let level = max(0, block.indentLevel - 1)
+            if level == 0 {
+                block.attrs.removeValue(forKey: "indent")
+            } else {
+                block.attrs["indent"] = .int(Int64(level))
+            }
+            applyBlockStyle(block)
+        }
+    }
+
     private func adjustListNesting(deeper: Bool) -> Bool {
         guard let view, let storage = view.pStorage else { return false }
         let selection = view.pSelectedRange
@@ -2907,6 +3145,7 @@ final class EditorCore {
     func updateHtmlBlock(_ box: BlockBox, html: String) {
         guard let view, let storage = view.pStorage else { return }
         guard let range = range(whereBlockBox: box, in: storage) else { return }
+        let undo = undoSnapshot()
         let newBlock = BlockValue.html(html)
         view.pPerformStorageEdit { storage in
             storage.replaceCharacters(
@@ -2914,6 +3153,7 @@ final class EditorCore {
                 with: RichText.embedAttachment(for: newBlock, cache: cache)
             )
         }
+        registerUndo(from: undo, actionName: "Edit HTML")
         scheduleSave()
     }
 
@@ -2921,9 +3161,11 @@ final class EditorCore {
         guard let view, let storage = view.pStorage else { return }
         guard let range = range(whereBlockBox: box, in: storage) else { return }
         NSLog("lush embed removed by user: %@", box.value.embedUrl ?? "?")
+        let undo = undoSnapshot()
         view.pPerformStorageEdit { storage in
             storage.replaceCharacters(in: range, with: NSAttributedString())
         }
+        registerUndo(from: undo, actionName: "Remove Embed")
         scheduleSave()
     }
 
@@ -3131,21 +3373,13 @@ final class EditorCore {
         let html = "<p>hello</p>"
         let block = BlockValue.html(html)
         let attachment = RichText.embedAttachment(for: block, cache: cache)
-        insertBlockAttachment(attachment)
-        guard let storage = view?.pStorage else { return }
-        var handle: HtmlBlockHandle?
-        storage.enumerateAttribute(
-            .amBlock,
-            in: NSRange(location: 0, length: storage.length)
-        ) { value, _, _ in
-            if let box = value as? BlockBox, box.value.type == "html",
-               box.value.htmlSource == html {
-                handle = HtmlBlockHandle(box: box, html: html)
-            }
-        }
-        if let handle {
-            controller.sheet = .html(handle)
-        }
+        guard let range = insertBlockAttachment(attachment),
+              let storage = view?.pStorage,
+              range.location < storage.length,
+              let box = storage.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox,
+              box.value.type == "html"
+        else { return }
+        controller.sheet = .html(HtmlBlockHandle(box: box, html: html))
     }
 
     private func insertEmbedBlock(url: String) {
@@ -3153,8 +3387,10 @@ final class EditorCore {
         insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
     }
 
-    private func insertBlockAttachment(_ attachment: NSAttributedString) {
-        guard let view, let storage = view.pStorage else { return }
+    @discardableResult
+    private func insertBlockAttachment(_ attachment: NSAttributedString) -> NSRange? {
+        guard let view, let storage = view.pStorage else { return nil }
+        let undo = undoSnapshot()
         let insertion = NSMutableAttributedString()
         let str = storage.string as NSString
         // insert after the current paragraph so it never splits text into
@@ -3168,6 +3404,7 @@ final class EditorCore {
                 attributes: view.pTypingAttributes
             ))
         }
+        let attachmentStart = location + (atParagraphStart ? 0 : 1)
         insertion.append(attachment)
         insertion.append(NSAttributedString(
             string: "\n",
@@ -3178,8 +3415,25 @@ final class EditorCore {
         }
         view.pSelectedRange = NSRange(location: location + insertion.length, length: 0)
         view.pTypingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        registerUndo(from: undo, actionName: "Insert Block")
+        scheduleSave()
+        return NSRange(location: attachmentStart, length: attachment.length)
+    }
+
+    #if os(iOS)
+    /// AppKit routes pReplace through shouldChangeText/didChangeText, which
+    /// registers undo; UIKit has no such hook, so snapshot it like the other
+    /// storage mutations do.
+    func pReplaceRegisteringUndo(_ range: NSRange, with attributed: NSAttributedString) {
+        guard let view, view.pStorage != nil else { return }
+        let undo = undoSnapshot()
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: range, with: attributed)
+        }
+        registerUndo(from: undo, actionName: "Edit")
         scheduleSave()
     }
+    #endif
 }
 
 @MainActor
@@ -3196,20 +3450,6 @@ func editorPlainText(_ slice: NSAttributedString) -> String {
 // MARK: - macOS
 
 #if os(macOS)
-
-/// The hover drag-handle in the gutter; dragging it reorders the paragraph.
-final class BlockHandleView: NSImageView {
-    var paragraphLocation: Int?
-
-    override func mouseDown(with event: NSEvent) {
-        guard let paragraphLocation, let textView = superview as? EditorTextView else { return }
-        let item = NSDraggingItem(
-            pasteboardWriter: "lush-block:\(paragraphLocation)" as NSString
-        )
-        item.setDraggingFrame(bounds, contents: image)
-        textView.beginDraggingSession(with: [item], event: event, source: textView)
-    }
-}
 
 final class EditorTextView: NSTextView, EditorTextViewLike {
     weak var core: EditorCore?
@@ -3240,76 +3480,6 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         }
     }
 
-    let blockHandle: BlockHandleView = {
-        let handle = BlockHandleView()
-        handle.image = PImage.symbol("line.3.horizontal")
-        handle.contentTintColor = .tertiaryLabelColor
-        handle.isHidden = true
-        return handle
-    }()
-
-    private var handleTrackingArea: NSTrackingArea?
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let handleTrackingArea { removeTrackingArea(handleTrackingArea) }
-        let area = NSTrackingArea(
-            rect: .zero,
-            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-            owner: self
-        )
-        addTrackingArea(area)
-        handleTrackingArea = area
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        super.mouseMoved(with: event)
-        if blockHandle.superview == nil { addSubview(blockHandle) }
-        let point = convert(event.locationInWindow, from: nil)
-        let containerPoint = CGPoint(
-            x: point.x - textContainerOrigin.x,
-            y: point.y - textContainerOrigin.y
-        )
-        guard let textLayoutManager,
-              let contentManager = textLayoutManager.textContentManager,
-              let fragment = textLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: containerPoint.y)),
-              let elementRange = fragment.textElement?.elementRange
-        else {
-            blockHandle.isHidden = true
-            return
-        }
-        let location = contentManager.offset(from: contentManager.documentRange.location, to: elementRange.location)
-        guard location >= 0, location < (textStorage?.length ?? 0) else {
-            blockHandle.isHidden = true
-            return
-        }
-        // headings own their gutter (fold chevron) — no handle there
-        if let box = textStorage?.attribute(.amBlock, at: location, effectiveRange: nil) as? BlockBox,
-           box.value.type == "heading" {
-            blockHandle.isHidden = true
-            return
-        }
-        blockHandle.paragraphLocation = location
-        blockHandle.frame = CGRect(
-            x: textContainerOrigin.x - 18,
-            y: fragment.layoutFragmentFrame.minY + textContainerOrigin.y + 3,
-            width: 14,
-            height: 12
-        )
-        blockHandle.isHidden = false
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        blockHandle.isHidden = true
-    }
-
-    override func draggingSession(
-        _ session: NSDraggingSession,
-        sourceOperationMaskFor context: NSDraggingContext
-    ) -> NSDragOperation {
-        context == .withinApplication ? .move : []
-    }
 
     /// `textStorage` can go stale after the content storage adopts the shared
     /// session storage, so everything resolves through the content storage.
@@ -3373,8 +3543,14 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
     }
 
     func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void) {
-        guard let storage = textStorage else { return }
-        edit(storage)
+        guard let storage = pStorage else { return }
+        if let contentStorage = pContentStorage {
+            contentStorage.performEditingTransaction {
+                edit(storage)
+            }
+        } else {
+            edit(storage)
+        }
     }
 
     func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int? {
@@ -3394,6 +3570,16 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
            event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift),
            core?.leaveCodeBlock() == true {
             return
+        }
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == .command {
+            if event.charactersIgnoringModifiers == "]" {
+                core?.indentBlock()
+                return
+            } else if event.charactersIgnoringModifiers == "[" {
+                core?.outdentBlock()
+                return
+            }
         }
         super.keyDown(with: event)
     }
@@ -3542,15 +3728,6 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
             let point = convert(sender.draggingLocation, from: nil)
             let dropIndex = characterIndexForInsertion(at: point)
             core.unstash(fromParagraphAt: sourceLocation, toDropIndex: dropIndex)
-            return true
-        }
-        if let core,
-           let text = dragString(pasteboard),
-           text.hasPrefix("lush-block:"),
-           let sourceLocation = Int(text.dropFirst("lush-block:".count)) {
-            let point = convert(sender.draggingLocation, from: nil)
-            let dropIndex = characterIndexForInsertion(at: point)
-            core.moveParagraph(fromParagraphAt: sourceLocation, toDropIndex: dropIndex)
             return true
         }
         if let core,
@@ -3890,15 +4067,20 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     }
 
     func pReplace(_ range: NSRange, with attributed: NSAttributedString) {
-        let range = clampedRange(range)
-        pPerformStorageEdit { storage in
-            storage.replaceCharacters(in: range, with: attributed)
-        }
-        core?.scheduleSave()
+        core?.pReplaceRegisteringUndo(clampedRange(range), with: attributed)
     }
 
     func pScrollRangeToVisible(_ range: NSRange) {
         scrollRangeToVisible(range)
+    }
+
+    func scrollSelectionAboveSheet(height: CGFloat) {
+        let range = pSelectedRange
+        guard range.location != NSNotFound else { return }
+        let saved = contentInset.bottom
+        contentInset.bottom = max(saved, height)
+        scrollRangeToVisible(range)
+        contentInset.bottom = saved
     }
 
     func pCenterCaretRect(_ containerRect: CGRect) {
@@ -3962,17 +4144,24 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     }
 
     override var keyCommands: [UIKeyCommand]? {
-        // claim Tab only inside list items; elsewhere the system keeps it
         let type = core?.blockAtSelection().type
-        guard type == "unordered-list-item" || type == "ordered-list-item" else { return nil }
-        return [
-            UIKeyCommand(input: "\t", modifierFlags: [], action: #selector(handleTabKey)),
-            UIKeyCommand(input: "\t", modifierFlags: .shift, action: #selector(handleShiftTabKey)),
+        var commands = [
+            UIKeyCommand(input: "[", modifierFlags: .command, action: #selector(handleOutdentBlock)),
+            UIKeyCommand(input: "]", modifierFlags: .command, action: #selector(handleIndentBlock)),
         ]
+        if type == "unordered-list-item" || type == "ordered-list-item" {
+            commands += [
+                UIKeyCommand(input: "\t", modifierFlags: [], action: #selector(handleTabKey)),
+                UIKeyCommand(input: "\t", modifierFlags: .shift, action: #selector(handleShiftTabKey)),
+            ]
+        }
+        return commands
     }
 
     @objc private func handleTabKey() { core?.nestListItem() }
     @objc private func handleShiftTabKey() { core?.unnestListItem() }
+    @objc private func handleIndentBlock() { core?.indentBlock() }
+    @objc private func handleOutdentBlock() { core?.outdentBlock() }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(paste(_:)) {
@@ -4119,7 +4308,7 @@ struct RichTextEditor: UIViewRepresentable {
         let accessory = UIHostingController(
             rootView: FormatAccessoryBar(controller: controller)
         )
-        accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 46)
+        accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 52)
         accessory.view.backgroundColor = .clear
         textView.inputAccessoryView = accessory.view
         context.coordinator.accessory = accessory
@@ -4217,70 +4406,66 @@ struct RichTextEditor: UIViewRepresentable {
     }
 }
 
-/// Notes-style formatting bar above the keyboard.
+/// Slim bar above the keyboard. Formatting lives behind "Aa".
 struct FormatAccessoryBar: View {
     let controller: EditorController
+    @State private var showFormat = false
 
     var body: some View {
         HStack(spacing: 0) {
-            // Scrollable controls, like Notes: the bar holds more than fits.
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 18) {
+                HStack(spacing: 22) {
+                    Button { showFormat = true } label: {
+                        Text("Aa")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                    }
                     Menu {
-                        ForEach(EditorController.styles, id: \.key) { style in
+                        Button {
+                            controller.attachImageFromPanel()
+                        } label: {
+                            Label("Choose Photo…", systemImage: "photo.on.rectangle")
+                        }
+                        if UIImagePickerController.isSourceTypeAvailable(.camera) {
                             Button {
-                                controller.applyStyle(style.key)
+                                controller.cameraPickerVisible = true
                             } label: {
-                                if controller.currentStyleKey == style.key {
-                                    Label(style.label, systemImage: "checkmark")
-                                } else {
-                                    Text(style.label)
-                                }
+                                Label("Take Photo", systemImage: "camera")
                             }
+                        }
+                        Button {
+                            controller.recorderVisible.toggle()
+                        } label: {
+                            Label("Record Audio", systemImage: "waveform")
+                        }
+                        Button {
+                            controller.attachFileFromPanel()
+                        } label: {
+                            Label("Attach File…", systemImage: "doc")
+                        }
+                        Divider()
+                        Button {
+                            controller.insertTable()
+                        } label: {
+                            Label("Table", systemImage: "tablecells")
+                        }
+                        Button {
+                            controller.insertColumns()
+                        } label: {
+                            Label("Columns", systemImage: "rectangle.split.2x1")
+                        }
+                        Button {
+                            controller.insertLogline()
+                        } label: {
+                            Label("Logline", systemImage: "clock")
+                        }
+                        Button {
+                            controller.insertPatchworkDoc()
+                        } label: {
+                            Label("Patchwork Doc…", systemImage: "shippingbox")
                         }
                     } label: {
-                        Image(systemName: "textformat")
-                    }
-                    if controller.isCodeBlockActive {
-                        Menu {
-                            ForEach(CodeLanguage.all) { language in
-                                Button {
-                                    controller.applyCodeLanguage(language)
-                                } label: {
-                                    if controller.currentCodeLanguage == language.id {
-                                        Label(language.name, systemImage: "checkmark")
-                                    } else {
-                                        Text(language.name)
-                                    }
-                                }
-                            }
-                        } label: {
-                            Text(CodeLanguage.named(controller.currentCodeLanguage).name)
-                                .font(.system(size: 13, weight: .medium))
-                        }
-                    }
-                    Divider()
-                        .frame(height: 22)
-                    barButton("bold", active: controller.strongActive) {
-                        controller.toggleStrong()
-                    }
-                    barButton("italic", active: controller.emActive) {
-                        controller.toggleEm()
-                    }
-                    barButton("underline", active: controller.underlineActive) {
-                        controller.toggleUnderline()
-                    }
-                    barButton("strikethrough", active: controller.strikethroughActive) {
-                        controller.toggleStrikethrough()
-                    }
-                    barButton("chevron.left.forwardslash.chevron.right", active: controller.codeActive) {
-                        controller.toggleCode()
-                    }
-                    barButton("textformat.superscript", active: controller.superscriptActive) {
-                        controller.toggleSuperscript()
-                    }
-                    barButton("textformat.subscript", active: controller.subscriptActive) {
-                        controller.toggleSubscript()
+                        Image(systemName: "paperclip").foregroundStyle(Color.primary)
                     }
                     Menu {
                         ForEach(Highlight.names, id: \.self) { name in
@@ -4298,22 +4483,17 @@ struct FormatAccessoryBar: View {
                         Button("None") { controller.applyHighlight(nil) }
                     } label: {
                         Image(systemName: "highlighter")
-                            .foregroundStyle(
-                                controller.highlightActive != nil ? Color.accentColor : Color.primary
-                            )
+                            .foregroundStyle(controller.highlightActive != nil ? Color.accentColor : Color.primary)
                     }
-                    Divider()
-                        .frame(height: 22)
-                    barButton("decrease.indent", active: false) {
-                        controller.outdent()
-                    }
-                    barButton("increase.indent", active: false) {
-                        controller.indent()
-                    }
+                    barButton("list.bullet") { controller.applyStyle("unordered-list-item") }
+                    barButton("decrease.indent") { controller.outdentBlock() }
+                    barButton("increase.indent") { controller.indentBlock() }
                 }
                 .padding(.horizontal, 16)
                 .frame(maxHeight: .infinity)
             }
+            Divider()
+                .frame(height: 28)
             Button {
                 controller.dismissKeyboard()
             } label: {
@@ -4321,20 +4501,181 @@ struct FormatAccessoryBar: View {
             }
             .padding(.horizontal, 16)
         }
-        .font(.system(size: 17))
+        .font(.system(size: 20))
         .frame(maxHeight: .infinity)
         .background(.bar)
+        .sheet(isPresented: $showFormat) {
+            FormatSheet(controller: controller)
+        }
+        .onChange(of: showFormat) { _, shown in
+            if shown, let textView = controller.core?.view as? EditorTextView {
+                textView.scrollSelectionAboveSheet(height: 320)
+            }
+        }
     }
 
-    private func barButton(
-        _ symbol: String,
-        active: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
+    private func barButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).foregroundStyle(Color.primary)
+        }
+    }
+}
+
+/// Notes-style format panel — block styles, marks, and indent.
+struct FormatSheet: View {
+    let controller: EditorController
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Format").font(.headline)
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(Color.secondary, Color(.systemFill))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(EditorController.styles, id: \.key) { style in
+                        let active = controller.currentStyleKey == style.key
+                        Button {
+                            controller.applyStyle(style.key)
+                        } label: {
+                            Text(style.label)
+                                .font(.system(size: 14, weight: active ? .semibold : .regular))
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(active ? Color.accentColor : Color(.secondarySystemFill))
+                                .foregroundStyle(active ? Color.white : Color.primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 9))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 20)
+            }
+
+            HStack(spacing: 0) {
+                markCell(active: controller.strongActive, action: controller.toggleStrong) {
+                    Text("B").font(.system(size: 16, weight: .bold))
+                }
+                markCell(active: controller.emActive, action: controller.toggleEm) {
+                    Text("I").font(.system(size: 16).italic())
+                }
+                markCell(active: controller.underlineActive, action: controller.toggleUnderline) {
+                    Text("U").underline().font(.system(size: 16))
+                }
+                markCell(active: controller.strikethroughActive, action: controller.toggleStrikethrough) {
+                    Text("S").strikethrough().font(.system(size: 16))
+                }
+                markCell(active: controller.codeActive, action: controller.toggleCode) {
+                    Image(systemName: "chevron.left.forwardslash.chevron.right").font(.system(size: 13))
+                }
+                markCell(active: controller.superscriptActive, action: controller.toggleSuperscript) {
+                    Image(systemName: "textformat.superscript").font(.system(size: 13))
+                }
+                markCell(active: controller.subscriptActive, action: controller.toggleSubscript) {
+                    Image(systemName: "textformat.subscript").font(.system(size: 13))
+                }
+                Menu {
+                    ForEach(Highlight.names, id: \.self) { name in
+                        Button {
+                            controller.applyHighlight(name)
+                        } label: {
+                            if controller.highlightActive == name {
+                                Label(name.capitalized, systemImage: "checkmark")
+                            } else {
+                                Text(name.capitalized)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("None") { controller.applyHighlight(nil) }
+                } label: {
+                    Image(systemName: "highlighter")
+                        .font(.system(size: 15))
+                        .foregroundStyle(controller.highlightActive != nil ? Color.accentColor : Color.primary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(height: 44)
+            .background(Color(.secondarySystemFill))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 20)
+
+            HStack(spacing: 10) {
+                HStack(spacing: 0) {
+                    indentCell("increase.indent") { controller.indentBlock() }
+                    indentCell("decrease.indent") { controller.outdentBlock() }
+                }
+                .frame(height: 44)
+                .background(Color(.secondarySystemFill))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+
+            if controller.isCodeBlockActive {
+                Menu {
+                    ForEach(CodeLanguage.all) { language in
+                        Button {
+                            controller.applyCodeLanguage(language)
+                        } label: {
+                            if controller.currentCodeLanguage == language.id {
+                                Label(language.name, systemImage: "checkmark")
+                            } else {
+                                Text(language.name)
+                            }
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Text("Language").foregroundStyle(Color.secondary)
+                        Spacer()
+                        Text(CodeLanguage.named(controller.currentCodeLanguage).name)
+                        Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                    }
+                    .font(.system(size: 15))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 13)
+                    .background(Color(.secondarySystemFill))
+                    .foregroundStyle(Color.primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .padding(.horizontal, 20)
+            }
+
+            Spacer()
+        }
+        .presentationDetents([.height(controller.isCodeBlockActive ? 316 : 264)])
+        .presentationDragIndicator(.visible)
+    }
+
+    @ViewBuilder
+    private func markCell(active: Bool, action: @escaping () -> Void, @ViewBuilder label: () -> some View) -> some View {
+        Button(action: action) {
+            label()
+                .foregroundStyle(active ? Color.accentColor : Color.primary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func indentCell(_ symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .foregroundStyle(active ? Color.accentColor : Color.primary)
+                .foregroundStyle(Color.primary)
+                .frame(width: 52)
+                .frame(maxHeight: .infinity)
         }
+        .buttonStyle(.plain)
     }
 }
 
