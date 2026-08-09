@@ -1,11 +1,21 @@
 import Foundation
 import Observation
+import SwiftUI
 import WidgetKit
 #if os(macOS)
 import AppKit
 #else
 import UIKit
 #endif
+
+func reordered<T: Equatable>(_ items: [T], moving item: T, adjacentTo target: T, after: Bool) -> [T] {
+    guard item != target else { return items }
+    var next = items
+    next.removeAll { $0 == item }
+    guard let index = next.firstIndex(of: target) else { return items }
+    next.insert(item, at: after ? index + 1 : index)
+    return next
+}
 
 @Observable @MainActor
 final class NotesModel {
@@ -254,6 +264,7 @@ final class NotesModel {
     private(set) var contactAvatarData: Data?
     var smartNotebooks: [SmartNotebook] = SmartNotebookStore.load()
     var smartHits: [String: [SearchHit]] = [:]
+    var folderSettings: [String: FolderSettings] = FolderSettingsStore.load()
     @ObservationIgnored var smartHitTasks: [String: Task<Void, Never>] = [:]
 
     var loggedIn: Bool { accountUrl != nil }
@@ -358,6 +369,8 @@ final class NotesModel {
         presence.leave()
         smartNotebooks = []
         SmartNotebookStore.save([])
+        folderSettings = [:]
+        FolderSettingsStore.save([:])
         applyPackageLists([])
         setQuickNote(nil)
         rootFolderUrls = []
@@ -544,8 +557,9 @@ final class NotesModel {
             await self?.start()
             guard let self, let core = self.core else { return }
             try? await core.openNote(url: url)
-            let snapshot = (try? await core.noteSpansSnapshot(url: url))
-                ?? NoteSpansSnapshot(spansJson: "[]", heads: [])
+            guard let snapshot = try? await core.noteSpansSnapshot(url: url),
+                  !snapshot.heads.isEmpty
+            else { return }
             self.cacheLaunchSnapshot(url, snapshot)
             self.saveLaunchSnapshot()
             self.notifyNoteObservers(url)
@@ -947,21 +961,27 @@ final class NotesModel {
         refreshNotes()
     }
 
-    func reorderRootFolder(_ url: String, adjacentTo targetUrl: String) {
-        guard url != targetUrl,
-              let sourceIndex = rootFolderUrls.firstIndex(of: url),
-              let targetIndex = rootFolderUrls.firstIndex(of: targetUrl)
-        else { return }
+    /// iOS edit mode moves rows within whatever is on screen; anything the
+    /// current focus hides keeps its place at the end.
+    func moveRootFolders(displayed: [String], from: IndexSet, to: Int) {
+        var urls = displayed
+        urls.move(fromOffsets: from, toOffset: to)
+        let hidden = rootFolderUrls.filter { !urls.contains($0) }
+        applyRootFolderOrder(urls + hidden)
+    }
 
-        rootFolderUrls.remove(at: sourceIndex)
-        let adjustedTargetIndex = rootFolderUrls.firstIndex(of: targetUrl) ?? targetIndex
-        let insertionIndex = sourceIndex < targetIndex
-            ? min(adjustedTargetIndex + 1, rootFolderUrls.count)
-            : adjustedTargetIndex
-        rootFolderUrls.insert(url, at: insertionIndex)
+    private func applyRootFolderOrder(_ urls: [String]) {
+        guard urls != rootFolderUrls else { return }
+        rootFolderUrls = urls
+        let ordered = urls.compactMap { url in folderTree.first { $0.url == url } }
+        if ordered.count == folderTree.count { folderTree = ordered }
         persistRoots()
         syncConfigFolders()
         buildTree()
+    }
+
+    func reorderRootFolder(_ url: String, adjacentTo targetUrl: String, after: Bool) {
+        applyRootFolderOrder(reordered(rootFolderUrls, moving: url, adjacentTo: targetUrl, after: after))
     }
 
     func refreshNotes() {
@@ -1044,6 +1064,22 @@ final class NotesModel {
         let richNotes = notes.filter { $0.kind == "rich" }
         backfillSemanticIndex(for: richNotes)
         backfillSpotlightIndex(for: richNotes)
+    }
+
+    /// Drops loose commits already covered by a fragment. Nothing reclaims them
+    /// otherwise, so they accumulate for the life of the account.
+    func reclaimLooseCommits() async -> String {
+        guard let core else { return "Lush is still starting." }
+        do {
+            let result = try await Task.detached { [core] in
+                try core.reclaimLooseCommits()
+            }.value
+            let summary = "\(result.dropped) dropped across \(result.trees) docs"
+            appendSyncEvent("Reclaimed loose commits: \(summary)")
+            return summary
+        } catch {
+            return error.localizedDescription
+        }
     }
 
     func forceSync() {
@@ -1340,6 +1376,7 @@ final class NotesModel {
                     self.smartNotebooks = state.smart
                     SmartNotebookStore.save(state.smart)
                 }
+                self.applyConfigFolderSettings(state.folderSettings)
                 if state.packages != self.packageListUrls {
                     self.applyPackageLists(state.packages)
                 }
@@ -1354,7 +1391,10 @@ final class NotesModel {
             scheduleSemanticIndex(url: url)
             scheduleSpotlightIndex(url: url)
         }
-        if startupSettled, smartNotebooks.contains(where: \.notifyOnChange), pendingSmartNotebookCheckTask == nil {
+        if startupSettled,
+           smartNotebooks.contains(where: \.notifyOnChange)
+               || folderSettings.values.contains(where: \.notifyOnChange),
+           pendingSmartNotebookCheckTask == nil {
             pendingSmartNotebookCheckTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(2))
                 guard let self else { return }
@@ -1634,7 +1674,13 @@ final class NotesModel {
         return folders + ordered
     }
 
-    func reorderChild(_ url: String, before targetUrl: String) {
+    func moveChildren(in folderUrl: String, displayed: [String], from: IndexSet, to: Int) {
+        var urls = displayed
+        urls.move(fromOffsets: from, toOffset: to)
+        childOrder[folderUrl] = urls.filter { node(for: $0)?.kind != "folder" }
+    }
+
+    func reorderChild(_ url: String, adjacentTo targetUrl: String, after: Bool) {
         guard url != targetUrl,
               let movingNode = node(for: url),
               let targetNode = node(for: targetUrl),
@@ -1643,13 +1689,10 @@ final class NotesModel {
               let folder = node(for: folderUrl),
               let rawChildren = folder.children
         else { return }
-        var urls = orderedChildren(rawChildren, in: folderUrl)
+        let urls = orderedChildren(rawChildren, in: folderUrl)
             .filter { $0.kind != "folder" }
             .map(\.url)
-        urls.removeAll { $0 == url }
-        guard let targetIndex = urls.firstIndex(of: targetUrl) else { return }
-        urls.insert(url, at: targetIndex)
-        childOrder[folderUrl] = urls
+        childOrder[folderUrl] = reordered(urls, moving: url, adjacentTo: targetUrl, after: after)
     }
 
     // Editor support -----------------------------------------------------
@@ -1663,8 +1706,8 @@ final class NotesModel {
         return (try? await core.noteSpansJson(url: url)) ?? "[]"
     }
 
-    func spansSnapshot(for url: String) async -> NoteSpansSnapshot {
-        if core == nil, let cached = launchNoteSnapshots[url] {
+    func spansSnapshot(for url: String) async -> NoteSpansSnapshot? {
+        if core == nil, let cached = launchNoteSnapshots[url], !cached.heads.isEmpty {
             Self.bootLog("note snapshot served from launch cache")
             refreshCachedOpenNote(url)
             return cached
@@ -1672,11 +1715,12 @@ final class NotesModel {
         if core == nil {
             await start()
         }
-        guard let core else { return NoteSpansSnapshot(spansJson: "[]", heads: []) }
+        guard let core else { return nil }
         let start = Date()
         try? await core.openNote(url: url)
-        let snapshot = (try? await core.noteSpansSnapshot(url: url))
-            ?? NoteSpansSnapshot(spansJson: "[]", heads: [])
+        guard let snapshot = try? await core.noteSpansSnapshot(url: url),
+              !snapshot.heads.isEmpty
+        else { return nil }
         cacheLaunchSnapshot(url, snapshot)
         saveLaunchSnapshot()
         Self.bootLog("note snapshot loaded from core ms=\(Int(Date().timeIntervalSince(start) * 1000))")
@@ -1735,7 +1779,7 @@ final class NotesModel {
     }
 
     func renderedCurrentSnapshot(for url: String) async -> NSAttributedString {
-        let snapshot = await spansSnapshot(for: url)
+        guard let snapshot = await spansSnapshot(for: url) else { return NSAttributedString() }
         let spans = await Task.detached { SpanNode.decodeList(snapshot.spansJson) }.value
         return RichText.attributed(from: spans, cache: AssetCache())
     }
@@ -2046,7 +2090,11 @@ final class NotesModel {
         #if os(macOS)
         if url == selectedNoteUrl { updateDockTilePreview() }
         #endif
-        cacheLaunchSnapshot(url, snapshot ?? NoteSpansSnapshot(spansJson: json, heads: newHeads ?? []))
+        let cached = snapshot.flatMap { $0.heads.isEmpty ? nil : $0 }
+            ?? newHeads.map { NoteSpansSnapshot(spansJson: json, heads: $0) }
+        if let cached {
+            cacheLaunchSnapshot(url, cached)
+        }
         saveLaunchSnapshot()
         scheduleSemanticIndex(url: url, name: title)
         return newHeads
@@ -2739,14 +2787,17 @@ final class NotesModel {
         UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
     }
 
-    func reorderPin(_ url: String, adjacentTo targetUrl: String) {
-        guard url != targetUrl,
-              let source = pinnedUrls.firstIndex(of: url),
-              let target = pinnedUrls.firstIndex(of: targetUrl)
-        else { return }
-        pinnedUrls.remove(at: source)
-        let adjusted = pinnedUrls.firstIndex(of: targetUrl) ?? target
-        pinnedUrls.insert(url, at: source < target ? min(adjusted + 1, pinnedUrls.count) : adjusted)
+    func movePins(displayed: [String], from: IndexSet, to: Int) {
+        var urls = displayed
+        urls.move(fromOffsets: from, toOffset: to)
+        pinnedUrls = urls + pinnedUrls.filter { !urls.contains($0) }
+        UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+    }
+
+    func reorderPin(_ url: String, adjacentTo targetUrl: String, after: Bool) {
+        let next = reordered(pinnedUrls, moving: url, adjacentTo: targetUrl, after: after)
+        guard next != pinnedUrls else { return }
+        pinnedUrls = next
         UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
     }
 

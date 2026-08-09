@@ -109,6 +109,9 @@ struct FormatPopover: View {
             markButton(active: controller.strikethroughActive, action: controller.toggleStrikethrough) {
                 Text("S").font(.system(size: 14)).strikethrough()
             }
+            markButton(active: controller.linkActive != nil, action: controller.editLink) {
+                Image(systemName: "link").font(.system(size: 12))
+            }
             Divider().frame(height: 18)
             markButton(active: controller.superscriptActive, action: controller.toggleSuperscript) {
                 Image(systemName: "textformat.superscript").font(.system(size: 12))

@@ -224,18 +224,31 @@ extension HelperSync {
     /// notification are counted — the rest can wait for the app.
     func checkSmartNotebooks() async {
         guard let core, let configUrl = accountConfigUrl else { return }
-        let folders = (core.configState(configUrl: configUrl)?.smart ?? [])
-            .filter(\.notifyOnChange)
-        guard !folders.isEmpty else { return }
-        let tree = await NotebookTree.walk(core: core, roots: rootUrls)
-        for folder in folders {
-            let vector = folder.query.contains("\"")
-                ? nil
-                : await QueryEmbedding.shared.vector(for: folder.query)
-            let hits = await Task.detached {
-                SmartNotebookRun.hits(folder, core: core, tree: tree, vector: vector)
-            }.value
-            await SmartNotebookAlerts.counted(folder, count: hits.count)
+        let state = core.configState(configUrl: configUrl)
+        let folders = (state?.smart ?? []).filter(\.notifyOnChange)
+        let watched = (state?.folderSettings ?? []).filter(\.notifyOnChange)
+        if !folders.isEmpty {
+            let tree = await NotebookTree.walk(core: core, roots: rootUrls)
+            for folder in folders {
+                let vector = folder.query.contains("\"")
+                    ? nil
+                    : await QueryEmbedding.shared.vector(for: folder.query)
+                let hits = await Task.detached {
+                    SmartNotebookRun.hits(folder, core: core, tree: tree, vector: vector)
+                }.value
+                await SmartNotebookAlerts.counted(folder, count: hits.count)
+            }
+        }
+        for settings in watched {
+            let count = await core.folderEntriesOf(url: settings.url)
+                .filter { $0.kind != "folder" }.count
+            let title = await core.noteTitle(url: settings.url)
+            await SmartNotebookAlerts.counted(
+                id: settings.url,
+                name: title.isEmpty ? "Untitled" : title,
+                notify: true,
+                count: count
+            )
         }
     }
 }

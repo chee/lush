@@ -851,6 +851,66 @@ pub fn config_set_smart_notebooks(
     Ok(())
 }
 
+/// Per-folder sidebar settings. Only folders that changed a default have an
+/// entry; `.folderSettings` is keyed by folder url.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FolderSettings {
+    pub url: String,
+    pub show_count: bool,
+    pub notify_on_change: bool,
+}
+
+pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
+    let Ok(Some((_, obj))) = doc.get(ROOT, "folderSettings") else {
+        return Vec::new();
+    };
+    let mut entries: Vec<FolderSettings> = doc
+        .keys(&obj)
+        .filter_map(|url| {
+            let (_, item) = doc.get(&obj, &url).ok()??;
+            Some(FolderSettings {
+                url,
+                show_count: bool_at(doc, &item, "showCount").unwrap_or(false),
+                notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| a.url.cmp(&b.url));
+    entries
+}
+
+pub fn config_set_folder_settings(
+    doc: &mut Automerge,
+    settings: &[FolderSettings],
+) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let obj = match t.get(ROOT, "folderSettings")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "folderSettings", ObjType::Map)?,
+            };
+            let stale: Vec<String> = t
+                .keys(&obj)
+                .filter(|url| !settings.iter().any(|s| &s.url == url))
+                .collect();
+            for url in stale {
+                t.delete(&obj, url.as_str())?;
+            }
+            for s in settings {
+                let item = match t.get(&obj, s.url.as_str())? {
+                    Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                    _ => t.put_object(&obj, s.url.as_str(), ObjType::Map)?,
+                };
+                t.put(&item, "showCount", s.show_count)?;
+                t.put(&item, "notifyOnChange", s.notify_on_change)?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
 pub fn config_inbox(doc: &Automerge) -> Option<String> {
     read_str(doc, &ROOT, "inbox")
 }

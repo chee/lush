@@ -1,0 +1,56 @@
+[package]
+name = "patchwork-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+
+[lib]
+name = "patchwork_server"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[dependencies]
+subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std", "system_time"] }
+subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+subduction_websocket = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["tokio_server_any", "tokio_client_any"] }
+sedimentree_fs_storage = { path = "../vendor/sedimentree_fs_storage" }
+sedimentree_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+subduction_iroh = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec" }
+subduction_ephemeral = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+tracing = "0.1"
+iroh = "1"
+future_form = "0.3"
+futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
+serde_json = "1"
+tokio-util = "0.7"
+
+# Feature-unification trick: gives subduction_websocket the
+# async_tungstenite::tokio module without any TLS backend; the server only
+# listens on loopback ws://.
+async-tungstenite = { version = "0.31", default-features = false, features = ["tokio-runtime"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+getrandom = "0.2"
+hex = "0.4"
+thiserror = "2"
+uniffi = "0.29"
+
+[build-dependencies]
+uniffi = { version = "0.29", features = ["build"] }
+
+[features]
+default = []
+cli = ["uniffi/cli"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+strip = "debuginfo"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

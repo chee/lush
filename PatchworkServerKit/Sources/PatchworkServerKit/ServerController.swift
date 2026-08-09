@@ -21,10 +21,12 @@ public final class ServerController {
 
     public init() {}
 
-    public static var dataDir: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SubductionServer", isDirectory: true)
-    }
+    /// Where the server keeps its key, peers and sedimentree. The host app
+    /// points this at the core's own directory so both open one storage rather
+    /// than keeping a second copy of every doc.
+    public static var dataDir: URL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("SubductionServer", isDirectory: true)
 
     /// Starts the in-process subduction server on 127.0.0.1, preferring a
     /// well-known port and falling back to an ephemeral one. Writes

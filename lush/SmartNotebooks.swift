@@ -55,6 +55,66 @@ enum SmartNotebookStore {
     }
 }
 
+enum FolderSettingsStore {
+    private static let key = "folderSettings"
+
+    static func load() -> [String: FolderSettings] {
+        let raw = UserDefaults.standard.dictionary(forKey: key) as? [String: [String: Bool]] ?? [:]
+        return raw.reduce(into: [:]) { result, entry in
+            result[entry.key] = FolderSettings(
+                url: entry.key,
+                showCount: entry.value["showCount"] ?? false,
+                notifyOnChange: entry.value["notifyOnChange"] ?? false
+            )
+        }
+    }
+
+    static func save(_ settings: [String: FolderSettings]) {
+        let raw = settings.mapValues {
+            ["showCount": $0.showCount, "notifyOnChange": $0.notifyOnChange]
+        }
+        UserDefaults.standard.set(raw, forKey: key)
+    }
+}
+
+extension NotesModel {
+    func folderSettings(for url: String) -> FolderSettings {
+        folderSettings[url] ?? FolderSettings(url: url, showCount: false, notifyOnChange: false)
+    }
+
+    func setFolderSettings(_ settings: FolderSettings) {
+        if settings.showCount || settings.notifyOnChange {
+            folderSettings[settings.url] = settings
+        } else {
+            folderSettings.removeValue(forKey: settings.url)
+        }
+        if !settings.notifyOnChange {
+            SmartNotebookAlerts.forget(id: settings.url)
+        }
+        FolderSettingsStore.save(folderSettings)
+        syncConfigFolderSettings()
+    }
+
+    func applyConfigFolderSettings(_ settings: [FolderSettings]) {
+        let keyed = Dictionary(settings.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
+        guard keyed != folderSettings else { return }
+        folderSettings = keyed
+        FolderSettingsStore.save(keyed)
+    }
+
+    func syncConfigFolderSettings() {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let settings = Array(folderSettings.values)
+        Task.detached {
+            try? core.setConfigFolderSettings(configUrl: configUrl, settings: settings)
+        }
+    }
+
+    func folderNoteCount(_ node: FolderNode) -> Int {
+        (node.children ?? []).filter { $0.kind != "folder" }.count
+    }
+}
+
 extension NotesModel {
     func smartNotebook(id: String) -> SmartNotebook? {
         smartNotebooks.first { $0.id == id }
@@ -71,6 +131,11 @@ extension NotesModel {
                 self.smartNotebooks = state.smart
                 SmartNotebookStore.save(state.smart)
             }
+            if state.folderSettings.isEmpty, !self.folderSettings.isEmpty {
+                self.syncConfigFolderSettings()
+            } else {
+                self.applyConfigFolderSettings(state.folderSettings)
+            }
         }
     }
 
@@ -83,17 +148,16 @@ extension NotesModel {
         persistSmartNotebooks()
     }
 
-    func reorderSmartNotebook(id: String, adjacentTo targetId: String) {
-        guard id != targetId,
-              let source = smartNotebooks.firstIndex(where: { $0.id == id }),
-              let target = smartNotebooks.firstIndex(where: { $0.id == targetId })
-        else { return }
-        let folder = smartNotebooks.remove(at: source)
-        let adjusted = smartNotebooks.firstIndex { $0.id == targetId } ?? target
-        smartNotebooks.insert(
-            folder,
-            at: source < target ? min(adjusted + 1, smartNotebooks.count) : adjusted
-        )
+    func moveSmartNotebooks(from: IndexSet, to: Int) {
+        smartNotebooks.move(fromOffsets: from, toOffset: to)
+        persistSmartNotebooks()
+    }
+
+    func reorderSmartNotebook(id: String, adjacentTo targetId: String, after: Bool) {
+        let ids = reordered(smartNotebooks.map(\.id), moving: id, adjacentTo: targetId, after: after)
+        let next = ids.compactMap { id in smartNotebooks.first { $0.id == id } }
+        guard next.count == smartNotebooks.count, next != smartNotebooks else { return }
+        smartNotebooks = next
         persistSmartNotebooks()
     }
 
@@ -189,6 +253,15 @@ extension NotesModel {
             let hits = await smartNotebookHits(folder)
             smartHits[folder.id] = hits
             await SmartNotebookAlerts.counted(folder, count: hits.count)
+        }
+        for settings in folderSettings.values where settings.notifyOnChange {
+            guard let node = node(for: settings.url) else { continue }
+            await SmartNotebookAlerts.counted(
+                id: settings.url,
+                name: node.displayName,
+                notify: true,
+                count: folderNoteCount(node)
+            )
         }
     }
 }

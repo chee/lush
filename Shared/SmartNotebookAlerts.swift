@@ -16,19 +16,23 @@ enum SmartNotebookAlerts {
     }
 
     static func counted(_ folder: SmartNotebook, count: Int) async {
-        let key = "smartCount:\(folder.id)"
+        await counted(id: folder.id, name: folder.displayName, notify: folder.notifyOnChange, count: count)
+    }
+
+    static func counted(id: String, name: String, notify: Bool, count: Int) async {
+        let key = "smartCount:\(id)"
         let previous = LushShared.defaults.object(forKey: key) as? Int
         LushShared.defaults.set(count, forKey: key)
-        guard folder.notifyOnChange, let previous, previous != count else { return }
+        guard notify, let previous, previous != count else { return }
         if await !authorized(), await !requestAuthorization() { return }
         let content = UNMutableNotificationContent()
-        content.title = folder.displayName
+        content.title = name
         content.body = count > previous
             ? "\(count - previous) new — \(count) in total"
             : "\(previous - count) gone — \(count) left"
         content.sound = .default
         try? await UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: "smart:\(folder.id)", content: content, trigger: nil)
+            UNNotificationRequest(identifier: "smart:\(id)", content: content, trigger: nil)
         )
     }
 

@@ -237,6 +237,10 @@ struct FormatCommands: Commands {
                 .keyboardShortcut("u")
             Button("Strikethrough") { editor?.toggleStrikethrough() }
                 .keyboardShortcut("/")
+            Button("Link…") { editor?.editLink() }
+                .keyboardShortcut("k")
+            Button("Remove Link") { editor?.applyLink(nil) }
+                .disabled(editor?.linkActive == nil)
             Button("Superscript") { editor?.toggleSuperscript() }
                 .keyboardShortcut("+", modifiers: [.command, .control])
             Button("Subscript") { editor?.toggleSubscript() }
@@ -386,6 +390,11 @@ struct LushApp: App {
         #if os(iOS) || os(visionOS)
         BackgroundSync.register()
         #endif
+        // Ahead of the scene's .task, which doesn't run until the first views
+        // are built — a second of main-thread work the core could have spent
+        // opening storage on another thread. The .task callers await the same
+        // startTask, so this only moves the start earlier.
+        Task { @MainActor in await NotesModel.shared.start() }
     }
 
     var body: some Scene {

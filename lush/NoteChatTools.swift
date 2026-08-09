@@ -98,7 +98,9 @@ enum NoteChatAction: Codable, Equatable {
                 return error.localizedDescription
             }
         case .appendToNote(let url, _, let markdown):
-            let snapshot = await model.spansSnapshot(for: url)
+            guard let snapshot = await model.spansSnapshot(for: url) else {
+                return "That note could not be read."
+            }
             let spans = SpanNode.decodeList(snapshot.spansJson)
                 + RichTextClipboard.spans(fromMarkdown: markdown)
             await model.updateDocument(
@@ -121,7 +123,9 @@ enum NoteChatAction: Codable, Equatable {
             }
         case .linkEvent(let url, _, let events):
             let items = AgendaStore.shared.items
-            let snapshot = await model.spansSnapshot(for: url)
+            guard let snapshot = await model.spansSnapshot(for: url) else {
+                return "That note could not be read."
+            }
             var spans = SpanNode.decodeList(snapshot.spansJson)
             let linked = Set(CalendarLinks.eventIds(in: spans))
             let fresh = events.compactMap { event in
@@ -192,6 +196,12 @@ final class NoteChatSession {
     var attachments: [NoteAttachment]
     private(set) var calls: [NoteChatToolCall] = []
     private(set) var proposals: [NoteChatProposal] = []
+    /// Whether this turn was a request for a change at all, and whether it was
+    /// a request for one of the two that cannot be undone. The catalog leaves
+    /// out what these rule out, and `execute` refuses it if the model invents
+    /// the name anyway.
+    var allowsWrites = true
+    var allowsDestructive = false
 
     init(
         model: NotesModel,
@@ -210,18 +220,44 @@ final class NoteChatSession {
 
     var outline: String { NoteChatEdits.outlineText(spans) }
 
-    /// The same tools spelled as tersely as they can be read, for models whose
-    /// context window cannot afford the full catalog.
-    static let briefCatalog = """
+    /// A model shown a page of tool syntax imitates it, so it is only ever
+    /// shown the tools this turn can actually use: the writing half is left out
+    /// of a question, and the two irreversible ones out of everything but an
+    /// explicit ask. `brief` is the same catalog spelled as tersely as it can
+    /// be read, for models whose context window cannot afford the long one.
+    static func catalog(brief: Bool, writes: Bool, destructive: Bool) -> String {
+        var parts = [brief ? briefReads : fullReads]
+        if writes {
+            parts.append(brief ? briefWrites : fullWrites)
+            if destructive {
+                parts.append(brief ? briefDestructive : fullDestructive)
+            }
+            parts.append(brief ? briefOps : fullOps)
+            parts.append(writeTail)
+        } else {
+            parts.append(readTail)
+        }
+        return parts.joined(separator: "\n\n")
+    }
+
+    private static let briefReads = """
     Tools, arguments as JSON. url defaults to the open note everywhere.
     find_notes{query?,folder_url?,limit?} — query searches, folder_url lists, neither is recents
     read{url?,attachment?,heads?,history?} — a note's outline, an attachment, an old version, or the version list
     read_agenda{days?} — events and reminders
+    """
+
+    private static let briefWrites = """
     edit_note{ops,url?} append_to_note{markdown,url?} create_note{title,markdown?,folder_url?}
     create_folder{name,parent_url?}
-    rename_note{url?,title} move_note{url?,folder_url} delete_note{url?}
-    revert_note{heads,url?} link_note_to_event{event_ids,url?}
+    rename_note{url?,title} move_note{url?,folder_url} link_note_to_event{event_ids,url?}
+    """
 
+    private static let briefDestructive = """
+    delete_note{url?} revert_note{heads,url?}
+    """
+
+    private static let briefOps = """
     edit_note ops, addressing blocks by their outline number:
     {"op":"replace","block":3,"markdown":"…"}, same shape for insert_after and insert_before
     {"op":"delete","block":3} {"op":"move_block","block":3,"after":1}
@@ -237,11 +273,9 @@ final class NoteChatSession {
     (\(RichText.fontRoles.map(\.key).joined(separator: " ")))
     markdown: **bold** *italic* `code` ~~strike~~ [text](url) <u> <mark class="yellow"> \
     <sup> <sub> and # - 1. - [ ] > at the start of a line
-
-    Tools that change something are queued for the person to accept, never written.
     """
 
-    static let catalog = """
+    private static let fullReads = """
     Every url argument defaults to the note being discussed.
 
     find_notes {"query": string?, "folder_url": string?, "limit": int?} — with a
@@ -252,6 +286,9 @@ final class NoteChatSession {
       instead, heads reads the note as it was at that version, history lists the
       versions and the heads that address them
     read_agenda {"days": int?} — calendar events and reminders, default 7 days
+    """
+
+    private static let fullWrites = """
     edit_note {"ops": [op, ...], "url": string?} — propose changes to a note; ops
       address the blocks of whichever note the url names, so read it first
     append_to_note {"markdown": string, "url": string?} — add to the end of a note
@@ -259,10 +296,15 @@ final class NoteChatSession {
     create_folder {"name": string, "parent_url": string?}
     rename_note {"title": string, "url": string?}
     move_note {"folder_url": string, "url": string?}
+    link_note_to_event {"event_ids": [string], "url": string?}
+    """
+
+    private static let fullDestructive = """
     delete_note {"url": string?}
     revert_note {"heads": [string], "url": string?}
-    link_note_to_event {"event_ids": [string], "url": string?}
+    """
 
+    private static let fullOps = """
     Ops for edit_note, each addressing a block by its number in the outline:
     {"op": "replace", "block": 3, "markdown": "new text"}
     {"op": "insert_after", "block": 3, "markdown": "a line\\nanother line"}
@@ -284,12 +326,25 @@ final class NoteChatSession {
     Markdown in any op: **bold**, *italic*, `code`, ~~strike~~, [text](url), \
     <u>underline</u>, <mark class="yellow">highlight</mark>, <sup>x</sup>, <sub>x</sub>, \
     # heading, - bullet, 1. number, - [ ] to-do, > quote.
+    """
 
+    private static let writeTail = """
     Every tool that changes something queues a proposal for the person to \
     accept or reject; nothing is written when you call one. Do not call one \
-    twice for the same change. Deleting and reverting cannot be undone — only \
-    propose them when the person has asked for exactly that.
+    twice for the same change.
     """
+
+    private static let readTail = """
+    None of these change anything, and there is no tool here that can. The \
+    person asked a question — find what you need and answer it.
+    """
+
+    static let writeTools: Set<String> = [
+        "edit_note", "append_to_note", "create_note", "create_folder",
+        "rename_note", "move_note", "link_note_to_event", "delete_note", "revert_note",
+    ]
+
+    static let destructiveTools: Set<String> = ["delete_note", "revert_note"]
 
     /// Runs a read tool for real; queues a write tool as a proposal. The
     /// returned string is what the model sees next round.
@@ -305,6 +360,14 @@ final class NoteChatSession {
     }
 
     private func execute(_ name: String, arguments: [String: Any]) async -> String {
+        if Self.writeTools.contains(name) {
+            guard allowsWrites else {
+                return "The person asked a question, not for a change. There is no \(name) here — answer them."
+            }
+            guard allowsDestructive || !Self.destructiveTools.contains(name) else {
+                return "\(name) cannot be undone and the person has not asked for it. Do not propose it."
+            }
+        }
         switch name {
         case "find_notes", "search_notes", "recent_notes", "list_folder":
             if let query = Self.string(arguments["query"]) {
@@ -383,7 +446,7 @@ final class NoteChatSession {
             }.joined(separator: "\n")
 
         case "edit_note":
-            let ops = NoteChatOp.list(from: arguments["ops"])
+            let ops = NoteChatOp.list(from: arguments["ops"] ?? (arguments["op"] is String ? arguments : nil))
             guard !ops.isEmpty else { return "edit_note needs at least one op." }
             let target = Self.string(arguments["url"]) ?? url
             // another note's blocks are numbered from its own outline, which

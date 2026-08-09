@@ -20,6 +20,9 @@ enum LocalSyncServer {
             await startTask.value
         }
         guard controller.port == nil else { return }
+        // One sedimentree for the app and the server it hosts: a doc synced
+        // through the server is the same copy the core reads.
+        ServerController.dataDir = LushShared.coreDataDirectory()
         let task = Task { await controller.start() }
         startTask = task
         await task.value

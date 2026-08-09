@@ -765,6 +765,7 @@ struct Ingested {
     fragments: Vec<(SedimentreeFragment, Blob)>,
     commit_heads: Vec<ChangeHash>,
     fragment_heads: Vec<ChangeHash>,
+    skipped: bool,
 }
 
 /// Decompose the doc's automerge fragments into sedimentree records, skipping
@@ -788,6 +789,7 @@ fn ingest(
             fragments: Vec::new(),
             commit_heads: Vec::new(),
             fragment_heads: Vec::new(),
+            skipped: false,
         };
         let mut pending_loose = Vec::new();
         for f in fragments {
@@ -811,6 +813,7 @@ fn ingest(
                 f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
             let Some(bytes) = doc.bundle_fragments([f]).into_iter().next() else {
                 tracing::warn!(?head, "fragment failed to bundle; retrying on next save");
+                out.skipped = true;
                 continue;
             };
             let blob = Blob::new(bytes);
@@ -864,6 +867,7 @@ fn ingest_loose_batch(
             ?head,
             "loose commit batch failed to bundle; retrying as loose commits"
         );
+        out.skipped = true;
         return;
     };
     let blob = Blob::new(bytes);
@@ -912,6 +916,7 @@ fn ingest_loose_tail(
                 ?head,
                 "loose commit failed to bundle; retrying on next save"
             );
+            out.skipped = true;
             continue;
         };
         let blob = Blob::new(bytes);
@@ -973,6 +978,19 @@ fn cpu_heavy<T>(f: impl FnOnce() -> T) -> T {
         }
         _ => f(),
     }
+}
+
+fn catching<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|cause| {
+        let msg = cause
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| cause.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        Err(anyhow!(
+            "internal error (automerge panic: {msg}); the change was not saved"
+        ))
+    })
 }
 
 fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> (bool, bool) {
@@ -1094,7 +1112,10 @@ impl Repo {
 
     async fn stage_doc(&self, id: DocId) -> Result<()> {
         let state = self.doc_state(id).await?;
-        let bytes = state.lock().await.doc.save();
+        let bytes = {
+            let state = state.lock().await;
+            cpu_heavy(|| state.doc.save())
+        };
         let path = self.outbox_path(id);
         let pending = path.with_extension("pending");
         std::fs::write(&pending, bytes).context("writing staged doc")?;
@@ -1611,6 +1632,57 @@ impl Repo {
         self.events.subscribe()
     }
 
+    /// Drops loose commits that a fragment already covers, tree by tree.
+    ///
+    /// Nothing else ever reclaims them: subduction only deletes loose commits
+    /// when a whole document is destroyed, so every commit ever written stays
+    /// on disk even once it has been bundled. `Sedimentree::minimize` decides
+    /// what is redundant — the same rule sync uses — so a commit is only
+    /// removed when the tree can still be rebuilt without it.
+    pub async fn reclaim_loose_commits(&self) -> Result<(u64, u64)> {
+        let ids = <ObservedStorage as Storage<Sendable>>::load_all_sedimentree_ids(&self.storage)
+            .await
+            .map_err(|e| anyhow::anyhow!("listing sedimentrees: {e}"))?;
+        let trees = ids.len() as u64;
+        let mut dropped = 0u64;
+        for id in ids {
+            let commits =
+                <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("loading loose commits: {e}"))?;
+            if commits.is_empty() {
+                continue;
+            }
+            let fragments =
+                <ObservedStorage as Storage<Sendable>>::load_fragment_metas(&self.storage, id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("loading fragments: {e}"))?;
+            if fragments.is_empty() {
+                continue;
+            }
+            let tree = Sedimentree::new(fragments, commits.clone());
+            let keep = tree.minimize(&CountLeadingZeroBytes);
+            for commit in commits {
+                let head = commit.head();
+                if keep.has_loose_commit(head) {
+                    continue;
+                }
+                match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(
+                    &self.storage,
+                    id,
+                    head,
+                )
+                .await
+                {
+                    Ok(()) => dropped += 1,
+                    Err(e) => tracing::warn!(error = %e, "deleting loose commit failed"),
+                }
+            }
+        }
+        tracing::info!(trees, dropped, "reclaimed loose commits");
+        Ok((trees, dropped))
+    }
+
     pub fn announce_notes_prefetched(&self) {
         let _ = self.events.send(RepoEvent::NotesPrefetched);
     }
@@ -2016,11 +2088,16 @@ impl Repo {
             })
         };
         let Some(ingested) = ingested else {
-            tracing::warn!(doc = %id.to_url(), "fragment ingest failed; retrying on next save");
+            tracing::warn!(doc = %id.to_url(), "fragment ingest failed; staging to outbox");
+            if let Err(e) = self.stage_doc(id).await {
+                tracing::warn!(doc = %id.to_url(), error = %e, "staging after failed ingest failed");
+            }
             return Ok(false);
         };
         if ingested.commits.is_empty() && ingested.fragments.is_empty() {
-            let _ = std::fs::remove_file(self.outbox_path(id));
+            if !ingested.skipped {
+                let _ = std::fs::remove_file(self.outbox_path(id));
+            }
             return Ok(false);
         }
 
@@ -2029,6 +2106,7 @@ impl Repo {
             fragments,
             commit_heads,
             fragment_heads,
+            skipped,
         } = ingested;
         self.core
             .store_built_batch(sid, commits, fragments)
@@ -2038,7 +2116,9 @@ impl Repo {
         let mut state = shared.lock().await;
         state.stored_commits.extend(commit_heads);
         state.stored_fragments.extend(fragment_heads);
-        let _ = std::fs::remove_file(self.outbox_path(id));
+        if !skipped {
+            let _ = std::fs::remove_file(self.outbox_path(id));
+        }
 
         Ok(true)
     }
@@ -2160,7 +2240,7 @@ impl Repo {
     {
         let id = DocId::random();
         let mut doc = Automerge::new();
-        init(&mut doc)?;
+        catching(|| init(&mut doc))?;
         self.docs.lock().await.insert(id, DocState::shared(doc));
         self.ephemeral
             .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
@@ -2188,7 +2268,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
-            f(&mut state.doc)?
+            catching(|| f(&mut state.doc))?
         };
         if self.save_doc(id).await? {
             self.request_sync(id).await;

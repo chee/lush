@@ -161,11 +161,18 @@ pub struct ContactInfo {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct CompactionResult {
+    pub trees: u64,
+    pub dropped: u64,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct ConfigState {
     pub folders: Vec<String>,
     pub inbox: Option<String>,
     pub calendar: Option<String>,
     pub smart: Vec<shapes::SmartNotebook>,
+    pub folder_settings: Vec<shapes::FolderSettings>,
     pub packages: Vec<String>,
     pub pad: Option<String>,
 }
@@ -416,6 +423,33 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
     }
 }
 
+/// Sends tracing lines to the unified log, so the core's own boot timings sit
+/// alongside the app's rather than vanishing into a stdout nobody reads.
+struct OsLogWriter;
+
+impl std::io::Write for OsLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        let line = text.trim_end();
+        if !line.is_empty() {
+            if let Ok(message) = std::ffi::CString::new(line) {
+                unsafe {
+                    libc::syslog(
+                        libc::LOG_NOTICE,
+                        b"%s\0".as_ptr() as *const libc::c_char,
+                        message.as_ptr(),
+                    );
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[uniffi::export]
 impl Core {
     #[uniffi::constructor]
@@ -424,6 +458,8 @@ impl Core {
         static TRACING: std::sync::Once = std::sync::Once::new();
         TRACING.call_once(|| {
             let _ = tracing_subscriber::fmt()
+                .with_writer(|| OsLogWriter)
+                .with_ansi(false)
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                         "lush_core=debug,subduction_websocket=warn,subduction_core=warn,warn".into()
@@ -672,6 +708,18 @@ impl Core {
 
     /// Port of the loopback subduction listener the core hosts, if it bound.
     /// Webviews connect here to sync against the core's own storage.
+    /// Runs a fragments-and-reclaim pass over local storage, returning how many
+    /// trees were looked at and how many loose commits were dropped.
+    pub fn reclaim_loose_commits(&self) -> Result<CompactionResult, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let (trees, dropped) = self
+                .runtime
+                .block_on(async move { repo.reclaim_loose_commits().await })?;
+            Ok(CompactionResult { trees, dropped })
+        })
+    }
+
     pub fn local_server_port(&self) -> Option<u16> {
         self.repo.local_server_port()
     }
@@ -1185,6 +1233,7 @@ impl Core {
                     inbox: shapes::config_inbox(doc),
                     calendar: shapes::config_calendar(doc),
                     smart: shapes::config_smart_notebooks(doc),
+                    folder_settings: shapes::config_folder_settings(doc),
                     packages: shapes::config_packages(doc),
                     pad: shapes::config_pad(doc),
                 })
@@ -1239,6 +1288,25 @@ impl Core {
                 let id = DocId::from_url(&config_url)?;
                 repo.change_doc(id, move |doc| {
                     shapes::config_set_smart_notebooks(doc, &folders)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_config_folder_settings(
+        &self,
+        config_url: String,
+        settings: Vec<shapes::FolderSettings>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::config_set_folder_settings(doc, &settings)
                 })
                 .await?;
                 Ok::<_, anyhow::Error>(())

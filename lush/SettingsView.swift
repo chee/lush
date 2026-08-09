@@ -217,6 +217,8 @@ struct SyncSettingsPane: View {
     @State private var peerError: String?
     @State private var addingPeer = false
     @State private var showingClearConfirm = false
+    @State private var compacting = false
+    @State private var compactionResult: String?
     var body: some View {
         Form {
             Section("Sync") {
@@ -298,6 +300,17 @@ struct SyncSettingsPane: View {
                 Button("Force Resync") {
                     model.forceSync()
                 }
+                Button(compacting ? "Reclaiming…" : "Reclaim Loose Commits") {
+                    compacting = true
+                    Task {
+                        compactionResult = await model.reclaimLooseCommits()
+                        compacting = false
+                    }
+                }
+                .disabled(compacting)
+                if let compactionResult {
+                    LabeledContent("Last Pass", value: compactionResult)
+                }
                 Button("Clear Local Storage…", role: .destructive) {
                     showingClearConfirm = true
                 }
@@ -319,7 +332,7 @@ struct SyncSettingsPane: View {
             } header: {
                 Text("Diagnostics")
             } footer: {
-                Text("Force Resync re-fetches all root folders from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend code still works.")
+                Text("Reclaim Loose Commits drops commits that a fragment already covers — nothing else ever removes them, so they build up for the life of the account. Force Resync re-fetches all root folders from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend code still works.")
             }
             if !model.syncLog.isEmpty {
                 Section("Sync Log") {

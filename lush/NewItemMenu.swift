@@ -10,7 +10,15 @@ struct NewItemMenuItems: View {
     private var target: String? { folderUrl ?? model.folderUrl }
 
     var body: some View {
-        Button("Note") {
+        Group {
+            content
+        }
+        .tint(.primary)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        Button {
             Task {
                 let url: String?
                 if let target {
@@ -20,38 +28,50 @@ struct NewItemMenuItems: View {
                 }
                 if let url { onCreate(url) }
             }
+        } label: {
+            Label("Note", systemImage: "square.and.pencil")
         }
         .keyboardShortcut(shortcuts ? KeyboardShortcut("n", modifiers: .command) : nil)
-        Button("Script") {
+        Button {
             if let target {
                 model.createScript(in: target)
             } else {
                 model.createScript()
             }
+        } label: {
+            Label("Script", systemImage: "curlybraces")
         }
         .keyboardShortcut(shortcuts ? KeyboardShortcut("n", modifiers: [.command, .shift]) : nil)
-        Button("Folder") {
+        Button {
             if let target {
                 model.createSubfolder(in: target)
             } else {
                 model.createFolder()
             }
+        } label: {
+            Label("Folder", systemImage: "folder.badge.plus")
         }
         if PatchworkWeb.available {
-            Button("Patchwork Doc…") {
+            Button {
                 AppRouter.shared.pending = .createPatchwork(
                     preferredType: nil,
                     toolId: nil,
                     folderUrl: folderUrl ?? model.folderUrl
                 )
+            } label: {
+                Label("Patchwork Doc…", systemImage: "shippingbox")
             }
         }
         Divider()
-        Button("Notebook") {
+        Button {
             Task { await model.createNotebook() }
+        } label: {
+            Label("Notebook", systemImage: "book.closed")
         }
-        Button("Smart Notebook…") {
+        Button {
             AppRouter.shared.pending = .newSmartNotebook
+        } label: {
+            Label("Smart Notebook…", systemImage: "folder.badge.gearshape")
         }
     }
 }

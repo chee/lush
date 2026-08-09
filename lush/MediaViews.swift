@@ -376,6 +376,8 @@ struct EditorSheetView: View {
             #else
             EmptyView()
             #endif
+        case .link(let initial):
+            LinkSheet(url: initial) { controller.applyLink($0) }
         }
     }
 }
@@ -883,4 +885,58 @@ struct HtmlEditorSheet: View {
             )
     }
 
+}
+
+struct LinkSheet: View {
+    @State var url: String
+    let onApply: (String?) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Link").font(.headline)
+            TextField("https://", text: $url)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .keyboardType(.URL)
+                #endif
+                .focused($focused)
+                .onSubmit(apply)
+            HStack {
+                Button("Remove") {
+                    onApply(nil)
+                    dismiss()
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Apply", action: apply)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(trimmed.isEmpty)
+            }
+        }
+        .padding(16)
+        #if os(macOS)
+        .frame(width: 380)
+        #endif
+        .onAppear { focused = true }
+    }
+
+    private var trimmed: String {
+        url.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func apply() {
+        guard !trimmed.isEmpty else { return }
+        onApply(LinkSheet.normalized(trimmed))
+        dismiss()
+    }
+
+    static func normalized(_ url: String) -> String {
+        if url.contains("://") || url.hasPrefix("mailto:") { return url }
+        if url.contains("@"), !url.contains("/") { return "mailto:" + url }
+        return "https://" + url
+    }
 }

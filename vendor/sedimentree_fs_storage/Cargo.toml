@@ -1,0 +1,33 @@
+[package]
+name = "sedimentree_fs_storage"
+version = "0.11.0"
+description = "Filesystem-based storage backend for Sedimentree"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/inkandswitch/subduction"
+readme = "./README.md"
+authors = [
+  "Alex Good <alex@patternist.xyz>",
+  "Brooklyn Zelenka <hello@brooklynzelenka.com>"
+]
+
+[dependencies]
+async-lock = { version = "3.4", default-features = false }
+future_form = "0.3.0"
+hex = "0.4"
+sedimentree_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1.46", features = ["fs", "io-util", "rt"] }
+tracing = { version = "0.1.41", default-features = true }
+
+[dev-dependencies]
+bolero = { version = "0.13.4", features = ["arbitrary"] }
+future_form = "0.3.0"
+subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std", "test_utils"] }
+subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
+tempfile = "3"
+testresult = "0.4.1"
+tokio = { version = "1.46", features = ["macros", "rt", "rt-multi-thread"] }

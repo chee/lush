@@ -774,10 +774,6 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func localHttpUrl()  -> String?
     
-    /**
-     * Port of the loopback subduction listener the core hosts, if it bound.
-     * Webviews connect here to sync against the core's own storage.
-     */
     func localServerPort()  -> UInt16?
     
     /**
@@ -891,6 +887,14 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func recentNotes(limit: UInt32)  -> [RecentNote]
     
     /**
+     * Port of the loopback subduction listener the core hosts, if it bound.
+     * Webviews connect here to sync against the core's own storage.
+     * Runs a fragments-and-reclaim pass over local storage, returning how many
+     * trees were looked at and how many loose commits were dropped.
+     */
+    func reclaimLooseCommits() throws  -> CompactionResult
+    
+    /**
      * Fix a folder entry whose name or type drifted from the doc it points
      * at — runs when the doc is opened, so stale entries heal over time.
      */
@@ -929,6 +933,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * config so every device files them in the same place.
      */
     func setConfigCalendar(configUrl: String, url: String) throws 
+    
+    func setConfigFolderSettings(configUrl: String, settings: [FolderSettings]) throws 
     
     func setConfigFolders(configUrl: String, urls: [String]) throws 
     
@@ -1625,10 +1631,6 @@ open func localHttpUrl() -> String?  {
 })
 }
     
-    /**
-     * Port of the loopback subduction listener the core hosts, if it bound.
-     * Webviews connect here to sync against the core's own storage.
-     */
 open func localServerPort() -> UInt16?  {
     return try!  FfiConverterOptionUInt16.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_local_server_port(self.uniffiClonePointer(),$0
@@ -1980,6 +1982,19 @@ open func recentNotes(limit: UInt32) -> [RecentNote]  {
 }
     
     /**
+     * Port of the loopback subduction listener the core hosts, if it bound.
+     * Webviews connect here to sync against the core's own storage.
+     * Runs a fragments-and-reclaim pass over local storage, returning how many
+     * trees were looked at and how many loose commits were dropped.
+     */
+open func reclaimLooseCommits()throws  -> CompactionResult  {
+    return try  FfiConverterTypeCompactionResult_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_reclaim_loose_commits(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Fix a folder entry whose name or type drifted from the doc it points
      * at — runs when the doc is opened, so stale entries heal over time.
      */
@@ -2084,6 +2099,14 @@ open func setConfigCalendar(configUrl: String, url: String)throws   {try rustCal
     uniffi_lush_core_fn_method_core_set_config_calendar(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),
         FfiConverterString.lower(url),$0
+    )
+}
+}
+    
+open func setConfigFolderSettings(configUrl: String, settings: [FolderSettings])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_folder_settings(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterSequenceTypeFolderSettings.lower(settings),$0
     )
 }
 }
@@ -2891,21 +2914,93 @@ public func FfiConverterTypeCloneResult_lower(_ value: CloneResult) -> RustBuffe
 }
 
 
+public struct CompactionResult {
+    public var trees: UInt64
+    public var dropped: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(trees: UInt64, dropped: UInt64) {
+        self.trees = trees
+        self.dropped = dropped
+    }
+}
+
+#if compiler(>=6)
+extension CompactionResult: Sendable {}
+#endif
+
+
+extension CompactionResult: Equatable, Hashable {
+    public static func ==(lhs: CompactionResult, rhs: CompactionResult) -> Bool {
+        if lhs.trees != rhs.trees {
+            return false
+        }
+        if lhs.dropped != rhs.dropped {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(trees)
+        hasher.combine(dropped)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompactionResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompactionResult {
+        return
+            try CompactionResult(
+                trees: FfiConverterUInt64.read(from: &buf), 
+                dropped: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CompactionResult, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.trees, into: &buf)
+        FfiConverterUInt64.write(value.dropped, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompactionResult_lift(_ buf: RustBuffer) throws -> CompactionResult {
+    return try FfiConverterTypeCompactionResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompactionResult_lower(_ value: CompactionResult) -> RustBuffer {
+    return FfiConverterTypeCompactionResult.lower(value)
+}
+
+
 public struct ConfigState {
     public var folders: [String]
     public var inbox: String?
     public var calendar: String?
     public var smart: [SmartNotebook]
+    public var folderSettings: [FolderSettings]
     public var packages: [String]
     public var pad: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], packages: [String], pad: String?) {
+    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], folderSettings: [FolderSettings], packages: [String], pad: String?) {
         self.folders = folders
         self.inbox = inbox
         self.calendar = calendar
         self.smart = smart
+        self.folderSettings = folderSettings
         self.packages = packages
         self.pad = pad
     }
@@ -2930,6 +3025,9 @@ extension ConfigState: Equatable, Hashable {
         if lhs.smart != rhs.smart {
             return false
         }
+        if lhs.folderSettings != rhs.folderSettings {
+            return false
+        }
         if lhs.packages != rhs.packages {
             return false
         }
@@ -2944,6 +3042,7 @@ extension ConfigState: Equatable, Hashable {
         hasher.combine(inbox)
         hasher.combine(calendar)
         hasher.combine(smart)
+        hasher.combine(folderSettings)
         hasher.combine(packages)
         hasher.combine(pad)
     }
@@ -2962,6 +3061,7 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
                 inbox: FfiConverterOptionString.read(from: &buf), 
                 calendar: FfiConverterOptionString.read(from: &buf), 
                 smart: FfiConverterSequenceTypeSmartNotebook.read(from: &buf), 
+                folderSettings: FfiConverterSequenceTypeFolderSettings.read(from: &buf), 
                 packages: FfiConverterSequenceString.read(from: &buf), 
                 pad: FfiConverterOptionString.read(from: &buf)
         )
@@ -2972,6 +3072,7 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.inbox, into: &buf)
         FfiConverterOptionString.write(value.calendar, into: &buf)
         FfiConverterSequenceTypeSmartNotebook.write(value.smart, into: &buf)
+        FfiConverterSequenceTypeFolderSettings.write(value.folderSettings, into: &buf)
         FfiConverterSequenceString.write(value.packages, into: &buf)
         FfiConverterOptionString.write(value.pad, into: &buf)
     }
@@ -3362,6 +3463,88 @@ public func FfiConverterTypeEmbeddingChunk_lift(_ buf: RustBuffer) throws -> Emb
 #endif
 public func FfiConverterTypeEmbeddingChunk_lower(_ value: EmbeddingChunk) -> RustBuffer {
     return FfiConverterTypeEmbeddingChunk.lower(value)
+}
+
+
+/**
+ * Per-folder sidebar settings. Only folders that changed a default have an
+ * entry; `.folderSettings` is keyed by folder url.
+ */
+public struct FolderSettings {
+    public var url: String
+    public var showCount: Bool
+    public var notifyOnChange: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, showCount: Bool, notifyOnChange: Bool) {
+        self.url = url
+        self.showCount = showCount
+        self.notifyOnChange = notifyOnChange
+    }
+}
+
+#if compiler(>=6)
+extension FolderSettings: Sendable {}
+#endif
+
+
+extension FolderSettings: Equatable, Hashable {
+    public static func ==(lhs: FolderSettings, rhs: FolderSettings) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.showCount != rhs.showCount {
+            return false
+        }
+        if lhs.notifyOnChange != rhs.notifyOnChange {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(showCount)
+        hasher.combine(notifyOnChange)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FolderSettings {
+        return
+            try FolderSettings(
+                url: FfiConverterString.read(from: &buf), 
+                showCount: FfiConverterBool.read(from: &buf), 
+                notifyOnChange: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FolderSettings, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterBool.write(value.showCount, into: &buf)
+        FfiConverterBool.write(value.notifyOnChange, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderSettings_lift(_ buf: RustBuffer) throws -> FolderSettings {
+    return try FfiConverterTypeFolderSettings.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFolderSettings_lower(_ value: FolderSettings) -> RustBuffer {
+    return FfiConverterTypeFolderSettings.lower(value)
 }
 
 
@@ -4997,6 +5180,31 @@ fileprivate struct FfiConverterSequenceTypeEmbeddingChunk: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFolderSettings: FfiConverterRustBuffer {
+    typealias SwiftType = [FolderSettings]
+
+    public static func write(_ value: [FolderSettings], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFolderSettings.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FolderSettings] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FolderSettings]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFolderSettings.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeIrohPeer: FfiConverterRustBuffer {
     typealias SwiftType = [IrohPeer]
 
@@ -5412,7 +5620,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_local_http_url() != 6170) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_local_server_port() != 63802) {
+    if (uniffi_lush_core_checksum_method_core_local_server_port() != 45668) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_login_account() != 1192) {
@@ -5496,6 +5704,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_recent_notes() != 1475) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_reclaim_loose_commits() != 60688) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_refresh_folder_entry() != 57229) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5527,6 +5738,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_config_calendar() != 47772) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_folder_settings() != 14031) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_config_folders() != 33231) {

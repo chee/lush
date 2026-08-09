@@ -168,6 +168,15 @@ enum RichTextClipboard {
         }
     }
 
+    static func loneURL(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed, encodingInvalidCharacters: false),
+              url.scheme != nil
+        else { return nil }
+        return trimmed
+    }
+
     static func spans(fromHTML html: String) -> [SpanNode] {
         guard let data = html.data(using: .utf8),
               let attributed = try? NSAttributedString(

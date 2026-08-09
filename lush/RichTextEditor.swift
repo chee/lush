@@ -21,6 +21,7 @@ enum EditorSheet: Identifiable {
     case info(assetUrl: String, name: String, image: PImage?)
     case patchworkCreate
     case format
+    case link(initial: String)
 
     var id: String {
         switch self {
@@ -30,6 +31,7 @@ enum EditorSheet: Identifiable {
         case .info(let url, _, _): "info-\(url)"
         case .patchworkCreate: "patchwork-create"
         case .format: "format"
+        case .link: "link"
         }
     }
 }
@@ -83,6 +85,7 @@ final class EditorController {
     var subscriptActive = false
     var highlightActive: String?
     var fontRoleActive: String?
+    var linkActive: String?
     var checkedItemsHidden = false
     var recorderVisible = false
     var sheet: EditorSheet?
@@ -147,6 +150,8 @@ final class EditorController {
     func toggleSuperscript() { format { $0.toggleBaseline("superscript") } }
     func toggleSubscript() { format { $0.toggleBaseline("subscript") } }
     func applyHighlight(_ name: String?) { format { $0.setHighlight(name) } }
+    func applyLink(_ url: String?) { format { $0.setLink(url) } }
+    func editLink() { sheet = .link(initial: linkActive ?? "") }
     func applyFontRole(_ role: String?) { format { $0.setFontRole(role) } }
     func moveItemUp() { format { $0.moveListItem(by: -1) } }
     func moveItemDown() { format { $0.moveListItem(by: 1) } }
@@ -336,7 +341,7 @@ private final class EditorDocumentSession {
     var title = ""
     var isApplyingDocumentState = false
     var loaded = false
-    var loadTask: Task<NoteSpansSnapshot, Never>?
+    var loadTask: Task<NoteSpansSnapshot?, Never>?
 
     init(noteUrl: String) {
         self.noteUrl = noteUrl
@@ -391,6 +396,7 @@ final class EditorCore {
     let controller: EditorController
     var noteUrl: String
     private var session: EditorDocumentSession
+    var isLoaded: Bool { session.loaded }
 
     private var saveTask: Task<Void, Never>?
     private var localWriteHeadsTask: Task<[String]?, Never>?
@@ -714,8 +720,8 @@ final class EditorCore {
                 self.apply(spans: spans)
                 // the cached session can be stale if the doc changed while no
                 // editor was attached — revalidate against the core
-                let snapshot = await self.model.spansSnapshot(for: url)
-                guard self.noteUrl == url, self.session === session,
+                guard let snapshot = await self.model.spansSnapshot(for: url),
+                      self.noteUrl == url, self.session === session,
                       snapshot.heads != session.heads
                 else { return }
                 session.heads = snapshot.heads
@@ -725,7 +731,7 @@ final class EditorCore {
                 }
                 return
             }
-            let task: Task<NoteSpansSnapshot, Never>
+            let task: Task<NoteSpansSnapshot?, Never>
             if let loadTask = session.loadTask {
                 task = loadTask
             } else {
@@ -733,13 +739,19 @@ final class EditorCore {
                 session.loadTask = task
             }
             let snapshot = await task.value
+            session.loadTask = nil
             guard self.noteUrl == url, self.session === session else { return }
+            guard let snapshot else {
+                #if !os(macOS)
+                self.apply(spans: [])
+                #endif
+                return
+            }
             let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
             let canonicalJSON = SpanNode.encodeList(spans)
             session.heads = snapshot.heads
             session.loaded = true
-            session.loadTask = nil
             let shouldFocus = self.model.pendingFocusUrl == url
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
@@ -967,6 +979,11 @@ final class EditorCore {
 
     private func remoteChanged(_ url: String) {
         guard url == noteUrl else { return }
+        guard session.loaded else {
+            session.loadTask = nil
+            load()
+            return
+        }
         // write out anything the user just typed before the reload discards
         // the pending splices; the flush defers the reload via localWrites
         if queuedTextSplice != nil {
@@ -983,7 +1000,7 @@ final class EditorCore {
             try? await Task.sleep(for: .milliseconds(40))
             guard !Task.isCancelled else { return }
             guard let self else { return }
-            let snapshot = await self.model.spansSnapshot(for: url)
+            guard let snapshot = await self.model.spansSnapshot(for: url) else { return }
             guard !Task.isCancelled, self.noteUrl == url, self.remoteReloadGeneration == generation else { return }
             // don't clobber an active IME composition; wait it out briefly
             var markedWaits = 0
@@ -1095,7 +1112,7 @@ final class EditorCore {
     }
 
     func textDidChange() {
-        guard !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
+        guard session.loaded, !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
         guard let pending = pendingTextSplice else {
             scheduleSave()
             return
@@ -1235,7 +1252,7 @@ final class EditorCore {
     }
 
     func scheduleSave() {
-        guard !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
+        guard session.loaded, !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
         flushQueuedTextSplice()
         saveTask?.cancel()
         saveTask = Task { [weak self] in
@@ -1246,7 +1263,7 @@ final class EditorCore {
     }
 
     func pushNow() {
-        guard !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
+        guard session.loaded, !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
         // flush, then still push the snapshot — returning here dropped the
         // structural save entirely, leaving the doc missing the last edits
         if queuedTextSplice != nil {
@@ -2468,6 +2485,7 @@ final class EditorCore {
         controller.subscriptActive = marks["subscript"] != nil
         controller.highlightActive = marks["highlight"]?.stringValue
         controller.fontRoleActive = marks["font"]?.stringValue
+        controller.linkActive = marks["link"]?.stringValue
         refreshTrailingMarker()
         updateFocusDim()
         centerCaretIfTypewriter()
@@ -2774,6 +2792,24 @@ final class EditorCore {
         applyMark("highlight", value: name.map { .string($0) })
     }
 
+    func setLink(_ url: String?) {
+        if let view, view.pSelectedRange.length == 0, let range = linkRangeAtCaret() {
+            view.pSelectedRange = range
+        }
+        applyMark("link", value: url.map { .string($0) })
+    }
+
+    private func linkRangeAtCaret() -> NSRange? {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return nil }
+        let caret = view.pSelectedRange.location
+        let probe = min(caret, storage.length - 1)
+        var range = NSRange(location: 0, length: 0)
+        let whole = NSRange(location: 0, length: storage.length)
+        guard storage.attribute(.link, at: probe, longestEffectiveRange: &range, in: whole) != nil
+        else { return nil }
+        return range
+    }
+
     func setFontRole(_ role: String?) {
         applyMark("font", value: role.map { .string($0) })
     }
@@ -2856,7 +2892,7 @@ final class EditorCore {
     }
 
     private func applyMark(_ mark: String, value: JSONValue?) {
-        guard let view, let storage = view.pStorage else { return }
+        guard session.loaded, let view, let storage = view.pStorage else { return }
         let undo = undoSnapshot()
         let selection = view.pSelectedRange
         if selection.length == 0 {
@@ -2878,7 +2914,7 @@ final class EditorCore {
                 var marks = RichText.marks(from: runAttrs, block: block)
                 marks[mark] = value
                 var newAttrs = RichText.attributes(block: block, marks: marks)
-                if let link = runAttrs[.link], marks["link"] == nil {
+                if mark != "link", let link = runAttrs[.link], marks["link"] == nil {
                     newAttrs[.link] = link
                 }
                 storage.setAttributes(newAttrs, range: runRange)
@@ -3874,6 +3910,11 @@ class EditorTextView: NSTextView, EditorTextViewLike {
 
     override func paste(_ sender: Any?) {
         let pasteboard = NSPasteboard.general
+        if let core, selectedRange().length > 0,
+           let url = RichTextClipboard.loneURL(pasteboard.string(forType: .string)) {
+            core.setLink(url)
+            return
+        }
         if let core,
            let json = pasteboard.string(forType: Self.spansPasteboardType),
            let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
@@ -4301,6 +4342,7 @@ struct RichTextEditor: NSViewRepresentable {
             shouldChangeTextInRanges affectedRanges: [NSValue],
             replacementStrings: [String]?
         ) -> Bool {
+            guard core.isLoaded else { return false }
             // multi-caret edits skip the splice pipeline; textDidChange falls
             // back to a whole-doc save, which automerge handles fine
             guard affectedRanges.count == 1, let range = affectedRanges.first?.rangeValue else {
@@ -4314,6 +4356,7 @@ struct RichTextEditor: NSViewRepresentable {
             shouldChangeTextIn affectedCharRange: NSRange,
             replacementString: String?
         ) -> Bool {
+            guard core.isLoaded else { return false }
             if replacementString == " ",
                affectedCharRange.length == 0,
                core.handleMarkdownTrigger(at: affectedCharRange.location) {
@@ -4591,6 +4634,11 @@ final class EditorTextView: UITextView, EditorTextViewLike {
 
     override func paste(_ sender: Any?) {
         let pasteboard = UIPasteboard.general
+        if let core, selectedRange.length > 0,
+           let url = RichTextClipboard.loneURL(pasteboard.string) {
+            core.setLink(url)
+            return
+        }
         if let value = pasteboard.value(forPasteboardType: Self.spansPasteboardType),
            let json = (value as? String) ?? (value as? Data).flatMap({ String(data: $0, encoding: .utf8) }),
            let core,
@@ -4803,6 +4851,7 @@ struct RichTextEditor: UIViewRepresentable {
             shouldChangeTextIn range: NSRange,
             replacementText text: String
         ) -> Bool {
+            guard core.isLoaded else { return false }
             if text == "\n", core.handleReturn() {
                 return false
             }
@@ -4991,6 +5040,9 @@ struct FormatSheet: View {
                 }
                 markCell(active: controller.subscriptActive, action: controller.toggleSubscript) {
                     Image(systemName: "textformat.subscript").font(.system(size: 13))
+                }
+                markCell(active: controller.linkActive != nil, action: controller.editLink) {
+                    Image(systemName: "link").font(.system(size: 13))
                 }
                 Menu {
                     ForEach(Highlight.names, id: \.self) { name in

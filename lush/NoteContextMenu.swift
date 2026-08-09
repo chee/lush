@@ -17,36 +17,155 @@ struct NoteContextMenu: View {
     }
 
     var body: some View {
+        Group {
+            content
+        }
+        .tint(.primary)
+    }
+
+    @ViewBuilder
+    private var content: some View {
         if node.kind == "lush" || node.kind == "rich" {
-            Button("Open in New Window") {
+            #if os(macOS)
+            Button {
                 openWindow(id: "note-detail", value: node.url)
+            } label: {
+                Label("Open in New Window", systemImage: "macwindow.badge.plus")
             }
             Divider()
-            Button(model.isPinned(node.url) ? "Unpin" : "Pin") {
+            #endif
+            Button {
                 model.togglePin(node.url)
+            } label: {
+                Label(
+                    model.isPinned(node.url) ? "Unpin" : "Pin",
+                    systemImage: model.isPinned(node.url) ? "pin.slash" : "pin"
+                )
             }
-            Button(model.quickNoteUrl == node.url ? "Unset Quick Note" : "Set as Quick Note") {
+            Button {
                 model.setQuickNote(model.quickNoteUrl == node.url ? nil : node.url)
+            } label: {
+                Label(
+                    model.quickNoteUrl == node.url ? "Unset Quick Note" : "Set as Quick Note",
+                    systemImage: "bolt"
+                )
             }
             if let showInFolder {
-                Button("Show in Folder", action: showInFolder)
+                Button(action: showInFolder) {
+                    Label("Show in Folder", systemImage: "folder")
+                }
+            }
+        }
+        Divider()
+        if let rename {
+            Button(action: rename) {
+                Label("Rename", systemImage: "pencil")
             }
         }
         if node.parentUrl != nil, let move {
-            Button("Move…", action: move)
+            Button(action: move) {
+                Label("Move…", systemImage: "arrowshape.turn.up.right")
+            }
         }
-        if let rename {
-            Button("Rename", action: rename)
-        }
-        Button("Copy Note URL") { Clipboard.copy(node.url) }
+        Divider()
+        CopyUrlMenu(url: node.url)
         if isPatchworkDoc {
-            Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: node.url) }
-            Button("Open in Patchwork") { model.openInPatchwork(node.url) }
+            Button {
+                model.openInPatchwork(node.url)
+            } label: {
+                Label("Open in Patchwork", systemImage: "arrow.up.forward.app")
+            }
         }
         if node.parentUrl != nil {
-            Button("Delete", role: .destructive) {
+            Divider()
+            Button(role: .destructive) {
                 model.removeEntry(parentUrl: node.parentUrl, url: node.url)
+            } label: {
+                Label("Delete", systemImage: "trash")
             }
         }
     }
+}
+
+/// The same actions a folder offers in the sidebar and in the column browser.
+struct FolderContextMenu: View {
+    let node: FolderNode
+    var open: (String) -> Void
+    var search: () -> Void
+    var settings: () -> Void
+    var rename: () -> Void
+    var move: () -> Void
+
+    @Environment(NotesModel.self) private var model
+
+    var body: some View {
+        Group {
+            content
+        }
+        .tint(.primary)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        Menu("New") {
+            NewItemMenuItems(model: model, folderUrl: node.url) { open($0) }
+        }
+        Divider()
+        Button(action: search) {
+            Label("Search in \(node.displayName)…", systemImage: "magnifyingglass")
+        }
+        Divider()
+        Button(action: settings) {
+            Label("Folder Settings…", systemImage: "gearshape")
+        }
+        Button(action: rename) {
+            Label("Rename", systemImage: "pencil")
+        }
+        if node.parentUrl != nil {
+            Button(action: move) {
+                Label("Move…", systemImage: "arrowshape.turn.up.right")
+            }
+        }
+        if !model.rootFolderUrls.contains(node.url) {
+            Button {
+                Task { await model.addRootFolder(node.url) }
+            } label: {
+                Label("Add to Notebooks", systemImage: "book.closed")
+            }
+        }
+        Divider()
+        CopyUrlMenu(url: node.url)
+        Divider()
+        if node.parentUrl != nil {
+            Button(role: .destructive) {
+                model.removeEntry(parentUrl: node.parentUrl, url: node.url)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        } else if model.rootFolderUrls.count > 1 {
+            Button(role: .destructive) {
+                model.removeRootFolder(node.url)
+            } label: {
+                Label("Remove from Notebooks", systemImage: "trash")
+            }
+        }
+    }
+}
+
+struct CopyUrlMenu: View {
+    let url: String
+
+    var body: some View {
+        Menu("Copy") {
+            Button("Automerge URL") { Clipboard.copy(url) }
+            Button("Patchwork URL") { Clipboard.copy(NotesModel.patchworkUrl(for: url)) }
+            Button("Lush URL") { Clipboard.copy(lushLink(for: url)) }
+        }
+    }
+}
+
+func lushLink(for url: String) -> String {
+    var components = URLComponents(string: "lush://show")
+    components?.queryItems = [URLQueryItem(name: "doc", value: url)]
+    return components?.url?.absoluteString ?? url
 }

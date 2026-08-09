@@ -185,6 +185,49 @@ enum NoteChatAssistant {
         return billions < 8 ? 3 : 8
     }
 
+    private static let changeWords: Set<String> = [
+        "add", "append", "write", "edit", "change", "rewrite", "revise", "fix",
+        "correct", "delete", "remove", "rename", "move", "create", "make",
+        "replace", "insert", "format", "reformat", "tidy", "clean", "sort",
+        "reorder", "translate", "mark", "check", "uncheck", "link", "revert",
+        "undo", "restore", "split", "merge", "shorten", "expand", "trim",
+        "bold", "italicise", "italicize", "highlight", "underline",
+        "capitalise", "capitalize", "indent", "outdent", "turn", "convert",
+        "update", "set", "draft", "reword", "rephrase", "proofread",
+    ]
+
+    private static let destructiveWords: Set<String> = [
+        "delete", "remove", "revert", "undo", "restore", "erase", "discard", "trash",
+    ]
+
+    private static let questionWords: Set<String> = [
+        "what", "whats", "who", "whos", "when", "where", "why", "how", "hows",
+        "which", "whose", "is", "isnt", "are", "was", "were", "does", "do",
+        "did", "has", "have", "am", "tell", "explain", "describe",
+        "summarise", "summarize", "remind",
+    ]
+
+    private static func words(in question: String) -> [String] {
+        question.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+    }
+
+    /// Writes are on unless the turn is plainly a question — someone asking
+    /// what a note says gets a catalog with nothing in it that could touch the
+    /// note, so there is nothing to imitate.
+    static func wantsChange(_ question: String) -> Bool {
+        let words = words(in: question)
+        if words.contains(where: changeWords.contains) { return true }
+        guard let first = words.first else { return true }
+        return !question.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+            && !questionWords.contains(first)
+    }
+
+    static func wantsDestruction(_ question: String) -> Bool {
+        words(in: question).contains(where: destructiveWords.contains)
+    }
+
     /// Generate, run whatever tool was called, generate again — until the model
     /// answers or the round budget runs out.
     static func respond(
@@ -196,6 +239,10 @@ enum NoteChatAssistant {
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else { throw ChatError.emptyQuestion }
         let choice = choice ?? LocalModelSettings.choice(for: .noteChat)
+        await MainActor.run {
+            session.allowsWrites = wantsChange(trimmedQuestion)
+            session.allowsDestructive = session.allowsWrites && wantsDestruction(trimmedQuestion)
+        }
 
         var transcript: [String] = []
         var called = Set<String>()
@@ -204,7 +251,7 @@ enum NoteChatAssistant {
             for: choice, response: settings.maximumResponseTokens
         )
 
-        func think(tools: Bool, last: Bool) async throws -> GeneratedReply {
+        func think(tools: Bool, last: Bool, insist: Bool = false) async throws -> GeneratedReply {
             while true {
                 let body = await prompt(
                     question: trimmedQuestion,
@@ -213,6 +260,7 @@ enum NoteChatAssistant {
                     previousTurns: previousTurns,
                     tools: tools,
                     last: last,
+                    insist: insist,
                     budget: budget
                 )
                 do {
@@ -227,12 +275,23 @@ enum NoteChatAssistant {
             }
         }
 
+        // a model that echoed the schema back gets told so and asked again
+        func answer(_ generated: GeneratedReply, tools: Bool, last: Bool) async throws
+            -> (answer: String, proposedMarkdown: String?) {
+            guard isPlaceholder(generated.answer) else {
+                return try await reply(from: generated, session: session)
+            }
+            return try await reply(
+                from: try await think(tools: tools, last: last, insist: true), session: session
+            )
+        }
+
         // First, the note and the question alone. Most of what gets asked is
         // answerable from the note that is already in front of it, and a model
         // shown a page of tool syntax will imitate the syntax instead.
         let opening = try await think(tools: false, last: false)
         if opening.tool == nil, !opening.needsTools, !opening.answer.isEmpty {
-            return try await reply(from: opening, session: session)
+            return try await answer(opening, tools: false, last: false)
         }
         if let need = opening.need, !need.isEmpty {
             transcript.append("You said you needed: \(limited(need, to: 400))")
@@ -242,7 +301,7 @@ enum NoteChatAssistant {
         for round in 0..<rounds {
             let generated = try await think(tools: true, last: round == rounds - 1)
             guard let tool = generated.tool, !tool.isEmpty else {
-                return try await reply(from: generated, session: session)
+                return try await answer(generated, tools: true, last: round == rounds - 1)
             }
             let call = "\(tool) \(json(generated.arguments))"
             // a model that asks the same thing twice is stuck, not thorough
@@ -255,7 +314,7 @@ enum NoteChatAssistant {
         }
 
         // out of rounds, or going in circles: make it answer with what it has
-        return try await reply(from: try await think(tools: false, last: true), session: session)
+        return try await answer(try await think(tools: false, last: true), tools: false, last: true)
     }
 
     private static func prompt(
@@ -265,13 +324,21 @@ enum NoteChatAssistant {
         previousTurns: [NoteChatTurn],
         tools: Bool,
         last: Bool,
+        insist: Bool,
         budget: Int
     ) async -> String {
         let outline = await MainActor.run { session.outline }
         let title = await MainActor.run { session.title }
         let attachments = await MainActor.run { session.attachments }
+        let writes = await MainActor.run { session.allowsWrites }
 
-        let catalog = tools ? await MainActor.run { budget < 14_000 ? NoteChatSession.briefCatalog : NoteChatSession.catalog } : ""
+        let catalog = tools ? await MainActor.run {
+            NoteChatSession.catalog(
+                brief: budget < 14_000,
+                writes: writes,
+                destructive: session.allowsDestructive
+            )
+        } : ""
         let question = limited(question, to: 2_000)
         // scaffolding, the title line and the closing instructions
         let spare = max(1_000, budget - catalog.count - question.count - 700)
@@ -288,30 +355,38 @@ enum NoteChatAssistant {
             calls.isEmpty ? nil : "What you have found so far this turn:\n\(calls)",
             catalog.isEmpty ? nil : "Tools:\n\(catalog)",
             "Person request:\n\(question)",
-            closing(tools: tools, last: last),
+            closing(tools: tools, last: last, writes: writes, insist: insist),
         ].compactMap { $0 }
         return sections.joined(separator: "\n\n")
     }
 
     /// Without the tools in front of it, the model is asked for an answer and
     /// nothing else — the one escape hatch is saying what it is missing, which
-    /// is what brings the tools out on the next pass.
-    private static func closing(tools: Bool, last: Bool) -> String {
+    /// is what brings the tools out on the next pass. The keys are described
+    /// rather than shown filled in: a small model handed an example value
+    /// copies it out verbatim as its reply.
+    private static func closing(tools: Bool, last: Bool, writes: Bool, insist: Bool) -> String {
+        let insisted = insist
+            ? "\nYour last reply repeated the description of the answer instead of answering. Write the real reply this time."
+            : ""
         guard tools else {
             return """
-            Answer the person, using the note above. Return one JSON object and no other text:
-            {"answer": "your reply"}
-            If — and only if — answering is impossible without something the note above \
-            does not contain, say what you are missing instead:
-            {"need": "what you are missing"}
+            Answer the person, using the note above. Return one JSON object and no other \
+            text, with the single key "answer", whose value is the reply itself — what you \
+            are saying to the person, written out, not a description of it.
+            If — and only if — answering is impossible without something the note above does \
+            not contain, return instead the single key "need", whose value names what is missing.\
+            \(insisted)
             """
         }
         return """
-        Return one JSON object and no other text. Call one tool:
-        {"tool": "name", "arguments": {…}}
-        or, once you have what you need, answer:
-        {"answer": "your reply to the person"}
-        \(last ? "\nThis is the last round: answer now, do not call another tool." : "")
+        Return one JSON object and no other text. To call a tool, use the key "tool" for \
+        its name and "arguments" for a JSON object of its arguments. To answer, use the \
+        single key "answer", whose value is the reply itself — what you are saying to the \
+        person, written out, not a description of it.\
+        \(writes ? "" : "\nThe person asked a question. Answer it — do not change the note.")\
+        \(last ? "\nThis is the last round: answer now, do not call another tool." : "")\
+        \(insisted)
         """
     }
 
@@ -504,12 +579,21 @@ enum NoteChatAssistant {
         return String(value.prefix(maxCharacters))
     }
 
+    private static let placeholders: Set<String> = [
+        "short helpful response", "what changed and why", "full revised note in markdown",
+        "your reply", "your reply to the person", "your reply here", "your answer",
+        "the reply itself", "what you are saying to the person", "answer", "reply",
+        "your response", "what you are missing", "name", "tool name",
+    ]
+
     private static func isPlaceholder(_ value: String?) -> Bool {
         guard let value else { return false }
-        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalized == "short helpful response"
-            || normalized == "what changed and why"
-            || normalized == "full revised note in markdown"
+        var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while let last = normalized.last, ".…!".contains(last) {
+            normalized.removeLast()
+        }
+        if normalized.hasPrefix("<"), normalized.hasSuffix(">") { return true }
+        return placeholders.contains(normalized)
     }
 
     private static func parse(_ raw: String) -> GeneratedReply? {
@@ -792,7 +876,11 @@ struct NoteChatView: View {
 
         chatTask?.cancel()
         chatTask = Task {
-            let snapshot = await model.spansSnapshot(for: currentUrl)
+            guard let snapshot = await model.spansSnapshot(for: currentUrl) else {
+                errorMessage = "That note could not be read."
+                isGenerating = false
+                return
+            }
             let spans = SpanNode.decodeList(snapshot.spansJson)
             let session = NoteChatSession(
                 model: model,
@@ -873,7 +961,11 @@ struct NoteChatView: View {
             }
             // the markdown round trip loses embeds/tables/columns/context —
             // carry them over from the live document before replacing it
-            let snapshot = await model.spansSnapshot(for: url)
+            guard let snapshot = await model.spansSnapshot(for: url) else {
+                errorMessage = "That note could not be read."
+                applyingTurnId = nil
+                return
+            }
             let current = SpanNode.decodeList(snapshot.spansJson)
             let spans = NoteChatAssistant.mergingAtomicBlocks(from: current, into: drafted)
             let title = RichText.title(from: spans)
