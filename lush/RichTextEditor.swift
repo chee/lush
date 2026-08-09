@@ -338,6 +338,7 @@ private final class EditorDocumentSession {
     let storage = NSTextStorage()
     var heads: [String] = []
     var lastKnownJSON = ""
+    var lastKnownEmbeds = 0
     var title = ""
     var isApplyingDocumentState = false
     var loaded = false
@@ -369,6 +370,10 @@ private enum EditorDocumentSessions {
         }
         return session
     }
+}
+
+private func embedCount(in spans: [SpanNode]) -> Int {
+    spans.filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
 }
 
 @MainActor
@@ -655,6 +660,7 @@ final class EditorCore {
 
     func startContext(_ tracker: ContextTracker) {
         contextTracker = tracker
+        tracker.start()
         if session.loaded {
             checkContextChangeOnOpen(in: SpanNode.decodeList(session.lastKnownJSON))
         }
@@ -712,12 +718,14 @@ final class EditorCore {
                 self.apply(spans: spans)
                 #endif
                 self.checkContextChangeOnOpen(in: spans)
-                await self.fetchMissingAssets(in: spans)
+                let populated = await self.fetchMissingAssets(in: spans)
                 guard self.noteUrl == url,
                       self.session === session,
                       self.session.lastKnownJSON == SpanNode.encodeList(spans)
                 else { return }
-                self.apply(spans: spans)
+                if populated {
+                    self.apply(spans: spans)
+                }
                 // the cached session can be stale if the doc changed while no
                 // editor was attached — revalidate against the core
                 guard let snapshot = await self.model.spansSnapshot(for: url),
@@ -756,8 +764,8 @@ final class EditorCore {
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
             self.checkContextChangeOnOpen(in: spans)
-            await self.fetchMissingAssets(in: spans)
-            guard self.noteUrl == url,
+            guard await self.fetchMissingAssets(in: spans),
+                  self.noteUrl == url,
                   self.session === session,
                   self.session.lastKnownJSON == canonicalJSON
             else { return }
@@ -773,7 +781,7 @@ final class EditorCore {
         refreshFormattingState()
     }
 
-    private func fetchMissingAssets(in spans: [SpanNode]) async {
+    private func fetchMissingAssets(in spans: [SpanNode]) async -> Bool {
         let urls: [String] = spans.compactMap { node -> String? in
             guard case .block(let block) = node,
                   block.isEmbedBlock,
@@ -784,7 +792,7 @@ final class EditorCore {
             else { return nil }
             return url
         }
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty else { return false }
         let model = self.model
         let fetched: [(String, Data?)] = await withTaskGroup(of: (String, Data?).self) { group in
             for url in urls {
@@ -797,14 +805,17 @@ final class EditorCore {
             for await pair in group { results.append(pair) }
             return results
         }
+        var populated = false
         for (url, data) in fetched {
             guard let data else {
                 let info = await model.assetInfo(url)
                 if (info?.mimeType ?? "").isEmpty {
                     cache.patchworkDocs.insert(url)
+                    populated = true
                 }
                 continue
             }
+            populated = true
             if let image = PImage(data: data) {
                 cache.images[url] = image
             } else {
@@ -824,6 +835,7 @@ final class EditorCore {
                 }
             }
         }
+        return populated
     }
 
     /// The media a copied selection stands for, so a paste outside this app
@@ -952,6 +964,7 @@ final class EditorCore {
             view.pTypingAttributes = RichText.attributes(block: .heading(level: 1), marks: [:])
         }
         session.lastKnownJSON = SpanNode.encodeList(spans)
+        session.lastKnownEmbeds = embedCount(in: spans)
         session.title = RichText.title(from: spans)
         refreshFormattingState()
         updateGlobalMatches()
@@ -1017,8 +1030,8 @@ final class EditorCore {
             if canonical != self.session.lastKnownJSON {
                 self.apply(spans: spans)
             }
-            await self.fetchMissingAssets(in: spans)
-            guard !Task.isCancelled,
+            guard await self.fetchMissingAssets(in: spans),
+                  !Task.isCancelled,
                   self.noteUrl == url,
                   self.remoteReloadGeneration == generation,
                   self.session.lastKnownJSON == canonical
@@ -1054,7 +1067,6 @@ final class EditorCore {
         var deleteCount: Int64
         var insert: String
         var utf16EndLocation: Int
-        var title: String
         let heads: [String]
     }
 
@@ -1118,16 +1130,9 @@ final class EditorCore {
             return
         }
         pendingTextSplice = nil
-        guard let storage = view?.pStorage else {
+        guard view?.pStorage != nil else {
             scheduleSave()
             return
-        }
-        let title: String
-        if pending.index < 120 || session.title.isEmpty {
-            title = titleFromStorage(storage)
-            session.title = title
-        } else {
-            title = session.title
         }
         let url = noteUrl
         if pending.deleteCount == 0,
@@ -1139,7 +1144,6 @@ final class EditorCore {
            pending.index == queued.index + UInt64(queued.insert.unicodeScalars.count) {
             queuedTextSplice?.insert += pending.insert
             queuedTextSplice?.utf16EndLocation += (pending.insert as NSString).length
-            queuedTextSplice?.title = title
             scheduleQueuedTextSpliceFlush()
             return
         }
@@ -1151,7 +1155,6 @@ final class EditorCore {
            pending.utf16Location == queued.utf16EndLocation,
            pending.index == queued.index {
             queuedTextSplice?.deleteCount += pending.deleteCount
-            queuedTextSplice?.title = title
             scheduleQueuedTextSpliceFlush()
             return
         }
@@ -1165,7 +1168,6 @@ final class EditorCore {
             queuedTextSplice?.index = pending.index
             queuedTextSplice?.deleteCount += pending.deleteCount
             queuedTextSplice?.utf16EndLocation = pending.utf16Location
-            queuedTextSplice?.title = title
             scheduleQueuedTextSpliceFlush()
             return
         }
@@ -1176,7 +1178,6 @@ final class EditorCore {
             deleteCount: pending.deleteCount,
             insert: pending.insert,
             utf16EndLocation: pending.utf16Location + (pending.insert as NSString).length,
-            title: title,
             heads: session.heads
         )
         scheduleQueuedTextSpliceFlush()
@@ -1197,6 +1198,11 @@ final class EditorCore {
         guard let queued = queuedTextSplice else { return }
         queuedTextSplice = nil
         let url = queued.url
+        let written = EditorDocumentSessions.session(for: url)
+        if url == noteUrl, let storage = view?.pStorage {
+            written.title = RichText.title(from: RichText.spans(from: storage))
+        }
+        let title = written.title
         let heads = queued.heads
         let previousHeadsTask = localWriteHeadsTask
         beginLocalWrite()
@@ -1210,7 +1216,7 @@ final class EditorCore {
                 index: queued.index,
                 deleteCount: queued.deleteCount,
                 insert: queued.insert,
-                title: queued.title,
+                title: title,
                 spansJson: nil,
                 heads: writeHeads,
                 origin: self.noteObserverId
@@ -1225,30 +1231,6 @@ final class EditorCore {
             return newHeads
         }
         localWriteHeadsTask = task
-    }
-
-    private func titleFromStorage(_ storage: NSAttributedString) -> String {
-        let string = storage.string as NSString
-        // accumulate a whole line across formatting runs; a bold word or a
-        // link at the start of the title otherwise clipped it at the run edge
-        var line = ""
-        storage.enumerateAttributes(in: NSRange(location: 0, length: storage.length)) { attrs, range, stop in
-            guard attrs[.amDisplayOnly] == nil else { return }
-            let text = string.substring(with: range)
-                .replacingOccurrences(of: "\u{FFFC}", with: "")
-            for char in text {
-                if char == "\n" {
-                    if !line.trimmingCharacters(in: .whitespaces).isEmpty {
-                        stop.pointee = true
-                        return
-                    }
-                    line = ""
-                } else {
-                    line.append(char)
-                }
-            }
-        }
-        return String(line.trimmingCharacters(in: .whitespaces).prefix(60))
     }
 
     func scheduleSave() {
@@ -1276,13 +1258,12 @@ final class EditorCore {
         let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
         let json = SpanNode.encodeList(spans)
         guard json != session.lastKnownJSON else { return }
-        let embedCount = spans.filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
-        let previousEmbeds = SpanNode.decodeList(session.lastKnownJSON)
-            .filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
-        if embedCount < previousEmbeds {
-            NSLog("lush save: embed count dropped %d -> %d in %@", previousEmbeds, embedCount, noteUrl)
+        let embeds = embedCount(in: spans)
+        if embeds < session.lastKnownEmbeds {
+            NSLog("lush save: embed count dropped %d -> %d in %@", session.lastKnownEmbeds, embeds, noteUrl)
         }
         session.lastKnownJSON = json
+        session.lastKnownEmbeds = embeds
         let url = noteUrl
         let title = RichText.title(from: spans)
         session.title = title
@@ -1476,14 +1457,22 @@ final class EditorCore {
     private func editableScalarCount(in storage: NSAttributedString, range: NSRange) -> Int {
         guard range.length > 0 else { return 0 }
         let string = storage.string as NSString
-        var count = 0
-        storage.enumerateAttributes(in: range) { attrs, runRange, _ in
-            guard attrs[.amDisplayOnly] == nil else { return }
-            let text = string.substring(with: runRange)
-                .replacingOccurrences(of: "\u{FFFC}", with: "")
-            count += text.unicodeScalars.count
+        return withUnsafeTemporaryAllocation(of: unichar.self, capacity: range.length) { units in
+            string.getCharacters(units.baseAddress!, range: range)
+            var count = 0
+            storage.enumerateAttribute(.amDisplayOnly, in: range) { displayOnly, runRange, _ in
+                guard displayOnly == nil else { return }
+                let start = runRange.location - range.location
+                for i in start ..< start + runRange.length {
+                    let unit = units[i]
+                    if unit == 0xFFFC { continue }
+                    if unit >= 0xDC00, unit < 0xE000, i > start,
+                       units[i - 1] >= 0xD800, units[i - 1] < 0xDC00 { continue }
+                    count += 1
+                }
+            }
+            return count
         }
-        return count
     }
 
     // MARK: outline
@@ -1639,14 +1628,16 @@ final class EditorCore {
             else { return }
             let selection = view.pSelectedRange
             guard !self.storageHasAtomicLayout(in: storage, before: selection.location) else { return }
-            guard let anchorIndex = self.automergeTextPosition(in: storage, at: selection.location),
-                  let headIndex = self.automergeTextPosition(in: storage, at: NSMaxRange(selection))
-            else { return }
+            guard let anchorIndex = self.automergeTextPosition(in: storage, at: selection.location) else { return }
+            let head = selection.length == 0
+                ? anchorIndex
+                : self.automergeTextPosition(in: storage, at: NSMaxRange(selection))
+            guard let headIndex = head else { return }
             // the cursor FFI can block on the doc lock — keep it off main
             let cursors = await Task.detached { () -> (String, String)? in
-                guard let anchor = try? core.textCursor(url: url, index: UInt64(anchorIndex)),
-                      let head = try? core.textCursor(url: url, index: UInt64(headIndex))
-                else { return nil }
+                guard let anchor = try? core.textCursor(url: url, index: UInt64(anchorIndex)) else { return nil }
+                if anchorIndex == headIndex { return (anchor, anchor) }
+                guard let head = try? core.textCursor(url: url, index: UInt64(headIndex)) else { return nil }
                 return (anchor, head)
             }.value
             guard let cursors, !Task.isCancelled,
@@ -2661,10 +2652,20 @@ final class EditorCore {
         let available = (view?.pTextContainer?.size.width ?? ideal) - padding * 2
         let width = available > 40 ? min(ideal, available) : ideal
         let zone = CalendarEventInlineView.buttonZone * width / max(ideal, 1)
-        if point.x >= padding + width - zone, box.value.openExternally() { return true }
+        let value = box.value
+        if point.x >= padding + width - zone {
+            Task { @MainActor in
+                if await value.openExternally() { return }
+                AppRouter.shared.pending = .calendar(
+                    day: value.calendarEventDay,
+                    item: value.attrs["event"]?.stringValue
+                )
+            }
+            return true
+        }
         AppRouter.shared.pending = .calendar(
-            day: box.value.calendarEventDay,
-            item: box.value.attrs["event"]?.stringValue
+            day: value.calendarEventDay,
+            item: value.attrs["event"]?.stringValue
         )
         return true
     }
@@ -2932,7 +2933,9 @@ final class EditorCore {
         let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
         let json = SpanNode.encodeList(spans)
         let previousJSON = session.lastKnownJSON
+        let previousEmbeds = session.lastKnownEmbeds
         session.lastKnownJSON = json
+        session.lastKnownEmbeds = embedCount(in: spans)
         let title = RichText.title(from: spans)
         let url = noteUrl
         let heads = session.heads
@@ -2960,6 +2963,7 @@ final class EditorCore {
                 let session = EditorDocumentSessions.session(for: url)
                 if session.lastKnownJSON == json {
                     session.lastKnownJSON = previousJSON
+                    session.lastKnownEmbeds = previousEmbeds
                 }
                 if self.noteUrl == url { self.scheduleSave() }
                 return nil

@@ -707,8 +707,7 @@ enum EditorSettings {
     }
 
     static var minimapVisible: Bool {
-        UserDefaults.standard.object(forKey: minimapKey) == nil
-            || UserDefaults.standard.bool(forKey: minimapKey)
+        UserDefaults.standard.bool(forKey: minimapKey)
     }
 
     static func setMinimapVisible(_ visible: Bool) {
@@ -1681,20 +1680,42 @@ enum RichText {
         return spans
     }
 
+    private static let titleBoxes: Set<String> = [
+        "table", "table-row", "table-cell", "table-header-cell", "columns", "column",
+    ]
+
     /// First non-empty line of text, for use as the note's title.
     static func title(from spans: [SpanNode]) -> String {
+        title(from: spans, skippingBoxes: true) ?? title(from: spans, skippingBoxes: false) ?? ""
+    }
+
+    private static func title(from spans: [SpanNode], skippingBoxes: Bool) -> String? {
+        // accumulate a whole line across formatting runs; a bold word or a
+        // link at the start of the title otherwise clipped it at the run edge
+        var line = ""
+        var skipping = false
         for node in spans {
-            if case .text(let text, _) = node {
-                let line = text
-                    .split(separator: "\n", omittingEmptySubsequences: true)
-                    .first
-                    .map(String.init)?
-                    .trimmingCharacters(in: .whitespaces) ?? ""
-                if !line.isEmpty {
-                    return String(line.prefix(60))
-                }
+            switch node {
+            case .block(let block):
+                if let title = titleLine(line) { return title }
+                line = ""
+                skipping = skippingBoxes && isTitleBox(block)
+            case .text(let value, _):
+                if !skipping { line += value }
             }
         }
-        return ""
+        return titleLine(line)
+    }
+
+    private static func isTitleBox(_ block: BlockValue) -> Bool {
+        titleBoxes.contains(block.type) || block.parents.contains(where: titleBoxes.contains)
+    }
+
+    private static func titleLine(_ text: String) -> String? {
+        for line in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { return String(trimmed.prefix(60)) }
+        }
+        return nil
     }
 }

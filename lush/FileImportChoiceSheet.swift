@@ -47,7 +47,7 @@ struct FileImportChoiceSheet: View {
     }
 
     private func finish(asNotes: Bool) {
-        model.importFiles(request.urls, into: request.folderUrl, asNotes: asNotes)
+        Task { await model.importFiles(request.urls, into: request.folderUrl, asNotes: asNotes) }
         dismiss()
     }
 }

@@ -68,29 +68,46 @@ struct NotebookTree {
 /// The one definition of what a smart notebook holds, so Lush and the helper
 /// always arrive at the same list. Blocking: call it off the main actor.
 enum SmartNotebookRun {
+    /// Every text a run of this notebook has to ask the index about, as the
+    /// index wants it. Title and tag rules are read off the index entries
+    /// instead, so they never come through here. The caller embeds these
+    /// before the blocking part.
+    static func searchQueries(_ folder: SmartNotebook) -> [String] {
+        var queries: [String] = []
+        walk(folder.rootRule) { rule in
+            guard case let .text(.anything, false, exact, text) = rule.body else { return }
+            let query = searchQuery(text, exact: exact)
+            if !query.isEmpty, !queries.contains(query) { queries.append(query) }
+        }
+        return queries
+    }
+
+    /// The list every run needs: one read of the index, shared across a cycle.
+    static let corpusLimit: UInt32 = 5000
+
+    /// `notes` is the whole index; a cycle over several notebooks reads it once
+    /// and hands the same list to each.
     static func hits(
         _ folder: SmartNotebook,
         core: Core,
         tree: NotebookTree,
-        vector: [Float]?
+        vectors: [String: [Float]],
+        notes: [IndexedNote]
     ) -> [SearchHit] {
-        let recent = core.recentNotes(limit: 5000)
-        let query = folder.query.trimmingCharacters(in: .whitespaces)
+        let root = folder.rootRule
         // The scope goes to the index rather than being applied to the results:
         // the text search keeps only its top matches, and narrowing afterwards
         // would leave a small folder with whatever survived of everywhere else.
-        let filter = SearchFilter(
-            scope: folder.scope.isEmpty ? nil : folder.scope,
-            tags: [],
-            whenFrom: nil,
-            whenTo: nil
-        )
-        var hits: [SearchHit]
-        if query.isEmpty {
-            hits = recent.map { SearchHit(url: $0.url, name: $0.name, snippet: "") }
-        } else {
-            hits = core.searchNotes(query: query, filter: filter)
-            if let vector, !query.contains("\"") {
+        // Only a scope every hit must be under can go there.
+        let scope = requiredFolder(root)
+        let filter = SearchFilter(scope: scope, tags: [], whenFrom: nil, whenTo: nil)
+        var matched: [String: Set<String>] = [:]
+        var snippets: [String: String] = [:]
+        var ranked: [String] = []
+        var seen: Set<String> = []
+        for query in searchQueries(folder) {
+            var hits = core.searchNotes(query: query, filter: filter)
+            if let vector = vectors[query], !query.contains("\"") {
                 hits += core.semanticSearch(
                     vector: vector,
                     limit: 12,
@@ -98,27 +115,120 @@ enum SmartNotebookRun {
                     filter: filter
                 )
             }
+            matched[query] = Set(hits.map(\.url))
+            for hit in hits {
+                if snippets[hit.url] == nil { snippets[hit.url] = hit.snippet }
+                if seen.insert(hit.url).inserted { ranked.append(hit.url) }
+            }
         }
-        let modified = Dictionary(
-            recent.map { ($0.url, seconds($0.modified)) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let kind = SmartNotebookKind(rawValue: folder.kind) ?? .any
-        let cutoff = folder.withinDays > 0
-            ? Date().timeIntervalSince1970 - Double(folder.withinDays) * 86_400
-            : nil
-        return hits.filter { hit in
-            guard let nodeKind = tree.kinds[hit.url], kind.matches(nodeKind) else { return false }
-            if !folder.scope.isEmpty, !tree.contains(hit.url, under: folder.scope) { return false }
-            if let cutoff { return (modified[hit.url] ?? 0) >= cutoff }
-            return true
+        let byUrl = Dictionary(notes.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
+        let now = Date().timeIntervalSince1970
+        var candidates = ranked.compactMap { byUrl[$0] }
+        // A tree that can be satisfied without the index — no text rule, or
+        // text only in an `any` branch — has to look at every doc, not just at
+        // what the searches turned up.
+        if matches(root, note: nil, tree: tree, matched: matched, now: now) {
+            candidates += notes.filter { !seen.contains($0.url) }
+        }
+        return candidates
+            .filter { note in
+                guard let kind = tree.kinds[note.url], kind != "folder" else { return false }
+                return matches(root, note: note, tree: tree, matched: matched, now: now)
+            }
+            .map { note in
+                SearchHit(url: note.url, name: note.title, snippet: snippets[note.url] ?? "")
+            }
+    }
+
+    /// A nil `note` asks the structural question instead of the per-doc one:
+    /// could this tree hold a doc the searches never turned up?
+    private static func matches(
+        _ rule: SmartRule,
+        note: IndexedNote?,
+        tree: NotebookTree,
+        matched: [String: Set<String>],
+        now: TimeInterval
+    ) -> Bool {
+        func check(_ rule: SmartRule) -> Bool {
+            matches(rule, note: note, tree: tree, matched: matched, now: now)
+        }
+        switch rule.body {
+        case let .group(.all, rules):
+            return rules.allSatisfy(check)
+        case let .group(.any, rules):
+            return rules.isEmpty ? false : rules.contains(where: check)
+        case let .text(field, whole, exact, text):
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { return true }
+            guard let note else { return field != .anything }
+            switch field {
+            case .anything:
+                return matched[searchQuery(text, exact: exact)]?.contains(note.url) == true
+            case .title:
+                return compare(note.title, text, whole: whole, exact: exact)
+            case .tag:
+                return note.tags.contains { compare($0, text, whole: whole, exact: exact) }
+            }
+        case let .kind(kind):
+            guard let note else { return true }
+            return tree.kinds[note.url].map(kind.matches) ?? false
+        case let .folder(folderUrl):
+            guard let note else { return true }
+            return folderUrl.isEmpty || tree.contains(note.url, under: folderUrl)
+        case let .date(on, op, age, day):
+            guard let note else { return true }
+            let stamp = Date(docTimestamp: on == .created ? note.created : note.modified)
+                .timeIntervalSince1970
+            switch op {
+            case .within:
+                return age == .any || stamp >= now - Double(age.rawValue) * 86_400
+            case .before:
+                guard let start = smartRuleDayStart(day) else { return true }
+                return stamp > 0 && stamp < start.timeIntervalSince1970
+            case .after:
+                guard let start = smartRuleDayStart(day) else { return true }
+                return stamp >= start.timeIntervalSince1970 + 86_400
+            }
         }
     }
 
-    private static func seconds(_ stamp: Int64) -> TimeInterval {
-        // older docs recorded milliseconds
-        let value = TimeInterval(stamp)
-        return value > 4_000_000_000 ? value / 1000 : value
+    /// "Like" is loose about case and accents; "exactly" wants the characters
+    /// as typed.
+    private static func compare(_ value: String, _ text: String, whole: Bool, exact: Bool) -> Bool {
+        if exact {
+            return whole ? value == text : value.contains(text)
+        }
+        let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        if whole {
+            return value.compare(text, options: options) == .orderedSame
+        }
+        return value.range(of: text, options: options) != nil
+    }
+
+    /// A folder every hit is guaranteed to be under: one `in` rule, on the
+    /// root's `all` chain, and no others anywhere.
+    private static func requiredFolder(_ root: SmartRule) -> String? {
+        var folders: [String] = []
+        walk(root) { rule in
+            if case let .folder(url) = rule.body, !url.isEmpty { folders.append(url) }
+        }
+        guard folders.count == 1, case let .group(.all, rules) = root.body else { return nil }
+        return rules.contains { $0.body == .folder(folders[0]) } ? folders[0] : nil
+    }
+
+    private static func walk(_ rule: SmartRule, _ visit: (SmartRule) -> Void) {
+        visit(rule)
+        for child in rule.children { walk(child, visit) }
+    }
+
+    /// Sentence vectors for every text rule, keyed by the query they belong to.
+    /// Quoted text is asking for that text, not for something like it.
+    static func vectors(for folder: SmartNotebook) async -> [String: [Float]] {
+        var vectors: [String: [Float]] = [:]
+        for query in searchQueries(folder) where !query.contains("\"") {
+            vectors[query] = await QueryEmbedding.shared.vector(for: query)
+        }
+        return vectors
     }
 }
 
@@ -135,14 +245,19 @@ actor QueryEmbedding {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return nil }
         if let cached = cache[query] { return cached }
+        guard let vector = embed(query) else { return nil }
+        cache[query] = vector
+        return vector
+    }
+
+    /// Uncached: document text is embedded once, and there is a lot of it.
+    func embed(_ text: String) -> [Float]? {
         if !loaded {
             loaded = true
             model = NLEmbedding.sentenceEmbedding(for: .english)
         }
-        guard let raw = model?.vector(for: query) else { return nil }
+        guard let raw = model?.vector(for: text) else { return nil }
         let magnitude = sqrt(raw.reduce(0) { $0 + $1 * $1 })
-        let vector = magnitude > 0 ? raw.map { Float($0 / magnitude) } : raw.map(Float.init)
-        cache[query] = vector
-        return vector
+        return magnitude > 0 ? raw.map { Float($0 / magnitude) } : raw.map(Float.init)
     }
 }

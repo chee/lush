@@ -1,14 +1,11 @@
 import Foundation
 import CryptoKit
-import NaturalLanguage
 
-/// Embeds note text with NLEmbedding and hands the vectors to the core, which
-/// stores them in search.sqlite3 beside the full-text index and does the
-/// similarity scan. This actor owns only the embedding model.
+/// Chunks note text, embeds it through `QueryEmbedding`, and hands the vectors
+/// to the core, which stores them in search.sqlite3 beside the full-text index
+/// and does the similarity scan.
 actor SemanticSearchIndex {
     private var core: Core?
-    private var embedding: NLEmbedding?
-    private var loadedEmbedding = false
 
     func attach(_ core: Core) {
         self.core = core
@@ -20,19 +17,16 @@ actor SemanticSearchIndex {
         return Set(core.noteEmbeddingDigests().keys)
     }
 
-    func indexFile(url: String, name: String, text: String) {
+    func indexFile(url: String, name: String, text: String) async {
         guard let core else { return }
         let digest = Self.digest(of: name + "\n" + text)
         if core.noteEmbeddingDigest(url: url) == digest { return }
-        guard !text.isEmpty, let embedding = embeddingModel() else { return }
-        let chunks = Self.chunks(for: text).compactMap { chunk -> EmbeddingChunk? in
-            guard let vector = embedding.vector(for: chunk) else { return nil }
-            return EmbeddingChunk(text: Self.snippet(from: chunk), vector: Self.unit(vector))
-        }
+        guard !text.isEmpty else { return }
+        let chunks = await Self.embed(Self.chunks(for: text))
         try? core.setNoteEmbeddings(url: url, name: name, digest: digest, chunks: chunks)
     }
 
-    func index(url: String, name: String, spansJson: String) {
+    func index(url: String, name: String, spansJson: String) async {
         guard let core else { return }
         let spans = SpanNode.decodeList(spansJson)
         let title = RichText.title(from: spans)
@@ -44,11 +38,7 @@ actor SemanticSearchIndex {
         if core.noteEmbeddingDigest(url: url) == digest {
             return
         }
-        guard let embedding = embeddingModel() else { return }
-        let chunks = Self.chunks(for: text).compactMap { chunk -> EmbeddingChunk? in
-            guard let vector = embedding.vector(for: chunk) else { return nil }
-            return EmbeddingChunk(text: Self.snippet(from: chunk), vector: Self.unit(vector))
-        }
+        let chunks = await Self.embed(Self.chunks(for: text))
         try? core.setNoteEmbeddings(url: url, name: displayName, digest: digest, chunks: chunks)
     }
 
@@ -72,12 +62,13 @@ actor SemanticSearchIndex {
         )
     }
 
-    private func embeddingModel() -> NLEmbedding? {
-        if !loadedEmbedding {
-            loadedEmbedding = true
-            embedding = NLEmbedding.sentenceEmbedding(for: .english)
+    private static func embed(_ chunks: [String]) async -> [EmbeddingChunk] {
+        var embedded: [EmbeddingChunk] = []
+        for chunk in chunks {
+            guard let vector = await QueryEmbedding.shared.embed(chunk) else { continue }
+            embedded.append(EmbeddingChunk(text: snippet(from: chunk), vector: vector))
         }
-        return embedding
+        return embedded
     }
 
     // MARK: legacy store
@@ -177,11 +168,5 @@ actor SemanticSearchIndex {
             snippet = String(snippet.prefix(140)) + "..."
         }
         return snippet
-    }
-
-    private static func unit(_ vector: [Double]) -> [Float] {
-        let magnitude = sqrt(vector.reduce(0) { $0 + $1 * $1 })
-        guard magnitude > 0 else { return vector.map(Float.init) }
-        return vector.map { Float($0 / magnitude) }
     }
 }

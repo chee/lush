@@ -70,8 +70,10 @@ function patchworkApi(): PatchworkApi {
   return window.Patchwork as PatchworkApi;
 }
 
+let dismissOpen: (() => void) | undefined;
+
 async function openSettings(): Promise<void> {
-  document.getElementById("patchwork-settings")?.remove();
+  dismissOpen?.();
   const api = patchworkApi();
   const [properties, folders] = await Promise.all([
     api.appleConfigProperties() as Promise<Property[]>,
@@ -93,10 +95,20 @@ async function openSettings(): Promise<void> {
   const title = document.createElement("div");
   title.className = "pw-settings__title";
   title.textContent = "Patchwork Settings";
+  const onKey = (event: KeyboardEvent) => {
+    if (event.key === "Escape") dismiss();
+  };
+  const dismiss = () => {
+    overlay.remove();
+    window.removeEventListener("keydown", onKey, true);
+    if (dismissOpen === dismiss) dismissOpen = undefined;
+  };
+  dismissOpen = dismiss;
+
   const close = document.createElement("button");
   close.className = "pw-settings__close";
   close.textContent = "✕";
-  close.onclick = () => overlay.remove();
+  close.onclick = dismiss;
   head.append(title, close);
   panel.appendChild(head);
 
@@ -120,14 +132,8 @@ async function openSettings(): Promise<void> {
   panel.appendChild(foot);
 
   overlay.addEventListener("mousedown", (event) => {
-    if (event.target === overlay) overlay.remove();
+    if (event.target === overlay) dismiss();
   });
-  const onKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      overlay.remove();
-      window.removeEventListener("keydown", onKey, true);
-    }
-  };
   window.addEventListener("keydown", onKey, true);
 
   document.body.appendChild(overlay);

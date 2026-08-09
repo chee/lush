@@ -63,7 +63,20 @@ enum PatchworkWeb {
 
     static var available: Bool { webRoot != nil }
 
+    @MainActor
+    private static var seedTask: Task<String, Never>?
+
+    @MainActor
     static var signerSeedHex: String {
+        get async {
+            if let existing = seedTask { return await existing.value }
+            let task = Task.detached(priority: .userInitiated) { Self.loadSignerSeedHex() }
+            seedTask = task
+            return await task.value
+        }
+    }
+
+    nonisolated private static func loadSignerSeedHex() -> String {
         if let saved = keychainSeed() {
             return saved
         }
@@ -167,7 +180,8 @@ enum PatchworkWeb {
     }
 
     @MainActor
-    static var configScriptTag: String {
+    static func configScriptTag() async -> String {
+        let seed = await signerSeedHex
         let ports = [coreServerPort, LocalSyncServer.wsPort].compactMap { $0 }
         let localPort = ports.isEmpty
             ? ""
@@ -183,7 +197,7 @@ enum PatchworkWeb {
             .replacingOccurrences(of: "</", with: "<\\/")
         return """
         <script>window.__patchwork_CONFIG = {"publicEndpoint": "\(endpoint)", \
-        "signerSeedHex": "\(signerSeedHex)", "moduleUrls": \(modules), \
+        "signerSeedHex": "\(seed)", "moduleUrls": \(modules), \
         "accountModuleUrl": \(accountModule)\(localPort)};</script>
         """
     }
@@ -898,14 +912,15 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
         let encodedPath = String(url.path(percentEncoded: true).dropFirst())
         let path = encodedPath.removingPercentEncoding ?? encodedPath
         let firstSegment = path.components(separatedBy: "/").first ?? ""
-        if firstSegment.hasPrefix("automerge:") {
+        if firstSegment.removingPercentEncoding?.hasPrefix("automerge:") == true {
             return try await resolveDocURL(path: encodedPath, url: url)
         }
         switch path {
         case "", "embed.html":
+            let config = await PatchworkWeb.configScriptTag()
             let html = PatchworkWeb.shellHTML.replacingOccurrences(
                 of: "<!-- lushweb_CONFIG -->",
-                with: PatchworkWeb.configScriptTag
+                with: config
             )
             return respond(url: url, data: Data(html.utf8), mime: "text/html; charset=utf-8")
         case "embed.js":

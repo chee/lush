@@ -44,42 +44,6 @@ private enum LushWidgetURL {
     }
 }
 
-private enum LushWidgetStore {
-    static let appGroupIdentifier = "group.party.chee.patchwork.lush"
-    static let snapshotFileName = "LushWidgetSnapshot.json"
-
-    static func snapshot() -> LushWidgetSnapshot? {
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroupIdentifier
-        ) else { return nil }
-
-        let url = root.appendingPathComponent(snapshotFileName)
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(LushWidgetSnapshot.self, from: data)
-    }
-}
-
-struct LushWidgetSnapshot: Codable {
-    let updatedAt: Date
-    let defaultFolderUrl: String?
-    let folders: [LushWidgetFolderSnapshot]
-}
-
-struct LushWidgetFolderSnapshot: Codable {
-    let url: String
-    let title: String
-    let path: String
-    let totalItemCount: Int
-    let items: [LushWidgetItemSnapshot]
-}
-
-struct LushWidgetItemSnapshot: Codable {
-    let url: String
-    let title: String
-    let preview: String
-    let kind: String
-}
-
 struct LushWidgetFolderEntity: AppEntity {
     static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Lush Folder")
     static let defaultQuery = LushWidgetFolderQuery()
@@ -120,7 +84,7 @@ struct LushWidgetFolderQuery: EntityStringQuery {
     }
 
     private static func entitiesFromSnapshot() -> [LushWidgetFolderEntity] {
-        guard let snapshot = LushWidgetStore.snapshot() else { return [] }
+        guard let snapshot = LushWidgetSnapshot.stored else { return [] }
         return snapshot.folders.map {
             LushWidgetFolderEntity(id: $0.url, title: $0.title, path: $0.path)
         }
@@ -169,7 +133,7 @@ struct FolderContentProvider: AppIntentTimelineProvider {
     }
 
     private func entry(for configuration: FolderWidgetConfiguration) -> FolderContentEntry {
-        let snapshot = LushWidgetStore.snapshot()
+        let snapshot = LushWidgetSnapshot.stored
         let folder = snapshot.flatMap { snapshot in
             if let configured = configuration.folder?.id {
                 return snapshot.folders.first { $0.url == configured }

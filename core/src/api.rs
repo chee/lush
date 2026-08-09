@@ -7,6 +7,7 @@ use std::{
 };
 
 use automerge::{Change, ChangeHash};
+use futures::StreamExt;
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -212,6 +213,23 @@ pub struct RecentNote {
     pub modified: i64,
 }
 
+/// Everything the index knows about a doc apart from its text. A saved search
+/// tests most of its rules against this rather than asking the index one
+/// question per rule.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IndexedNote {
+    pub url: String,
+    pub title: String,
+    pub kind: String,
+    /// Unix seconds; 0 when the doc has not been indexed yet.
+    pub modified: i64,
+    /// Unix seconds of the doc's first change; 0 when its history carries none.
+    pub created: i64,
+    pub tags: Vec<String>,
+    /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
+    pub when: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AssetVision {
     pub description: String,
@@ -245,6 +263,7 @@ pub struct Core {
     runtime: Runtime,
     repo: Arc<Repo>,
     index: Arc<SearchIndex>,
+    index_slots: Arc<IndexSlots>,
     folder: std::sync::Mutex<Option<DocId>>,
     history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
 }
@@ -310,6 +329,11 @@ fn edit_counts(change: &Change) -> (u64, u64) {
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const LINK_TIMEOUT: Duration = Duration::from_secs(5);
 const HISTORY_CACHE_DOCS: usize = 8;
+const PREFETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many docs a prefetch level waits on and indexes at once. Every one of
+/// these holds a doc lock and, at the end, the index's single connection.
+const PREFETCH_CONCURRENCY: usize = 8;
+const PREFETCH_MAX_DOCS: usize = 500;
 const ADOPTED_FOLDER_TITLE: &str = "📦 Lush items from before you logged in";
 
 impl Core {
@@ -317,7 +341,7 @@ impl Core {
         let mut events = self.repo.subscribe();
         let repo = self.repo.clone();
         let index = self.index.clone();
-        let slots: Arc<IndexSlots> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let slots = self.index_slots.clone();
         self.runtime.spawn(async move {
             loop {
                 match events.recv().await {
@@ -337,11 +361,17 @@ impl Core {
         });
     }
 
+    /// Queue an index update for a doc a write path just touched. Goes through
+    /// the same per-doc slots as change events, so it can't race one, and the
+    /// caller isn't held for a read plus an FTS write.
     fn reindex_doc(&self, id: DocId) {
-        let repo = self.repo.clone();
-        let index = self.index.clone();
-        self.runtime
-            .block_on(async move { index_doc(repo, index, id).await });
+        let _guard = self.runtime.enter();
+        schedule_index_doc(
+            self.repo.clone(),
+            self.index.clone(),
+            self.index_slots.clone(),
+            id,
+        );
     }
 
     /// Run work on the core's runtime and hand the caller a future instead of
@@ -353,12 +383,14 @@ impl Core {
         F: std::future::Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.runtime
-            .spawn(fut)
-            .await
-            .map_err(|e| CoreError::General {
-                msg: format!("core task failed: {e}"),
-            })
+        self.runtime.spawn(fut).await.map_err(|e| {
+            let msg = if e.is_panic() {
+                "internal error (automerge panic); the change was not saved".into()
+            } else {
+                format!("core task failed: {e}")
+            };
+            CoreError::General { msg }
+        })
     }
 }
 
@@ -403,23 +435,34 @@ fn schedule_index_doc(
     });
 }
 
+/// The sqlite write runs on a blocking thread: the index is one connection
+/// behind a mutex, and a fan-out of index tasks would otherwise park that many
+/// runtime workers waiting for it.
 async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
     let url = id.to_url();
-    let indexed = repo
+    let indexed = match repo
         .read_doc(id, |doc| Ok(search::indexed_doc(url.clone(), doc)))
-        .await;
-    match indexed {
-        Ok(doc) if doc.kind == "rich" || doc.kind == "file" => {
-            if let Err(e) = index.upsert(doc) {
-                tracing::warn!(error = %e, "search index update failed");
-            }
+        .await
+    {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!(error = %e, "search index read failed");
+            return;
         }
-        Ok(_) => {
-            if let Err(e) = index.remove(&url) {
-                tracing::warn!(error = %e, "search index remove failed");
-            }
+    };
+    let searchable = indexed.kind == "rich" || indexed.kind == "file";
+    let written = tokio::task::spawn_blocking(move || {
+        if searchable {
+            index.upsert(indexed)
+        } else {
+            index.remove(&url)
         }
-        Err(e) => tracing::warn!(error = %e, "search index read failed"),
+    })
+    .await;
+    match written {
+        Ok(Err(e)) => tracing::warn!(error = %e, "search index write failed"),
+        Err(e) => tracing::warn!(error = %e, "search index task failed"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -488,6 +531,7 @@ impl Core {
             runtime,
             repo,
             index,
+            index_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             folder: std::sync::Mutex::new(None),
             history_cache: std::sync::Mutex::new(HashMap::new()),
         });
@@ -523,14 +567,15 @@ impl Core {
         });
     }
 
-    pub fn resync_doc(&self, url: String) -> Result<(), CoreError> {
+    pub async fn resync_doc(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let id = DocId::from_url(&url)?;
         self.history_cache.lock().unwrap().remove(&id);
-        self.runtime.block_on(async move {
+        self.run(async move {
             repo.drop_doc(id).await;
             repo.ensure_doc(id).await
-        })?;
+        })
+        .await??;
         Ok(())
     }
 
@@ -551,39 +596,41 @@ impl Core {
             return Vec::new();
         };
         let cached = self.history_cache.lock().unwrap().get(&id).cloned();
-        let history = self
+        // Only the change collection happens under the doc lock. Decoding each
+        // change's ops to count edits is the expensive half, and doing it here
+        // would stall every keystroke in the note whose history is being read.
+        let since = cached.as_ref().map(|c| c.heads.clone()).unwrap_or_default();
+        let snapshot = self
             .runtime
             .block_on(self.repo.read_doc(id, move |doc| {
-                let current_heads = normalized_heads(doc.get_heads());
-                if let Some(cached) = cached {
-                    if cached.heads == current_heads {
-                        return Ok(cached);
-                    }
-
-                    let changes = doc.get_changes(&cached.heads);
-                    if !cached.heads.is_empty() && !changes.is_empty() {
-                        let mut next = (*cached).clone();
-                        next.heads = current_heads;
-                        append_history_entries(&mut next, changes);
-                        return Ok(Arc::new(next));
-                    }
+                let heads = normalized_heads(doc.get_heads());
+                if !since.is_empty() && since == heads {
+                    return Ok((heads, Vec::new(), true));
                 }
-
-                let mut next = CachedDocHistory {
-                    heads: current_heads,
-                    frontier: HashSet::new(),
-                    known_hashes: HashSet::new(),
-                    entries: Vec::new(),
-                };
-                append_history_entries(&mut next, doc.get_changes(&[]));
-                Ok(Arc::new(next))
+                let changes = doc.get_changes(&since);
+                if !since.is_empty() && !changes.is_empty() {
+                    return Ok((heads, changes, true));
+                }
+                Ok((heads, doc.get_changes(&[]), false))
             }))
             .ok();
 
-        let Some(history) = history else {
+        let Some((heads, changes, incremental)) = snapshot else {
             return Vec::new();
         };
-        let entries = history.entries.clone();
+        let mut next = match (incremental, cached) {
+            (true, Some(cached)) => (*cached).clone(),
+            _ => CachedDocHistory {
+                heads: Vec::new(),
+                frontier: HashSet::new(),
+                known_hashes: HashSet::new(),
+                entries: Vec::new(),
+            },
+        };
+        next.heads = heads;
+        append_history_entries(&mut next, changes);
+        let entries = next.entries.clone();
+        let history = Arc::new(next);
         {
             let mut cache = self.history_cache.lock().unwrap();
             if cache.len() >= HISTORY_CACHE_DOCS && !cache.contains_key(&id) {
@@ -606,34 +653,42 @@ impl Core {
         let Ok(since) = decode_heads(heads) else {
             return Vec::new();
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, move |doc| {
-                let mut history = CachedDocHistory {
-                    heads: Vec::new(),
-                    frontier: since.iter().copied().collect(),
-                    known_hashes: HashSet::new(),
-                    entries: Vec::new(),
-                };
-                append_history_entries(&mut history, doc.get_changes(&since));
-                Ok(history.entries)
+        let changes = self
+            .runtime
+            .block_on(self.repo.read_doc(id, {
+                let since = since.clone();
+                move |doc| Ok(doc.get_changes(&since))
             }))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let mut history = CachedDocHistory {
+            heads: Vec::new(),
+            frontier: since.into_iter().collect(),
+            known_hashes: HashSet::new(),
+            entries: Vec::new(),
+        };
+        append_history_entries(&mut history, changes);
+        history.entries
     }
 
     pub fn is_connected(&self) -> bool {
         self.repo.is_connected()
     }
 
-    pub fn set_apply_incoming(&self, enabled: bool) {
+    /// Both of these walk every tracked doc, applying or publishing changes as
+    /// they go, so they are async: a repo with a few hundred docs open would
+    /// otherwise hold the caller for the length of that whole pass.
+    pub async fn set_apply_incoming(&self, enabled: bool) {
         let repo = self.repo.clone();
-        self.runtime
-            .block_on(async move { repo.set_apply_incoming(enabled).await });
+        let _ = self
+            .run(async move { repo.set_apply_incoming(enabled).await })
+            .await;
     }
 
-    pub fn set_send_changes(&self, enabled: bool) {
+    pub async fn set_send_changes(&self, enabled: bool) {
         let repo = self.repo.clone();
-        self.runtime
-            .block_on(async move { repo.set_send_changes(enabled).await });
+        let _ = self
+            .run(async move { repo.set_send_changes(enabled).await })
+            .await;
     }
 
     pub fn is_applying_incoming(&self) -> bool {
@@ -985,10 +1040,10 @@ impl Core {
     /// doc exists at `.tools.lush`, and on first login creates the
     /// "🍡 Lush notes" folder inside the account's root folder, seeding
     /// `.folders` and `.inbox` with it.
-    pub fn login_account(&self, account_url: String) -> Result<AccountState, CoreError> {
-        guarded(|| {
-            let repo = self.repo.clone();
-            let state = self.runtime.block_on(async move {
+    pub async fn login_account(&self, account_url: String) -> Result<AccountState, CoreError> {
+        let repo = self.repo.clone();
+        let state = self
+            .run(async move {
                 let account = DocId::from_url(&account_url)?;
                 repo.ensure_doc(account).await?;
                 if !repo.wait_for_doc(account, OPEN_TIMEOUT).await {
@@ -1070,9 +1125,9 @@ impl Core {
                     folders,
                     inbox,
                 })
-            })?;
-            Ok(state)
-        })
+            })
+            .await??;
+        Ok(state)
     }
 
     /// Fold pre-login local docs into the account just signed into: one folder
@@ -1081,15 +1136,15 @@ impl Core {
     /// already holds. That folder goes to the top of the account's root folder
     /// and is appended to the lush config's `.folders`. Returns the merged
     /// folder list.
-    pub fn adopt_local_docs(
+    pub async fn adopt_local_docs(
         &self,
         account_url: String,
         folder_urls: Vec<String>,
         doc_urls: Vec<String>,
     ) -> Result<Vec<String>, CoreError> {
-        guarded(|| {
-            let repo = self.repo.clone();
-            let folders = self.runtime.block_on(async move {
+        let repo = self.repo.clone();
+        let folders = self
+            .run(async move {
                 let account = DocId::from_url(&account_url)?;
                 let (root_url, config_url) = repo
                     .read_doc(account, |doc| {
@@ -1199,15 +1254,15 @@ impl Core {
                 repo.change_doc(config, move |doc| shapes::config_set_folders(doc, &urls))
                     .await?;
                 Ok::<_, anyhow::Error>(folders)
-            })?;
-            Ok(folders)
-        })
+            })
+            .await??;
+        Ok(folders)
     }
 
-    pub fn contact_info(&self, url: String) -> Option<ContactInfo> {
+    pub async fn contact_info(&self, url: String) -> Option<ContactInfo> {
         let id = DocId::from_url(&url).ok()?;
         let repo = self.repo.clone();
-        self.runtime.block_on(async move {
+        self.run(async move {
             let _ = repo.ensure_doc(id).await;
             if !repo.wait_for_doc(id, LINK_TIMEOUT).await {
                 return None;
@@ -1221,6 +1276,9 @@ impl Core {
             .await
             .ok()
         })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub fn config_state(&self, config_url: String) -> Option<ConfigState> {
@@ -1630,7 +1688,11 @@ impl Core {
     /// The folder entry's name and type come from the doc itself when the
     /// caller has none — picker-created patchwork docs arrive here with no
     /// title, and their type is whatever their datatype says, not "rich".
-    pub fn link_note_to_folder(&self, note_url: String, title: String) -> Result<(), CoreError> {
+    pub async fn link_note_to_folder(
+        &self,
+        note_url: String,
+        title: String,
+    ) -> Result<(), CoreError> {
         let folder = self
             .folder
             .lock()
@@ -1639,7 +1701,7 @@ impl Core {
                 msg: "no folder open".into(),
             })?;
         let repo = self.repo.clone();
-        self.runtime.block_on(async move {
+        self.run(async move {
             let mut name = title;
             let mut kind = "rich".to_string();
             if let Ok(id) = DocId::from_url(&note_url) {
@@ -1673,7 +1735,8 @@ impl Core {
             })
             .await?;
             Ok::<_, anyhow::Error>(())
-        })?;
+        })
+        .await??;
         Ok(())
     }
 
@@ -1738,41 +1801,61 @@ impl Core {
     /// Start tracking + syncing docs without waiting for them to arrive,
     /// recursing into subfolders. Once a doc lands, its legacy scalar
     /// strings are normalized to Text.
+    /// Walks breadth-first. Every doc in a level is asked for before any of
+    /// them is waited on, so one doc the server doesn't have costs the level
+    /// one timeout rather than costing every doc behind it thirty seconds.
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
         let index = self.index.clone();
         self.runtime.spawn(async move {
-            let mut indexing = Vec::new();
-            let mut visited = std::collections::HashSet::new();
-            let mut queue: Vec<String> = urls;
-            while let Some(url) = queue.pop() {
-                let Ok(id) = DocId::from_url(&url) else {
-                    continue;
-                };
-                if !visited.insert(id) || visited.len() > 500 {
-                    continue;
+            let mut visited = HashSet::new();
+            let mut level: Vec<DocId> = urls
+                .iter()
+                .filter_map(|url| DocId::from_url(url).ok())
+                .filter(|id| visited.insert(*id))
+                .collect();
+            while !level.is_empty() {
+                for id in &level {
+                    let _ = repo.ensure_doc(*id).await;
                 }
-                if repo.ensure_doc(id).await.is_err() {
-                    continue;
-                }
-                if !repo.wait_for_doc(id, Duration::from_secs(30)).await {
-                    continue;
-                }
-                let _ = repo
-                    .change_doc(id, |doc| shapes::normalize_strings(doc))
-                    .await;
-                indexing.push(tokio::spawn(index_doc(repo.clone(), index.clone(), id)));
-                if let Ok(entries) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
-                    for entry in entries {
-                        queue.push(entry.url);
+                let found = futures::stream::iter(level.drain(..).map(|id| {
+                    let repo = repo.clone();
+                    let index = index.clone();
+                    async move {
+                        if !repo.wait_for_doc(id, PREFETCH_TIMEOUT).await {
+                            return Vec::new();
+                        }
+                        let _ = repo
+                            .change_doc(id, |doc| shapes::normalize_strings(doc))
+                            .await;
+                        index_doc(repo.clone(), index, id).await;
+                        let mut children: Vec<String> = repo
+                            .read_doc(id, |doc| shapes::folder_entries(doc))
+                            .await
+                            .map(|entries| entries.into_iter().map(|e| e.url).collect())
+                            .unwrap_or_default();
+                        if let Ok(embeds) =
+                            repo.read_doc(id, |doc| Ok(shapes::embed_urls(doc))).await
+                        {
+                            children.extend(embeds);
+                        }
+                        children
+                    }
+                }))
+                .buffer_unordered(PREFETCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+                for url in found.into_iter().flatten() {
+                    if visited.len() >= PREFETCH_MAX_DOCS {
+                        break;
+                    }
+                    let Ok(id) = DocId::from_url(&url) else {
+                        continue;
+                    };
+                    if visited.insert(id) {
+                        level.push(id);
                     }
                 }
-                if let Ok(embeds) = repo.read_doc(id, |doc| Ok(shapes::embed_urls(doc))).await {
-                    queue.extend(embeds);
-                }
-            }
-            for task in indexing {
-                let _ = task.await;
             }
             repo.announce_notes_prefetched();
         });
@@ -1830,7 +1913,7 @@ impl Core {
     }
 
     /// Write Vision OCR + description onto a UnixFileEntry doc.
-    pub fn update_asset_vision(
+    pub async fn update_asset_vision(
         &self,
         url: String,
         description: String,
@@ -1838,7 +1921,7 @@ impl Core {
     ) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let reindex_url = url.clone();
-        self.runtime.block_on(async move {
+        self.run(async move {
             let id = DocId::from_url(&url)?;
             repo.ensure_doc(id).await?;
             if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
@@ -1849,7 +1932,8 @@ impl Core {
             })
             .await?;
             Ok::<_, anyhow::Error>(())
-        })?;
+        })
+        .await??;
         self.reindex_doc(DocId::from_url(&reindex_url)?);
         Ok(())
     }
@@ -1877,7 +1961,7 @@ impl Core {
     }
 
     /// Write generated ML metadata onto a UnixFileEntry doc.
-    pub fn update_asset_ml(
+    pub async fn update_asset_ml(
         &self,
         url: String,
         summary: String,
@@ -1886,7 +1970,7 @@ impl Core {
     ) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let reindex_url = url.clone();
-        self.runtime.block_on(async move {
+        self.run(async move {
             let id = DocId::from_url(&url)?;
             repo.ensure_doc(id).await?;
             if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
@@ -1897,7 +1981,8 @@ impl Core {
             })
             .await?;
             Ok::<_, anyhow::Error>(())
-        })?;
+        })
+        .await??;
         self.reindex_doc(DocId::from_url(&reindex_url)?);
         Ok(())
     }
@@ -2278,6 +2363,12 @@ impl Core {
         self.index.recent_notes(limit).unwrap_or_default()
     }
 
+    /// Every indexed doc, newest first, minus its text. What a saved search
+    /// walks when its rules ask about titles, tags, kinds or days.
+    pub fn indexed_notes(&self, limit: u32) -> Vec<IndexedNote> {
+        self.index.indexed_notes(limit).unwrap_or_default()
+    }
+
     /// Unix seconds of the newest change in the doc (0 when unknown).
     pub fn note_modified(&self, url: String) -> i64 {
         let Ok(id) = DocId::from_url(&url) else {
@@ -2363,10 +2454,10 @@ impl Core {
 
     /// Full-history fork of a doc installed as a new repo doc. `cloned_at`
     /// is the source's heads at fork time.
-    pub fn clone_doc(&self, url: String) -> Result<CloneResult, CoreError> {
-        guarded(|| {
-            let repo = self.repo.clone();
-            let result = self.runtime.block_on(async move {
+    pub async fn clone_doc(&self, url: String) -> Result<CloneResult, CoreError> {
+        let repo = self.repo.clone();
+        let result = self
+            .run(async move {
                 let id = DocId::from_url(&url)?;
                 repo.ensure_doc(id).await?;
                 if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
@@ -2385,18 +2476,22 @@ impl Core {
                     clone_url: clone.to_url(),
                     cloned_at,
                 })
-            })?;
-            Ok(result)
-        })
+            })
+            .await??;
+        Ok(result)
     }
 
     /// Plain automerge merge of `from` into `into`; returns the target's
     /// heads after the merge.
-    pub fn merge_doc(&self, into_url: String, from_url: String) -> Result<Vec<String>, CoreError> {
-        guarded(|| {
-            let repo = self.repo.clone();
-            let reindex_url = into_url.clone();
-            let heads = self.runtime.block_on(async move {
+    pub async fn merge_doc(
+        &self,
+        into_url: String,
+        from_url: String,
+    ) -> Result<Vec<String>, CoreError> {
+        let repo = self.repo.clone();
+        let reindex_url = into_url.clone();
+        let heads = self
+            .run(async move {
                 let into = DocId::from_url(&into_url)?;
                 let from = DocId::from_url(&from_url)?;
                 repo.ensure_doc(from).await?;
@@ -2415,10 +2510,10 @@ impl Core {
                 .await?;
                 repo.read_doc(into, |doc| Ok(encode_heads(doc.get_heads())))
                     .await
-            })?;
-            self.reindex_doc(DocId::from_url(&reindex_url)?);
-            Ok(heads)
-        })
+            })
+            .await??;
+        self.reindex_doc(DocId::from_url(&reindex_url)?);
+        Ok(heads)
     }
 
     pub fn create_draft_doc(&self, parent_url: String, is_main: bool) -> Result<String, CoreError> {
@@ -2728,7 +2823,7 @@ mod tests {
         )
         .unwrap();
         let source_heads = heads(&core, &note);
-        let result = core.clone_doc(note.clone()).unwrap();
+        let result = core.runtime.block_on(core.clone_doc(note.clone())).unwrap();
         assert_ne!(result.clone_url, note);
         assert_eq!(result.cloned_at, source_heads);
         assert_eq!(full_text(&core, &result.clone_url), full_text(&core, &note));
@@ -2748,7 +2843,11 @@ mod tests {
             heads(&core, &note),
         )
         .unwrap();
-        let clone = core.clone_doc(note.clone()).unwrap().clone_url;
+        let clone = core
+            .runtime
+            .block_on(core.clone_doc(note.clone()))
+            .unwrap()
+            .clone_url;
         core.splice_note_text(
             clone.clone(),
             6,
@@ -2758,7 +2857,10 @@ mod tests {
             heads(&core, &clone),
         )
         .unwrap();
-        let merged_heads = core.merge_doc(note.clone(), clone).unwrap();
+        let merged_heads = core
+            .runtime
+            .block_on(core.merge_doc(note.clone(), clone))
+            .unwrap();
         assert_eq!(full_text(&core, &note), "hello from the draft");
         assert_eq!(merged_heads, heads(&core, &note));
     }

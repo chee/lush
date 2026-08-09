@@ -202,7 +202,7 @@ struct FolderCommands: Commands {
 struct ViewCommands: Commands {
     @AppStorage(EditorSettings.zenModeKey) private var zenMode = false
     @AppStorage(EditorSettings.typewriterModeKey) private var typewriterMode = false
-    @AppStorage(EditorSettings.minimapKey) private var minimapVisible = true
+    @AppStorage(EditorSettings.minimapKey) private var minimapVisible = false
 
     var body: some Commands {
         CommandGroup(after: .toolbar) {
@@ -408,7 +408,6 @@ struct LushApp: App {
                     async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
                     await server
-                    contextTracker.start()
                 }
         }
         .windowToolbarStyle(.unified(showsTitle: false))
@@ -430,7 +429,6 @@ struct LushApp: App {
                         async let server: Void = LocalSyncServer.startIfNeeded()
                         await model.start()
                         await server
-                        contextTracker.start()
                     }
             }
         }
@@ -470,7 +468,6 @@ struct LushApp: App {
                     async let server: Void = LocalSyncServer.startIfNeeded()
                     await model.start()
                     await server
-                    contextTracker.start()
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(

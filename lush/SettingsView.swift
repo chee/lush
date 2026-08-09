@@ -434,6 +434,7 @@ struct FontsSettingsPane: View {
 }
 
 struct PageSettingsPane: View {
+    @AppStorage(EditorSettings.minimapKey) private var minimapVisible = false
     @State private var limitWidth = EditorSettings.maxNoteCharacters > 0
     @State private var characters = EditorSettings.maxNoteCharacters > 0
         ? EditorSettings.maxNoteCharacters
@@ -458,6 +459,17 @@ struct PageSettingsPane: View {
                 Text("Width")
             } footer: {
                 Text("A note stops growing at the measure and centres itself. The measure is in characters of the body font, so it follows the base size.")
+            }
+
+            Section {
+                Toggle("Show minimap", isOn: Binding(
+                    get: { minimapVisible },
+                    set: { EditorSettings.setMinimapVisible($0) }
+                ))
+            } header: {
+                Text("Minimap")
+            } footer: {
+                Text("A scaled outline of the note down the right edge. Click or drag it to jump.")
             }
         }
         .formStyle(.grouped)
@@ -592,6 +604,7 @@ struct LoglineSettingsPane: View {
                 importStatus = nil
             }
         }
+        .task { contextTracker.start() }
     }
 
     private var currentCoordinate: CLLocationCoordinate2D? {

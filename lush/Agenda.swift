@@ -287,6 +287,22 @@ struct CalendarSidebarLabel: View {
     }
 }
 
+struct LocalEvent: Sendable {
+    var identifier: String?
+    var itemIdentifier: String
+    var externalIdentifier: String?
+    var start: Date?
+    var repeats: Bool
+
+    init(_ event: EKEvent) {
+        identifier = event.eventIdentifier
+        itemIdentifier = event.calendarItemIdentifier
+        externalIdentifier = event.calendarItemExternalIdentifier
+        start = event.occurrenceDate ?? event.startDate
+        repeats = event.hasRecurrenceRules
+    }
+}
+
 @MainActor
 @Observable
 final class AgendaStore {
@@ -315,13 +331,12 @@ final class AgendaStore {
     /// just its master; detached occurrences come back alongside it, and the
     /// one starting nearest the occurrence the note was taken at is the one
     /// she meant.
-    func localEvent(uid: String, occurrence: Date?) -> EKEvent? {
+    func localEvent(uid: String, occurrence: Date?) async -> LocalEvent? {
         guard access == .fullAccess else { return nil }
-        let events = items(for: uid).compactMap { $0 as? EKEvent }
+        let events = await items(for: uid)
         guard let occurrence, events.count > 1 else { return events.first }
-        func gap(_ event: EKEvent) -> TimeInterval {
-            let start = event.occurrenceDate ?? event.startDate ?? .distantPast
-            return abs(start.timeIntervalSince(occurrence))
+        func gap(_ event: LocalEvent) -> TimeInterval {
+            abs((event.start ?? .distantPast).timeIntervalSince(occurrence))
         }
         return events.min { gap($0) < gap($1) }
     }
@@ -329,10 +344,15 @@ final class AgendaStore {
     /// Notes written before links moved to the shared UID stored this device's
     /// `eventIdentifier` instead — but that is `<store UUID>:<uid>`, so the uid
     /// is still in there and those notes keep working without being rewritten.
-    private func items(for uid: String) -> [EKCalendarItem] {
-        let found = store.calendarItems(withExternalIdentifier: uid)
-        guard found.isEmpty, let colon = uid.firstIndex(of: ":") else { return found }
-        return store.calendarItems(withExternalIdentifier: String(uid[uid.index(after: colon)...]))
+    private func items(for uid: String) async -> [LocalEvent] {
+        let store = self.store
+        return await Task.detached {
+            var found = store.calendarItems(withExternalIdentifier: uid)
+            if found.isEmpty, let colon = uid.firstIndex(of: ":") {
+                found = store.calendarItems(withExternalIdentifier: String(uid[uid.index(after: colon)...]))
+            }
+            return found.compactMap { $0 as? EKEvent }.map(LocalEvent.init)
+        }.value
     }
 
     /// Opens the item where the note means it. Everything is built from the
@@ -340,7 +360,7 @@ final class AgendaStore {
     /// detached occurrence carries `/RID=` on its UID; Calendar wants the master
     /// it broke off from, with the date doing the work of picking the instance.
     @discardableResult
-    func openExternally(for id: String) -> Bool {
+    func openExternally(for id: String) async -> Bool {
         if id.hasPrefix(Agenda.reminderPrefix) {
             let uuid = String(id.dropFirst(Agenda.reminderPrefix.count))
             guard let url = URL(string: "x-apple-reminderkit://REMCDReminder/\(uuid)") else { return false }
@@ -349,8 +369,8 @@ final class AgendaStore {
         }
         let key = Agenda.eventKey(id)
         let master = key.uid.components(separatedBy: "/RID=").first ?? key.uid
-        guard let event = localEvent(uid: master, occurrence: key.occurrence),
-              let identifier = event.eventIdentifier
+        guard let event = await localEvent(uid: master, occurrence: key.occurrence),
+              let identifier = event.identifier
         else { return false }
         #if os(macOS)
         // The event link travels to where the event *starts*, which for a
@@ -359,7 +379,7 @@ final class AgendaStore {
         // of whatever Calendar already shows, but won't travel to it. So a
         // series is scripted to the day first, then sent the link that selects
         // it once it is there.
-        guard let occurrence = key.occurrence, event.hasRecurrenceRules else {
+        guard let occurrence = key.occurrence, event.repeats else {
             guard let url = URL(
                 string: "ical://ekevent/\(Agenda.escapePath(identifier))?method=show&options=more"
             ) else { return false }
@@ -368,7 +388,7 @@ final class AgendaStore {
         }
         let stamp = Agenda.occurrenceStamp.string(from: occurrence)
         guard let select = URL(
-            string: "ical://occurrence/\(stamp)/\(event.calendarItemIdentifier)?method=show&options=more"
+            string: "ical://occurrence/\(stamp)/\(event.itemIdentifier)?method=show&options=more"
         ) else { return false }
         // Scripting Calendar blocks until it has launched and navigated, which
         // is far too long to hold the main actor. The script is built and run
@@ -381,9 +401,9 @@ final class AgendaStore {
         #else
         // iOS carries the occurrence in the link itself and needs none of this.
         guard let uuid = identifier.components(separatedBy: ":").first,
-              let external = event.calendarItemExternalIdentifier
+              let external = event.externalIdentifier
         else { return false }
-        let when = key.occurrence ?? event.occurrenceDate ?? event.startDate ?? Date()
+        let when = key.occurrence ?? event.start ?? Date()
         let seconds = Int(when.timeIntervalSinceReferenceDate)
         guard let url = URL(
             string: "x-apple-calevent://\(uuid)/\(Agenda.escapeStrict(external))?o=\(seconds)"
@@ -497,6 +517,13 @@ enum CalendarLinks {
     static let changed = Notification.Name("io.lush.calendarLinksChanged")
 
     private static let key = "calendarEventNotes"
+    private static let headsKey = "calendarEventNoteHeads"
+
+    /// The doc state each note was last read at, so a rebuild only opens the
+    /// notes that have actually moved since.
+    static var scannedHeads: [String: String] {
+        UserDefaults.standard.dictionary(forKey: headsKey) as? [String: String] ?? [:]
+    }
 
     private static var map: [String: [String]] {
         UserDefaults.standard.dictionary(forKey: key) as? [String: [String]] ?? [:]
@@ -528,7 +555,10 @@ enum CalendarLinks {
     /// rebuilt from their spans — which is how it reaches a second device,
     /// where the notes sync but this index never did. Only the notes actually
     /// read are replaced; the rest keep whatever they had.
-    static func replace(_ links: [String: [String]], scanned: Set<String>) {
+    static func replace(_ links: [String: [String]], scanned: Set<String>, heads: [String: String]) {
+        var nextHeads = scannedHeads
+        nextHeads.merge(heads) { _, new in new }
+        UserDefaults.standard.set(nextHeads, forKey: headsKey)
         var next = map.filter { !scanned.contains($0.key) }
         next.merge(links) { _, new in new }
         guard next != map else { return }
@@ -591,9 +621,9 @@ extension BlockValue {
 
     @MainActor
     @discardableResult
-    func openExternally() -> Bool {
+    func openExternally() async -> Bool {
         guard opensExternally, let id = attrs["event"]?.stringValue else { return false }
-        return AgendaStore.shared.openExternally(for: id)
+        return await AgendaStore.shared.openExternally(for: id)
     }
 
     var calendarEventTitle: String? {
@@ -701,7 +731,7 @@ struct CalendarEventInlineView: View {
 
 extension AgendaItem {
     @MainActor
-    func openExternally() { AgendaStore.shared.openExternally(for: id) }
+    func openExternally() { Task { await AgendaStore.shared.openExternally(for: id) } }
 }
 
 extension NotesModel {

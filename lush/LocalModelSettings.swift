@@ -336,6 +336,7 @@ enum LocalModelSettings {
     }
 
     static func isConnected(_ backend: LocalModelBackend) -> Bool {
+        if backend == .mlx { return LocalLLMRuntime.isLinked }
         guard backend.needsAPIKey else { return true }
         return !ModelCredentialStore.apiKey(for: backend).isEmpty
     }

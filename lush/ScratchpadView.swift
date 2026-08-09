@@ -231,6 +231,7 @@ private struct PadCanvasView: View {
     /// Where a selection drag has got to, before it is written to the pad.
     @State private var selectionOffset: CGSize = .zero
     @State private var marquee: CGRect?
+    @State private var inkCache = InkPathCache()
 
     private var store: PadStore { model.pads }
 
@@ -343,25 +344,25 @@ private struct PadCanvasView: View {
     }
 
     private func inkLayer(_ size: CGSize) -> some View {
-        Canvas { context, _ in
-            for item in items where item.padKind == .ink {
-                guard let stroke = item.stroke else { continue }
-                let shift = selection.contains(item.id)
-                    ? CGVector(dx: item.x + selectionOffset.width, dy: item.y + selectionOffset.height)
-                    : CGVector(dx: item.x, dy: item.y)
-                context.fill(
-                    Freehand.outline(stroke.translated(by: shift)),
-                    with: .color(PadInk.color(stroke.color))
-                )
-            }
-            if live.count > 0 {
+        StoredInkLayer(
+            items: items,
+            selection: selection,
+            selectionOffset: selectionOffset,
+            size: size,
+            cache: inkCache
+        )
+        .equatable()
+        .overlay {
+            Canvas { context, _ in
+                guard live.count > 0 else { return }
                 context.fill(
                     Freehand.outline(InkStroke(color: inkColor, size: inkSize, points: live)),
                     with: .color(PadInk.color(inkColor))
                 )
             }
+            .frame(width: size.width, height: size.height)
+            .allowsHitTesting(false)
         }
-        .frame(width: size.width, height: size.height)
         // the capture rides on the ink layer rather than beside it, so a point
         // taken from a touch is the point the stroke is drawn at
         .overlay {
@@ -621,6 +622,53 @@ private struct PadCanvasView: View {
 
 // MARK: - cards
 
+final class InkPathCache {
+    private var drawings: [String: (path: Path, color: Color)] = [:]
+
+    func drawing(for item: PadItem) -> (path: Path, color: Color)? {
+        let key = "\(item.id)|\(item.data)"
+        if let cached = drawings[key] { return cached }
+        guard let stroke = item.stroke else { return nil }
+        if drawings.count > 512 { drawings.removeAll() }
+        let drawing = (Freehand.outline(stroke), PadInk.color(stroke.color))
+        drawings[key] = drawing
+        return drawing
+    }
+}
+
+private struct StoredInkLayer: View, Equatable {
+    let items: [PadItem]
+    let selection: Set<String>
+    let selectionOffset: CGSize
+    let size: CGSize
+    let cache: InkPathCache
+
+    static func == (a: StoredInkLayer, b: StoredInkLayer) -> Bool {
+        a.size == b.size
+            && a.selectionOffset == b.selectionOffset
+            && a.selection == b.selection
+            && a.items == b.items
+    }
+
+    var body: some View {
+        Canvas { context, _ in
+            for item in items where item.padKind == .ink {
+                guard let drawing = cache.drawing(for: item) else { continue }
+                let shift = selection.contains(item.id)
+                    ? CGSize(width: item.x + selectionOffset.width, height: item.y + selectionOffset.height)
+                    : CGSize(width: item.x, height: item.y)
+                context.fill(
+                    drawing.path.applying(
+                        CGAffineTransform(translationX: shift.width, y: shift.height)
+                    ),
+                    with: .color(drawing.color)
+                )
+            }
+        }
+        .frame(width: size.width, height: size.height)
+    }
+}
+
 private struct PadCardView: View {
     let item: PadItem
     let padUrl: String
@@ -635,6 +683,7 @@ private struct PadCardView: View {
     @State private var dragOffset: CGSize = .zero
     @State private var resize: CGSize = .zero
     @State private var editing = false
+    @State private var attributed = NSAttributedString()
 
     private var store: PadStore { model.pads }
 
@@ -688,6 +737,12 @@ private struct PadCardView: View {
             y: item.y + dragOffset.height + offset.height
         )
         .contextMenu { menu }
+        .onChange(of: item.data, initial: true) { renderText() }
+        .onChange(of: store.version) { renderText() }
+    }
+
+    private func renderText() {
+        attributed = RichText.attributed(from: item.spans, cache: store.cache)
     }
 
     @ViewBuilder
@@ -772,10 +827,6 @@ private struct PadCardView: View {
                     .onEnded { moved(by: $0.translation) }
             )
         #endif
-    }
-
-    private var attributed: NSAttributedString {
-        RichText.attributed(from: item.spans, cache: store.cache)
     }
 
     @ViewBuilder

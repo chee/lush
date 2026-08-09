@@ -6,6 +6,15 @@ import MLXLMCommon
 #endif
 
 enum LocalLLMRuntime {
+    /// Whether this build can run an MLX model at all.
+    static var isLinked: Bool {
+        #if canImport(MLXLLM)
+        true
+        #else
+        false
+        #endif
+    }
+
     enum RuntimeError: LocalizedError {
         case packageUnavailable
         case modelNotConfigured

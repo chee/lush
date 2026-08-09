@@ -55,7 +55,7 @@ final class NotesModel {
         changingIncomingChanges = true
         Task { [weak self] in
             let actual = await Task.detached {
-                core.setApplyIncoming(enabled: enabled)
+                await core.setApplyIncoming(enabled: enabled)
                 return core.isApplyingIncoming()
             }.value
             guard let self else { return }
@@ -74,7 +74,7 @@ final class NotesModel {
         changingSendingChanges = true
         Task { [weak self] in
             let actual = await Task.detached {
-                core.setSendChanges(enabled: enabled)
+                await core.setSendChanges(enabled: enabled)
                 return core.isSendingChanges()
             }.value
             guard let self else { return }
@@ -118,7 +118,6 @@ final class NotesModel {
     var selectedNoteUrl: String? {
         didSet {
             UserDefaults.standard.set(selectedNoteUrl, forKey: Self.lastOpenNoteKey)
-            saveLaunchSnapshot()
             #if os(macOS)
             updateDockTilePreview()
             #endif
@@ -126,11 +125,13 @@ final class NotesModel {
     }
     var pendingFocusUrl: String?
     var status: String = "Starting…"
-    var previews: [String: String] = [:]
-    private(set) var contextMetas: [String: NoteContextMeta] = [:]
+    @ObservationIgnored private var noteRows: [String: NoteRow] = [:]
     var rootFolderUrl: String? { rootFolderUrls.first }
     var rootFolderUrls: [String] = []
-    var folderTree: [FolderNode] = []
+    var folderTree: [FolderNode] = [] {
+        didSet { rebuildNodeIndex() }
+    }
+    private var nodeIndex: [String: FolderNode] = [:]
     let focus = FocusModes()
 
     /// The sidebar's tree, cut down to the folders the running Focus allows. A
@@ -192,36 +193,30 @@ final class NotesModel {
     @ObservationIgnored private var maintenanceTask: Task<Void, Never>?
     @ObservationIgnored private var documentHistoryCache: [String: DocumentHistorySummary] = [:]
     @ObservationIgnored private var snapshotCache: [HistorySnapshotKey: NoteSpansSnapshot] = [:]
+    @ObservationIgnored private var snapshotRecency: [HistorySnapshotKey] = []
     @ObservationIgnored private var renderedSnapshotCache: [HistorySnapshotKey: NSAttributedString] = [:]
-    private(set) var thumbnails: [String: Data] = [:]
+    @ObservationIgnored private var renderedRecency: [HistorySnapshotKey] = []
+    private static let snapshotCacheCapacity = 12
     @ObservationIgnored private var pendingRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var pendingSmartNotebookCheckTask: Task<Void, Never>?
+    @ObservationIgnored private var widgetSnapshotTask: Task<Void, Never>?
+    @ObservationIgnored private var lastWidgetSnapshot: LushWidgetSnapshot?
     private var lastKnownCounts: [String: Int] = [:]
     private static let patchworkDocUrlsKey = "patchworkDocUrls"
-    private static let launchSnapshotFileName = "LaunchStateSnapshot.json"
     private static let bootStart = Date()
     private(set) var patchworkDocUrls: Set<String> = Set(
         UserDefaults.standard.stringArray(forKey: patchworkDocUrlsKey) ?? []
     )
     @ObservationIgnored private var folderNodeCache: [String: (heads: [String], node: FolderNode)] = [:]
-    /// Every tree walk is detached and they overlap freely at launch. A walk
-    /// only publishes if nothing newer has started since it did.
     @ObservationIgnored private var treeGeneration = 0
+    @ObservationIgnored private var refreshGeneration = 0
     /// Notes whose preview + thumbnail have been read from the core. A refresh
     /// must not re-read the whole tree; docChanged drops the entries it stales.
     @ObservationIgnored private var metaFetched: Set<String> = []
-    @ObservationIgnored private var launchNoteSnapshots: [String: NoteSpansSnapshot] = [:]
-    @ObservationIgnored private var launchSnapshotOrder: [String] = []
-    @ObservationIgnored private var launchSnapshotSaveTask: Task<Void, Never>?
-    private static let launchSnapshotNoteCap = 8
+    @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
 
     init() {
-        if let saved = Self.loadLaunchSnapshot() {
-            launchNoteSnapshots = saved.noteSnapshots
-            launchSnapshotOrder = Array(saved.noteSnapshots.keys)
-            selectedNoteUrl = saved.selectedNoteUrl
-        }
         Self.bootLog("model init")
         pads.attach(self)
     }
@@ -244,9 +239,6 @@ final class NotesModel {
     }
 
     private static let lastOpenNoteKey = "lastOpenNoteUrl"
-    private static let appGroupIdentifier = "group.party.chee.patchwork.lush"
-    private static let widgetSnapshotFileName = "LushWidgetSnapshot.json"
-    private static let folderContentWidgetKind = "FolderContentWidget"
 
     private(set) var accountUrl: String? = LushShared.accountUrl
     private(set) var accountUrls: [String] = LushShared.accountUrls
@@ -272,15 +264,14 @@ final class NotesModel {
 
     var loggedIn: Bool { accountUrl != nil }
 
+    /// Same rule as the web side's `parseAccountInput`: `account:name/DocumentId`
+    /// with exactly one slash, and an alphanumeric document id either way.
     static func normalizedAccountUrl(_ raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("automerge:") { return trimmed }
-        if trimmed.hasPrefix("account:") {
-            let rest = trimmed.dropFirst("account:".count)
-            guard let id = rest.split(separator: "/").last, !id.isEmpty else { return nil }
-            return "automerge:" + id
-        }
-        return nil
+        let candidate = trimmed.wholeMatch(of: /account:[^\/]+\/([A-Za-z0-9]+)/)
+            .map { "automerge:" + $0.1 } ?? trimmed
+        guard candidate.wholeMatch(of: /automerge:[A-Za-z0-9]+/) != nil else { return nil }
+        return candidate
     }
 
     func logIn(accountUrl url: String) async -> Bool {
@@ -304,12 +295,12 @@ final class NotesModel {
         let localDocs = loggedIn ? [] : ([localScratchpad].compactMap { $0 } + CalendarLinks.noteUrls)
         do {
             var state = try await Task.detached {
-                try core.loginAccount(accountUrl: normalized)
+                try await core.loginAccount(accountUrl: normalized)
             }.value
             if !localFolders.isEmpty || !localDocs.isEmpty {
                 let account = state.accountUrl
                 let merged = await Task.detached { () -> [String]? in
-                    try? core.adoptLocalDocs(
+                    try? await core.adoptLocalDocs(
                         accountUrl: account,
                         folderUrls: localFolders,
                         docUrls: localDocs
@@ -401,7 +392,7 @@ final class NotesModel {
         }
         guard let contactUrl = state.contactUrl, let core else { return }
         presenceContactUrl = contactUrl
-        let info = await Task.detached { core.contactInfo(url: contactUrl) }.value
+        let info = await Task.detached { await core.contactInfo(url: contactUrl) }.value
         contactName = info?.name
         if let name = info?.name, !name.isEmpty {
             accountNames[state.accountUrl] = name
@@ -499,74 +490,9 @@ final class NotesModel {
         LushShared.rootFolderUrls = rootFolderUrls
     }
 
-    private static func bootLog(_ message: String) {
+    nonisolated private static func bootLog(_ message: String) {
         let ms = Int(Date().timeIntervalSince(bootStart) * 1000)
         NSLog("lush boot +%dms %@", ms, message)
-    }
-
-    private static func loadLaunchSnapshot() -> NotesLaunchSnapshot? {
-        guard let data = try? Data(contentsOf: launchSnapshotURL) else { return nil }
-        return try? JSONDecoder().decode(NotesLaunchSnapshot.self, from: data)
-    }
-
-    /// Keeps only the last few opened notes' snapshots; boot needs the
-    /// last-open note, not every note ever visited.
-    private func cacheLaunchSnapshot(_ url: String, _ snapshot: NoteSpansSnapshot) {
-        launchNoteSnapshots[url] = snapshot
-        launchSnapshotOrder.removeAll { $0 == url }
-        launchSnapshotOrder.append(url)
-        while launchSnapshotOrder.count > Self.launchSnapshotNoteCap {
-            launchNoteSnapshots.removeValue(forKey: launchSnapshotOrder.removeFirst())
-        }
-    }
-
-    /// Debounced; the encode and write run off the main actor.
-    private func saveLaunchSnapshot() {
-        launchSnapshotSaveTask?.cancel()
-        launchSnapshotSaveTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(500))
-            guard !Task.isCancelled, let self else { return }
-            let snapshot = NotesLaunchSnapshot(
-                rootFolderUrls: self.rootFolderUrls,
-                folderUrl: self.folderUrl,
-                folderTitle: self.folderTitle,
-                selectedNoteUrl: self.selectedNoteUrl,
-                notes: self.notes,
-                folderTree: self.folderTree,
-                previews: self.previews,
-                thumbnails: self.thumbnails,
-                noteSnapshots: self.launchNoteSnapshots
-            )
-            let url = Self.launchSnapshotURL
-            await Task.detached(priority: .utility) {
-                guard let data = try? JSONEncoder().encode(snapshot) else { return }
-                try? FileManager.default.createDirectory(
-                    at: url.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try? data.write(to: url, options: [.atomic])
-            }.value
-        }
-    }
-
-    private static var launchSnapshotURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Lush", isDirectory: true)
-            .appendingPathComponent(launchSnapshotFileName)
-    }
-
-    private func refreshCachedOpenNote(_ url: String) {
-        Task { @MainActor [weak self] in
-            await self?.start()
-            guard let self, let core = self.core else { return }
-            try? await core.openNote(url: url)
-            guard let snapshot = try? await core.noteSpansSnapshot(url: url),
-                  !snapshot.heads.isEmpty
-            else { return }
-            self.cacheLaunchSnapshot(url, snapshot)
-            self.saveLaunchSnapshot()
-            self.notifyNoteObservers(url)
-        }
     }
 
     func start() async {
@@ -592,14 +518,18 @@ final class NotesModel {
         do {
             let dataDir = LushShared.coreDataDirectory()
             var saved = LushShared.rootFolderUrls
+            Self.bootLog("core paths read")
             let core = try await Task.detached {
-                try Core(dataDir: dataDir.path, serverUrl: nil)
+                Self.bootLog("core init entered")
+                let core = try Core(dataDir: dataDir.path, serverUrl: nil)
+                Self.bootLog("core init returned")
+                return core
             }.value
             Self.bootLog("Core constructed")
             self.core = core
             LushAgentServer.shared.start(model: self)
-            core.setApplyIncoming(enabled: applyingIncomingChanges)
-            core.setSendChanges(enabled: sendingChanges)
+            await core.setApplyIncoming(enabled: applyingIncomingChanges)
+            await core.setSendChanges(enabled: sendingChanges)
             applyingIncomingChanges = core.isApplyingIncoming()
             sendingChanges = core.isSendingChanges()
             PatchworkWeb.coreServerPort = core.localServerPort()
@@ -613,22 +543,10 @@ final class NotesModel {
             connected = core.isConnected()
             Self.bootLog("Core bridged")
 
-            // Determine the priority note — the one we know we're opening —
-            // so we can kick off its storage load before the full folder tree.
-            let priorityNoteUrl: String? = {
-                if case .note(let url) = AppRouter.shared.pending { return url }
-                if saved.first != nil {
-                    return UserDefaults.standard.string(forKey: Self.lastOpenNoteKey)
-                }
-                return nil
-            }()
-            if let last = priorityNoteUrl {
-                selectedNoteUrl = last
-                // Start loading this note immediately — before refreshNotes fans
-                // out across the entire folder tree, so it gets first access to
-                // the storage layer and its ensure_doc background-sync task is
-                // queued before the flood of others.
-                core.prefetchNotes(urls: [last])
+            if case .note(let url) = AppRouter.shared.pending {
+                selectedNoteUrl = url
+            } else if saved.first != nil {
+                selectedNoteUrl = UserDefaults.standard.string(forKey: Self.lastOpenNoteKey)
             }
 
             if let first = saved.first {
@@ -642,7 +560,6 @@ final class NotesModel {
                 folderUrl = first
                 status = ""
                 core.prefetchNotes(urls: Array(saved.dropFirst()))
-                refreshNotes()
                 startPolling()
                 startMaintenancePolling()
                 Self.bootLog("startup UI state queued")
@@ -719,18 +636,19 @@ final class NotesModel {
 
     func addDocToCurrentFolder(url: String) {
         guard let core else { return }
+        patchworkDocUrls.insert(url)
         Task.detached { [core, weak self, url] in
             do {
-                try core.linkNoteToFolder(noteUrl: url, title: "")
+                try await core.linkNoteToFolder(noteUrl: url, title: "")
             } catch {
                 await MainActor.run { [weak self] in
+                    self?.patchworkDocUrls.remove(url)
                     self?.status = "Couldn't add document: \(error.localizedDescription)"
                 }
                 return
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.patchworkDocUrls.insert(url)
                 UserDefaults.standard.set(Array(self.patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
                 self.selectedNoteUrl = url
                 self.refreshNotes()
@@ -855,8 +773,8 @@ final class NotesModel {
     }
 
     private func buildTree() {
-        guard let core else { folderTree = []; return }
         treeGeneration += 1
+        guard let core else { folderTree = []; return }
         let generation = treeGeneration
         let rootUrls = rootFolderUrls
         let cache = folderNodeCache
@@ -873,17 +791,49 @@ final class NotesModel {
         }
     }
 
-    func node(for url: String) -> FolderNode? {
-        func find(_ nodes: [FolderNode]) -> FolderNode? {
+    func noteRow(for url: String) -> NoteRow {
+        if let row = noteRows[url] { return row }
+        let row = NoteRow()
+        noteRows[url] = row
+        return row
+    }
+
+    func preview(_ url: String) -> String { noteRows[url]?.preview ?? "" }
+
+    private func setPreview(_ url: String, _ text: String) {
+        noteRow(for: url).preview = text
+    }
+
+    private func mergeMeta(previews: [String: String], thumbnails: [String: Data]) {
+        for (url, preview) in previews { noteRow(for: url).preview = preview }
+        for (url, thumbnail) in thumbnails { noteRow(for: url).thumbnail = thumbnail }
+    }
+
+    private func clearRow(_ url: String) {
+        guard let row = noteRows[url] else { return }
+        if !row.preview.isEmpty { row.preview = "" }
+        if row.thumbnail != nil { row.thumbnail = nil }
+        if row.contextMeta != nil { row.contextMeta = nil }
+    }
+
+    private func pruneRows(to liveUrls: Set<String>) {
+        for url in noteRows.keys where !liveUrls.contains(url) { clearRow(url) }
+    }
+
+    private func rebuildNodeIndex() {
+        var index: [String: FolderNode] = [:]
+        func walk(_ nodes: [FolderNode]) {
             for node in nodes {
-                if node.url == url { return node }
-                if let children = node.children, let found = find(children) {
-                    return found
-                }
+                index[node.url] = node
+                if let children = node.children { walk(children) }
             }
-            return nil
         }
-        if let found = find(folderTree) { return found }
+        walk(folderTree)
+        nodeIndex = index
+    }
+
+    func node(for url: String) -> FolderNode? {
+        if let found = nodeIndex[url] { return found }
         // a draft clone borrows its origin's node so titles stay right
         if let origin = draftCloneOrigins[url], origin != url {
             return node(for: origin)
@@ -1001,12 +951,15 @@ final class NotesModel {
     func refreshNotes() {
         guard let core else { return }
         treeGeneration += 1
-        let generation = treeGeneration
+        refreshGeneration += 1
+        let treeGen = treeGeneration
+        let refreshGen = refreshGeneration
         let rootUrls = rootFolderUrls
         let cache = folderNodeCache
         let fetched = metaFetched
+        let prefetched = prefetchedUrls
         Self.bootLog("refreshNotes begin roots=\(rootUrls.count)")
-        Task.detached { [core, rootUrls, cache, fetched, generation, weak self] in
+        Task.detached { [core, rootUrls, cache, fetched, prefetched, treeGen, refreshGen, weak self] in
             let refreshStart = Date()
             async let notesTask = core.listNotes()
             async let titleTask = core.folderTitle()
@@ -1015,25 +968,27 @@ final class NotesModel {
             let (tree, newCache) = await Self.computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
             let visible = Self.visibleNotes(in: tree)
             let localMs = Int(Date().timeIntervalSince(refreshStart) * 1000)
-            core.prefetchNotes(urls: notes.map(\.url))
+            let unprefetched = notes.map(\.url).filter { !prefetched.contains($0) }
+            if !unprefetched.isEmpty { core.prefetchNotes(urls: unprefetched) }
             let richNotes = visible.filter { $0.kind == "rich" }.map {
                 NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
             }
             let urlsNeedingMeta = visible.map(\.url).filter { !fetched.contains($0) }
             let published = await MainActor.run { [weak self] () -> Bool in
-                guard let self, self.treeGeneration == generation else { return false }
+                guard let self, self.refreshGeneration == refreshGen else { return false }
+                self.prefetchedUrls.formUnion(unprefetched)
                 self.notes = notes
                 self.folderTitle = folderTitle
-                self.folderTree = tree
-                self.folderNodeCache = newCache
+                if self.treeGeneration == treeGen {
+                    self.folderTree = tree
+                    self.folderNodeCache = newCache
+                }
                 if let selected = self.selectedNoteUrl, self.node(for: selected) == nil {
                     self.selectedNoteUrl = nil
                 }
-                self.saveLaunchSnapshot()
                 Self.bootLog(
                     "sidebar published notes=\(notes.count) visible=\(visible.count) localMs=\(localMs)"
                 )
-                self.writeWidgetSnapshot()
                 return true
             }
             guard published else { return }
@@ -1044,15 +999,12 @@ final class NotesModel {
             )
             let metaMs = Int(Date().timeIntervalSince(metaStart) * 1000)
             await MainActor.run { [weak self] in
-                guard let self, self.treeGeneration == generation else { return }
-                self.previews.merge(newPreviews) { _, new in new }
-                self.thumbnails.merge(newThumbnails) { _, new in new }
+                guard let self, self.refreshGeneration == refreshGen else { return }
+                self.mergeMeta(previews: newPreviews, thumbnails: newThumbnails)
                 let liveUrls = Set(visible.map(\.url))
-                self.previews = self.previews.filter { liveUrls.contains($0.key) }
-                self.thumbnails = self.thumbnails.filter { liveUrls.contains($0.key) }
+                self.pruneRows(to: liveUrls)
                 self.metaFetched.formUnion(newPreviews.keys)
                 self.metaFetched.formIntersection(liveUrls)
-                self.contextMetas = self.contextMetas.filter { liveUrls.contains($0.key) }
                 let fileNotes = visible.filter { $0.kind == "file" }.map {
                     NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
                 }
@@ -1060,7 +1012,6 @@ final class NotesModel {
                 self.backfillFileSemanticIndex(for: fileNotes)
                 self.backfillSpotlightIndex(for: richNotes)
                 self.backfillAssetVision()
-                self.saveLaunchSnapshot()
                 Self.bootLog(
                     "metadata published previews=\(newPreviews.count) thumbnails=\(newThumbnails.count) metaMs=\(metaMs)"
                 )
@@ -1108,7 +1059,7 @@ final class NotesModel {
                 let changes = await Task.detached { core.docChangeCount(url: url) }.value
                 let entries = await core.folderEntriesOf(url: url).count
                 appendSyncEvent("  \(url.suffix(12)): \(entries) entries, \(changes) changes locally")
-                await Task.detached { try? core.resyncDoc(url: url) }.value
+                await Task.detached { try? await core.resyncDoc(url: url) }.value
             }
             try? await Task.sleep(for: .seconds(5))
             refreshNotes()
@@ -1127,7 +1078,7 @@ final class NotesModel {
         core.connect()
         await drainSharedIntake()
         let urls = rootFolderUrls
-        await Task.detached { for url in urls { try? core.resyncDoc(url: url) } }.value
+        await Task.detached { for url in urls { try? await core.resyncDoc(url: url) } }.value
 
         let deadline = ContinuousClock.now.advanced(by: budget)
         var counts = lastKnownCounts
@@ -1152,25 +1103,13 @@ final class NotesModel {
         appendSyncEvent("Background sync finished")
     }
 
-    func releaseCore() {
-        drainStartupWaiters()
-        pollTask?.cancel()
-        pollTask = nil
-        maintenanceTask?.cancel()
-        maintenanceTask = nil
-        activeEditor?.core?.pushNow()
-        presence.leave()
-        core?.shutdown()
-        core = nil
-    }
-
+    /// A safety net, not the mechanism: `docChanged` already refreshes when a
+    /// folder moves. This only catches a change the delegate never announced.
     private func startPolling() {
         pollTask?.cancel()
         pollTask = Task.detached { [weak self] in
-            var interval: Duration = .seconds(5)
-            var elapsed = 0
             while !Task.isCancelled {
-                try? await Task.sleep(for: interval)
+                try? await Task.sleep(for: .seconds(120))
                 guard !Task.isCancelled else { break }
                 guard let (core, rootUrls, knownCounts) = await MainActor.run(body: { [weak self] () -> (Core, [String], [String: Int])? in
                     guard let self, let core = self.core else { return nil }
@@ -1193,8 +1132,6 @@ final class NotesModel {
                     }
                     if anyChanged { self.refreshNotes() }
                 }
-                elapsed += Int(interval.components.seconds)
-                if elapsed >= 60 { interval = .seconds(30) }
             }
         }
     }
@@ -1207,8 +1144,6 @@ final class NotesModel {
         drainStartupWaiters()
     }
 
-    /// A waiter is only ever resumed by whoever takes it out of the dictionary,
-    /// and the dictionary is main-actor state, so a waiter resumes exactly once.
     private func drainStartupWaiters() {
         let waiters = startupWaiters
         startupWaiters = [:]
@@ -1245,31 +1180,40 @@ final class NotesModel {
     }
 
     func writeWidgetSnapshot() {
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: Self.appGroupIdentifier
-        ) else { return }
+        guard widgetSnapshotTask == nil else { return }
+        widgetSnapshotTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self else { return }
+            self.widgetSnapshotTask = nil
+            guard let root = LushShared.container else { return }
 
-        let folders = widgetFolders(from: folderTree)
-        let defaultFolderUrl = folderUrl ?? rootFolderUrls.first ?? folders.first?.url
-        let url = root.appendingPathComponent(Self.widgetSnapshotFileName)
-        let oldData = try? Data(contentsOf: url)
-        let oldSnapshot = oldData.flatMap { try? JSONDecoder().decode(LushWidgetSnapshot.self, from: $0) }
-        let updatedAt = oldSnapshot?.defaultFolderUrl == defaultFolderUrl && oldSnapshot?.folders == folders
-            ? oldSnapshot?.updatedAt ?? Date()
-            : Date()
-        let snapshot = LushWidgetSnapshot(
-            updatedAt: updatedAt,
-            defaultFolderUrl: defaultFolderUrl,
-            folders: folders
-        )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        guard oldData != data else { return }
-
-        do {
-            try data.write(to: url, options: .atomic)
-            WidgetCenter.shared.reloadTimelines(ofKind: Self.folderContentWidgetKind)
-        } catch {
-            appendSyncEvent("Widget snapshot failed: \(error.localizedDescription)")
+            let folders = self.widgetFolders(from: self.folderTree)
+            let defaultFolderUrl = self.folderUrl ?? self.rootFolderUrls.first ?? folders.first?.url
+            let url = root.appendingPathComponent(LushShared.widgetSnapshotFileName)
+            let previous = self.lastWidgetSnapshot
+            do {
+                let (snapshot, wrote) = try await Task.detached { () throws -> (LushWidgetSnapshot, Bool) in
+                    let old = previous ?? (try? Data(contentsOf: url)).flatMap {
+                        try? JSONDecoder().decode(LushWidgetSnapshot.self, from: $0)
+                    }
+                    if let old, old.defaultFolderUrl == defaultFolderUrl, old.folders == folders {
+                        return (old, false)
+                    }
+                    let snapshot = LushWidgetSnapshot(
+                        updatedAt: Date(),
+                        defaultFolderUrl: defaultFolderUrl,
+                        folders: folders
+                    )
+                    try JSONEncoder().encode(snapshot).write(to: url, options: .atomic)
+                    return (snapshot, true)
+                }.value
+                self.lastWidgetSnapshot = snapshot
+                if wrote {
+                    WidgetCenter.shared.reloadTimelines(ofKind: LushShared.folderContentWidgetKind)
+                }
+            } catch {
+                self.appendSyncEvent("Widget snapshot failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1288,7 +1232,7 @@ final class NotesModel {
                         LushWidgetItemSnapshot(
                             url: $0.url,
                             title: $0.displayName,
-                            preview: previews[$0.url] ?? "",
+                            preview: preview($0.url),
                             kind: $0.kind
                         )
                     }
@@ -1347,7 +1291,7 @@ final class NotesModel {
     }
 
     func loadContextMeta(url: String) async {
-        guard contextMetas[url] == nil, let core else { return }
+        guard noteRow(for: url).contextMeta == nil, let core else { return }
         let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
         let spans = await Task.detached { SpanNode.decodeList(json) }.value
         let fmt = ISO8601DateFormatter()
@@ -1360,7 +1304,7 @@ final class NotesModel {
             meta.nowPlaying = b.attrs["nowPlaying"]?.stringValue
             break
         }
-        contextMetas[url] = meta
+        noteRow(for: url).contextMeta = meta
     }
 
     func documentHistorySummary(url: String) async -> DocumentHistorySummary {
@@ -1397,7 +1341,7 @@ final class NotesModel {
         pads.docChanged(url: url)
         folderNodeCache.removeValue(forKey: url)
         documentHistoryCache.removeValue(forKey: url)
-        thumbnails.removeValue(forKey: url)
+        noteRows[url]?.thumbnail = nil
         metaFetched.remove(url)
         docVersions[url, default: 0] += 1
         notifyNoteObservers(url)
@@ -1462,10 +1406,8 @@ final class NotesModel {
                     return
                 }
                 let (freshPreviews, freshThumbnails) = await Self.fetchMeta(core: core, urls: Array(stale))
-                self.previews.merge(freshPreviews) { _, new in new }
-                self.thumbnails.merge(freshThumbnails) { _, new in new }
+                self.mergeMeta(previews: freshPreviews, thumbnails: freshThumbnails)
                 self.metaFetched.formUnion(freshPreviews.keys)
-                self.saveLaunchSnapshot()
                 self.writeWidgetSnapshot()
             }
             self.pendingRefreshTask = nil
@@ -1474,14 +1416,7 @@ final class NotesModel {
     }
 
     private func isFolderInTree(_ url: String) -> Bool {
-        func contains(_ nodes: [FolderNode]) -> Bool {
-            for node in nodes {
-                if node.url == url { return true }
-                if let children = node.children, contains(children) { return true }
-            }
-            return false
-        }
-        return contains(folderTree)
+        nodeIndex[url] != nil
     }
 
     @discardableResult
@@ -1495,7 +1430,7 @@ final class NotesModel {
                 let url = try core.createNoteDoc(title: "")
                 let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
-                try core.linkNoteToFolder(noteUrl: url, title: "")
+                try await core.linkNoteToFolder(noteUrl: url, title: "")
                 return url
             }.value
             pendingFocusUrl = url
@@ -1631,16 +1566,14 @@ final class NotesModel {
         previewUpdateTasks[url] = nil
         noteWriteTasks[url]?.cancel()
         noteWriteTasks[url] = nil
-        previews[url] = nil
-        thumbnails[url] = nil
-        contextMetas[url] = nil
+        clearRow(url)
         metaFetched.remove(url)
         folderNodeCache.removeValue(forKey: url)
         documentHistoryCache.removeValue(forKey: url)
         snapshotCache = snapshotCache.filter { $0.key.url != url }
+        snapshotRecency.removeAll { $0.url == url }
         renderedSnapshotCache = renderedSnapshotCache.filter { $0.key.url != url }
-        launchNoteSnapshots.removeValue(forKey: url)
-        launchSnapshotOrder.removeAll { $0 == url }
+        renderedRecency.removeAll { $0.url == url }
         lastKnownCounts.removeValue(forKey: url)
         if pinnedUrls.contains(url) {
             pinnedUrls.removeAll { $0 == url }
@@ -1657,7 +1590,6 @@ final class NotesModel {
         focus.forgetDocument(url)
         CalendarLinks.set([], for: url)
         if selectedNoteUrl == url { selectedNoteUrl = nil }
-        saveLaunchSnapshot()
     }
 
     func copyFolderUrl() {
@@ -1745,11 +1677,6 @@ final class NotesModel {
     }
 
     func spansSnapshot(for url: String) async -> NoteSpansSnapshot? {
-        if core == nil, let cached = launchNoteSnapshots[url], !cached.heads.isEmpty {
-            Self.bootLog("note snapshot served from launch cache")
-            refreshCachedOpenNote(url)
-            return cached
-        }
         if core == nil {
             await start()
         }
@@ -1759,10 +1686,19 @@ final class NotesModel {
         guard let snapshot = try? await core.noteSpansSnapshot(url: url),
               !snapshot.heads.isEmpty
         else { return nil }
-        cacheLaunchSnapshot(url, snapshot)
-        saveLaunchSnapshot()
         Self.bootLog("note snapshot loaded from core ms=\(Int(Date().timeIntervalSince(start) * 1000))")
         return snapshot
+    }
+
+    private func cacheSnapshot(_ snapshot: NoteSpansSnapshot, for url: String) {
+        guard !snapshot.heads.isEmpty else { return }
+        let key = HistorySnapshotKey(url: url, heads: snapshot.heads)
+        snapshotCache[key] = snapshot
+        snapshotRecency.removeAll { $0 == key }
+        snapshotRecency.append(key)
+        while snapshotRecency.count > Self.snapshotCacheCapacity {
+            snapshotCache.removeValue(forKey: snapshotRecency.removeFirst())
+        }
     }
 
     func spansSnapshot(for url: String, heads: [String]) async -> NoteSpansSnapshot {
@@ -1787,9 +1723,7 @@ final class NotesModel {
                     ?? NoteSpansSnapshot(spansJson: "[]", heads: heads)
             }.value
         }
-        if !snapshot.heads.isEmpty {
-            snapshotCache[HistorySnapshotKey(url: url, heads: snapshot.heads)] = snapshot
-        }
+        cacheSnapshot(snapshot, for: url)
         return snapshot
     }
 
@@ -1812,14 +1746,13 @@ final class NotesModel {
         let attributed = RichText.attributed(from: spans, cache: AssetCache())
         if !snapshot.heads.isEmpty {
             renderedSnapshotCache[key] = attributed
+            renderedRecency.removeAll { $0 == key }
+            renderedRecency.append(key)
+            while renderedRecency.count > Self.snapshotCacheCapacity {
+                renderedSnapshotCache.removeValue(forKey: renderedRecency.removeFirst())
+            }
         }
         return attributed
-    }
-
-    func renderedCurrentSnapshot(for url: String) async -> NSAttributedString {
-        guard let snapshot = await spansSnapshot(for: url) else { return NSAttributedString() }
-        let spans = await Task.detached { SpanNode.decodeList(snapshot.spansJson) }.value
-        return RichText.attributed(from: spans, cache: AssetCache())
     }
 
     /// The snapshot with `.amChanged` stamped on paragraphs that differ from
@@ -2051,7 +1984,7 @@ final class NotesModel {
                    state.clones.contains(where: { $0.originalUrl == host }) {
                     return true
                 }
-                let clone = try core.cloneDoc(url: host)
+                let clone = try await core.cloneDoc(url: host)
                 try core.draftRecordClone(
                     draftUrl: draftUrl,
                     originalUrl: host,
@@ -2087,7 +2020,7 @@ final class NotesModel {
                 guard let state = try core.draftState(url: draftUrl) else { return false }
                 for entry in state.clones
                 where entry.cloneUrl != entry.originalUrl && entry.mergedAt == nil {
-                    let heads = try core.mergeDoc(intoUrl: entry.originalUrl, fromUrl: entry.cloneUrl)
+                    let heads = try await core.mergeDoc(intoUrl: entry.originalUrl, fromUrl: entry.cloneUrl)
                     try core.draftRecordMerge(
                         draftUrl: draftUrl,
                         originalUrl: entry.originalUrl,
@@ -2122,18 +2055,11 @@ final class NotesModel {
         }.value
         async let previewTask = core.notePreview(url: url)
         async let titleTask = core.noteTitle(url: url)
-        async let snapshotTask = core.noteSpansSnapshot(url: url)
-        let (preview, title, snapshot) = await (previewTask, titleTask, try? snapshotTask)
-        previews[url] = preview
+        let (preview, title) = await (previewTask, titleTask)
+        setPreview(url, preview)
         #if os(macOS)
         if url == selectedNoteUrl { updateDockTilePreview() }
         #endif
-        let cached = snapshot.flatMap { $0.heads.isEmpty ? nil : $0 }
-            ?? newHeads.map { NoteSpansSnapshot(spansJson: json, heads: $0) }
-        if let cached {
-            cacheLaunchSnapshot(url, cached)
-        }
-        saveLaunchSnapshot()
         scheduleSemanticIndex(url: url, name: title)
         return newHeads
     }
@@ -2247,6 +2173,7 @@ final class NotesModel {
         // Anything still in the tree, which is what a smart notebook counts
         // too. `notes` is only the open folder's own entries, so using it here
         // quietly threw away every hit that lived anywhere else.
+        if Task.isCancelled { return [] }
         let liveUrls = notebookTree.kinds
         let filter = SearchFilter(scope: scope, tags: [], whenFrom: nil, whenTo: nil)
         let exact = await Task.detached { core.searchNotes(query: query, filter: filter) }.value
@@ -2292,17 +2219,23 @@ final class NotesModel {
     private func rebuildCalendarLinks(_ notes: [NoteInfo]) async {
         guard let core else { return }
         let urls = notes.map(\.url)
-        let links = await Task.detached { [core, urls] () -> [String: [String]] in
+        let known = CalendarLinks.scannedHeads
+        let (links, heads) = await Task.detached {
+            [core, urls, known] () -> ([String: [String]], [String: String]) in
             var links: [String: [String]] = [:]
+            var heads: [String: String] = [:]
             for url in urls {
+                let current = await core.docHeads(url: url).sorted().joined(separator: ",")
+                if !current.isEmpty, known[url] == current { continue }
                 try? await core.openNote(url: url)
                 guard let json = try? await core.noteSpansJson(url: url) else { continue }
                 let ids = CalendarLinks.eventIds(in: SpanNode.decodeList(json))
                 if !ids.isEmpty { links[url] = ids }
+                heads[url] = current
             }
-            return links
+            return (links, heads)
         }.value
-        CalendarLinks.replace(links, scanned: Set(urls))
+        CalendarLinks.replace(links, scanned: Set(heads.keys), heads: heads)
     }
 
     private func backfillFileSemanticIndex(for files: [NoteInfo]) {
@@ -2400,7 +2333,7 @@ final class NotesModel {
             guard !Task.isCancelled, let self, let core = self.core else { return }
             let preview = await core.notePreview(url: url)
             guard !Task.isCancelled else { return }
-            self.previews[url] = preview
+            self.setPreview(url, preview)
             #if os(macOS)
             if url == self.selectedNoteUrl { self.updateDockTilePreview() }
             #endif
@@ -2433,7 +2366,7 @@ final class NotesModel {
     func updateAssetVision(_ url: String, description: String, ocr: String) async {
         guard let core else { return }
         await Task.detached {
-            try? core.updateAssetVision(url: url, description: description, ocr: ocr)
+            try? await core.updateAssetVision(url: url, description: description, ocr: ocr)
         }.value
         scheduleFileSemanticIndex(url: url)
     }
@@ -2441,7 +2374,7 @@ final class NotesModel {
     func updateAssetML(_ url: String, summary: String, caption: String, keywords: String) async {
         guard let core else { return }
         await Task.detached {
-            try? core.updateAssetMl(url: url, summary: summary, caption: caption, keywords: keywords)
+            try? await core.updateAssetMl(url: url, summary: summary, caption: caption, keywords: keywords)
         }.value
         scheduleFileSemanticIndex(url: url)
     }
@@ -2589,7 +2522,7 @@ final class NotesModel {
                         continue
                     }
                     let url = try core.createNoteIn(folderUrl: sub, title: note.name)
-                    let spans = await MainActor.run { AppleNotesImporter.spans(fromHTML: note.html) }
+                    let spans = await MainActor.run { RichTextClipboard.spans(fromHTML: note.html) }
                     if !spans.isEmpty {
                         try core.updateNoteSpansAt(
                             url: url,
@@ -2749,7 +2682,7 @@ final class NotesModel {
                     return try core.createNoteIn(folderUrl: target, title: "Quick Note")
                 }
                 let noteUrl = try core.createNoteDoc(title: "Quick Note")
-                try core.linkNoteToFolder(noteUrl: noteUrl, title: "Quick Note")
+                try await core.linkNoteToFolder(noteUrl: noteUrl, title: "Quick Note")
                 return noteUrl
             }.value
             setQuickNote(url)
@@ -2762,7 +2695,7 @@ final class NotesModel {
 
     private func refreshQuickNote(_ url: String, core: Core) {
         Task {
-            previews[url] = await core.notePreview(url: url)
+            setPreview(url, await core.notePreview(url: url))
             pendingFocusUrl = url
             selectedNoteUrl = url
             scheduleSemanticIndex(url: url)
@@ -2860,10 +2793,7 @@ final class NotesModel {
         walk(folderTree)
         recents = rows.compactMap { row in
             guard let node = index[row.url] else { return nil }
-            // older docs recorded milliseconds
-            var seconds = TimeInterval(row.modified)
-            if seconds > 4_000_000_000 { seconds /= 1000 }
-            return RecentEntry(node: node, modified: Date(timeIntervalSince1970: seconds))
+            return RecentEntry(node: node, modified: Date(docTimestamp: row.modified))
         }
         #if os(macOS)
         writeDockMenuSnapshot()
@@ -2872,10 +2802,7 @@ final class NotesModel {
 
     #if os(macOS)
     private func writeDockMenuSnapshot() {
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: "group.party.chee.patchwork.lush"
-        ) else { return }
-        let snapshot = DockMenuSnapshot(
+        DockMenuSnapshot(
             recents: recents.prefix(8).map {
                 DockMenuRecent(
                     title: $0.node.displayName.isEmpty ? "Untitled" : $0.node.displayName,
@@ -2883,11 +2810,7 @@ final class NotesModel {
                     modified: $0.modified.timeIntervalSince1970
                 )
             }
-        )
-        let url = root.appendingPathComponent("DockMenuSnapshot.json")
-        if let data = try? JSONEncoder().encode(snapshot) {
-            try? data.write(to: url, options: .atomic)
-        }
+        ).write()
     }
 
     func updateDockTilePreview() {
@@ -2896,7 +2819,7 @@ final class NotesModel {
             return
         }
         let title = node(for: url)?.displayName ?? ""
-        let body = previews[url] ?? ""
+        let body = preview(url)
         guard !title.isEmpty || !body.isEmpty else { return }
         DockTilePreview.update(title: title, body: body)
     }
@@ -2917,7 +2840,7 @@ final class NotesModel {
                 try? core.renameNote(url: url, title: name)
             }
         }.value
-        previews[url] = await core.notePreview(url: url)
+        setPreview(url, await core.notePreview(url: url))
         scheduleSemanticIndex(url: url, name: name)
         refreshNotes()
     }
@@ -2927,7 +2850,7 @@ final class NotesModel {
     var pendingIncoming: IncomingContent?
     var showingFileImporter = false
 
-    func importAsNewNote(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) {
+    func importAsNewNote(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) async {
         guard let core else { return }
         do {
             var textSpans: [SpanNode] = []
@@ -2941,7 +2864,7 @@ final class NotesModel {
                     if textFilesAsNotes, Self.canImportAsNote(url) {
                         importedUrls.append(try importFileAsNote(url, core: core, folderUrl: nil))
                     } else {
-                        importedUrls += try importFileEntries(from: url, core: core)
+                        importedUrls += try await importFileEntries(from: url, core: core)
                     }
                 case .batch:
                     break
@@ -2975,9 +2898,7 @@ final class NotesModel {
             await start()
         }
         guard core != nil else { return }
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: SharedHandoff.appGroupIdentifier
-        ) else { return }
+        guard let root = LushShared.container else { return }
         let intake = root.appendingPathComponent("SharedIntake", isDirectory: true)
         let entries = (try? FileManager.default.contentsOfDirectory(
             at: intake,
@@ -2992,11 +2913,11 @@ final class NotesModel {
                 try? FileManager.default.removeItem(at: entry)
                 continue
             }
-            importToInbox(content)
+            await importToInbox(content)
         }
     }
 
-    func importToInbox(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) {
+    func importToInbox(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) async {
         guard let core else { return }
         defer { content.cleanupHandoff() }
         let target = effectiveInboxUrl ?? folderUrl
@@ -3013,7 +2934,7 @@ final class NotesModel {
                     if textFilesAsNotes, Self.canImportAsNote(url) {
                         importedUrls.append(try importFileAsNote(url, core: core, folderUrl: target))
                     } else {
-                        importedUrls += try importFileEntries(from: url, core: core, folderUrl: target)
+                        importedUrls += try await importFileEntries(from: url, core: core, folderUrl: target)
                     }
                 } catch {
                     failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -3063,7 +2984,7 @@ final class NotesModel {
     }
 
     @discardableResult
-    func importFiles(_ urls: [URL], into folderUrl: String?, asNotes: Bool) -> [String] {
+    func importFiles(_ urls: [URL], into folderUrl: String?, asNotes: Bool) async -> [String] {
         guard let core else { return [] }
         let target = folderUrl ?? self.folderUrl
         var imported: [String] = []
@@ -3073,7 +2994,7 @@ final class NotesModel {
                 if asNotes, Self.canImportAsNote(url) {
                     imported.append(try importFileAsNote(url, core: core, folderUrl: target))
                 } else {
-                    imported += try importFileEntries(from: url, core: core, folderUrl: target)
+                    imported += try await importFileEntries(from: url, core: core, folderUrl: target)
                 }
             } catch {
                 failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -3123,7 +3044,7 @@ final class NotesModel {
         return RichTextClipboard.spans(fromMarkdown: text)
     }
 
-    private func importFileEntries(from url: URL, core: Core, folderUrl: String? = nil) throws -> [String] {
+    private func importFileEntries(from url: URL, core: Core, folderUrl: String? = nil) async throws -> [String] {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
@@ -3139,11 +3060,11 @@ final class NotesModel {
             for file in files {
                 let values = try? file.resourceValues(forKeys: [.isRegularFileKey])
                 guard values?.isRegularFile == true else { continue }
-                imported.append(try importSingleFileEntry(file, displayName: relativeDisplayName(for: file, under: url), core: core, folderUrl: folderUrl))
+                imported.append(try await importSingleFileEntry(file, displayName: relativeDisplayName(for: file, under: url), core: core, folderUrl: folderUrl))
             }
             return imported
         }
-        return [try importSingleFileEntry(url, displayName: url.lastPathComponent, core: core, folderUrl: folderUrl)]
+        return [try await importSingleFileEntry(url, displayName: url.lastPathComponent, core: core, folderUrl: folderUrl)]
     }
 
     private func importSingleFileEntry(
@@ -3151,7 +3072,7 @@ final class NotesModel {
         displayName: String,
         core: Core,
         folderUrl: String? = nil
-    ) throws -> String {
+    ) async throws -> String {
         let data = try Data(contentsOf: url)
         let ext = url.pathExtension.lowercased()
         let name = displayName.isEmpty ? url.lastPathComponent : displayName
@@ -3170,7 +3091,7 @@ final class NotesModel {
             mimeType: mimeType(for: ext),
             data: data
         )
-        try core.linkNoteToFolder(noteUrl: assetUrl, title: name)
+        try await core.linkNoteToFolder(noteUrl: assetUrl, title: name)
         return assetUrl
     }
 
@@ -3248,60 +3169,8 @@ private final class DelegateBridge: CoreDelegate {
     }
 }
 
-extension NoteInfo: Identifiable, Codable {
+extension NoteInfo: Identifiable {
     public var id: String { url }
-
-    private enum CodingKeys: String, CodingKey {
-        case url, name, kind
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            url: try container.decode(String.self, forKey: .url),
-            name: try container.decode(String.self, forKey: .name),
-            kind: try container.decode(String.self, forKey: .kind)
-        )
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(url, forKey: .url)
-        try container.encode(name, forKey: .name)
-        try container.encode(kind, forKey: .kind)
-    }
-}
-
-extension NoteSpansSnapshot: Codable {
-    private enum CodingKeys: String, CodingKey {
-        case spansJson, heads
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            spansJson: try container.decode(String.self, forKey: .spansJson),
-            heads: try container.decode([String].self, forKey: .heads)
-        )
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(spansJson, forKey: .spansJson)
-        try container.encode(heads, forKey: .heads)
-    }
-}
-
-private struct NotesLaunchSnapshot: Codable {
-    let rootFolderUrls: [String]
-    let folderUrl: String?
-    let folderTitle: String
-    let selectedNoteUrl: String?
-    let notes: [NoteInfo]
-    let folderTree: [FolderNode]
-    let previews: [String: String]
-    let thumbnails: [String: Data]
-    let noteSnapshots: [String: NoteSpansSnapshot]
 }
 
 struct RecentEntry: Identifiable {
@@ -3310,17 +3179,14 @@ struct RecentEntry: Identifiable {
     var id: String { node.url }
 }
 
-#if os(macOS)
-struct DockMenuSnapshot: Codable {
-    let recents: [DockMenuRecent]
-}
 
-struct DockMenuRecent: Codable {
-    let title: String
-    let url: String
-    let modified: TimeInterval
+@MainActor
+@Observable
+final class NoteRow {
+    var preview: String = ""
+    var thumbnail: Data?
+    var contextMeta: NoteContextMeta?
 }
-#endif
 
 struct NoteContextMeta {
     var created: Date?
@@ -3371,7 +3237,7 @@ struct HistorySnapshotKey: Hashable {
     }
 }
 
-struct FolderNode: Identifiable, Hashable, Codable {
+struct FolderNode: Identifiable, Hashable {
     let url: String
     let name: String
     let kind: String

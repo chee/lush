@@ -597,7 +597,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * and is appended to the lush config's `.folders`. Returns the merged
      * folder list.
      */
-    func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String]) throws  -> [String]
+    func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String]) async throws  -> [String]
     
     func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String]) throws  -> [String]
     
@@ -619,7 +619,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Full-history fork of a doc installed as a new repo doc. `cloned_at`
      * is the source's heads at fork time.
      */
-    func cloneDoc(url: String) throws  -> CloneResult
+    func cloneDoc(url: String) async throws  -> CloneResult
     
     func configState(configUrl: String)  -> ConfigState?
     
@@ -629,7 +629,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func connect() 
     
-    func contactInfo(url: String)  -> ContactInfo?
+    func contactInfo(url: String) async  -> ContactInfo?
     
     /**
      * Store binary data as a patchwork UnixFileEntry doc; returns its URL.
@@ -747,6 +747,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func forgetIrohPeer(nodeId: String) 
     
     /**
+     * Every indexed doc, newest first, minus its text. What a saved search
+     * walks when its rules ask about titles, tags, kinds or days.
+     */
+    func indexedNotes(limit: UInt32)  -> [IndexedNote]
+    
+    /**
      * This device's friend code: iroh node id and subduction peer id.
      */
     func irohFriendCode()  -> String?
@@ -768,7 +774,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * caller has none — picker-created patchwork docs arrive here with no
      * title, and their type is whatever their datatype says, not "rich".
      */
-    func linkNoteToFolder(noteUrl: String, title: String) throws 
+    func linkNoteToFolder(noteUrl: String, title: String) async throws 
     
     func listNotes() async  -> [NoteInfo]
     
@@ -783,7 +789,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * "🍡 Lush notes" folder inside the account's root folder, seeding
      * `.folders` and `.inbox` with it.
      */
-    func loginAccount(accountUrl: String) throws  -> AccountState
+    func loginAccount(accountUrl: String) async throws  -> AccountState
     
     func mainDraftUrl(docUrl: String) throws  -> String?
     
@@ -797,7 +803,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Plain automerge merge of `from` into `into`; returns the target's
      * heads after the merge.
      */
-    func mergeDoc(intoUrl: String, fromUrl: String) throws  -> [String]
+    func mergeDoc(intoUrl: String, fromUrl: String) async throws  -> [String]
     
     /**
      * Move an entry from one folder doc to another, refusing cycles.
@@ -871,6 +877,9 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Start tracking + syncing docs without waiting for them to arrive,
      * recursing into subfolders. Once a doc lands, its legacy scalar
      * strings are normalized to Text.
+     * Walks breadth-first. Every doc in a level is asked for before any of
+     * them is waited on, so one doc the server doesn't have costs the level
+     * one timeout rather than costing every doc behind it thirty seconds.
      */
     func prefetchNotes(urls: [String]) 
     
@@ -911,7 +920,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func renameNote(url: String, title: String) throws 
     
-    func resyncDoc(url: String) throws 
+    func resyncDoc(url: String) async throws 
     
     /**
      * Full-text search across every locally indexed note. The index is local
@@ -924,7 +933,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], filter: SearchFilter?)  -> [SearchHit]
     
-    func setApplyIncoming(enabled: Bool) 
+    /**
+     * Both of these walk every tracked doc, applying or publishing changes as
+     * they go, so they are async: a repo with a few hundred docs open would
+     * otherwise hold the caller for the length of that whole pass.
+     */
+    func setApplyIncoming(enabled: Bool) async 
     
     func setCheckoutState(url: String, checkedOut: String?, pins: [CheckpointPin]?) throws 
     
@@ -961,7 +975,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func setSearchParents(parents: [String: String]) 
     
-    func setSendChanges(enabled: Bool) 
+    func setSendChanges(enabled: Bool) async 
     
     /**
      * Flush all pending saves and do a best-effort final sync before the app
@@ -989,12 +1003,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     /**
      * Write generated ML metadata onto a UnixFileEntry doc.
      */
-    func updateAssetMl(url: String, summary: String, caption: String, keywords: String) throws 
+    func updateAssetMl(url: String, summary: String, caption: String, keywords: String) async throws 
     
     /**
      * Write Vision OCR + description onto a UnixFileEntry doc.
      */
-    func updateAssetVision(url: String, description: String, ocr: String) throws 
+    func updateAssetVision(url: String, description: String, ocr: String) async throws 
     
     /**
      * Replace the note's content with the given spans. When `heads` is
@@ -1088,14 +1102,21 @@ open func addIrohPeer(code: String)throws   {try rustCallWithError(FfiConverterT
      * and is appended to the lush config's `.folders`. Returns the merged
      * folder list.
      */
-open func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String])throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_adopt_local_docs(self.uniffiClonePointer(),
-        FfiConverterString.lower(accountUrl),
-        FfiConverterSequenceString.lower(folderUrls),
-        FfiConverterSequenceString.lower(docUrls),$0
-    )
-})
+open func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String])async throws  -> [String]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_adopt_local_docs(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountUrl),FfiConverterSequenceString.lower(folderUrls),FfiConverterSequenceString.lower(docUrls)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String])throws  -> [String]  {
@@ -1169,12 +1190,21 @@ open func assetsWithoutVision(limit: UInt32) -> [String]  {
      * Full-history fork of a doc installed as a new repo doc. `cloned_at`
      * is the source's heads at fork time.
      */
-open func cloneDoc(url: String)throws  -> CloneResult  {
-    return try  FfiConverterTypeCloneResult_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_clone_doc(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),$0
-    )
-})
+open func cloneDoc(url: String)async throws  -> CloneResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_clone_doc(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCloneResult_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func configState(configUrl: String) -> ConfigState?  {
@@ -1195,12 +1225,22 @@ open func connect()  {try! rustCall() {
 }
 }
     
-open func contactInfo(url: String) -> ContactInfo?  {
-    return try!  FfiConverterOptionTypeContactInfo.lift(try! rustCall() {
-    uniffi_lush_core_fn_method_core_contact_info(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),$0
-    )
-})
+open func contactInfo(url: String)async  -> ContactInfo?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_contact_info(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeContactInfo.lift,
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -1547,6 +1587,18 @@ open func forgetIrohPeer(nodeId: String)  {try! rustCall() {
 }
     
     /**
+     * Every indexed doc, newest first, minus its text. What a saved search
+     * walks when its rules ask about titles, tags, kinds or days.
+     */
+open func indexedNotes(limit: UInt32) -> [IndexedNote]  {
+    return try!  FfiConverterSequenceTypeIndexedNote.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_indexed_notes(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
      * This device's friend code: iroh node id and subduction peer id.
      */
 open func irohFriendCode() -> String?  {
@@ -1598,12 +1650,21 @@ open func isSendingChanges() -> Bool  {
      * caller has none — picker-created patchwork docs arrive here with no
      * title, and their type is whatever their datatype says, not "rich".
      */
-open func linkNoteToFolder(noteUrl: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_link_note_to_folder(self.uniffiClonePointer(),
-        FfiConverterString.lower(noteUrl),
-        FfiConverterString.lower(title),$0
-    )
-}
+open func linkNoteToFolder(noteUrl: String, title: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_link_note_to_folder(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(noteUrl),FfiConverterString.lower(title)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func listNotes()async  -> [NoteInfo]  {
@@ -1645,12 +1706,21 @@ open func localServerPort() -> UInt16?  {
      * "🍡 Lush notes" folder inside the account's root folder, seeding
      * `.folders` and `.inbox` with it.
      */
-open func loginAccount(accountUrl: String)throws  -> AccountState  {
-    return try  FfiConverterTypeAccountState_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_login_account(self.uniffiClonePointer(),
-        FfiConverterString.lower(accountUrl),$0
-    )
-})
+open func loginAccount(accountUrl: String)async throws  -> AccountState  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_login_account(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(accountUrl)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAccountState_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func mainDraftUrl(docUrl: String)throws  -> String?  {
@@ -1676,13 +1746,21 @@ open func markVisionAttempted(url: String)  {try! rustCall() {
      * Plain automerge merge of `from` into `into`; returns the target's
      * heads after the merge.
      */
-open func mergeDoc(intoUrl: String, fromUrl: String)throws  -> [String]  {
-    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_merge_doc(self.uniffiClonePointer(),
-        FfiConverterString.lower(intoUrl),
-        FfiConverterString.lower(fromUrl),$0
-    )
-})
+open func mergeDoc(intoUrl: String, fromUrl: String)async throws  -> [String]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_merge_doc(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(intoUrl),FfiConverterString.lower(fromUrl)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -1949,6 +2027,9 @@ open func pinnedDocUrl(url: String, heads: [String])throws  -> String  {
      * Start tracking + syncing docs without waiting for them to arrive,
      * recursing into subfolders. Once a doc lands, its legacy scalar
      * strings are normalized to Text.
+     * Walks breadth-first. Every doc in a level is asked for before any of
+     * them is waited on, so one doc the server doesn't have costs the level
+     * one timeout rather than costing every doc behind it thirty seconds.
      */
 open func prefetchNotes(urls: [String])  {try! rustCall() {
     uniffi_lush_core_fn_method_core_prefetch_notes(self.uniffiClonePointer(),
@@ -2041,11 +2122,21 @@ open func renameNote(url: String, title: String)throws   {try rustCallWithError(
 }
 }
     
-open func resyncDoc(url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_resync_doc(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),$0
-    )
-}
+open func resyncDoc(url: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_resync_doc(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -2075,11 +2166,27 @@ open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], fi
 })
 }
     
-open func setApplyIncoming(enabled: Bool)  {try! rustCall() {
-    uniffi_lush_core_fn_method_core_set_apply_incoming(self.uniffiClonePointer(),
-        FfiConverterBool.lower(enabled),$0
-    )
-}
+    /**
+     * Both of these walk every tracked doc, applying or publishing changes as
+     * they go, so they are async: a repo with a few hundred docs open would
+     * otherwise hold the caller for the length of that whole pass.
+     */
+open func setApplyIncoming(enabled: Bool)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_set_apply_incoming(
+                    self.uniffiClonePointer(),
+                    FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
 }
     
 open func setCheckoutState(url: String, checkedOut: String?, pins: [CheckpointPin]?)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -2184,11 +2291,22 @@ open func setSearchParents(parents: [String: String])  {try! rustCall() {
 }
 }
     
-open func setSendChanges(enabled: Bool)  {try! rustCall() {
-    uniffi_lush_core_fn_method_core_set_send_changes(self.uniffiClonePointer(),
-        FfiConverterBool.lower(enabled),$0
-    )
-}
+open func setSendChanges(enabled: Bool)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_set_send_changes(
+                    self.uniffiClonePointer(),
+                    FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -2244,26 +2362,41 @@ open func textCursor(url: String, index: UInt64)throws  -> String  {
     /**
      * Write generated ML metadata onto a UnixFileEntry doc.
      */
-open func updateAssetMl(url: String, summary: String, caption: String, keywords: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_update_asset_ml(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),
-        FfiConverterString.lower(summary),
-        FfiConverterString.lower(caption),
-        FfiConverterString.lower(keywords),$0
-    )
-}
+open func updateAssetMl(url: String, summary: String, caption: String, keywords: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_update_asset_ml(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url),FfiConverterString.lower(summary),FfiConverterString.lower(caption),FfiConverterString.lower(keywords)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
      * Write Vision OCR + description onto a UnixFileEntry doc.
      */
-open func updateAssetVision(url: String, description: String, ocr: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_update_asset_vision(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),
-        FfiConverterString.lower(description),
-        FfiConverterString.lower(ocr),$0
-    )
-}
+open func updateAssetVision(url: String, description: String, ocr: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_update_asset_vision(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url),FfiConverterString.lower(description),FfiConverterString.lower(ocr)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -3549,6 +3682,139 @@ public func FfiConverterTypeFolderSettings_lower(_ value: FolderSettings) -> Rus
 
 
 /**
+ * Everything the index knows about a doc apart from its text. A saved search
+ * tests most of its rules against this rather than asking the index one
+ * question per rule.
+ */
+public struct IndexedNote {
+    public var url: String
+    public var title: String
+    public var kind: String
+    /**
+     * Unix seconds; 0 when the doc has not been indexed yet.
+     */
+    public var modified: Int64
+    /**
+     * Unix seconds of the doc's first change; 0 when its history carries none.
+     */
+    public var created: Int64
+    public var tags: [String]
+    /**
+     * The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
+     */
+    public var when: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, title: String, kind: String, 
+        /**
+         * Unix seconds; 0 when the doc has not been indexed yet.
+         */modified: Int64, 
+        /**
+         * Unix seconds of the doc's first change; 0 when its history carries none.
+         */created: Int64, tags: [String], 
+        /**
+         * The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
+         */when: String) {
+        self.url = url
+        self.title = title
+        self.kind = kind
+        self.modified = modified
+        self.created = created
+        self.tags = tags
+        self.when = when
+    }
+}
+
+#if compiler(>=6)
+extension IndexedNote: Sendable {}
+#endif
+
+
+extension IndexedNote: Equatable, Hashable {
+    public static func ==(lhs: IndexedNote, rhs: IndexedNote) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.modified != rhs.modified {
+            return false
+        }
+        if lhs.created != rhs.created {
+            return false
+        }
+        if lhs.tags != rhs.tags {
+            return false
+        }
+        if lhs.when != rhs.when {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(title)
+        hasher.combine(kind)
+        hasher.combine(modified)
+        hasher.combine(created)
+        hasher.combine(tags)
+        hasher.combine(when)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIndexedNote: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IndexedNote {
+        return
+            try IndexedNote(
+                url: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                modified: FfiConverterInt64.read(from: &buf), 
+                created: FfiConverterInt64.read(from: &buf), 
+                tags: FfiConverterSequenceString.read(from: &buf), 
+                when: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IndexedNote, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterInt64.write(value.modified, into: &buf)
+        FfiConverterInt64.write(value.created, into: &buf)
+        FfiConverterSequenceString.write(value.tags, into: &buf)
+        FfiConverterString.write(value.when, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexedNote_lift(_ buf: RustBuffer) throws -> IndexedNote {
+    return try FfiConverterTypeIndexedNote.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexedNote_lower(_ value: IndexedNote) -> RustBuffer {
+    return FfiConverterTypeIndexedNote.lower(value)
+}
+
+
+/**
  * An iroh peer. `added` peers are dialed on launch; the rest dialed us and
  * are offered as suggestions.
  */
@@ -4172,9 +4438,10 @@ public func FfiConverterTypeSearchHit_lower(_ value: SearchHit) -> RustBuffer {
 
 
 /**
- * A saved search. Empty `kind`/`scope` and a zero `within_days` mean "no
- * filter"; the query may be empty too, in which case the filters alone
- * select the docs.
+ * A saved search. `rules` is the JSON rule tree the editor writes; the flat
+ * `query`/`kind`/`scope`/`within_days` fields carry a best-effort projection
+ * of it for clients that predate the tree, and are what those clients wrote.
+ * Empty `kind`/`scope` and a zero `within_days` mean "no filter".
  */
 public struct SmartNotebook {
     public var id: String
@@ -4185,10 +4452,11 @@ public struct SmartNotebook {
     public var withinDays: Int64
     public var showCount: Bool
     public var notifyOnChange: Bool
+    public var rules: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, name: String, query: String, kind: String, scope: String, withinDays: Int64, showCount: Bool, notifyOnChange: Bool) {
+    public init(id: String, name: String, query: String, kind: String, scope: String, withinDays: Int64, showCount: Bool, notifyOnChange: Bool, rules: String) {
         self.id = id
         self.name = name
         self.query = query
@@ -4197,6 +4465,7 @@ public struct SmartNotebook {
         self.withinDays = withinDays
         self.showCount = showCount
         self.notifyOnChange = notifyOnChange
+        self.rules = rules
     }
 }
 
@@ -4231,6 +4500,9 @@ extension SmartNotebook: Equatable, Hashable {
         if lhs.notifyOnChange != rhs.notifyOnChange {
             return false
         }
+        if lhs.rules != rhs.rules {
+            return false
+        }
         return true
     }
 
@@ -4243,6 +4515,7 @@ extension SmartNotebook: Equatable, Hashable {
         hasher.combine(withinDays)
         hasher.combine(showCount)
         hasher.combine(notifyOnChange)
+        hasher.combine(rules)
     }
 }
 
@@ -4262,7 +4535,8 @@ public struct FfiConverterTypeSmartNotebook: FfiConverterRustBuffer {
                 scope: FfiConverterString.read(from: &buf), 
                 withinDays: FfiConverterInt64.read(from: &buf), 
                 showCount: FfiConverterBool.read(from: &buf), 
-                notifyOnChange: FfiConverterBool.read(from: &buf)
+                notifyOnChange: FfiConverterBool.read(from: &buf), 
+                rules: FfiConverterString.read(from: &buf)
         )
     }
 
@@ -4275,6 +4549,7 @@ public struct FfiConverterTypeSmartNotebook: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.withinDays, into: &buf)
         FfiConverterBool.write(value.showCount, into: &buf)
         FfiConverterBool.write(value.notifyOnChange, into: &buf)
+        FfiConverterString.write(value.rules, into: &buf)
     }
 }
 
@@ -5205,6 +5480,31 @@ fileprivate struct FfiConverterSequenceTypeFolderSettings: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeIndexedNote: FfiConverterRustBuffer {
+    typealias SwiftType = [IndexedNote]
+
+    public static func write(_ value: [IndexedNote], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeIndexedNote.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [IndexedNote] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [IndexedNote]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeIndexedNote.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeIrohPeer: FfiConverterRustBuffer {
     typealias SwiftType = [IrohPeer]
 
@@ -5467,7 +5767,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_add_iroh_peer() != 44741) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 40160) {
+    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 39538) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_apply_note_mark() != 29508) {
@@ -5488,7 +5788,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_assets_without_vision() != 63793) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_clone_doc() != 61323) {
+    if (uniffi_lush_core_checksum_method_core_clone_doc() != 45060) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_config_state() != 45575) {
@@ -5497,7 +5797,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_connect() != 33521) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_contact_info() != 36844) {
+    if (uniffi_lush_core_checksum_method_core_contact_info() != 61745) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_asset() != 18937) {
@@ -5593,6 +5893,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_forget_iroh_peer() != 29223) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_indexed_notes() != 8063) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_iroh_friend_code() != 24179) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5611,7 +5914,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_is_sending_changes() != 41426) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 60899) {
+    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 43907) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_list_notes() != 11889) {
@@ -5623,7 +5926,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_local_server_port() != 45668) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_login_account() != 1192) {
+    if (uniffi_lush_core_checksum_method_core_login_account() != 41755) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_main_draft_url() != 27513) {
@@ -5632,7 +5935,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_mark_vision_attempted() != 8028) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_merge_doc() != 19105) {
+    if (uniffi_lush_core_checksum_method_core_merge_doc() != 44210) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_move_entry() != 40698) {
@@ -5695,7 +5998,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_pinned_doc_url() != 53180) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 23856) {
+    if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 18043) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_publish_ephemeral() != 11927) {
@@ -5722,7 +6025,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_rename_note() != 13351) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_resync_doc() != 27414) {
+    if (uniffi_lush_core_checksum_method_core_resync_doc() != 12944) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_search_notes() != 9591) {
@@ -5731,7 +6034,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_semantic_search() != 33300) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_set_apply_incoming() != 65158) {
+    if (uniffi_lush_core_checksum_method_core_set_apply_incoming() != 5016) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_checkout_state() != 43074) {
@@ -5767,7 +6070,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_search_parents() != 11459) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_set_send_changes() != 21542) {
+    if (uniffi_lush_core_checksum_method_core_set_send_changes() != 8485) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_shutdown() != 44681) {
@@ -5782,10 +6085,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_text_cursor() != 65402) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_update_asset_ml() != 42424) {
+    if (uniffi_lush_core_checksum_method_core_update_asset_ml() != 2016) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_update_asset_vision() != 689) {
+    if (uniffi_lush_core_checksum_method_core_update_asset_vision() != 61819) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_update_note_spans() != 63225) {

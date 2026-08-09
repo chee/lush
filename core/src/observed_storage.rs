@@ -33,11 +33,11 @@ impl StoredBatch {
 #[derive(Clone, Debug)]
 pub(crate) struct ObservedStorage {
     inner: FsStorage,
-    stored: mpsc::UnboundedSender<StoredBatch>,
+    stored: mpsc::Sender<StoredBatch>,
 }
 
 impl ObservedStorage {
-    pub(crate) fn new(inner: FsStorage, stored: mpsc::UnboundedSender<StoredBatch>) -> Self {
+    pub(crate) fn new(inner: FsStorage, stored: mpsc::Sender<StoredBatch>) -> Self {
         Self { inner, stored }
     }
 }
@@ -89,11 +89,13 @@ impl Storage<Sendable> for ObservedStorage {
                 verified,
             )
             .await?;
-            let _ = stored.send(StoredBatch {
-                sedimentree_id,
-                commits: vec![record],
-                fragments: Vec::new(),
-            });
+            let _ = stored
+                .send(StoredBatch {
+                    sedimentree_id,
+                    commits: vec![record],
+                    fragments: Vec::new(),
+                })
+                .await;
             Ok(())
         })
     }
@@ -161,11 +163,13 @@ impl Storage<Sendable> for ObservedStorage {
         Sendable::from_future(async move {
             <FsStorage as Storage<Sendable>>::save_fragment(&self.inner, sedimentree_id, verified)
                 .await?;
-            let _ = stored.send(StoredBatch {
-                sedimentree_id,
-                commits: Vec::new(),
-                fragments: vec![record],
-            });
+            let _ = stored
+                .send(StoredBatch {
+                    sedimentree_id,
+                    commits: Vec::new(),
+                    fragments: vec![record],
+                })
+                .await;
             Ok(())
         })
     }
@@ -253,7 +257,7 @@ impl Storage<Sendable> for ObservedStorage {
             )
             .await?;
             if !batch.is_empty() {
-                let _ = stored.send(batch);
+                let _ = stored.send(batch).await;
             }
             Ok(count)
         })

@@ -254,6 +254,7 @@ struct ContentView: View {
         switch action {
         case .newNote:
             Task {
+                contextTracker.start()
                 if let url = await model.createNoteInInbox(snap: contextTracker.snapshot) {
                     open(url)
                 }
@@ -489,6 +490,8 @@ struct ContentView: View {
             return
         }
         searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
             let hits = await model.search(query, in: searchScope)
             guard !Task.isCancelled else { return }
             searchHits = hits
@@ -1189,11 +1192,7 @@ struct ContentView: View {
                 } else if calendarSelected {
                     AgendaScreen { open($0) }
                 } else if let url = model.selectedNoteUrl {
-                    if model.core == nil {
-                        BootNoteSnapshotView(url: url)
-                    } else {
-                        detailContent(for: url)
-                    }
+                    detailContent(for: url)
                 } else {
                     ContentUnavailableView(
                         "No Note Selected",
@@ -1224,7 +1223,10 @@ struct ContentView: View {
                 } label: {
                     Image(systemName: "square.and.pencil")
                 } primaryAction: {
-                    Task { if let url = await model.createNote(snap: contextTracker.snapshot) { open(url) } }
+                    Task {
+                        contextTracker.start()
+                        if let url = await model.createNote(snap: contextTracker.snapshot) { open(url) }
+                    }
                 }
                 .disabled(model.folderUrl == nil)
             }
@@ -1382,7 +1384,8 @@ struct NoteRowView: View {
     var commitRename: () -> Void = {}
     @Environment(NotesModel.self) private var model
 
-    private var meta: NoteContextMeta? { model.contextMetas[node.url] }
+    private var row: NoteRow { model.noteRow(for: node.url) }
+    private var meta: NoteContextMeta? { row.contextMeta }
 
     private var secondLine: String {
         var parts: [String] = []
@@ -1427,8 +1430,8 @@ struct NoteRowView: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .lineLimit(2)
-                } else if let preview = model.previews[node.url], !preview.isEmpty {
-                    Text(preview)
+                } else if !row.preview.isEmpty {
+                    Text(row.preview)
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .lineLimit(2)
@@ -1440,7 +1443,7 @@ struct NoteRowView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            if let data = model.thumbnails[node.url],
+            if let data = row.thumbnail,
                let thumbnail = thumbnailImage(from: data) {
                 thumbnail
                     .resizable()
@@ -1775,8 +1778,11 @@ struct FolderScreen: View {
         .onChange(of: searchText) {
             model.searchQuery = searchText
             searchTask?.cancel()
+            let query = searchText
             searchTask = Task {
-                let hits = await model.search(searchText, in: folderUrl)
+                try? await Task.sleep(for: .milliseconds(180))
+                guard !Task.isCancelled else { return }
+                let hits = await model.search(query, in: folderUrl)
                 guard !Task.isCancelled else { return }
                 searchHits = hits
             }
@@ -1848,6 +1854,7 @@ struct FolderScreen: View {
                 Menu {
                     Button {
                         Task {
+                            contextTracker.start()
                             if let url = await model.createNote(snap: contextTracker.snapshot) {
                                 push(.note(url))
                             }
@@ -1867,6 +1874,7 @@ struct FolderScreen: View {
                         .font(.title2)
                 } primaryAction: {
                     Task {
+                        contextTracker.start()
                         if let url = await model.createNote(snap: contextTracker.snapshot) {
                             push(.note(url))
                         }
@@ -2233,7 +2241,7 @@ struct RightSidebarView: View {
             selectedEntry = nil
             await refreshHistory()
         }
-        .onChange(of: model.previews[url]) {
+        .onChange(of: model.noteRow(for: url).preview) {
             scheduleHistoryRefresh()
         }
         .onChange(of: model.syncLog.count) {
@@ -2939,20 +2947,6 @@ private extension Array {
 }
 
 #if os(macOS)
-private struct BootNoteSnapshotView: View {
-    let url: String
-    @Environment(NotesModel.self) private var model
-    @State private var attributed = NSAttributedString(string: "")
-
-    var body: some View {
-        HistorySnapshotTextView(attributed: attributed)
-            .opacity(0.5)
-            .task(id: url) {
-                attributed = await model.renderedCurrentSnapshot(for: url)
-            }
-    }
-}
-
 private struct HistoricalNoteSnapshotView: View {
     let noteUrl: String
     let entry: DocHistoryEntry
@@ -4677,12 +4671,13 @@ struct IncomingContentSheet: View {
     @Environment(NotesModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
+    @State private var allNotes: [FolderNode] = []
 
     private var displayTitle: String {
         content.displayTitle
     }
 
-    private var allNotes: [FolderNode] {
+    private func collectNotes() {
         var out: [FolderNode] = []
         func walk(_ nodes: [FolderNode]) {
             for node in nodes {
@@ -4691,7 +4686,7 @@ struct IncomingContentSheet: View {
             }
         }
         walk(model.folderTree)
-        return out
+        allNotes = out
     }
 
     private var filtered: [FolderNode] {
@@ -4704,7 +4699,7 @@ struct IncomingContentSheet: View {
             List {
                 Section {
                     Button {
-                        model.importAsNewNote(content)
+                        Task { await model.importAsNewNote(content) }
                         dismiss()
                     } label: {
                         Label("New Note", systemImage: "square.and.pencil")
@@ -4731,6 +4726,7 @@ struct IncomingContentSheet: View {
                 }
             }
             .searchable(text: $search, prompt: "Search notes")
+            .onChange(of: model.folderTree, initial: true) { collectNotes() }
             .navigationTitle(displayTitle.isEmpty ? "Import" : displayTitle)
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)

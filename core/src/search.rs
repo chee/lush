@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use rusqlite::{params, Connection, ErrorCode};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
-use crate::api::{EmbeddingChunk, RecentNote, SearchFilter, SearchHit};
+use crate::api::{EmbeddingChunk, IndexedNote, RecentNote, SearchFilter, SearchHit};
 use crate::shapes;
 
 /// Cosine below this is noise rather than a weak match.
@@ -41,11 +41,16 @@ pub struct IndexedDoc {
     pub body: String,
     pub links: Vec<String>,
     pub modified: i64,
+    pub created: i64,
     /// File docs only: whether `@computervision` has been written yet.
     pub has_vision: bool,
     pub tags: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
+    /// The doc state this row was built from. An upsert whose heads match what
+    /// is already stored is a no-op, so a re-crawl costs a read instead of a
+    /// full FTS rewrite.
+    pub heads: String,
 }
 
 /// Tags are stored as one space-delimited string wrapped in spaces, so
@@ -163,6 +168,14 @@ impl SearchIndex {
             "ALTER TABLE search_docs ADD COLUMN when_day TEXT NOT NULL DEFAULT ''",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN heads TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN created INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS search_docs_modified
                 ON search_docs(modified DESC);
@@ -176,10 +189,26 @@ impl SearchIndex {
 
     pub fn upsert(&self, doc: IndexedDoc) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
+        if !doc.heads.is_empty() {
+            // A row written before `created` existed has to be rewritten even
+            // though its heads still match, or it never gets one.
+            let stored: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT heads, created FROM search_docs WHERE url = ?1",
+                    params![doc.url],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((heads, created)) = stored {
+                if heads == doc.heads && (created != 0 || doc.created == 0) {
+                    return Ok(());
+                }
+            }
+        }
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -187,7 +216,9 @@ impl SearchIndex {
                 modified = excluded.modified,
                 has_vision = excluded.has_vision,
                 tags = excluded.tags,
-                when_day = excluded.when_day",
+                when_day = excluded.when_day,
+                heads = excluded.heads,
+                created = excluded.created",
             params![
                 doc.url,
                 doc.kind,
@@ -196,7 +227,9 @@ impl SearchIndex {
                 doc.modified,
                 doc.has_vision,
                 encode_tags(&doc.tags),
-                doc.when
+                doc.when,
+                doc.heads,
+                doc.created
             ],
         )?;
         tx.execute(
@@ -424,6 +457,32 @@ impl SearchIndex {
         Ok(out)
     }
 
+    /// Every doc the index holds, newest first, without its text.
+    pub fn indexed_notes(&self, limit: u32) -> Result<Vec<IndexedNote>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, title, kind, modified, created, tags, when_day
+             FROM search_docs
+             ORDER BY modified DESC
+             LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let tags: String = row.get(5)?;
+            out.push(IndexedNote {
+                url: row.get(0)?,
+                title: row.get(1)?,
+                kind: row.get(2)?,
+                modified: row.get(3)?,
+                created: row.get(4)?,
+                tags: tags.split_whitespace().map(str::to_string).collect(),
+                when: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Everything a filter can narrow, resolved to a url set. Only worth the
     /// scan when a filter is actually set — it exists so a hit on an asset can
     /// check the notes that embed it against the same filter as the asset.
@@ -538,6 +597,8 @@ pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
         Vec::new()
     };
     let has_vision = kind == "file" && shapes::asset_vision(doc).is_some();
+    let mut heads: Vec<String> = doc.get_heads().iter().map(ToString::to_string).collect();
+    heads.sort();
     IndexedDoc {
         url,
         kind,
@@ -545,9 +606,11 @@ pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
         body,
         links,
         modified: shapes::doc_modified(doc),
+        created: shapes::doc_created(doc),
         has_vision,
         tags: shapes::doc_tags(doc),
         when: shapes::doc_when(doc),
+        heads: heads.join(","),
     }
 }
 
@@ -734,9 +797,11 @@ mod tests {
             body: "cake recipe".into(),
             links: Vec::new(),
             modified: 0,
+            created: 0,
             has_vision: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             when: when.into(),
+            heads: String::new(),
         }
     }
 

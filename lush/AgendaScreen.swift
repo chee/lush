@@ -8,7 +8,7 @@ struct AgendaScreen: View {
     @Environment(ContextTracker.self) private var contextTracker
     @State private var agenda = AgendaStore.shared
     @State private var noteUrls: [String: String] = [:]
-    @State private var hovered: String?
+    @State private var dayGroups: [DayGroup] = []
     @State private var highlighted: String?
     @State private var highlightTask: Task<Void, Never>?
 
@@ -42,6 +42,14 @@ struct AgendaScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: CalendarLinks.changed)) { _ in
             noteUrls = CalendarLinks.noteUrlByItem
         }
+        .onChange(of: agenda.items, initial: true) { regroup() }
+        .onChange(of: agenda.horizon) { regroup() }
+    }
+
+    private func regroup() {
+        dayGroups = Agenda
+            .days(agenda.items, from: Calendar.current.startOfDay(for: Date()), count: agenda.horizon)
+            .map(DayGroup.init)
     }
 
     private var list: some View {
@@ -51,14 +59,14 @@ struct AgendaScreen: View {
                 // through those, and a loose header plus a nested ForEach left
                 // it dropping rows until they were scrolled well past.
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(dayGroups, id: \.day) { group in
+                    ForEach(dayGroups) { group in
                         Section {
                             // An event running over several days appears in
                             // each of them, so the day has to be part of the
                             // identity — one lazy stack holding the same id
                             // twice draws it once and leaves a hole.
-                            ForEach(keyed(group), id: \.key) { entry in
-                                row(entry.item, on: group.day)
+                            ForEach(group.rows) { entry in
+                                row(entry.item)
                             }
                         } header: {
                             header(group.day)
@@ -99,16 +107,6 @@ struct AgendaScreen: View {
         }
     }
 
-    private var dayGroups: [(day: Date, items: [AgendaItem])] {
-        Agenda.days(agenda.items, from: Calendar.current.startOfDay(for: Date()), count: agenda.horizon)
-    }
-
-    private func keyed(
-        _ group: (day: Date, items: [AgendaItem])
-    ) -> [(key: String, item: AgendaItem)] {
-        group.items.map { ("\(group.day.timeIntervalSince1970)|\($0.rowKey)", $0) }
-    }
-
 
     private func header(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -125,11 +123,58 @@ struct AgendaScreen: View {
         .padding(.bottom, 10)
     }
 
-    private func row(_ item: AgendaItem, on day: Date) -> some View {
-        let noteUrl = noteUrls[item.id] ?? item.seriesId.flatMap { noteUrls[$0] }
-        let key = "\(day.timeIntervalSince1970)|\(item.rowKey)"
-        let hovering = hovered == key
-        return HStack(alignment: .top, spacing: 8) {
+    private func row(_ item: AgendaItem) -> some View {
+        AgendaRow(
+            item: item,
+            noteUrl: noteUrls[item.id] ?? item.seriesId.flatMap { noteUrls[$0] },
+            hasSeriesNote: noteUrls[item.seriesId ?? ""] != nil,
+            highlighted: highlighted == item.id,
+            open: open,
+            create: create
+        )
+    }
+
+    private func create(_ item: AgendaItem, series: Bool = false) {
+        Task {
+            contextTracker.start()
+            if let url = await model.createNote(for: item, series: series, snap: contextTracker.snapshot) {
+                open(url)
+            }
+        }
+    }
+}
+
+struct DayGroup: Identifiable {
+    let day: Date
+    let rows: [Row]
+    var id: Date { day }
+
+    struct Row: Identifiable {
+        let id: String
+        let item: AgendaItem
+    }
+
+    init(_ group: (day: Date, items: [AgendaItem])) {
+        day = group.day
+        rows = group.items.map {
+            Row(id: "\(group.day.timeIntervalSince1970)|\($0.rowKey)", item: $0)
+        }
+    }
+}
+
+private struct AgendaRow: View {
+    let item: AgendaItem
+    let noteUrl: String?
+    let hasSeriesNote: Bool
+    let highlighted: Bool
+    let open: (String) -> Void
+    let create: (AgendaItem, Bool) -> Void
+
+    @Environment(NotesModel.self) private var model
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(item.title)
@@ -186,31 +231,29 @@ struct AgendaScreen: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(item.color, lineWidth: highlighted == item.id ? 2 : 0)
+                .strokeBorder(item.color, lineWidth: highlighted ? 2 : 0)
         )
         .padding(.vertical, 3)
         .contentShape(Rectangle())
-        .onHover { inside in
-            hovered = inside ? key : (hovered == key ? nil : hovered)
-        }
+        .onHover { hovering = $0 }
         #if os(macOS)
         .pointerStyle(.link)
         #endif
-        .onTapGesture { openOrCreate(item) }
+        .onTapGesture { openOrCreate() }
         .contextMenu {
             if let noteUrl {
                 Button("Open Note") { open(noteUrl) }
                 Button("Copy Note URL") { Clipboard.copy(noteUrl) }
-                Button("New Note") { create(item) }
-                if item.isRecurring, noteUrls[item.seriesId ?? ""] == nil {
-                    Button("New Note for the Whole Series") { create(item, series: true) }
+                Button("New Note") { create(item, false) }
+                if item.isRecurring, !hasSeriesNote {
+                    Button("New Note for the Whole Series") { create(item, true) }
                 }
                 Divider()
                 Button("Delete Note", role: .destructive) { model.deleteNote(noteUrl) }
             } else {
-                Button("New Note") { create(item) }
+                Button("New Note") { create(item, false) }
                 if item.isRecurring {
-                    Button("New Note for the Whole Series") { create(item, series: true) }
+                    Button("New Note for the Whole Series") { create(item, true) }
                 }
             }
             Divider()
@@ -227,19 +270,11 @@ struct AgendaScreen: View {
         }
     }
 
-    private func openOrCreate(_ item: AgendaItem) {
+    private func openOrCreate() {
         if let url = model.noteUrl(for: item) {
             open(url)
         } else {
-            create(item)
-        }
-    }
-
-    private func create(_ item: AgendaItem, series: Bool = false) {
-        Task {
-            if let url = await model.createNote(for: item, series: series, snap: contextTracker.snapshot) {
-                open(url)
-            }
+            create(item, false)
         }
     }
 }

@@ -5,6 +5,44 @@ import AppKit
 import UIKit
 #endif
 
+@MainActor
+final class CellHeights {
+    private struct Cell: Hashable {
+        let row: Int
+        let column: Int
+    }
+
+    private struct Measured {
+        let spans: [SpanNode]
+        let width: CGFloat
+        let height: CGFloat
+    }
+
+    private var entries: [Cell: Measured] = [:]
+
+    func height(row: Int, column: Int, spans: [SpanNode], width: CGFloat, cache: AssetCache) -> CGFloat {
+        let cell = Cell(row: row, column: column)
+        if let hit = entries[cell], hit.width == width, hit.spans == spans { return hit.height }
+        let measured = RichText.measuredHeight(of: spans, width: width, cache: cache)
+        entries[cell] = Measured(spans: spans, width: width, height: measured)
+        return measured
+    }
+
+    func rowHeight(_ row: [[SpanNode]], index: Int, cache: AssetCache) -> CGFloat {
+        var tallest: CGFloat = 0
+        for (column, spans) in row.enumerated() {
+            tallest = max(tallest, height(
+                row: index,
+                column: column,
+                spans: spans,
+                width: TableInlineView.cellWidth - 12,
+                cache: cache
+            ))
+        }
+        return max(30, tallest + 10)
+    }
+}
+
 /// Hosts the live SwiftUI views for attachment characters. TextKit 2 places
 /// and sizes them through `NSTextAttachmentViewProvider`; this manager only
 /// owns the view cache, so embed state (a playing video, a focused column)
@@ -23,6 +61,7 @@ final class InlineViewManager {
     }
 
     private var hosts: [ObjectIdentifier: Host] = [:]
+    private var locations: [ObjectIdentifier: Int] = [:]
 
     func viewProvider(
         for attachment: EmbedAttachment,
@@ -62,17 +101,32 @@ final class InlineViewManager {
               let textLayoutManager = view.pTextLayoutManager,
               let contentManager = textLayoutManager.textContentManager
         else { return }
+        guard let location = attachmentLocation(of: box, in: storage),
+              let textRange = contentManager.textRange(
+                  for: NSRange(location: location, length: 1)
+              )
+        else { return }
+        textLayoutManager.invalidateLayout(for: textRange)
+    }
+
+    private func attachmentLocation(of box: AnyObject, in storage: NSTextStorage) -> Int? {
+        let id = ObjectIdentifier(box)
+        if let known = locations[id], known < storage.length,
+           let attachment = storage.attribute(.attachment, at: known, effectiveRange: nil) as? EmbedAttachment,
+           attachment.box === box {
+            return known
+        }
+        var found: Int?
         storage.enumerateAttribute(
             .attachment,
             in: NSRange(location: 0, length: storage.length)
         ) { value, range, stop in
             guard let attachment = value as? EmbedAttachment, attachment.box === box else { return }
+            found = range.location
             stop.pointee = true
-            guard let textRange = contentManager.textRange(
-                for: NSRange(location: range.location, length: 1)
-            ) else { return }
-            textLayoutManager.invalidateLayout(for: textRange)
         }
+        locations[id] = found
+        return found
     }
 
     func hasLiveView(at point: CGPoint) -> Bool {
@@ -84,13 +138,15 @@ final class InlineViewManager {
             host.view.removeFromSuperview()
         }
         hosts.removeAll()
+        locations.removeAll()
     }
 
     private func makeTableHost(for box: TableBox) -> Host? {
         guard let core else { return nil }
         let cache = core.cache
+        let heights = CellHeights()
         let getManager: () -> InlineViewManager? = { [weak self] in self }
-        let root = TableInlineView(box: box, cache: cache, getManager: getManager) { [weak self] in
+        let root = TableInlineView(box: box, cache: cache, heights: heights, getManager: getManager) { [weak self] in
             self?.core?.tableChanged(box)
         }
         let (view, _, retained) = makeHosting(root)
@@ -99,8 +155,8 @@ final class InlineViewManager {
             preferredSize: { width in
                 CGSize(
                     width: min(CGFloat(max(box.grid.columnCount, 1)) * 150 + 2, width),
-                    height: box.grid.rows.reduce(CGFloat(2)) { sum, row in
-                        sum + TableInlineView.rowHeight(row, cache: cache)
+                    height: box.grid.rows.enumerated().reduce(CGFloat(2)) { sum, entry in
+                        sum + heights.rowHeight(entry.element, index: entry.offset, cache: cache)
                     }
                 )
             },
@@ -111,6 +167,7 @@ final class InlineViewManager {
     private func makeColumnsHost(for box: ColumnsBox) -> Host? {
         guard let core else { return nil }
         let cache = core.cache
+        let heights = CellHeights()
         let root = ColumnsInlineView(box: box, cache: cache) { [weak self] in
             self?.core?.columnsChanged(box)
         }
@@ -121,8 +178,16 @@ final class InlineViewManager {
                 let count = max(box.columns.count, 1)
                 let chrome = CGFloat(count - 1) * 17 + 12
                 let columnWidth = max((width - chrome) / CGFloat(count), 60)
-                let tallest = box.columns
-                    .map { RichText.measuredHeight(of: $0, width: columnWidth - 4, cache: cache) }
+                let tallest = box.columns.enumerated()
+                    .map {
+                        heights.height(
+                            row: 0,
+                            column: $0.offset,
+                            spans: $0.element,
+                            width: columnWidth - 4,
+                            cache: cache
+                        )
+                    }
                     .max() ?? 40
                 return CGSize(width: width, height: max(tallest + 26, 80))
             },
@@ -305,13 +370,15 @@ final class EmbedViewProvider: NSTextAttachmentViewProvider {
 struct TableInlineView: View {
     let box: TableBox
     let cache: AssetCache
+    let heights: CellHeights
     let getManager: (() -> InlineViewManager?)?
     let onEdit: () -> Void
     @State private var grid: TableGrid
 
-    init(box: TableBox, cache: AssetCache, getManager: (() -> InlineViewManager?)? = nil, onEdit: @escaping () -> Void) {
+    init(box: TableBox, cache: AssetCache, heights: CellHeights, getManager: (() -> InlineViewManager?)? = nil, onEdit: @escaping () -> Void) {
         self.box = box
         self.cache = cache
+        self.heights = heights
         self.getManager = getManager
         self.onEdit = onEdit
         _grid = State(initialValue: box.grid)
@@ -320,18 +387,11 @@ struct TableInlineView: View {
     static let cellWidth: CGFloat = 150
     private var line: Color { Color.secondary.opacity(0.35) }
 
-    @MainActor
-    static func rowHeight(_ row: [[SpanNode]], cache: AssetCache) -> CGFloat {
-        let tallest = row.map {
-            RichText.measuredHeight(of: $0, width: cellWidth - 12, cache: cache)
-        }.max() ?? 0
-        return max(30, tallest + 10)
-    }
-
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             Grid(horizontalSpacing: 0, verticalSpacing: 0) {
                 ForEach(0..<grid.rows.count, id: \.self) { r in
+                    let rowHeight = heights.rowHeight(grid.rows[r], index: r, cache: cache)
                     GridRow {
                         ForEach(0..<max(grid.columnCount, 1), id: \.self) { c in
                             SpanCellEditor(spans: cellSpans(r, c), cache: cache, getManager: getManager) { spans in
@@ -339,7 +399,7 @@ struct TableInlineView: View {
                             }
                             .frame(
                                 width: Self.cellWidth,
-                                height: Self.rowHeight(grid.rows[r], cache: cache),
+                                height: rowHeight,
                                 alignment: .topLeading
                             )
                             .background(isHeader(r) ? Color.secondary.opacity(0.12) : .clear)

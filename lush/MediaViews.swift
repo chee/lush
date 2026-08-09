@@ -150,9 +150,11 @@ struct AudioInlineView: View {
         .task {
             let url = fileURL
             levels = await Task.detached { WaveformView.levels(for: url) }.value
-            while !Task.isCancelled {
+        }
+        .task(id: playing) {
+            while playing, !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
-                guard let player, playing else { continue }
+                guard !Task.isCancelled, let player else { continue }
                 progress = player.duration > 0 ? player.currentTime / player.duration : 0
                 if !player.isPlaying {
                     playing = false
@@ -690,14 +692,14 @@ struct AudioPlayerSheet: View {
                     editableTranscript = ocr
                 }
             }
-            while !Task.isCancelled {
+        }
+        .task(id: playing) {
+            while playing, !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
-                guard let player else { continue }
-                if playing {
-                    position = player.currentTime
-                    if !player.isPlaying {
-                        playing = false
-                    }
+                guard !Task.isCancelled, let player else { continue }
+                position = player.currentTime
+                if !player.isPlaying {
+                    playing = false
                 }
             }
         }
@@ -857,7 +859,9 @@ struct HtmlEditorSheet: View {
         #if os(macOS)
         .frame(minWidth: 680, minHeight: 460)
         #endif
-        .onChange(of: html, initial: true) {
+        .task(id: html) {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
             page.load(html: HtmlPreview.wrapped(html), baseURL: URL(string: "about:blank")!)
         }
     }

@@ -135,6 +135,16 @@ struct NoteAttachment: Equatable {
     }
 }
 
+/// What Apple Intelligence is asked to fill in on a pass that only wants prose.
+/// A schema it completes beats an object it has to spell out by hand.
+@Generable
+struct NoteChatGuidedAnswer {
+    @Guide(description: "The answer to the question the person actually asked, in your own words. Not a summary of the note unless a summary is what was asked for. Empty only when you cannot answer from what you were given.")
+    let answer: String
+    @Guide(description: "What you would need in order to answer. Empty whenever you have answered.")
+    let need: String
+}
+
 enum NoteChatAssistant {
     enum ChatError: LocalizedError {
         case emptyQuestion
@@ -228,6 +238,16 @@ enum NoteChatAssistant {
         words(in: question).contains(where: destructiveWords.contains)
     }
 
+    private static let attachmentWords: Set<String> = [
+        "attachment", "attachments", "image", "images", "picture", "pictures",
+        "photo", "photos", "screenshot", "screenshots", "audio", "recording",
+        "transcript", "file", "diagram", "chart", "drawing", "video",
+    ]
+
+    static func asksAboutAttachment(_ question: String) -> Bool {
+        words(in: question).contains(where: attachmentWords.contains)
+    }
+
     /// Generate, run whatever tool was called, generate again — until the model
     /// answers or the round budget runs out.
     static func respond(
@@ -239,19 +259,29 @@ enum NoteChatAssistant {
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else { throw ChatError.emptyQuestion }
         let choice = choice ?? LocalModelSettings.choice(for: .noteChat)
+        let profile = await ChatProfileSettings.profile(for: .noteChat, choice: choice)
         await MainActor.run {
-            session.allowsWrites = wantsChange(trimmedQuestion)
+            session.allowsWrites = switch profile.tools {
+            case .none: false
+            case .asked: wantsChange(trimmedQuestion)
+            case .full: true
+            }
             session.allowsDestructive = session.allowsWrites && wantsDestruction(trimmedQuestion)
         }
 
         var transcript: [String] = []
         var called = Set<String>()
-        let settings = LocalModelSettings.generationSettings(for: .noteChat)
         var budget = await ModelContextWindow.promptCharacters(
-            for: choice, response: settings.maximumResponseTokens
+            for: choice, response: profile.maximumResponseTokens
         )
+        if let limit = profile.promptLimit { budget = min(budget, limit) }
 
+        // Apple Intelligence fills a schema far better than it writes JSON by
+        // hand, so the passes that only want prose ask it for a value instead
+        // of for an object. The tool passes still go through the text protocol
+        // every other backend shares.
         func think(tools: Bool, last: Bool, insist: Bool = false) async throws -> GeneratedReply {
+            let guided = choice.backend == .appleIntelligence && !tools
             while true {
                 let body = await prompt(
                     question: trimmedQuestion,
@@ -261,10 +291,11 @@ enum NoteChatAssistant {
                     tools: tools,
                     last: last,
                     insist: insist,
+                    guided: guided,
                     budget: budget
                 )
                 do {
-                    return try await generate(body, choice: choice)
+                    return try await generate(body, choice: choice, guided: guided, profile: profile)
                 } catch ChatError.promptTooLong {
                     // the window was smaller than this model let on; remember
                     // that and try again rather than losing the turn
@@ -275,12 +306,13 @@ enum NoteChatAssistant {
             }
         }
 
-        // a model that echoed the schema back gets told so and asked again
+        // a model that echoed the schema, or the person, gets told so and asked
+        // again — a reply that is just their own words back is not an answer
         func answer(_ generated: GeneratedReply, tools: Bool, last: Bool) async throws
             -> (answer: String, proposedMarkdown: String?) {
-            guard isPlaceholder(generated.answer) else {
-                return try await reply(from: generated, session: session)
-            }
+            let useless = isPlaceholder(generated.answer)
+                || isEcho(generated.answer, of: trimmedQuestion)
+            guard useless else { return try await reply(from: generated, session: session) }
             return try await reply(
                 from: try await think(tools: tools, last: last, insist: true), session: session
             )
@@ -293,11 +325,14 @@ enum NoteChatAssistant {
         if opening.tool == nil, !opening.needsTools, !opening.answer.isEmpty {
             return try await answer(opening, tools: false, last: false)
         }
+        guard profile.tools != .none else {
+            return try await answer(try await think(tools: false, last: true), tools: false, last: true)
+        }
         if let need = opening.need, !need.isEmpty {
             transcript.append("You said you needed: \(limited(need, to: 400))")
         }
 
-        let rounds = await maximumRounds(for: choice)
+        let rounds = min(profile.rounds, await maximumRounds(for: choice))
         for round in 0..<rounds {
             let generated = try await think(tools: true, last: round == rounds - 1)
             guard let tool = generated.tool, !tool.isEmpty else {
@@ -325,6 +360,7 @@ enum NoteChatAssistant {
         tools: Bool,
         last: Bool,
         insist: Bool,
+        guided: Bool,
         budget: Int
     ) async -> String {
         let outline = await MainActor.run { session.outline }
@@ -339,27 +375,45 @@ enum NoteChatAssistant {
                 destructive: session.allowsDestructive
             )
         } : ""
+        // a model with no tools has no use for block numbers, tool syntax, or
+        // most of the framing — it needs the note, the thread, and the question
+        let terse = !tools && guided
         let question = limited(question, to: 2_000)
+        // an attachment listed beside the note is the last concrete thing a
+        // small model reads before the question, and it answers about that
+        // instead — so it only gets one when the question is about one
+        let shown = terse && !asksAboutAttachment(question) ? [] : attachments
         // scaffolding, the title line and the closing instructions
         let spare = max(1_000, budget - catalog.count - question.count - 700)
         let calls = transcript.isEmpty ? "" : fittedTranscript(transcript, to: spare * 45 / 100)
-        let notes = fit(attachmentsSection(attachments), to: min(spare * 15 / 100, 1_500))
-        let history = fit(historySummary(from: previousTurns), to: min(spare * 15 / 100, 1_500))
+        let share = terse ? 10 : 15
+        let cap = terse ? 700 : 1_500
+        let notes = fit(attachmentsSection(shown), to: min(spare * share / 100, cap))
+        let history = fit(
+            historySummary(from: previousTurns, keeping: terse ? 4 : 8),
+            to: min(spare * share / 100, cap)
+        )
         let blocks = fitOutline(outline, to: spare - calls.count - notes.count - history.count)
 
-        let sections = [
+        let noteHeader = terse ? "The note:" : "The note, one line per block, numbered for editing:"
+        let historyHeader = terse
+            ? "Earlier in this chat:"
+            : "Recent chat — the person has read all of this, so do not repeat an answer word for word:"
+        let questionHeader = terse
+            ? "The question, which is what your answer must be about:"
+            : "Person request:"
+
+        let sections: [String?] = [
             "Note title: \(limited(title, to: 300))",
-            "The note, one line per block, numbered for editing:\n\(blocks)",
-            attachments.isEmpty ? nil : "Attachments:\n\(notes)",
-            previousTurns.isEmpty
-                ? nil
-                : "Recent chat — the person has read all of this, so do not repeat an answer word for word:\n\(history)",
+            "\(noteHeader)\n\(blocks)",
+            shown.isEmpty ? nil : "Attachments:\n\(notes)",
+            previousTurns.isEmpty ? nil : "\(historyHeader)\n\(history)",
             calls.isEmpty ? nil : "What you have found so far this turn:\n\(calls)",
             catalog.isEmpty ? nil : "Tools:\n\(catalog)",
-            "Person request:\n\(question)",
-            closing(tools: tools, last: last, writes: writes, insist: insist),
-        ].compactMap { $0 }
-        return sections.joined(separator: "\n\n")
+            "\(questionHeader)\n\(question)",
+            closing(tools: tools, last: last, writes: writes, insist: insist, guided: guided),
+        ]
+        return sections.compactMap { $0 }.joined(separator: "\n\n")
     }
 
     /// Without the tools in front of it, the model is asked for an answer and
@@ -367,17 +421,28 @@ enum NoteChatAssistant {
     /// is what brings the tools out on the next pass. The keys are described
     /// rather than shown filled in: a small model handed an example value
     /// copies it out verbatim as its reply.
-    private static func closing(tools: Bool, last: Bool, writes: Bool, insist: Bool) -> String {
+    private static func closing(
+        tools: Bool, last: Bool, writes: Bool, insist: Bool, guided: Bool
+    ) -> String {
         let insisted = insist
-            ? "\nYour last reply repeated the description of the answer instead of answering. Write the real reply this time."
+            ? "\nYour last reply was not an answer — it repeated the person's words, or the description of the answer. Answer properly this time."
             : ""
+        let manners = """
+        Say something of substance: what the note actually says, in your own words. \
+        Never repeat the person's message back to them, and never repeat an answer \
+        you have already given.
+        """
+        // the schema carries the rest; a small window is better spent on the note
+        if guided {
+            return "Answer the person from the note above, in your own words.\(insisted)"
+        }
         guard tools else {
             return """
-            Answer the person, using the note above. Return one JSON object and no other \
-            text, with the single key "answer", whose value is the reply itself — what you \
-            are saying to the person, written out, not a description of it.
+            Answer the person, using the note above. \(manners)
+            Return one JSON object and no other text — the key "answer", with the reply \
+            itself as its value: {"answer": …}
             If — and only if — answering is impossible without something the note above does \
-            not contain, return instead the single key "need", whose value names what is missing.\
+            not contain, return the single key "need" instead, naming what is missing.\
             \(insisted)
             """
         }
@@ -416,22 +481,38 @@ enum NoteChatAssistant {
         }.joined(separator: "\n")
     }
 
-    private static func generate(_ body: String, choice: ModelChoice) async throws -> GeneratedReply {
-        let settings = LocalModelSettings.generationSettings(for: .noteChat)
+    private static func instructions(_ profile: ChatProfile) -> String {
+        let base = LocalModelSettings.systemPrompt(for: .noteChat)
+        return profile.instruction.isEmpty ? base : "\(base)\n\(profile.instruction)"
+    }
+
+    private static func generate(
+        _ body: String, choice: ModelChoice, guided: Bool, profile: ChatProfile
+    ) async throws -> GeneratedReply {
         let raw: String
         switch choice.backend {
         case .appleIntelligence:
             guard SystemLanguageModel.default.isAvailable else {
                 throw ChatError.appleIntelligenceUnavailable
             }
-            let session = LanguageModelSession(
-                instructions: LocalModelSettings.systemPrompt(for: .noteChat)
-            )
+            let session = LanguageModelSession(instructions: instructions(profile))
             let options = GenerationOptions(
-                temperature: settings.temperature,
-                maximumResponseTokens: settings.maximumResponseTokens
+                temperature: profile.temperature,
+                maximumResponseTokens: profile.maximumResponseTokens
             )
             do {
+                if guided {
+                    let content = try await session.respond(
+                        to: body, generating: NoteChatGuidedAnswer.self, options: options
+                    ).content
+                    return GeneratedReply(
+                        answer: content.answer,
+                        tool: nil,
+                        arguments: [:],
+                        need: content.need.isEmpty ? nil : content.need,
+                        editedMarkdown: nil
+                    )
+                }
                 raw = try await session.respond(to: body, options: options).content
             } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
                 throw ChatError.promptTooLong
@@ -442,14 +523,14 @@ enum NoteChatAssistant {
                 throw ChatError.customModelNotConfigured
             }
             raw = try await LocalLLMRuntime.generateText(
-                prompt: "\(LocalModelSettings.systemPrompt(for: .noteChat))\n\n\(body)",
+                prompt: "\(instructions(profile))\n\n\(body)",
                 config: config,
-                maxTokens: settings.maximumResponseTokens,
-                temperature: settings.temperature
+                maxTokens: profile.maximumResponseTokens,
+                temperature: profile.temperature
             )
         case .openRouter, .openAI, .anthropic, .compatible, .ollama:
             raw = try await CloudLLMRuntime.generateText(
-                prompt: "\(LocalModelSettings.systemPrompt(for: .noteChat))\n\n\(body)",
+                prompt: "\(instructions(profile))\n\n\(body)",
                 operation: .noteChat,
                 choice: choice
             )
@@ -515,8 +596,8 @@ enum NoteChatAssistant {
 
     /// A placeholder that reached the transcript before this was caught teaches
     /// the model to write another one, so history leaves them out.
-    private static func historySummary(from turns: [NoteChatTurn]) -> String {
-        let lines = turns.suffix(8).compactMap { turn -> String? in
+    private static func historySummary(from turns: [NoteChatTurn], keeping: Int) -> String {
+        let lines = turns.suffix(keeping).compactMap { turn -> String? in
             guard !isPlaceholder(turn.text) else { return nil }
             let role = turn.role == .user ? "Person" : "Assistant"
             return "\(role): \(limited(turn.text, to: 1_000))"
@@ -590,6 +671,18 @@ enum NoteChatAssistant {
         "the reply itself", "what you are saying to the person", "answer", "reply",
         "your response", "what you are missing", "name", "tool name",
     ]
+
+    /// The person's own words handed back, give or take punctuation and case.
+    private static func isEcho(_ answer: String, of question: String) -> Bool {
+        func bare(_ value: String) -> String {
+            value.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        }
+        let answered = bare(answer)
+        return !answered.isEmpty && answered == bare(question)
+    }
 
     private static func isPlaceholder(_ value: String?) -> Bool {
         guard let value else { return false }
@@ -753,6 +846,12 @@ struct NoteChatView: View {
                 ModelChoiceMenu(operation: .noteChat, selection: $modelChoice)
                     .uiFont(.caption)
                     .disabled(isGenerating)
+                ChatProfileMenu(
+                    operation: .noteChat,
+                    choice: modelChoice ?? LocalModelSettings.choice(for: .noteChat)
+                )
+                .uiFont(.caption)
+                .disabled(isGenerating)
                 Button {
                     clearChat()
                 } label: {

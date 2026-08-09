@@ -1,20 +1,16 @@
 import Foundation
 import Security
 
-/// State the app and the background helper both need to find: the core's
-/// storage, the saved root folders, the account. All of it lives in the app
-/// group container, since the two processes have separate sandboxes.
+/// State the app and its extensions both need to find: the core's storage, the
+/// saved root folders, the account. All of it lives in the app group
+/// container, since the processes have separate sandboxes.
 enum LushShared {
     static let appGroup = "group.party.chee.patchwork.lush"
     static let mainBundleId = "party.chee.patchwork.lush"
-    static let helperBundleId = "party.chee.patchwork.lush.Helper"
-    static let helperName = "Lush Helper"
 
     static let foldersKey = "folderURLs"
     static let legacyFolderKey = "folderURL"
     static let accountKey = "patchworkAccountUrl"
-    static let helperEnabledKey = "backgroundSyncEnabled"
-    static let helperMenuBarKey = "backgroundSyncShowsMenuBar"
     static let widgetSnapshotFileName = "LushWidgetSnapshot.json"
     static let folderContentWidgetKind = "FolderContentWidget"
 
@@ -22,16 +18,6 @@ enum LushShared {
 
     static var container: URL? {
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup)
-    }
-
-    static var helperEnabled: Bool {
-        get { defaults.object(forKey: helperEnabledKey) as? Bool ?? true }
-        set { defaults.set(newValue, forKey: helperEnabledKey) }
-    }
-
-    static var helperShowsMenuBar: Bool {
-        get { defaults.object(forKey: helperMenuBarKey) as? Bool ?? true }
-        set { defaults.set(newValue, forKey: helperMenuBarKey) }
     }
 
     static var rootFolderUrls: [String] {
@@ -45,7 +31,7 @@ enum LushShared {
 
     /// The account url is a capability — anyone holding it can read and write
     /// the account — so it lives in the keychain, in the app group's access
-    /// group so the helper can read it too.
+    /// group so the extensions can read it too.
     static var accountUrl: String? {
         get {
             if let saved = keychainAccount() { return saved }

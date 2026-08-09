@@ -20,15 +20,28 @@ struct ModelChoiceMenu: View {
             }
             Divider()
             ForEach(groupedChoices, id: \.backend) { group in
-                Menu(group.backend.label) {
-                    ForEach(group.choices) { choice in
-                        Button {
-                            selection = choice
-                        } label: {
-                            Label(
-                                choice.model.isEmpty ? "Default" : choice.model,
-                                systemImage: selection == choice ? "checkmark" : ""
-                            )
+                // a provider that offers one model is that model; a submenu
+                // holding a single "Default" is a click for nothing
+                if let only = group.choices.first, group.choices.count == 1 {
+                    Button {
+                        selection = only
+                    } label: {
+                        Label(
+                            only.model.isEmpty ? group.backend.label : only.model,
+                            systemImage: selection == only ? "checkmark" : ""
+                        )
+                    }
+                } else {
+                    Menu(group.backend.label) {
+                        ForEach(group.choices) { choice in
+                            Button {
+                                selection = choice
+                            } label: {
+                                Label(
+                                    choice.model.isEmpty ? "Default" : choice.model,
+                                    systemImage: selection == choice ? "checkmark" : ""
+                                )
+                            }
                         }
                     }
                 }
@@ -39,9 +52,10 @@ struct ModelChoiceMenu: View {
                 systemImage: "sparkles"
             )
             .lineLimit(1)
+            .truncationMode(.middle)
         }
         .menuStyle(.borderlessButton)
-        .fixedSize()
+        .frame(maxWidth: 190, alignment: .leading)
         .task {
             choices = LocalModelSettings.availableChoices()
             // ollama names no default model, so it has nothing to offer until

@@ -11,11 +11,8 @@ final class LushDockTilePlugin: NSObject, NSDockTilePlugIn {
     }
 
     private func applyOverlay(to dockTile: NSDockTile) {
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: "group.party.chee.patchwork.lush"
-        ) else { return }
-        let url = root.appendingPathComponent("DockTileImage.png")
-        guard let image = NSImage(contentsOf: url) else { return }
+        guard let url = DockMenuSnapshot.tileImageURL,
+              let image = NSImage(contentsOf: url) else { return }
         let view = NSImageView(frame: NSRect(origin: .zero, size: dockTile.size))
         view.image = image
         view.imageScaling = .scaleProportionallyUpOrDown
@@ -30,7 +27,7 @@ final class LushDockTilePlugin: NSObject, NSDockTilePlugIn {
         addRoute("Open Quick Note", url: "lush://show?doc=quick", to: menu)
         addRoute("Quick Capture", url: "lush://capture", to: menu)
 
-        let recents = loadSnapshot().recents.prefix(8)
+        let recents = DockMenuSnapshot.stored.recents.prefix(8)
         if !recents.isEmpty {
             menu.addItem(.separator())
             for recent in recents {
@@ -56,28 +53,4 @@ final class LushDockTilePlugin: NSObject, NSDockTilePlugIn {
               let url = URL(string: route) else { return }
         NSWorkspace.shared.open(url)
     }
-
-    private func loadSnapshot() -> DockMenuSnapshot {
-        guard let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: "group.party.chee.patchwork.lush"
-        ) else {
-            return DockMenuSnapshot(recents: [])
-        }
-        let url = root.appendingPathComponent("DockMenuSnapshot.json")
-        guard let data = try? Data(contentsOf: url),
-              let snapshot = try? JSONDecoder().decode(DockMenuSnapshot.self, from: data) else {
-            return DockMenuSnapshot(recents: [])
-        }
-        return snapshot
-    }
-}
-
-private struct DockMenuSnapshot: Codable {
-    let recents: [DockMenuRecent]
-}
-
-private struct DockMenuRecent: Codable {
-    let title: String
-    let url: String
-    let modified: TimeInterval
 }

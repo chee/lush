@@ -1,23 +1,5 @@
 import SwiftUI
 
-enum SmartNotebookAge: Int64, CaseIterable {
-    case any = 0
-    case day = 1
-    case week = 7
-    case month = 30
-    case year = 365
-
-    var label: String {
-        switch self {
-        case .any: "Any time"
-        case .day: "Last 24 hours"
-        case .week: "Last week"
-        case .month: "Last month"
-        case .year: "Last year"
-        }
-    }
-}
-
 enum SmartNotebookStore {
     private static let key = "smartNotebooks"
 
@@ -33,7 +15,8 @@ enum SmartNotebookStore {
                 scope: row["scope"] ?? "",
                 withinDays: Int64(row["withinDays"] ?? "") ?? 0,
                 showCount: row["showCount"] != "0",
-                notifyOnChange: row["notifyOnChange"] == "1"
+                notifyOnChange: row["notifyOnChange"] == "1",
+                rules: row["rules"] ?? ""
             )
         }
     }
@@ -49,6 +32,7 @@ enum SmartNotebookStore {
                 "withinDays": String(folder.withinDays),
                 "showCount": folder.showCount ? "1" : "0",
                 "notifyOnChange": folder.notifyOnChange ? "1" : "0",
+                "rules": folder.rules,
             ]
         }
         UserDefaults.standard.set(raw, forKey: key)
@@ -195,15 +179,19 @@ extension NotesModel {
 
     /// Runs the saved search through the shared runner, so an open Lush and a
     /// background helper always agree about what a notebook holds.
-    func smartNotebookHits(_ folder: SmartNotebook) async -> [SearchHit] {
+    func smartNotebookHits(_ folder: SmartNotebook, notes: [IndexedNote]? = nil) async -> [SearchHit] {
         guard let core else { return [] }
         let tree = notebookTree
-        let vector = folder.query.contains("\"")
-            ? nil
-            : await QueryEmbedding.shared.vector(for: folder.query)
+        let vectors = await SmartNotebookRun.vectors(for: folder)
+        let corpus = if let notes { notes } else { await indexedCorpus() }
         return await Task.detached {
-            SmartNotebookRun.hits(folder, core: core, tree: tree, vector: vector)
+            SmartNotebookRun.hits(folder, core: core, tree: tree, vectors: vectors, notes: corpus)
         }.value
+    }
+
+    func indexedCorpus() async -> [IndexedNote] {
+        guard let core else { return [] }
+        return await Task.detached { core.indexedNotes(limit: SmartNotebookRun.corpusLimit) }.value
     }
 
     var notebookTree: NotebookTree {
@@ -248,8 +236,9 @@ extension NotesModel {
         // The tree is what the hit filter reads: a hit not in it is dropped,
         // so an unloaded tree turns a full index into no results at all.
         guard await waitForStartup(), !folderTree.isEmpty else { return }
+        let corpus = smartNotebooks.contains(where: \.notifyOnChange) ? await indexedCorpus() : []
         for folder in smartNotebooks where folder.notifyOnChange {
-            let hits = await smartNotebookHits(folder)
+            let hits = await smartNotebookHits(folder, notes: corpus)
             smartHits[folder.id] = hits
             await SmartNotebookAlerts.counted(folder, count: hits.count)
         }
@@ -271,11 +260,7 @@ struct SmartNotebookEditor: View {
     @Environment(NotesModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
-    @State private var query = ""
-    @State private var kind = SmartNotebookKind.any
-    @State private var scope = ""
-    @State private var age = SmartNotebookAge.any
-    @State private var exact = false
+    @State private var root = SmartRule.group(.all, [])
     @State private var showCount = true
     @State private var notifyOnChange = false
     @State private var notificationsDenied = false
@@ -285,29 +270,17 @@ struct SmartNotebookEditor: View {
             Form {
                 TextField("Name", text: $name)
                 Section {
-                    TextField("Search for", text: $query)
-                    Picker("Match", selection: $exact) {
-                        Text("Anything like it").tag(false)
-                        Text("This exact text").tag(true)
-                    }
+                    SmartRuleGroup(rule: $root, depth: 0)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Color.clear)
+                } header: {
+                    Text("Rules")
                 } footer: {
-                    Text("Quoting part of a search — \"like this\" — makes only that part exact.")
-                }
-                Picker("Kind", selection: $kind) {
-                    ForEach(SmartNotebookKind.allCases, id: \.self) { kind in
-                        Text(kind.label).tag(kind)
-                    }
-                }
-                Picker("In", selection: $scope) {
-                    Text("Everywhere").tag("")
-                    ForEach(model.folderChoices(), id: \.url) { choice in
-                        Text(choice.path).tag(choice.url)
-                    }
-                }
-                Picker("Modified", selection: $age) {
-                    ForEach(SmartNotebookAge.allCases, id: \.self) { age in
-                        Text(age.label).tag(age)
-                    }
+                    Text(
+                        "“Contains” is loose: it ignores case and accents, and a Note rule also "
+                            + "finds notes that mean the same thing without saying it. "
+                            + "“Exactly” matches the characters as typed."
+                    )
                 }
                 Section {
                     Toggle("Show how many", isOn: $showCount)
@@ -332,11 +305,7 @@ struct SmartNotebookEditor: View {
         }
         .onAppear {
             name = existing.name
-            exact = isQuotedPhrase(existing.query)
-            query = exact ? String(existing.query.dropFirst().dropLast()) : existing.query
-            kind = SmartNotebookKind(rawValue: existing.kind) ?? .any
-            scope = existing.scope
-            age = SmartNotebookAge(rawValue: existing.withinDays) ?? .any
+            root = existing.rootRule
             showCount = existing.showCount
             notifyOnChange = existing.notifyOnChange
         }
@@ -345,23 +314,16 @@ struct SmartNotebookEditor: View {
             Task { notificationsDenied = await !SmartNotebookAlerts.requestAuthorization() }
         }
         #if os(macOS)
-        .frame(minWidth: 420, minHeight: 300)
+        .frame(minWidth: 620, minHeight: 460)
         #endif
     }
 
     private func save() {
-        var text = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if exact, !text.isEmpty {
-            text = "\"" + text.replacingOccurrences(of: "\"", with: "") + "\""
-        }
         model.saveSmartNotebook(
-            SmartNotebook(
+            smartNotebook(
                 id: existing.id,
                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-                query: text,
-                kind: kind.rawValue,
-                scope: scope,
-                withinDays: age.rawValue,
+                root: root,
                 showCount: showCount,
                 notifyOnChange: notifyOnChange
             )
@@ -370,21 +332,282 @@ struct SmartNotebookEditor: View {
     }
 }
 
-/// The whole query is one quoted phrase, which is how the editor stores
-/// "match this exact text".
-func isQuotedPhrase(_ query: String) -> Bool {
-    query.count > 1 && query.hasPrefix("\"") && query.hasSuffix("\"")
-        && !query.dropFirst().dropLast().contains("\"")
+/// A block of rules. Nested groups are the same view one level in: a group is
+/// a closed box that holds its children on every side, which is what makes the
+/// nesting readable without reading the words.
+struct SmartRuleGroup: View {
+    @Binding var rule: SmartRule
+    let depth: Int
+    var remove: (() -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("Match")
+                Picker("", selection: $rule.op) {
+                    ForEach(SmartRule.Op.allCases, id: \.self) { op in
+                        Text(op.label).tag(op)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+                Text("of these")
+                Spacer(minLength: 4)
+                if let remove {
+                    RuleDeleteButton(remove: remove)
+                }
+            }
+            .font(.callout.weight(.medium))
+            ForEach($rule.children) { $child in
+                if child.isGroup {
+                    SmartRuleGroup(rule: $child, depth: depth + 1, remove: { drop(child.id) })
+                } else {
+                    SmartRuleRow(rule: $child, remove: { drop(child.id) })
+                }
+            }
+            SmartRuleAddMenu(add: add)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ruleBox(groupFill, groupStroke, radius: 12))
+    }
+
+    private func add(_ body: SmartRule.Body) {
+        withAnimation(.snappy) { rule.children.append(SmartRule(body)) }
+    }
+
+    private func drop(_ id: UUID) {
+        withAnimation(.snappy) { rule.children.removeAll { $0.id == id } }
+    }
+}
+
+struct SmartRuleRow: View {
+    @Binding var rule: SmartRule
+    let remove: () -> Void
+    @Environment(NotesModel.self) private var model
+
+    var body: some View {
+        HStack(spacing: 6) {
+            SmartRuleTypeMenu(rule: $rule)
+            comparison
+            value
+                .layoutPriority(1)
+            RuleDeleteButton(remove: remove)
+        }
+        .font(.callout)
+        .padding(.vertical, 7)
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(ruleBox(rowFill, rowStroke, radius: 9))
+    }
+
+    @ViewBuilder private var comparison: some View {
+        switch rule.body {
+        case let .text(field, whole, exact, text):
+            Picker("", selection: bind(SmartTextOp(whole: whole, exact: exact)) {
+                .text(field, whole: $0.isWhole, exact: $0.isExact, text)
+            }) {
+                ForEach(SmartTextOp.allCases, id: \.self) { op in
+                    if field.canBeWhole || !op.isWhole {
+                        Text(op.label).tag(op)
+                    }
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+        case let .date(on, op, age, day):
+            Picker("", selection: bind(op) { .date(on, $0, age: age, day: day) }) {
+                ForEach(SmartDateOp.allCases, id: \.self) { op in
+                    Text(op.label).tag(op)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+        case .kind:
+            Text("is").foregroundStyle(.secondary)
+        case .folder:
+            EmptyView()
+        case .group:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder private var value: some View {
+        switch rule.body {
+        case let .text(field, whole, exact, text):
+            TextField("text to find", text: bind(text) { .text(field, whole: whole, exact: exact, $0) })
+                .textFieldStyle(.roundedBorder)
+                .frame(minWidth: 120)
+        case let .kind(kind):
+            Picker("", selection: bind(kind) { .kind($0) }) {
+                ForEach(SmartNotebookKind.allCases, id: \.self) { kind in
+                    Text(kind.label).tag(kind)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+        case let .folder(url):
+            Picker("", selection: bind(url) { .folder($0) }) {
+                Text("Everywhere").tag("")
+                ForEach(model.folderChoices(), id: \.url) { choice in
+                    Text(choice.path).tag(choice.url)
+                }
+            }
+            .labelsHidden()
+            .frame(minWidth: 120)
+        case let .date(on, op, age, day):
+            if op.wantsDay {
+                DatePicker(
+                    "",
+                    selection: bind(smartRuleDayStart(day) ?? Date()) {
+                        .date(on, op, age: age, day: smartRuleDay($0))
+                    },
+                    displayedComponents: .date
+                )
+                .labelsHidden()
+                .fixedSize()
+            } else {
+                Picker("", selection: bind(age) { .date(on, op, age: $0, day: day) }) {
+                    ForEach(SmartNotebookAge.allCases, id: \.self) { age in
+                        Text(age.label).tag(age)
+                    }
+                }
+                .labelsHidden()
+                .fixedSize()
+            }
+        case .group:
+            EmptyView()
+        }
+    }
+
+    private func bind<T>(_ value: T, _ body: @escaping (T) -> SmartRule.Body) -> Binding<T> {
+        Binding(get: { value }, set: { rule.body = body($0) })
+    }
+}
+
+/// The rule's own type menu and the group's add menu offer the same list, so
+/// picking a rule and changing one's mind read the same way.
+struct SmartRuleTypeMenu: View {
+    @Binding var rule: SmartRule
+
+    var body: some View {
+        Menu(rule.typeLabel) {
+            SmartRuleTypeButtons(pick: become)
+        }
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .fixedSize()
+    }
+
+    private func become(_ body: SmartRule.Body) {
+        guard rule.typeLabel != SmartRule(body).typeLabel else { return }
+        withAnimation(.snappy) { rule.body = body }
+    }
+}
+
+struct SmartRuleAddMenu: View {
+    let add: (SmartRule.Body) -> Void
+
+    var body: some View {
+        Menu {
+            SmartRuleTypeButtons(pick: add)
+            Divider()
+            Button("Group of rules") { add(.group(.all, [])) }
+        } label: {
+            Label("Add rule", systemImage: "plus.circle.fill")
+                .font(.callout)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+}
+
+struct SmartRuleTypeButtons: View {
+    let pick: (SmartRule.Body) -> Void
+
+    var body: some View {
+        ForEach(SmartTextField.allCases, id: \.self) { field in
+            Button(field.label) { pick(.text(field, whole: false, exact: false, "")) }
+        }
+        Divider()
+        Button("Kind") { pick(.kind(.any)) }
+        Button("In") { pick(.folder("")) }
+        Divider()
+        ForEach(SmartDateField.allCases, id: \.self) { field in
+            Button(field.label) { pick(.date(field, .within, age: .week, day: "")) }
+        }
+    }
+}
+
+extension SmartRule {
+    var typeLabel: String {
+        switch body {
+        case let .text(field, _, _, _): field.label
+        case .kind: "Kind"
+        case .folder: "In"
+        case let .date(field, _, _, _): field.label
+        case .group: "Group"
+        }
+    }
+}
+
+struct RuleDeleteButton: View {
+    let remove: () -> Void
+
+    var body: some View {
+        Button(action: remove) {
+            Image(systemName: "minus.circle.fill")
+                .foregroundStyle(.tertiary)
+        }
+        .buttonStyle(.plain)
+        .help("Remove")
+    }
+}
+
+/// Groups are pink and rules are yellow, so a block is recognisable as one or
+/// the other before you read it. Both are drawn as a filled box with a line
+/// round it: the line is what says where a group ends and its neighbour
+/// begins, which a wash on its own never managed.
+private func ruleBox(_ fill: Color, _ stroke: Color, radius: CGFloat) -> some View {
+    RoundedRectangle(cornerRadius: radius)
+        .fill(fill)
+        .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(stroke))
+}
+
+private let groupFill = Color.pink.opacity(0.07)
+private let groupStroke = Color.pink.opacity(0.35)
+private let rowFill = Color.yellow.opacity(0.16)
+private let rowStroke = Color.orange.opacity(0.30)
+
+func smartNotebook(
+    id: String,
+    name: String,
+    root: SmartRule,
+    showCount: Bool,
+    notifyOnChange: Bool
+) -> SmartNotebook {
+    let flat = smartNotebookProjection(root)
+    return SmartNotebook(
+        id: id,
+        name: name,
+        query: flat.query,
+        kind: flat.kind,
+        scope: flat.scope,
+        withinDays: flat.withinDays,
+        showCount: showCount,
+        notifyOnChange: notifyOnChange,
+        rules: encodeSmartRules(root)
+    )
 }
 
 func newSmartNotebook(query: String = "", scope: String = "") -> SmartNotebook {
-    SmartNotebook(
+    var rules: [SmartRule] = []
+    if !query.isEmpty { rules.append(.text(query)) }
+    if !scope.isEmpty { rules.append(SmartRule(.folder(scope))) }
+    return smartNotebook(
         id: UUID().uuidString,
         name: query.isEmpty ? "" : query,
-        query: query,
-        kind: "",
-        scope: scope,
-        withinDays: 0,
+        root: .group(.all, rules),
         showCount: true,
         notifyOnChange: false
     )

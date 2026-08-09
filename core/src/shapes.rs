@@ -12,6 +12,7 @@ use automerge::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const RICH_TOOL_URL: &str =
     "automerge:2XoPZihn6Vo2aqeVu2WN39W8cdAN#28JkzFqXzKReCZ3DGo81Z4QbCUnxcPh7uy84e2wY4FZNT8M2xq";
@@ -299,20 +300,66 @@ fn json_spans_to_spans(spans: &[SpanJson]) -> Vec<Span> {
         .collect()
 }
 
+const TITLE_CAP: usize = 60;
+
+fn title_space(c: char) -> bool {
+    c.is_whitespace()
+        && !matches!(
+            c,
+            '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+        )
+}
+
+fn title_line(text: &str) -> Option<String> {
+    text.split(['\n', '\r'])
+        .map(|line| line.trim_matches(title_space))
+        .find(|line| !line.is_empty())
+        .map(|line| line.graphemes(true).take(TITLE_CAP).collect())
+}
+
+fn is_title_container(value: &Json) -> bool {
+    fn tabular(v: &Json) -> bool {
+        matches!(
+            v.as_str(),
+            Some("table" | "table-row" | "table-cell" | "table-header-cell" | "columns" | "column")
+        )
+    }
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.get("type").is_some_and(tabular)
+        || obj
+            .get("parents")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parents| parents.iter().any(tabular))
+}
+
 fn title_from_spans(spans: &[SpanJson]) -> String {
-    let mut title = String::new();
-    let mut seen_text = false;
+    title_in_spans(spans, true)
+        .or_else(|| title_in_spans(spans, false))
+        .unwrap_or_default()
+}
+
+fn title_in_spans(spans: &[SpanJson], skip_containers: bool) -> Option<String> {
+    let mut line = String::new();
+    let mut skipping = false;
     for span in spans {
         match span {
-            SpanJson::Block { .. } if seen_text => break,
-            SpanJson::Block { .. } => {}
+            SpanJson::Block { value } => {
+                if let Some(title) = title_line(&line) {
+                    return Some(title);
+                }
+                line.clear();
+                skipping = skip_containers && is_title_container(value);
+            }
             SpanJson::Text { value, .. } => {
-                seen_text = true;
-                title.push_str(value);
+                if !skipping {
+                    line.push_str(value);
+                }
             }
         }
     }
-    title.trim().to_string()
+    title_line(&line)
 }
 
 pub fn update_spans_from_json_at(
@@ -764,9 +811,10 @@ fn config_set_url_list(doc: &mut Automerge, key: &str, urls: &[String]) -> anyho
     Ok(())
 }
 
-/// A saved search. Empty `kind`/`scope` and a zero `within_days` mean "no
-/// filter"; the query may be empty too, in which case the filters alone
-/// select the docs.
+/// A saved search. `rules` is the JSON rule tree the editor writes; the flat
+/// `query`/`kind`/`scope`/`within_days` fields carry a best-effort projection
+/// of it for clients that predate the tree, and are what those clients wrote.
+/// Empty `kind`/`scope` and a zero `within_days` mean "no filter".
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct SmartNotebook {
     pub id: String,
@@ -777,6 +825,7 @@ pub struct SmartNotebook {
     pub within_days: i64,
     pub show_count: bool,
     pub notify_on_change: bool,
+    pub rules: String,
 }
 
 /// `.smart` is an object keyed by numeric index, like `.folders`.
@@ -800,6 +849,7 @@ pub fn config_smart_notebooks(doc: &Automerge) -> Vec<SmartNotebook> {
                     within_days: int_at(doc, &item, "withinDays").unwrap_or(0),
                     show_count: bool_at(doc, &item, "showCount").unwrap_or(true),
                     notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
+                    rules: string_at(doc, &item, "rules").unwrap_or_default(),
                 },
             ))
         })
@@ -844,6 +894,7 @@ pub fn config_set_smart_notebooks(
                 t.put(&item, "withinDays", folder.within_days)?;
                 t.put(&item, "showCount", folder.show_count)?;
                 t.put(&item, "notifyOnChange", folder.notify_on_change)?;
+                set_text(t, &item, "rules", &folder.rules)?;
             }
             Ok(())
         },
@@ -948,6 +999,17 @@ pub fn doc_modified(doc: &Automerge) -> i64 {
         .filter_map(|hash| doc.get_change_by_hash(hash))
         .map(|change| change.timestamp())
         .max()
+        .unwrap_or(0)
+}
+
+/// Unix seconds of the first change. A doc with no timestamped history — an
+/// import that carries none — reports 0, which reads as "unknown" rather than
+/// as 1970.
+pub fn doc_created(doc: &Automerge) -> i64 {
+    doc.get_changes(&[])
+        .into_iter()
+        .map(|change| change.timestamp())
+        .find(|stamp| *stamp > 0)
         .unwrap_or(0)
 }
 
@@ -2064,6 +2126,262 @@ mod embed_resize_tests {
         assert!(json.contains("\"embed\""), "embed block vanished: {json}");
         assert!(json.contains("automerge:abc"), "embed url vanished: {json}");
         assert!(json.contains("420"), "width attr missing: {json}");
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    fn block(kind: &str) -> SpanJson {
+        SpanJson::Block {
+            value: json!({ "type": kind, "parents": [] }),
+        }
+    }
+
+    fn nested(kind: &str, parents: Json) -> SpanJson {
+        SpanJson::Block {
+            value: json!({ "type": kind, "parents": parents }),
+        }
+    }
+
+    fn text(value: &str) -> SpanJson {
+        SpanJson::Text {
+            value: value.into(),
+            marks: None,
+        }
+    }
+
+    #[test]
+    fn empty_document_has_no_title() {
+        assert_eq!(title_from_spans(&[]), "");
+    }
+
+    #[test]
+    fn blocks_without_text_fall_back_to_empty() {
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), block("paragraph")]),
+            ""
+        );
+    }
+
+    #[test]
+    fn whitespace_only_first_block_is_skipped() {
+        assert_eq!(
+            title_from_spans(&[
+                block("paragraph"),
+                text("   \u{a0}\t"),
+                block("paragraph"),
+                text("Real title"),
+            ]),
+            "Real title"
+        );
+    }
+
+    #[test]
+    fn blank_line_inside_a_block_is_skipped() {
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text("\n \nReal title\nrest")]),
+            "Real title"
+        );
+    }
+
+    #[test]
+    fn runs_of_one_paragraph_are_joined() {
+        assert_eq!(
+            title_from_spans(&[
+                nested("heading", json!([])),
+                SpanJson::Text {
+                    value: "Grocery".into(),
+                    marks: Some(
+                        serde_json::from_value(json!({ "strong": true })).unwrap()
+                    ),
+                },
+                text(" list for Tuesday"),
+                block("paragraph"),
+                text("milk"),
+            ]),
+            "Grocery list for Tuesday"
+        );
+    }
+
+    #[test]
+    fn embedded_newline_ends_the_title() {
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text("Shopping\nlist")]),
+            "Shopping"
+        );
+    }
+
+    #[test]
+    fn leading_media_block_contributes_nothing() {
+        assert_eq!(
+            title_from_spans(&[
+                SpanJson::Block {
+                    value: json!({ "type": "image", "parents": [], "attrs": { "url": "automerge:x" } }),
+                },
+                block("paragraph"),
+                text("Trip photos"),
+            ]),
+            "Trip photos"
+        );
+    }
+
+    #[test]
+    fn table_cells_are_not_the_title() {
+        assert_eq!(
+            title_from_spans(&[
+                block("table"),
+                nested("table-row", json!(["table"])),
+                nested("table-header-cell", json!(["table", "table-row"])),
+                nested("paragraph", json!(["table", "table-row", "table-cell"])),
+                text("Qty"),
+                nested("table-header-cell", json!(["table", "table-row"])),
+                nested("paragraph", json!(["table", "table-row", "table-cell"])),
+                text("Item"),
+                block("paragraph"),
+                text("Shopping for the week"),
+            ]),
+            "Shopping for the week"
+        );
+    }
+
+    #[test]
+    fn a_table_is_the_title_when_it_is_the_whole_note() {
+        assert_eq!(
+            title_from_spans(&[
+                block("table"),
+                nested("table-row", json!(["table"])),
+                nested("table-header-cell", json!(["table", "table-row"])),
+                nested("paragraph", json!(["table", "table-row", "table-cell"])),
+                text("Qty"),
+                nested("table-header-cell", json!(["table", "table-row"])),
+                nested("paragraph", json!(["table", "table-row", "table-cell"])),
+                text("Item"),
+            ]),
+            "Qty"
+        );
+    }
+
+    #[test]
+    fn a_bare_cell_block_is_still_a_container() {
+        assert_eq!(
+            title_from_spans(&[
+                block("table-cell"),
+                text("Qty"),
+                block("paragraph"),
+                text("Shopping"),
+            ]),
+            "Shopping"
+        );
+    }
+
+    #[test]
+    fn a_table_nested_in_a_list_is_still_a_container() {
+        assert_eq!(
+            title_from_spans(&[
+                nested("table", json!(["bullet-list", "list-item"])),
+                nested("table-row", json!(["bullet-list", "list-item", "table"])),
+                nested(
+                    "table-cell",
+                    json!(["bullet-list", "list-item", "table", "table-row"])
+                ),
+                text("Qty"),
+                block("paragraph"),
+                text("Shopping for the week"),
+            ]),
+            "Shopping for the week"
+        );
+    }
+
+    #[test]
+    fn columns_are_not_the_title() {
+        assert_eq!(
+            title_from_spans(&[
+                block("columns"),
+                nested("column", json!(["columns"])),
+                nested("paragraph", json!(["columns", "column"])),
+                text("left"),
+                block("paragraph"),
+                text("After the columns"),
+            ]),
+            "After the columns"
+        );
+    }
+
+    #[test]
+    fn columns_are_the_title_when_they_are_the_whole_note() {
+        assert_eq!(
+            title_from_spans(&[
+                block("columns"),
+                nested("column", json!(["columns"])),
+                nested("paragraph", json!(["columns", "column"])),
+                text("left"),
+            ]),
+            "left"
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_ends_the_title() {
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text("Line one\r\nLine two")]),
+            "Line one"
+        );
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text("Line one\rLine two")]),
+            "Line one"
+        );
+    }
+
+    #[test]
+    fn title_at_the_cap_is_kept_whole() {
+        let line = "a".repeat(TITLE_CAP);
+        let title = title_from_spans(&[block("paragraph"), text(&line)]);
+        assert_eq!(title, line);
+        assert_eq!(title.chars().count(), TITLE_CAP);
+    }
+
+    #[test]
+    fn title_past_the_cap_is_truncated() {
+        let line = "a".repeat(TITLE_CAP + 14);
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text(&line)]),
+            "a".repeat(TITLE_CAP)
+        );
+    }
+
+    #[test]
+    fn the_cap_counts_graphemes() {
+        let line = format!("{}👍👍", "a".repeat(TITLE_CAP - 1));
+        let title = title_from_spans(&[block("paragraph"), text(&line)]);
+        assert_eq!(title, format!("{}👍", "a".repeat(TITLE_CAP - 1)));
+
+        let zwj = format!("{}👨‍👩‍👧extra", "a".repeat(TITLE_CAP - 1));
+        let title = title_from_spans(&[block("paragraph"), text(&zwj)]);
+        assert_eq!(title, format!("{}👨‍👩‍👧", "a".repeat(TITLE_CAP - 1)));
+        assert_eq!(title.graphemes(true).count(), TITLE_CAP);
+
+        let accented = format!("{}e\u{301}xtra", "a".repeat(TITLE_CAP - 1));
+        let title = title_from_spans(&[block("paragraph"), text(&accented)]);
+        assert_eq!(title, format!("{}e\u{301}", "a".repeat(TITLE_CAP - 1)));
+    }
+
+    #[test]
+    fn cap_counts_after_trimming() {
+        let line = format!("  {}  ", "a".repeat(TITLE_CAP));
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text(&line)]),
+            "a".repeat(TITLE_CAP)
+        );
+    }
+
+    #[test]
+    fn line_separators_are_not_trimmed() {
+        assert_eq!(
+            title_from_spans(&[block("paragraph"), text("Title\u{2028}")]),
+            "Title\u{2028}"
+        );
     }
 }
 

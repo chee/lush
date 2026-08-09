@@ -4,8 +4,8 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(console.warn);
 }
 import { initializeWasm } from "@automerge/automerge/slim";
-// @ts-expect-error initSync is a wasm-bindgen helper missing from the published typings
-import { initSync as initSubductionSync } from "@automerge/automerge-subduction/slim";
+// @ts-expect-error the wasm-bindgen default init is missing from the published typings
+import initSubduction from "@automerge/automerge-subduction/slim";
 import { MemorySigner } from "@automerge/automerge-subduction/slim";
 import { Repo, type PeerId } from "@automerge/automerge-repo/slim";
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
@@ -54,12 +54,10 @@ function notifyNativeReady(error?: unknown) {
 async function boot() {
   const config: PatchworkConfig = window.__patchwork_CONFIG ?? {};
 
-  const [amWasm, subWasm] = await Promise.all([
-    fetch("/automerge.wasm").then((r) => r.arrayBuffer()),
-    fetch("/subduction.wasm").then((r) => r.arrayBuffer()),
+  await Promise.all([
+    initializeWasm(fetch("/automerge.wasm") as never),
+    initSubduction({ module_or_path: fetch("/subduction.wasm") }),
   ]);
-  initSubductionSync(new Uint8Array(subWasm));
-  await initializeWasm(new Uint8Array(amWasm));
 
   const signer = config.signerSeedHex
     ? MemorySigner.fromBytes(hexToBytes(config.signerSeedHex))
@@ -96,7 +94,7 @@ async function boot() {
     }
   };
   updateConnection();
-  setInterval(updateConnection, 2000);
+  const connectionTimer = setInterval(updateConnection, 2000);
   (repo as unknown as { on?: (e: string, f: () => void) => void }).on?.(
     "subduction-connection",
     updateConnection,
@@ -121,9 +119,13 @@ async function boot() {
       Patchwork.appleConfig().catch(console.warn);
       const frameId = accountFrameId(account.doc());
       show("frame", frameId ?? "none set on account", !!frameId);
-      mountFrame(repo, account, signer).catch((error) => {
-        show("frame", `${frameId}: ${error}`, false);
-      });
+      mountFrame(repo, account, signer)
+        .then((mounted) => {
+          if (mounted) clearInterval(connectionTimer);
+        })
+        .catch((error) => {
+          show("frame", `${frameId}: ${error}`, false);
+        });
       return account;
     } catch (error) {
       show("account", String(error), false);

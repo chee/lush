@@ -16,7 +16,6 @@
 		F0872FA4301F62AD003F9B3B /* PatchworkWeb.bundle in Resources */ = {isa = PBXBuildFile; fileRef = F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */; };
 		F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA6301F718C003F9B3B /* PatchworkServerKit */; };
 		F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA9301F756A003F9B3B /* PatchworkServerKit */; };
-		F0AA71D0000000000000001D /* Lush Helper.app in Embed Login Items */ = {isa = PBXBuildFile; fileRef = F0AA71D00000000000000013 /* Lush Helper.app */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -48,13 +47,6 @@
 			remoteGlobalIDString = F073172430241AD500FFA544;
 			remoteInfo = LushFinderAction;
 		};
-		F0AA71D0000000000000001B /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = F001D300301E8AA900E154BD /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = F0AA71D00000000000000017;
-			remoteInfo = "Lush Helper";
-		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -78,7 +70,6 @@
 			dstPath = Contents/Library/LoginItems;
 			dstSubfolderSpec = 1;
 			files = (
-				F0AA71D0000000000000001D /* Lush Helper.app in Embed Login Items */,
 			);
 			name = "Embed Login Items";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -93,7 +84,6 @@
 		F073170F30241ABC00FFA544 /* LushShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F073172530241AD500FFA544 /* LushFinderAction.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushFinderAction.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
-		F0AA71D00000000000000013 /* Lush Helper.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Lush Helper.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0DC71D0000000000000000A /* LushDockTile.docktileplugin */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LushDockTile.docktileplugin; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -125,13 +115,6 @@
 				Info.plist,
 			);
 			target = F001D307301E8AA900E154BD /* Lush */;
-		};
-		F0AA71D00000000000000012 /* Exceptions for "LushHelper" folder in "Lush Helper" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				Info.plist,
-			);
-			target = F0AA71D00000000000000017 /* Lush Helper */;
 		};
 		F0DC71D00000000000000009 /* Exceptions for "LushDockTile" folder in "LushDockTile" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
@@ -185,12 +168,9 @@
 			path = Shared;
 			sourceTree = "<group>";
 		};
-		F0AA71D00000000000000011 /* LushHelper */ = {
+		F0AA71D00000000000000012 /* Common */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				F0AA71D00000000000000012 /* Exceptions for "LushHelper" folder in "Lush Helper" target */,
-			);
-			path = LushHelper;
+			path = Common;
 			sourceTree = "<group>";
 		};
 		F0DC71D00000000000000008 /* LushDockTile */ = {
@@ -236,13 +216,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		F0AA71D00000000000000015 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		F0DC71D00000000000000006 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -261,8 +234,8 @@
 				F073171030241ABC00FFA544 /* LushShareExtension */,
 				F073172630241AD500FFA544 /* LushFinderAction */,
 				F0DC71D00000000000000008 /* LushDockTile */,
-				F0AA71D00000000000000011 /* LushHelper */,
 				F0AA71D00000000000000010 /* Shared */,
+				F0AA71D00000000000000012 /* Common */,
 				F07316B13022831200FFA544 /* Frameworks */,
 				F001D309301E8AA900E154BD /* Products */,
 				F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */,
@@ -278,7 +251,6 @@
 				F073170F30241ABC00FFA544 /* LushShareExtension.appex */,
 				F073172530241AD500FFA544 /* LushFinderAction.appex */,
 				F0DC71D0000000000000000A /* LushDockTile.docktileplugin */,
-				F0AA71D00000000000000013 /* Lush Helper.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -313,12 +285,12 @@
 				F073171A30241ABC00FFA544 /* PBXTargetDependency */,
 				F073173230241AD500FFA544 /* PBXTargetDependency */,
 				F036339630278A64008E0213 /* PBXTargetDependency */,
-				F0AA71D0000000000000001C /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				F07318543024EBD200FFA544 /* fonts */,
 				F09B1AA13020DCF500417560 /* lush */,
 				F0AA71D00000000000000010 /* Shared */,
+				F0AA71D00000000000000012 /* Common */,
 			);
 			name = Lush;
 			packageProductDependencies = (
@@ -343,6 +315,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				F07316B63022831200FFA544 /* LushWidget */,
+				F0AA71D00000000000000012 /* Common */,
 			);
 			name = LushWidgetExtension;
 			packageProductDependencies = (
@@ -365,6 +338,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				F073171030241ABC00FFA544 /* LushShareExtension */,
+				F0AA71D00000000000000012 /* Common */,
 			);
 			name = LushShareExtension;
 			packageProductDependencies = (
@@ -387,6 +361,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				F073172630241AD500FFA544 /* LushFinderAction */,
+				F0AA71D00000000000000012 /* Common */,
 			);
 			name = LushFinderAction;
 			packageProductDependencies = (
@@ -394,29 +369,6 @@
 			productName = LushFinderAction;
 			productReference = F073172530241AD500FFA544 /* LushFinderAction.appex */;
 			productType = "com.apple.product-type.app-extension";
-		};
-		F0AA71D00000000000000017 /* Lush Helper */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = F0AA71D00000000000000018 /* Build configuration list for PBXNativeTarget "Lush Helper" */;
-			buildPhases = (
-				F0AA71D00000000000000014 /* Sources */,
-				F0AA71D00000000000000015 /* Frameworks */,
-				F0AA71D00000000000000016 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				F0AA71D00000000000000010 /* Shared */,
-				F0AA71D00000000000000011 /* LushHelper */,
-			);
-			name = "Lush Helper";
-			packageProductDependencies = (
-			);
-			productName = "Lush Helper";
-			productReference = F0AA71D00000000000000013 /* Lush Helper.app */;
-			productType = "com.apple.product-type.application";
 		};
 		F0DC71D00000000000000001 /* LushDockTile */ = {
 			isa = PBXNativeTarget;
@@ -431,6 +383,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
+				F0AA71D00000000000000012 /* Common */,
 				F0DC71D00000000000000008 /* LushDockTile */,
 			);
 			name = LushDockTile;
@@ -462,9 +415,6 @@
 					F073172430241AD500FFA544 = {
 						CreatedOnToolsVersion = 26.6;
 					};
-					F0AA71D00000000000000017 = {
-						CreatedOnToolsVersion = 26.6;
-					};
 					F0DC71D00000000000000001 = {
 						CreatedOnToolsVersion = 26.6;
 					};
@@ -492,7 +442,6 @@
 				F073170E30241ABC00FFA544 /* LushShareExtension */,
 				F073172430241AD500FFA544 /* LushFinderAction */,
 				F0DC71D00000000000000001 /* LushDockTile */,
-				F0AA71D00000000000000017 /* Lush Helper */,
 			);
 		};
 /* End PBXProject section */
@@ -521,13 +470,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		F073172330241AD500FFA544 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		F0AA71D00000000000000016 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -594,13 +536,6 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		F0AA71D00000000000000014 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		F0DC71D00000000000000005 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -633,12 +568,6 @@
 			isa = PBXTargetDependency;
 			target = F073172430241AD500FFA544 /* LushFinderAction */;
 			targetProxy = F073173130241AD500FFA544 /* PBXContainerItemProxy */;
-		};
-		F0AA71D0000000000000001C /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			name = "Lush Helper";
-			target = F0AA71D00000000000000017 /* Lush Helper */;
-			targetProxy = F0AA71D0000000000000001B /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1164,86 +1093,6 @@
 			};
 			name = Release;
 		};
-		F0AA71D00000000000000019 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ALWAYS_SEARCH_USER_PATHS = NO;
-				CODE_SIGN_ENTITLEMENTS = LushHelper/LushHelper.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = R2MP6EU7T3;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
-				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = LushHelper/Info.plist;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/core/lib/$(PLATFORM_NAME)";
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
-				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = (
-					"-llush_core",
-					"-framework",
-					SystemConfiguration,
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.Helper;
-				PRODUCT_NAME = "Lush Helper";
-				REGISTER_APP_GROUPS = YES;
-				SDKROOT = macosx;
-				SKIP_INSTALL = YES;
-				SUPPORTED_PLATFORMS = macosx;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/core/bindings/include";
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Debug;
-		};
-		F0AA71D0000000000000001A /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ALWAYS_SEARCH_USER_PATHS = NO;
-				CODE_SIGN_ENTITLEMENTS = LushHelper/LushHelper.entitlements;
-				CODE_SIGN_STYLE = Automatic;
-				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = R2MP6EU7T3;
-				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
-				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = LushHelper/Info.plist;
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
-				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/core/lib/$(PLATFORM_NAME)";
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
-				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = (
-					"-llush_core",
-					"-framework",
-					SystemConfiguration,
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.Helper;
-				PRODUCT_NAME = "Lush Helper";
-				REGISTER_APP_GROUPS = YES;
-				SDKROOT = macosx;
-				SKIP_INSTALL = YES;
-				SUPPORTED_PLATFORMS = macosx;
-				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
-				SWIFT_EMIT_LOC_STRINGS = YES;
-				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/core/bindings/include";
-				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
-			};
-			name = Release;
-		};
 		F0DC71D00000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -1356,15 +1205,6 @@
 			buildConfigurations = (
 				F073173630241AD500FFA544 /* Debug */,
 				F073173730241AD500FFA544 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		F0AA71D00000000000000018 /* Build configuration list for PBXNativeTarget "Lush Helper" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				F0AA71D00000000000000019 /* Debug */,
-				F0AA71D0000000000000001A /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

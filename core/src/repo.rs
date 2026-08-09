@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::IntoFuture,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -16,7 +17,7 @@ use async_tungstenite::{
 };
 use automerge::{Automerge, ChangeHash, Fragment as AutomergeFragment, ReadDoc};
 use future_form::Sendable;
-use futures::{future::BoxFuture, FutureExt};
+use futures::{future::BoxFuture, FutureExt, StreamExt};
 use sedimentree_core::{
     blob::{Blob, BlobMeta},
     collections::Map,
@@ -87,6 +88,22 @@ const HEAL_MAX_ATTEMPTS: u32 = 12;
 const LOCAL_SERVER_PORT: u16 = 43219;
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
 const LOOSE_FRAGMENT_BATCH_SIZE: usize = 32;
+/// Once a doc is holding this many loose commits, the next save bundles the
+/// ones already on disk too. Without this a commit written loose could never
+/// join a fragment — only commits new to a save were ever eligible — so
+/// ordinary editing, a few changes at a time, never reached the batch size and
+/// left everything loose for good.
+const REBUNDLE_LOOSE_THRESHOLD: usize = 64;
+/// How many absorbed commits to delete at once. Deleting one at a time makes a
+/// pass over a doc with thousands of them crawl; unbounded floods the disk.
+const RECLAIM_DELETE_CONCURRENCY: usize = 16;
+/// How long a freshly accepted loopback socket has to reveal what protocol it
+/// speaks. A silent connection used to wedge the whole accept loop.
+const LOCAL_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Depth of the queues carrying saved blobs and observed remote heads. Bounded
+/// so a burst of writes back-pressures the writer instead of piling cloned
+/// blobs up in memory.
+const OBSERVER_QUEUE: usize = 64;
 
 /// Requests reaching the loopback sync server must come from the app's own
 /// webview, which loads under the custom `lushweb://` scheme. Native peers send
@@ -99,17 +116,18 @@ fn origin_allowed(origin: Option<&str>) -> bool {
     }
 }
 
-/// A local-peer WebSocket transport that intercepts incoming BatchSyncRequests
-/// and pre-fetches unknown docs from the remote server before letting the
-/// SyncHandler process the message. This prevents automerge-repo from seeing
-/// an empty sync response and immediately marking the doc "unavailable".
+/// A local-peer WebSocket transport that notices incoming BatchSyncRequests for
+/// docs this device isn't tracking and starts fetching them from the remote
+/// server. The message goes straight on to the SyncHandler: the prefetch runs
+/// alongside it, so a doc the server has never heard of can't hold up the
+/// socket's whole receive path. What lands arrives as an ordinary sync update.
 ///
 /// The repo reference is held outside this type (in a spawned task) to avoid
 /// a recursive type-parameter cycle that would make the Sync bound overflow.
 #[derive(Debug, Clone)]
 pub struct PrefetchTransport {
     inner: WebSocket<TokioAdapter<TcpStream>, Sendable>,
-    prefetch_tx: mpsc::UnboundedSender<(SedimentreeId, tokio::sync::oneshot::Sender<()>)>,
+    prefetch_tx: mpsc::UnboundedSender<SedimentreeId>,
 }
 
 impl PartialEq for PrefetchTransport {
@@ -212,11 +230,7 @@ impl Transport<Sendable> for WsTransport {
                     if let Ok(SyncMessage::BatchSyncRequest(req)) = SyncMessage::try_decode(&bytes)
                     {
                         if req.subscribe {
-                            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-                            if prefetch_tx.send((req.id, done_tx)).is_ok() {
-                                let _ =
-                                    tokio::time::timeout(Duration::from_secs(30), done_rx).await;
-                            }
+                            let _ = prefetch_tx.send(req.id);
                         }
                     }
                     Ok(bytes)
@@ -467,8 +481,7 @@ async fn accept_local_peer(
         Err(_) => return,
     };
 
-    let (prefetch_tx, mut prefetch_rx) =
-        mpsc::unbounded_channel::<(SedimentreeId, tokio::sync::oneshot::Sender<()>)>();
+    let (prefetch_tx, mut prefetch_rx) = mpsc::unbounded_channel::<SedimentreeId>();
 
     let result = handshake::respond::<Sendable, _, _, _, _>(
         WebSocketHandshake::new(ws_stream),
@@ -513,16 +526,14 @@ async fn accept_local_peer(
     repo.ephemeral.subscribe_peer(peer).await;
 
     tokio::spawn(async move {
-        while let Some((sid, done_tx)) = prefetch_rx.recv().await {
+        while let Some(sid) = prefetch_rx.recv().await {
+            if sid.as_bytes()[16..].iter().any(|byte| *byte != 0) {
+                continue;
+            }
             let repo = repo.clone();
             tokio::spawn(async move {
-                if sid.as_bytes()[16..].iter().any(|byte| *byte != 0) {
-                    let _ = done_tx.send(());
-                    return;
-                }
-                let id = DocId::from_sedimentree_id(sid);
-                repo.prefetch_doc(id, Duration::from_secs(30)).await;
-                let _ = done_tx.send(());
+                repo.prefetch_doc(DocId::from_sedimentree_id(sid), Duration::from_secs(30))
+                    .await;
             });
         }
     });
@@ -618,12 +629,20 @@ pub enum RepoEvent {
 
 #[derive(Debug, Clone)]
 struct HeadsObserver {
-    tx: mpsc::UnboundedSender<(SedimentreeId, Vec<CommitId>)>,
+    tx: mpsc::Sender<(SedimentreeId, Vec<CommitId>)>,
 }
 
+/// The observer hook is synchronous, so a full queue can't be awaited inline.
+/// Handing the item to a task keeps back-pressure without ever dropping a
+/// report — a dropped one would leave a doc waiting for the next server nudge.
 impl RemoteHeadsObserver for HeadsObserver {
     fn on_remote_heads(&self, id: SedimentreeId, _peer: PeerId, heads: RemoteHeads) {
-        let _ = self.tx.send((id, heads.heads));
+        if let Err(mpsc::error::TrySendError::Full(item)) = self.tx.try_send((id, heads.heads)) {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(item).await;
+            });
+        }
     }
 }
 
@@ -633,6 +652,9 @@ struct DocState {
     stored_fragments: HashSet<ChangeHash>,
     applied: HashSet<Digest<Blob>>,
     failed: HashSet<Digest<Blob>>,
+    /// Heads the outbox file already holds, when it holds anything. Lets a
+    /// stage append the changes since instead of recompacting the whole doc.
+    staged_heads: Option<Vec<ChangeHash>>,
 }
 
 impl DocState {
@@ -647,6 +669,7 @@ impl DocState {
             stored_fragments: HashSet::new(),
             applied: HashSet::new(),
             failed: HashSet::new(),
+            staged_heads: None,
         }
     }
 }
@@ -781,6 +804,7 @@ fn ingest(
     sid: SedimentreeId,
     stored_commits: &HashSet<ChangeHash>,
     stored_fragments: &HashSet<ChangeHash>,
+    rebundle_loose: bool,
 ) -> Option<Ingested> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let fragments = doc.fragments(0..);
@@ -795,7 +819,7 @@ fn ingest(
         for f in fragments {
             let head = f.head;
             let level = f.level;
-            if (level == 0 && stored_commits.contains(&head))
+            if (level == 0 && !rebundle_loose && stored_commits.contains(&head))
                 || (level > 0 && stored_fragments.contains(&head))
             {
                 continue;
@@ -1110,17 +1134,48 @@ impl Repo {
             .join(format!("{}.automerge", hex::encode(id.0)))
     }
 
+    /// Mirror the in-memory doc into the outbox file. The first stage writes a
+    /// compacted document; later ones append only the changes since, so a
+    /// keystroke's debounced save costs a change chunk rather than a full
+    /// rewrite of the note.
     async fn stage_doc(&self, id: DocId) -> Result<()> {
         let state = self.doc_state(id).await?;
-        let bytes = {
-            let state = state.lock().await;
-            cpu_heavy(|| state.doc.save())
+        let (bytes, heads, append) = {
+            let guard = state.lock().await;
+            let heads = guard.doc.get_heads();
+            match guard.staged_heads.clone() {
+                Some(staged) if staged == heads => return Ok(()),
+                Some(staged) => (cpu_heavy(|| guard.doc.save_after(&staged)), heads, true),
+                None => (cpu_heavy(|| guard.doc.save()), heads, false),
+            }
         };
         let path = self.outbox_path(id);
-        let pending = path.with_extension("pending");
-        std::fs::write(&pending, bytes).context("writing staged doc")?;
-        std::fs::rename(pending, path).context("committing staged doc")?;
+        cpu_heavy(|| -> Result<()> {
+            if append {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .context("opening staged doc")?;
+                file.write_all(&bytes).context("appending staged doc")?;
+            } else {
+                let pending = path.with_extension("pending");
+                std::fs::write(&pending, &bytes).context("writing staged doc")?;
+                std::fs::rename(&pending, &path).context("committing staged doc")?;
+            }
+            Ok(())
+        })?;
+        state.lock().await.staged_heads = Some(heads);
         Ok(())
+    }
+
+    /// Drop the outbox file once its contents are safely in the sedimentree.
+    async fn clear_outbox(&self, id: DocId) {
+        let path = self.outbox_path(id);
+        cpu_heavy(|| std::fs::remove_file(path)).ok();
+        if let Ok(state) = self.doc_state(id).await {
+            state.lock().await.staged_heads = None;
+        }
     }
 
     pub async fn set_apply_incoming(self: &Arc<Self>, enabled: bool) {
@@ -1263,7 +1318,7 @@ impl Repo {
     fn write_peers(&self, peers: &Peers) {
         match serde_json::to_vec_pretty(peers) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&self.peers_path, json) {
+                if let Err(e) = cpu_heavy(|| std::fs::write(&self.peers_path, json)) {
                     tracing::warn!(error = %e, "iroh: writing peer list failed");
                 }
             }
@@ -1381,8 +1436,8 @@ impl Repo {
             elapsed_ms = boot.elapsed().as_millis(),
             "repo storage opened"
         );
-        let (stored_tx, mut stored_rx) = mpsc::unbounded_channel();
-        let (heads_tx, mut heads_rx) = mpsc::unbounded_channel();
+        let (stored_tx, mut stored_rx) = mpsc::channel(OBSERVER_QUEUE);
+        let (heads_tx, mut heads_rx) = mpsc::channel(OBSERVER_QUEUE);
         let storage = ObservedStorage::new(storage, stored_tx);
 
         let sedimentrees = Arc::new(BoundedShardedMap::new());
@@ -1541,27 +1596,22 @@ impl Repo {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     };
-                    let mut peek = [0u8; 4];
-                    match tcp.peek(&mut peek).await {
-                        Ok(n) if n >= 3 => {}
-                        _ => continue,
-                    }
-                    if peek.starts_with(b"POST") || peek.starts_with(b"OPTI") {
-                        tokio::spawn(accept_local_http_peer(
-                            tcp,
-                            node.clone(),
-                            lp_handler.clone(),
-                            relay_repo.ephemeral.clone(),
-                        ));
-                    } else {
-                        tokio::spawn(accept_local_peer(
-                            tcp,
-                            node.clone(),
-                            relay_repo.clone(),
-                            peer_id,
-                            audience,
-                        ));
-                    }
+                    let node = node.clone();
+                    let lp_handler = lp_handler.clone();
+                    let relay_repo = relay_repo.clone();
+                    tokio::spawn(async move {
+                        let mut peek = [0u8; 4];
+                        match tokio::time::timeout(LOCAL_PEEK_TIMEOUT, tcp.peek(&mut peek)).await {
+                            Ok(Ok(n)) if n >= 3 => {}
+                            _ => return,
+                        }
+                        if peek.starts_with(b"POST") || peek.starts_with(b"OPTI") {
+                            let ephemeral = relay_repo.ephemeral.clone();
+                            accept_local_http_peer(tcp, node, lp_handler, ephemeral).await;
+                        } else {
+                            accept_local_peer(tcp, node, relay_repo, peer_id, audience).await;
+                        }
+                    });
                 }
             });
         }
@@ -1646,51 +1696,80 @@ impl Repo {
         let trees = ids.len() as u64;
         let mut dropped = 0u64;
         for id in ids {
-            dropped += self.reclaim_tree(id).await;
+            dropped += self.reclaim_doc(DocId::from_sedimentree_id(id)).await;
         }
         tracing::info!(trees, dropped, "reclaimed loose commits");
         Ok((trees, dropped))
     }
 
-    /// One tree's worth of the same pass. Runs whenever fragments land, so the
-    /// commits they cover go at that moment rather than waiting for a sweep.
-    pub(crate) async fn reclaim_tree(&self, id: SedimentreeId) -> u64 {
+    /// One doc's worth of the same pass, using automerge as the source of
+    /// truth: any persisted hash the doc no longer reports is absorbed, so
+    /// dropping it is provably safe.
+    ///
+    /// Only runs against a resident, hydrated doc. A doc still loading reports
+    /// no commits, and comparing that against what is on disk would read as
+    /// "everything is absorbed" and delete live data.
+    pub(crate) async fn reclaim_doc(&self, id: DocId) -> u64 {
+        let sid = id.sedimentree_id();
+        let Some(shared) = self.docs.lock().await.get(&id).cloned() else {
+            return 0;
+        };
+        let live: HashSet<ChangeHash> = {
+            let state = shared.lock().await;
+            if state.doc.get_heads().is_empty() {
+                return 0;
+            }
+            let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.doc.fragments(0..).into_iter().map(|f| f.head).collect()
+            }));
+            match collected {
+                Ok(live) => live,
+                Err(_) => {
+                    tracing::warn!(doc = %id.to_url(), "fragment walk panicked; skipping reclaim");
+                    return 0;
+                }
+            }
+        };
+        if live.is_empty() {
+            return 0;
+        }
         let commits =
-            match <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, id)
+            match <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, sid)
                 .await
             {
-                Ok(commits) if !commits.is_empty() => commits,
-                Ok(_) => return 0,
+                Ok(commits) => commits,
                 Err(e) => {
                     tracing::warn!(error = %e, "loading loose commits failed");
                     return 0;
                 }
             };
-        let fragments =
-            match <ObservedStorage as Storage<Sendable>>::load_fragment_metas(&self.storage, id)
+        let absorbed: Vec<_> = commits
+            .into_iter()
+            .map(|commit| commit.head())
+            .filter(|head| !live.contains(&ChangeHash(*head.as_bytes())))
+            .collect();
+        let dropped: u64 = futures::stream::iter(absorbed)
+            .map(|head| async move {
+                match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(
+                    &self.storage,
+                    sid,
+                    head,
+                )
                 .await
-            {
-                Ok(fragments) if !fragments.is_empty() => fragments,
-                Ok(_) => return 0,
-                Err(e) => {
-                    tracing::warn!(error = %e, "loading fragments failed");
-                    return 0;
+                {
+                    Ok(()) => 1,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "deleting loose commit failed");
+                        0
+                    }
                 }
-            };
-        let tree = Sedimentree::new(fragments, commits.clone());
-        let keep = tree.minimize(&CountLeadingZeroBytes);
-        let mut dropped = 0;
-        for commit in commits {
-            let head = commit.head();
-            if keep.has_loose_commit(head) {
-                continue;
-            }
-            match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(&self.storage, id, head)
-                .await
-            {
-                Ok(()) => dropped += 1,
-                Err(e) => tracing::warn!(error = %e, "deleting loose commit failed"),
-            }
+            })
+            .buffer_unordered(RECLAIM_DELETE_CONCURRENCY)
+            .fold(0u64, |total, n| async move { total + n })
+            .await;
+        if dropped > 0 {
+            let mut state = shared.lock().await;
+            state.stored_commits.retain(|hash| live.contains(hash));
         }
         dropped
     }
@@ -1782,14 +1861,17 @@ impl Repo {
                     let keepalive = tokio::spawn(async move {
                         keepalive_task.await;
                     });
-                    if let Err(e) = self
-                        .core
-                        .add_connection(
-                            authenticated.map(|c| MessageTransport::new(WsTransport::Dialed(c))),
-                        )
-                        .await
-                    {
+                    let mut dialed = None;
+                    let transport = authenticated.map(|c| {
+                        dialed = Some(c.clone());
+                        MessageTransport::new(WsTransport::Dialed(c))
+                    });
+                    if let Err(e) = self.core.add_connection(transport).await {
                         tracing::error!(error = %e, "failed to register connection");
+                        listener.abort();
+                        if let Some(c) = dialed {
+                            let _ = Transport::<Sendable>::disconnect(&c).await;
+                        }
                     } else {
                         self.connected
                             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2074,7 +2156,8 @@ impl Repo {
         };
         self.emit_batch_events(id, count, advanced, failed);
         if received_fragments {
-            self.reclaim_tree(sid).await;
+            let _ = sid;
+            self.reclaim_doc(id).await;
         }
         Ok(advanced)
     }
@@ -2097,12 +2180,14 @@ impl Repo {
         let shared = self.doc_state(id).await?;
         let ingested = {
             let state = shared.lock().await;
+            let rebundle = state.stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD;
             cpu_heavy(|| {
                 ingest(
                     &state.doc,
                     sid,
                     &state.stored_commits,
                     &state.stored_fragments,
+                    rebundle,
                 )
             })
         };
@@ -2115,7 +2200,7 @@ impl Repo {
         };
         if ingested.commits.is_empty() && ingested.fragments.is_empty() {
             if !ingested.skipped {
-                let _ = std::fs::remove_file(self.outbox_path(id));
+                self.clear_outbox(id).await;
             }
             return Ok(false);
         }
@@ -2139,10 +2224,10 @@ impl Repo {
             state.stored_fragments.extend(fragment_heads);
         }
         if !skipped {
-            let _ = std::fs::remove_file(self.outbox_path(id));
+            self.clear_outbox(id).await;
         }
         if wrote_fragments {
-            self.reclaim_tree(sid).await;
+            self.reclaim_doc(id).await;
         }
 
         Ok(true)
@@ -2430,7 +2515,10 @@ impl Repo {
                 (0, false, false)
             }
         };
-        if let Ok(bytes) = std::fs::read(self.outbox_path(id)) {
+        cpu_heavy(|| {
+            let Ok(bytes) = std::fs::read(self.outbox_path(id)) else {
+                return;
+            };
             match Automerge::load(&bytes) {
                 Ok(mut staged) => {
                     if let Err(e) = guard.doc.merge(&mut staged) {
@@ -2441,7 +2529,7 @@ impl Repo {
                     tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to load")
                 }
             }
-        }
+        });
         drop(guard);
         self.emit_batch_events(id, count, advanced, failed);
         self.request_sync(id).await;
@@ -2702,6 +2790,7 @@ mod tests {
             DocId([7; 16]).sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
+            false,
         )
         .unwrap();
         let mut commits: Vec<_> = ingested
@@ -2738,6 +2827,7 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
+            false,
         )
         .unwrap();
         assert!(!ingested.fragments.is_empty());
@@ -2771,7 +2861,7 @@ mod tests {
             put(&mut source, &format!("value-{index}"), index as i64);
         }
 
-        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new(), false).unwrap();
         assert!(
             !ingested.fragments.is_empty(),
             "level-0 changes should be batched into fragment records"
@@ -2818,6 +2908,7 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
+            false,
         )
         .unwrap();
         let commit_heads = ingested.commit_heads.clone();
@@ -2847,12 +2938,7 @@ mod tests {
         assert_eq!(state.doc.get_heads(), source.get_heads());
         assert_eq!(state.stored_commits.len(), commit_heads.len());
         assert_eq!(state.stored_fragments.len(), fragment_heads.len());
-        let repeated = ingest(
-            &state.doc,
-            sid,
-            &state.stored_commits,
-            &state.stored_fragments,
-        )
+        let repeated = ingest(&state.doc, sid, &state.stored_commits, &state.stored_fragments, false)
         .unwrap();
         assert!(repeated.commits.is_empty());
         assert!(repeated.fragments.is_empty());
@@ -2910,6 +2996,7 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
+            false,
         )
         .unwrap();
         repo.core
@@ -2942,7 +3029,7 @@ mod tests {
         let sid = id.sedimentree_id();
         let mut source = Automerge::new().with_actor(ActorId::from([11; 16].as_slice()));
         put(&mut source, "value", "legacy");
-        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new(), false).unwrap();
         assert_eq!(ingested.commits.len(), 1);
         assert!(ingested.fragments.is_empty());
         let (commit, blob) = ingested.commits.pop().unwrap();

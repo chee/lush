@@ -50,6 +50,8 @@ final class PadStore {
     let cache = AssetCache()
     @ObservationIgnored weak var model: NotesModel?
     @ObservationIgnored private var loading: Set<String> = []
+    @ObservationIgnored private var notePadLookups: Set<String> = []
+    @ObservationIgnored private var notesWithoutPad: Set<String> = []
     @ObservationIgnored private var padWriteTasks: [String: Task<Void, Never>] = [:]
 
     private static let localPocketKey = "pocketPadUrl"
@@ -62,10 +64,17 @@ final class PadStore {
 
     func notePad(for noteUrl: String) -> String? {
         if let known = notePads[noteUrl] { return known }
+        guard !notesWithoutPad.contains(noteUrl), !notePadLookups.contains(noteUrl) else { return nil }
         guard let core = model?.core else { return nil }
+        notePadLookups.insert(noteUrl)
         Task { @MainActor [weak self] in
             let url = await Task.detached { core.notePad(url: noteUrl) }.value
-            guard let self, let url else { return }
+            guard let self else { return }
+            self.notePadLookups.remove(noteUrl)
+            guard let url else {
+                self.notesWithoutPad.insert(noteUrl)
+                return
+            }
             self.notePads[noteUrl] = url
             self.track(url)
             self.load(url)
@@ -79,6 +88,7 @@ final class PadStore {
         guard let core = model?.core else { return nil }
         let made: String? = await Task.detached { try? core.ensureNotePad(url: noteUrl) }.value
         guard let url = made else { return nil }
+        notesWithoutPad.remove(noteUrl)
         notePads[noteUrl] = url
         load(url)
         return url
@@ -136,6 +146,7 @@ final class PadStore {
     }
 
     func docChanged(url: String) {
+        notesWithoutPad.remove(url)
         guard items[url] != nil else { return }
         load(url)
     }

@@ -323,19 +323,14 @@ enum RichTextClipboard {
         return spans
     }
 
+    // "\t•\t" / "\t1.\t" from HTML import, "- " / "* " from pasted text, and
+    // the bullet characters Apple Notes writes.
+    private static let listMarker = /^[ \t]*(?:\t[^\t]*\t|[•◦▪‣∙*+-][ \t]*|\d{1,4}[.)][ \t]*)/
+
     private static func trimListMarker(in str: NSString, range: inout NSRange) {
-        guard range.length > 0 else { return }
-        let text = str.substring(with: range)
-        let markerCharacters: Int
-        if text.hasPrefix("\t"), let secondTab = text.dropFirst().firstIndex(of: "\t") {
-            // HTML import emits "\t•\t" / "\t1.\t"
-            markerCharacters = text.distance(from: text.startIndex, to: secondTab) + 1
-        } else if text.hasPrefix("- ") || text.hasPrefix("* ") {
-            markerCharacters = 2
-        } else {
-            markerCharacters = orderedListPrefixLength(in: text) ?? 0
-        }
-        let markerLength = String(text.prefix(markerCharacters)).utf16.count
+        guard range.length > 0,
+              let marker = str.substring(with: range).prefixMatch(of: listMarker) else { return }
+        let markerLength = (String(marker.output) as NSString).length
         range.location += markerLength
         range.length = max(0, range.length - markerLength)
     }

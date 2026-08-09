@@ -4,9 +4,6 @@ import CoreText
 
 @MainActor
 enum DockTilePreview {
-    nonisolated static let appGroupIdentifier = "group.party.chee.patchwork.lush"
-    nonisolated static let imageName = "DockTileImage.png"
-
     private static var lastRendered: String?
     private static let writeQueue = DispatchQueue(label: "party.chee.patchwork.lush.docktile")
 
@@ -34,7 +31,7 @@ enum DockTilePreview {
             app.dockTile.contentView = nil
             app.dockTile.display()
         }
-        let url = fileURL()
+        let url = DockMenuSnapshot.tileImageURL
         writeQueue.async {
             if let url { try? FileManager.default.removeItem(at: url) }
         }
@@ -111,14 +108,8 @@ enum DockTilePreview {
         return (1 - fraction) * size + 0.016 * size
     }
 
-    nonisolated private static func fileURL() -> URL? {
-        FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)?
-            .appendingPathComponent(imageName)
-    }
-
     nonisolated private static func write(_ image: CGImage) {
-        guard let url = fileURL(),
+        guard let url = DockMenuSnapshot.tileImageURL,
               let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
         else { return }
         try? png.write(to: url, options: .atomic)
