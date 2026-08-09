@@ -47,19 +47,40 @@ struct AgendaScreen: View {
     private var list: some View {
         ScrollViewReader { proxy in
             ScrollView {
+                // Each day is a Section: a lazy stack tracks its children
+                // through those, and a loose header plus a nested ForEach left
+                // it dropping rows until they were scrolled well past.
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Agenda.days(agenda.items), id: \.day) { group in
-                        header(group.day)
-                            .id(group.day)
-                        ForEach(group.items, id: \.rowKey) { item in
-                            row(item, on: group.day)
+                    ForEach(dayGroups, id: \.day) { group in
+                        Section {
+                            // An event running over several days appears in
+                            // each of them, so the day has to be part of the
+                            // identity — one lazy stack holding the same id
+                            // twice draws it once and leaves a hole.
+                            ForEach(keyed(group), id: \.key) { entry in
+                                row(entry.item, on: group.day)
+                            }
+                        } header: {
+                            header(group.day)
+                                .id(group.day)
+                                // The last header to scroll past the top is
+                                // where she was; a lazy stack only builds those
+                                // as they come into view, which is the signal.
+                                .onAppear { agenda.restoreDay = group.day }
                         }
                     }
+                    Color.clear
+                        .frame(height: 1)
+                        .onAppear { Task { await agenda.extendHorizon() } }
                 }
                 .padding(.horizontal, 28)
                 .padding(.bottom, 40)
                 .frame(maxWidth: 720)
                 .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .onAppear {
+                guard agenda.focusDay == nil, let day = agenda.restoreDay else { return }
+                proxy.scrollTo(day, anchor: .top)
             }
             .onChange(of: agenda.focusDay, initial: true) {
                 guard let day = agenda.focusDay else { return }
@@ -77,6 +98,17 @@ struct AgendaScreen: View {
             }
         }
     }
+
+    private var dayGroups: [(day: Date, items: [AgendaItem])] {
+        Agenda.days(agenda.items, from: Calendar.current.startOfDay(for: Date()), count: agenda.horizon)
+    }
+
+    private func keyed(
+        _ group: (day: Date, items: [AgendaItem])
+    ) -> [(key: String, item: AgendaItem)] {
+        group.items.map { ("\(group.day.timeIntervalSince1970)|\($0.rowKey)", $0) }
+    }
+
 
     private func header(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {

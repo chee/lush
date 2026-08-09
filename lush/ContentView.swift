@@ -15,6 +15,7 @@ enum NavRoute: Hashable {
     case recents
     case smart(String)
     case calendar
+    case meetingNotes
 }
 
 struct MoveTarget: Identifiable {
@@ -167,6 +168,8 @@ struct ContentView: View {
                         SmartNotebookScreen(smartNotebookId: id, push: { path.append($0) })
                     case .calendar:
                         AgendaScreen { path.append(.note($0)) }
+                    case .meetingNotes:
+                        MeetingNotesScreen { path.append(.note($0)) }
                     }
                 }
         }
@@ -579,7 +582,20 @@ struct ContentView: View {
             .padding(.bottom, 5)
             .contentShape(Rectangle())
             .background(SuppressListSelectionHighlight().frame(width: 0, height: 0))
-            .onTapGesture { selectedItemUrls = [Agenda.sidebarTag] }
+            .onTapGesture {
+                // Coming back lands where she left. Clicking it while it is
+                // already showing is the one way to ask for today instead.
+                if calendarSelected {
+                    AgendaStore.shared.restoreDay = nil
+                    AgendaStore.shared.focusDay = Calendar.current.startOfDay(for: Date())
+                }
+                selectedItemUrls = [Agenda.sidebarTag]
+            }
+            .contextMenu {
+                Button("Show Meeting Notes") {
+                    selectedItemUrls = [Agenda.meetingNotesTag]
+                }
+            }
             .tag(Agenda.sidebarTag)
             .listRowInsets(sidebarRowInsets(depth: 0))
             .listRowBackground(selectionBackground(Agenda.sidebarTag))
@@ -587,6 +603,10 @@ struct ContentView: View {
 
     private var calendarSelected: Bool {
         selectedItemUrls.count == 1 && selectedItemUrls.first == Agenda.sidebarTag
+    }
+
+    private var meetingNotesSelected: Bool {
+        selectedItemUrls.count == 1 && selectedItemUrls.first == Agenda.meetingNotesTag
     }
 
     @ViewBuilder
@@ -1088,7 +1108,9 @@ struct ContentView: View {
         // drags the field over into the sidebar.
         HStack(spacing: 0) {
             Group {
-                if calendarSelected {
+                if meetingNotesSelected {
+                    MeetingNotesScreen { open($0) }
+                } else if calendarSelected {
                     AgendaScreen { open($0) }
                 } else if let url = model.selectedNoteUrl {
                     if model.core == nil {
@@ -1240,35 +1262,12 @@ struct ContentView: View {
 
     @ViewBuilder
     private func singleNoteContextMenu(for node: FolderNode, showInFolder: Bool = false) -> some View {
-        if node.kind == "lush" || node.kind == "rich" {
-            Button("Open in New Window") {
-                openWindow(id: "note-detail", value: node.url)
-            }
-            Divider()
-            Button(model.isPinned(node.url) ? "Unpin" : "Pin") {
-                model.togglePin(node.url)
-            }
-            Button(model.quickNoteUrl == node.url ? "Unset Quick Note" : "Set as Quick Note") {
-                model.setQuickNote(model.quickNoteUrl == node.url ? nil : node.url)
-            }
-            if showInFolder {
-                Button("Show in Folder") { showNoteInFolder(node) }
-            }
-        }
-        if node.parentUrl != nil {
-            Button("Move…") { moveTarget = MoveTarget(urls: [node.url]) }
-        }
-        Button("Rename") { beginRename(node) }
-        Button("Copy Note URL") { Clipboard.copy(node.url) }
-        if isPatchworkDoc(node) {
-            Button("Copy Patchwork URL") { model.copyPatchworkUrl(for: node.url) }
-            Button("Open in Patchwork") { model.openInPatchwork(node.url) }
-        }
-        if node.parentUrl != nil {
-            Button("Delete", role: .destructive) {
-                model.removeEntry(parentUrl: node.parentUrl, url: node.url)
-            }
-        }
+        NoteContextMenu(
+            node: node,
+            showInFolder: showInFolder ? { showNoteInFolder(node) } : nil,
+            move: { moveTarget = MoveTarget(urls: [node.url]) },
+            rename: { beginRename(node) }
+        )
     }
 
     #endif

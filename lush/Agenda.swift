@@ -98,26 +98,35 @@ extension String {
 enum Agenda {
     static let iso = ISO8601DateFormatter()
     static let sidebarTag = "agenda:calendar"
+    static let meetingNotesTag = "agenda:meeting-notes"
     static let reminderPrefix = "reminder:"
     static let dayInIconKey = "calendarIconShowsDay"
     static let horizonDays = 14
+    /// How far scrolling will run on before it stops. Further than she means
+    /// to look, not forever.
+    static let horizonLimit = 730
 
     #if os(macOS)
-    /// Moves Calendar to a day. The date is given as an offset from the
-    /// script's own `current date` so it never has to be spelled out in a
-    /// locale's format; noon keeps a second of drift from landing on the day
-    /// either side. Returns once Calendar has arrived.
+    private static func fourCharCode(_ text: String) -> FourCharCode {
+        text.utf8.reduce(0) { ($0 << 8) + FourCharCode($1) }
+    }
+
+    /// Moves Calendar to a day: its `view calendar at` command, sent as a raw
+    /// Apple Event rather than compiled from AppleScript source, which costs a
+    /// round trip instead of a compile. Noon keeps an hour of slop from landing
+    /// on the day either side. Waits for the reply, so it returns once Calendar
+    /// has actually arrived and the occurrence link has something to select.
     static func showDay(_ date: Date) {
         let noon = Foundation.Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: date) ?? date
-        let source = """
-        tell application "Calendar"
-            activate
-            view calendar at ((current date) + \(Int(noon.timeIntervalSinceNow)))
-        end tell
-        """
-        guard let script = NSAppleScript(source: source) else { return }
-        var errorInfo: NSDictionary?
-        script.executeAndReturnError(&errorInfo)
+        let event = NSAppleEventDescriptor.appleEvent(
+            withEventClass: fourCharCode("wrbt"),
+            eventID: fourCharCode("aec9"),
+            targetDescriptor: NSAppleEventDescriptor(bundleIdentifier: "com.apple.iCal"),
+            returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID)
+        )
+        event.setDescriptor(NSAppleEventDescriptor(date: noon), forKeyword: fourCharCode("wtdt"))
+        _ = try? event.sendEvent(options: .waitForReply, timeout: 10)
     }
     #endif
 
@@ -220,9 +229,16 @@ enum Agenda {
     /// Every day in the window gets a section, empty or not, and an item that
     /// runs over several days appears on each of them.
     static func days(_ items: [AgendaItem]) -> [(day: Date, items: [AgendaItem])] {
+        days(items, from: Calendar.current.startOfDay(for: Date()), count: horizonDays)
+    }
+
+    static func days(
+        _ items: [AgendaItem],
+        from first: Date,
+        count: Int
+    ) -> [(day: Date, items: [AgendaItem])] {
         let calendar = Calendar.current
-        let first = calendar.startOfDay(for: Date())
-        let window = (0..<horizonDays).compactMap {
+        let window = (0..<count).compactMap {
             calendar.date(byAdding: .day, value: $0, to: first)
         }
         guard let last = window.last else { return [] }
@@ -277,6 +293,12 @@ final class AgendaStore {
     static let shared = AgendaStore()
 
     private(set) var items: [AgendaItem] = []
+    /// How many days the list currently reaches. Grows as she scrolls rather
+    /// than fetching a year nobody asked for.
+    private(set) var horizon = Agenda.horizonDays
+    /// Where she was when she last left the calendar, so coming back lands
+    /// there instead of at today.
+    var restoreDay: Date?
     /// Set by a link into the Calendar view: the day to scroll to, and the
     /// item to pick out when it gets there.
     var focusDay: Date?
@@ -419,7 +441,18 @@ final class AgendaStore {
     private func reload() async {
         let calendar = Calendar.current
         let from = calendar.startOfDay(for: Date())
-        let to = calendar.date(byAdding: .day, value: Agenda.horizonDays, to: from) ?? from
+        let to = calendar.date(byAdding: .day, value: horizon, to: from) ?? from
+        items = await fetch(from: from, to: to)
+    }
+
+    /// Another fortnight, each time the end of the list comes into view.
+    func extendHorizon() async {
+        guard horizon < Agenda.horizonLimit else { return }
+        horizon += Agenda.horizonDays
+        await reload()
+    }
+
+    private func fetch(from: Date, to: Date) async -> [AgendaItem] {
         let shownIds = Set(NotesModel.shared.focus.state?.shownCalendarIds ?? [])
         var next: [AgendaItem] = []
         if access == .fullAccess {
@@ -427,12 +460,15 @@ final class AgendaStore {
                 ? nil
                 : store.calendars(for: .event).filter { shownIds.contains($0.calendarIdentifier) }
             let predicate = store.predicateForEvents(withStart: from, end: to, calendars: ekCalendars)
-            next += store.events(matching: predicate).compactMap(AgendaItem.init)
+            let store = self.store
+            next += await Task.detached {
+                store.events(matching: predicate).compactMap(AgendaItem.init)
+            }.value
         }
         if reminderAccess == .fullAccess {
             next += await reminders(from: from, to: to, shownIds: shownIds)
         }
-        items = next.sorted { $0.start < $1.start }
+        return next.sorted { $0.start < $1.start }
     }
 
     private func reminders(from: Date, to: Date, shownIds: Set<String>) async -> [AgendaItem] {
@@ -676,7 +712,8 @@ extension NotesModel {
     @discardableResult
     func createNote(for item: AgendaItem, series: Bool = false, snap: ContextSnapshot? = nil) async -> String? {
         guard let core else { return nil }
-        guard let folder = folderUrl ?? inboxUrl ?? rootFolderUrls.first else {
+        guard let folder = await calendarFolder() ?? folderUrl ?? inboxUrl ?? rootFolderUrls.first
+        else {
             status = "Couldn't create note: no folder yet"
             return nil
         }

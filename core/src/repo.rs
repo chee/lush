@@ -610,6 +610,10 @@ pub enum RepoEvent {
     SyncEvent(String),
     Ephemeral(DocId, Vec<u8>),
     PeersChanged,
+    /// Local storage has been enumerated: what this device already holds is
+    /// known. Dialing the server before this asks for things we have.
+    StorageLoaded,
+    NotesPrefetched,
 }
 
 #[derive(Debug, Clone)]
@@ -1599,11 +1603,32 @@ impl Repo {
                 }
             });
         }
+        repo.start_storage_load();
         Ok(repo)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RepoEvent> {
         self.events.subscribe()
+    }
+
+    pub fn announce_notes_prefetched(&self) {
+        let _ = self.events.send(RepoEvent::NotesPrefetched);
+    }
+
+    /// Reads what is on disk, then says so and dials out. Owning the order here
+    /// means no caller has to judge when the local load is done.
+    fn start_storage_load(self: &Arc<Self>) {
+        let repo = self.clone();
+        tokio::spawn(async move {
+            match <ObservedStorage as Storage<Sendable>>::load_all_sedimentree_ids(&repo.storage)
+                .await
+            {
+                Ok(ids) => tracing::info!(count = ids.len(), "local storage enumerated"),
+                Err(e) => tracing::warn!(error = %e, "local storage enumeration failed"),
+            }
+            let _ = repo.events.send(RepoEvent::StorageLoaded);
+            repo.start_connect_loop_if_needed();
+        });
     }
 
     pub fn is_connected(&self) -> bool {

@@ -164,6 +164,7 @@ pub struct ContactInfo {
 pub struct ConfigState {
     pub folders: Vec<String>,
     pub inbox: Option<String>,
+    pub calendar: Option<String>,
     pub smart: Vec<shapes::SmartNotebook>,
     pub packages: Vec<String>,
     pub pad: Option<String>,
@@ -224,6 +225,12 @@ pub trait CoreDelegate: Send + Sync {
     fn on_sync_event(&self, message: String);
     fn on_ephemeral_message(&self, url: String, payload: Vec<u8>);
     fn on_peers_changed(&self);
+    /// Every note found on disk is now in the search index. Until this lands,
+    /// an empty search result only means the search was early.
+    fn on_notes_prefetched(&self);
+    /// Local storage has been read: the folder tree can be trusted to be about
+    /// what this device holds, rather than about how far loading has got.
+    fn on_storage_loaded(&self);
 }
 
 #[derive(uniffi::Object)]
@@ -466,6 +473,8 @@ impl Core {
                         delegate.on_ephemeral_message(id.to_url(), payload)
                     }
                     Ok(RepoEvent::PeersChanged) => delegate.on_peers_changed(),
+                    Ok(RepoEvent::NotesPrefetched) => delegate.on_notes_prefetched(),
+                    Ok(RepoEvent::StorageLoaded) => delegate.on_storage_loaded(),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("delegate missed {n} events");
                         delegate.on_sync_event(format!(
@@ -1174,6 +1183,7 @@ impl Core {
                 Ok(ConfigState {
                     folders: shapes::config_folders(doc),
                     inbox: shapes::config_inbox(doc),
+                    calendar: shapes::config_calendar(doc),
                     smart: shapes::config_smart_notebooks(doc),
                     packages: shapes::config_packages(doc),
                     pad: shapes::config_pad(doc),
@@ -1231,6 +1241,21 @@ impl Core {
                     shapes::config_set_smart_notebooks(doc, &folders)
                 })
                 .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    /// The folder notes about calendar items are filed in. Kept on the account
+    /// config so every device files them in the same place.
+    pub fn set_config_calendar(&self, config_url: String, url: String) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| shapes::config_set_calendar(doc, &url))
+                    .await?;
                 Ok::<_, anyhow::Error>(())
             })?;
             Ok(())
@@ -1649,6 +1674,7 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         self.runtime.spawn(async move {
+            let mut indexing = Vec::new();
             let mut visited = std::collections::HashSet::new();
             let mut queue: Vec<String> = urls;
             while let Some(url) = queue.pop() {
@@ -1667,7 +1693,7 @@ impl Core {
                 let _ = repo
                     .change_doc(id, |doc| shapes::normalize_strings(doc))
                     .await;
-                tokio::spawn(index_doc(repo.clone(), index.clone(), id));
+                indexing.push(tokio::spawn(index_doc(repo.clone(), index.clone(), id)));
                 if let Ok(entries) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
                     for entry in entries {
                         queue.push(entry.url);
@@ -1677,6 +1703,10 @@ impl Core {
                     queue.extend(embeds);
                 }
             }
+            for task in indexing {
+                let _ = task.await;
+            }
+            repo.announce_notes_prefetched();
         });
     }
 

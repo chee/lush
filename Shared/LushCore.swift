@@ -924,6 +924,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func setCheckoutState(url: String, checkedOut: String?, pins: [CheckpointPin]?) throws 
     
+    /**
+     * The folder notes about calendar items are filed in. Kept on the account
+     * config so every device files them in the same place.
+     */
+    func setConfigCalendar(configUrl: String, url: String) throws 
+    
     func setConfigFolders(configUrl: String, urls: [String]) throws 
     
     func setConfigInbox(configUrl: String, url: String) throws 
@@ -2070,6 +2076,18 @@ open func setCheckoutState(url: String, checkedOut: String?, pins: [CheckpointPi
 }
 }
     
+    /**
+     * The folder notes about calendar items are filed in. Kept on the account
+     * config so every device files them in the same place.
+     */
+open func setConfigCalendar(configUrl: String, url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_calendar(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterString.lower(url),$0
+    )
+}
+}
+    
 open func setConfigFolders(configUrl: String, urls: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_set_config_folders(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),
@@ -2876,15 +2894,17 @@ public func FfiConverterTypeCloneResult_lower(_ value: CloneResult) -> RustBuffe
 public struct ConfigState {
     public var folders: [String]
     public var inbox: String?
+    public var calendar: String?
     public var smart: [SmartNotebook]
     public var packages: [String]
     public var pad: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(folders: [String], inbox: String?, smart: [SmartNotebook], packages: [String], pad: String?) {
+    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], packages: [String], pad: String?) {
         self.folders = folders
         self.inbox = inbox
+        self.calendar = calendar
         self.smart = smart
         self.packages = packages
         self.pad = pad
@@ -2904,6 +2924,9 @@ extension ConfigState: Equatable, Hashable {
         if lhs.inbox != rhs.inbox {
             return false
         }
+        if lhs.calendar != rhs.calendar {
+            return false
+        }
         if lhs.smart != rhs.smart {
             return false
         }
@@ -2919,6 +2942,7 @@ extension ConfigState: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(folders)
         hasher.combine(inbox)
+        hasher.combine(calendar)
         hasher.combine(smart)
         hasher.combine(packages)
         hasher.combine(pad)
@@ -2936,6 +2960,7 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
             try ConfigState(
                 folders: FfiConverterSequenceString.read(from: &buf), 
                 inbox: FfiConverterOptionString.read(from: &buf), 
+                calendar: FfiConverterOptionString.read(from: &buf), 
                 smart: FfiConverterSequenceTypeSmartNotebook.read(from: &buf), 
                 packages: FfiConverterSequenceString.read(from: &buf), 
                 pad: FfiConverterOptionString.read(from: &buf)
@@ -2945,6 +2970,7 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
     public static func write(_ value: ConfigState, into buf: inout [UInt8]) {
         FfiConverterSequenceString.write(value.folders, into: &buf)
         FfiConverterOptionString.write(value.inbox, into: &buf)
+        FfiConverterOptionString.write(value.calendar, into: &buf)
         FfiConverterSequenceTypeSmartNotebook.write(value.smart, into: &buf)
         FfiConverterSequenceString.write(value.packages, into: &buf)
         FfiConverterOptionString.write(value.pad, into: &buf)
@@ -4245,6 +4271,18 @@ public protocol CoreDelegate: AnyObject, Sendable {
     
     func onPeersChanged() 
     
+    /**
+     * Every note found on disk is now in the search index. Until this lands,
+     * an empty search result only means the search was early.
+     */
+    func onNotesPrefetched() 
+    
+    /**
+     * Local storage has been read: the folder tree can be trusted to be about
+     * what this device holds, rather than about how far loading has got.
+     */
+    func onStorageLoaded() 
+    
 }
 
 
@@ -4366,6 +4404,50 @@ fileprivate struct UniffiCallbackInterfaceCoreDelegate {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return uniffiObj.onPeersChanged(
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onNotesPrefetched: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCoreDelegate.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onNotesPrefetched(
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onStorageLoaded: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCoreDelegate.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onStorageLoaded(
                 )
             }
 
@@ -5444,6 +5526,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_checkout_state() != 43074) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_set_config_calendar() != 47772) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_set_config_folders() != 33231) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5511,6 +5596,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_coredelegate_on_peers_changed() != 58468) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_coredelegate_on_notes_prefetched() != 51051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_coredelegate_on_storage_loaded() != 48471) {
         return InitializationResult.apiChecksumMismatch
     }
 

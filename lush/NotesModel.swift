@@ -92,8 +92,14 @@ final class NotesModel {
     var folderUrl: String?
     var folderTitle: String = ""
     var connected = false
-    private(set) var storageLoaded = false
+    /// The core has read what is on disk. Until then an empty answer only
+    /// means nothing has been loaded to answer with.
+    fileprivate(set) var storageLoaded = false
+    /// Set when the core says every note on disk has reached the search index.
+    /// Anything that would read an empty result as "nothing there" waits for
+    /// it rather than guessing how long loading takes.
     private(set) var startupSettled = false
+    private var startupWaiters: [CheckedContinuation<Void, Never>] = []
     var irohPeers: [IrohPeer] = []
 
     func refreshPeers() {
@@ -240,6 +246,10 @@ final class NotesModel {
     private(set) var accountModuleSettingsUrl: String? = PatchworkWeb.accountModuleUrl
     private(set) var packageListUrls: [String] = PatchworkWeb.moduleUrls
     private(set) var inboxUrl: String?
+    /// Notes about calendar items are filed here rather than in whichever
+    /// notebook happened to be open. Made the first time one is written and
+    /// kept on the account config, so every device files them together.
+    private(set) var calendarFolderUrl: String?
     private(set) var contactName: String?
     private(set) var contactAvatarData: Data?
     var smartNotebooks: [SmartNotebook] = SmartNotebookStore.load()
@@ -341,6 +351,7 @@ final class NotesModel {
         accountModuleSettingsUrl = nil
         PatchworkWeb.accountModuleUrl = nil
         inboxUrl = nil
+        calendarFolderUrl = nil
         contactName = nil
         contactAvatarData = nil
         presenceContactUrl = nil
@@ -421,6 +432,35 @@ final class NotesModel {
         guard let core, let configUrl = accountConfigUrl else { return }
         let urls = packageListUrls
         Task.detached { try? core.setConfigPackages(configUrl: configUrl, urls: urls) }
+    }
+
+    /// The calendar folder, made on first use. It is a folder like any other —
+    /// it syncs, it is searched, and its notes are indexed — it is only where
+    /// they go that is decided here.
+    func calendarFolder() async -> String? {
+        guard let core else { return nil }
+        if let url = calendarFolderUrl { return url }
+        if let configUrl = accountConfigUrl {
+            let existing = await Task.detached { [core, configUrl] () -> String? in
+                core.configState(configUrl: configUrl)?.calendar
+            }.value
+            if let existing {
+                calendarFolderUrl = existing
+                return existing
+            }
+        }
+        let created = try? await Task.detached { [core] () -> String in
+            try core.createSubfolder(title: "Calendar")
+        }.value
+        guard let url = created else { return nil }
+        calendarFolderUrl = url
+        if let configUrl = accountConfigUrl {
+            Task.detached { [core, configUrl, url] in
+                try? core.setConfigCalendar(configUrl: configUrl, url: url)
+            }
+        }
+        refreshNotes()
+        return url
     }
 
     func setInbox(_ url: String) {
@@ -940,9 +980,6 @@ final class NotesModel {
             let visible = Self.visibleNotes(in: tree)
             let localMs = Int(Date().timeIntervalSince(refreshStart) * 1000)
             core.prefetchNotes(urls: notes.map(\.url))
-            // Local load phase is done — now allow the network connection to
-            // start. Idempotent: only the first call spawns the connect loop.
-            core.connect()
             let richNotes = visible.filter { $0.kind == "rich" }.map {
                 NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
             }
@@ -953,7 +990,6 @@ final class NotesModel {
                 self.folderTitle = folderTitle
                 self.folderTree = tree
                 self.folderNodeCache = newCache
-                self.storageLoaded = true
                 if let selected = self.selectedNoteUrl, self.node(for: selected) == nil {
                     self.selectedNoteUrl = nil
                 }
@@ -1108,20 +1144,24 @@ final class NotesModel {
         }
     }
 
+    /// The core announces this once the prefetch walk has indexed every note it
+    /// found on disk. Before it, an empty search means the search was early.
+    func notesPrefetched() {
+        guard !startupSettled else { return }
+        startupSettled = true
+        let waiters = startupWaiters
+        startupWaiters = []
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func awaitStartup() async {
+        guard !startupSettled else { return }
+        await withCheckedContinuation { startupWaiters.append($0) }
+    }
+
     private func startMaintenancePolling() {
         maintenanceTask?.cancel()
         maintenanceTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                if !self.folderTree.isEmpty { break }
-                try? await Task.sleep(for: .seconds(2))
-            }
-            // Wait for note docs to finish loading into the Rust search index
-            // before allowing smart notebook checks — prevents spurious boot
-            // notifications caused by incomplete search results.
-            try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in self?.startupSettled = true }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
                 guard let self, !Task.isCancelled else { break }
@@ -1295,6 +1335,7 @@ final class NotesModel {
                 let state = await Task.detached { core.configState(configUrl: configUrl) }.value
                 guard let self, let state else { return }
                 self.inboxUrl = state.inbox
+                self.calendarFolderUrl = state.calendar
                 if state.smart != self.smartNotebooks {
                     self.smartNotebooks = state.smart
                     SmartNotebookStore.save(state.smart)
@@ -2117,15 +2158,18 @@ final class NotesModel {
     /// the semantic pass sits out.
     func search(_ query: String, in scope: String? = nil) async -> [SearchHit] {
         guard let core, !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
-        let liveUrls = Set(notes.map(\.url))
+        // Anything still in the tree, which is what a smart notebook counts
+        // too. `notes` is only the open folder's own entries, so using it here
+        // quietly threw away every hit that lived anywhere else.
+        let liveUrls = notebookTree.kinds
         let filter = SearchFilter(scope: scope, tags: [], whenFrom: nil, whenTo: nil)
         let exact = await Task.detached { core.searchNotes(query: query, filter: filter) }.value
-            .filter { liveUrls.contains($0.url) }
+            .filter { liveUrls[$0.url] != nil }
         if Task.isCancelled { return [] }
         if query.contains("\"") { return exact }
         let seen = Set(exact.map(\.url))
         return await exact + semanticSearch.search(query, excluding: seen, in: scope)
-            .filter { liveUrls.contains($0.url) }
+            .filter { liveUrls[$0.url] != nil }
     }
 
     /// Notes the index has never seen — everything else is kept current by
@@ -3099,6 +3143,18 @@ private final class DelegateBridge: CoreDelegate {
     func onPeersChanged() {
         Task { @MainActor [model] in
             model?.refreshPeers()
+        }
+    }
+
+    func onNotesPrefetched() {
+        Task { @MainActor [model] in
+            model?.notesPrefetched()
+        }
+    }
+
+    func onStorageLoaded() {
+        Task { @MainActor [model] in
+            model?.storageLoaded = true
         }
     }
 }

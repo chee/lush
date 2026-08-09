@@ -115,6 +115,21 @@ extension NotesModel {
         }
     }
 
+    /// A background launch can reach the check before the docs have loaded.
+    /// The core says when they have; this only bounds how long it is worth
+    /// holding a background task open waiting to hear it.
+    private func waitForStartup(timeout: Duration = .seconds(20)) async -> Bool {
+        guard !startupSettled else { return true }
+        let waited = Task { await awaitStartup() }
+        let bound = Task {
+            try? await Task.sleep(for: timeout)
+            waited.cancel()
+        }
+        await waited.value
+        bound.cancel()
+        return startupSettled
+    }
+
     /// Runs the saved search through the shared runner, so an open Lush and a
     /// background helper always agree about what a notebook holds.
     func smartNotebookHits(_ folder: SmartNotebook) async -> [SearchHit] {
@@ -161,7 +176,15 @@ extension NotesModel {
 
     /// Counted straight through, no debounce: background time is short and the
     /// caller has to wait for the answer.
+    ///
+    /// Nothing loaded yet counts the same as nothing found, and recording that
+    /// zero is what made a notebook report everything gone and then, once the
+    /// docs arrived, report it all back again. A count is only worth believing
+    /// once there is something to count.
     func checkSmartNotebooks() async {
+        // The tree is what the hit filter reads: a hit not in it is dropped,
+        // so an unloaded tree turns a full index into no results at all.
+        guard await waitForStartup(), !folderTree.isEmpty else { return }
         for folder in smartNotebooks where folder.notifyOnChange {
             let hits = await smartNotebookHits(folder)
             smartHits[folder.id] = hits

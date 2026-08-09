@@ -1303,6 +1303,21 @@ pub fn set_note_pad(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn config_calendar(doc: &Automerge) -> Option<String> {
+    read_str(doc, &ROOT, "calendar")
+}
+
+pub fn config_set_calendar(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            set_text(t, &ROOT, "calendar", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
 pub fn config_pad(doc: &Automerge) -> Option<String> {
     read_str(doc, &ROOT, "pad")
 }
