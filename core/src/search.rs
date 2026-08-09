@@ -362,9 +362,10 @@ impl SearchIndex {
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
-        let Some(fts_query) = fts_query(query) else {
+        let Some(parsed) = parse_query(query) else {
             return Ok(Vec::new());
         };
+        let term = parsed.snippet_term(query).to_string();
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT url, kind, title, body
@@ -373,7 +374,7 @@ impl SearchIndex {
              ORDER BY rank
              LIMIT 200",
         )?;
-        let mut rows = stmt.query(params![fts_query])?;
+        let mut rows = stmt.query(params![parsed.fts])?;
         let mut hits = Vec::new();
         let mut seen_notes = std::collections::HashSet::new();
         while let Some(row) = rows.next()? {
@@ -381,12 +382,15 @@ impl SearchIndex {
             let kind: String = row.get(1)?;
             let title: String = row.get(2)?;
             let body: String = row.get(3)?;
+            if !parsed.matches(&title, &body) {
+                continue;
+            }
             if kind == "rich" {
                 if seen_notes.insert(url.clone()) {
                     hits.push(SearchHit {
                         url,
                         name: title.clone(),
-                        snippet: snippet(&body, &title, query),
+                        snippet: snippet(&body, &title, &term),
                     });
                 }
             } else if kind == "file" {
@@ -394,7 +398,7 @@ impl SearchIndex {
                     hits.push(SearchHit {
                         url: url.clone(),
                         name: title.clone(),
-                        snippet: snippet(&body, &title, query),
+                        snippet: snippet(&body, &title, &term),
                     });
                 }
                 let mut links = conn.prepare(
@@ -411,7 +415,7 @@ impl SearchIndex {
                         hits.push(SearchHit {
                             url: note_url,
                             name: note_name,
-                            snippet: snippet(&body, &title, query),
+                            snippet: snippet(&body, &title, &term),
                         });
                     }
                 }
@@ -446,22 +450,64 @@ pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
     }
 }
 
-fn fts_query(query: &str) -> Option<String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .filter_map(|term| {
-            let cleaned: String = term.chars().filter(|c| c.is_alphanumeric()).collect();
-            if cleaned.is_empty() {
-                None
-            } else {
-                Some(format!("\"{}\"*", cleaned))
+/// A query is loose words plus any double-quoted phrases. Loose words match by
+/// prefix; a phrase must appear verbatim, so the FTS match is only a
+/// prefilter — `phrases` is checked against the text itself afterwards.
+struct ParsedQuery {
+    fts: String,
+    phrases: Vec<String>,
+}
+
+fn word(term: &str) -> String {
+    term.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+fn parse_query(query: &str) -> Option<ParsedQuery> {
+    let mut terms: Vec<String> = Vec::new();
+    let mut phrases: Vec<String> = Vec::new();
+    for (index, part) in query.split('"').enumerate() {
+        if index % 2 == 1 {
+            let words: Vec<String> = part
+                .split_whitespace()
+                .map(word)
+                .filter(|w| !w.is_empty())
+                .collect();
+            if words.is_empty() {
+                continue;
             }
-        })
-        .collect();
+            phrases.push(part.trim().to_lowercase());
+            terms.push(format!("\"{}\"", words.join(" ")));
+        } else {
+            terms.extend(part.split_whitespace().filter_map(|term| {
+                let cleaned = word(term);
+                (!cleaned.is_empty()).then(|| format!("\"{cleaned}\"*"))
+            }));
+        }
+    }
     if terms.is_empty() {
         None
     } else {
-        Some(terms.join(" "))
+        Some(ParsedQuery {
+            fts: terms.join(" "),
+            phrases,
+        })
+    }
+}
+
+impl ParsedQuery {
+    fn matches(&self, title: &str, body: &str) -> bool {
+        if self.phrases.is_empty() {
+            return true;
+        }
+        let title = title.to_lowercase();
+        let body = body.to_lowercase();
+        self.phrases
+            .iter()
+            .all(|phrase| body.contains(phrase) || title.contains(phrase))
+    }
+
+    fn snippet_term<'a>(&'a self, query: &'a str) -> &'a str {
+        self.phrases.first().map(String::as_str).unwrap_or(query)
     }
 }
 
@@ -481,4 +527,37 @@ fn snippet(body: &str, title: &str, query: &str) -> String {
             }
             out
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loose_words_match_by_prefix() {
+        let parsed = parse_query("blue hat").unwrap();
+        assert_eq!(parsed.fts, "\"blue\"* \"hat\"*");
+        assert!(parsed.phrases.is_empty());
+        assert!(parsed.matches("anything", "at all"));
+    }
+
+    #[test]
+    fn quoted_text_must_appear_verbatim() {
+        let parsed = parse_query("\"blue hat\"").unwrap();
+        assert_eq!(parsed.fts, "\"blue hat\"");
+        assert!(parsed.matches("note", "she wore a Blue Hat"));
+        assert!(!parsed.matches("note", "a blue and green hat"));
+    }
+
+    #[test]
+    fn quotes_mix_with_loose_words() {
+        let parsed = parse_query("notes on \"blue hat\"").unwrap();
+        assert_eq!(parsed.fts, "\"notes\"* \"on\"* \"blue hat\"");
+        assert_eq!(parsed.snippet_term("notes on \"blue hat\""), "blue hat");
+    }
+
+    #[test]
+    fn punctuation_only_query_matches_nothing() {
+        assert!(parse_query("\"\" ...").is_none());
+    }
 }

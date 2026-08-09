@@ -277,9 +277,15 @@ struct ContextToolsView: View {
                                 state.select(tool.id)
                             }
                             .buttonStyle(.plain)
+                            #if os(iOS)
+                            .uiFont(.subheadline)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            #else
                             .uiFont(.caption)
                             .padding(.horizontal, 9)
                             .padding(.vertical, 5)
+                            #endif
                             .background(
                                 isActive ? AnyShapeStyle(.tint.opacity(0.18)) : AnyShapeStyle(.clear),
                                 in: Capsule()

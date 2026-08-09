@@ -13,8 +13,6 @@
 		F07316C03022831400FFA544 /* LushWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F07316B03022831200FFA544 /* LushWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		F073171B30241ABC00FFA544 /* LushShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F073170F30241ABC00FFA544 /* LushShareExtension.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		F073173330241AD500FFA544 /* LushFinderAction.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = F073172530241AD500FFA544 /* LushFinderAction.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		F07318773025000000FFA544 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = F07318753025000000FFA544 /* MLXLLM */; };
-		F07318783025000000FFA544 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = F07318763025000000FFA544 /* MLXLMCommon */; };
 		F0872FA4301F62AD003F9B3B /* PatchworkWeb.bundle in Resources */ = {isa = PBXBuildFile; fileRef = F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */; };
 		F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA6301F718C003F9B3B /* PatchworkServerKit */; };
 		F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */ = {isa = PBXBuildFile; productRef = F0872FA9301F756A003F9B3B /* PatchworkServerKit */; };
@@ -212,8 +210,6 @@
 			files = (
 				F0872FAA301F756A003F9B3B /* PatchworkServerKit in Frameworks */,
 				F0872FA7301F718C003F9B3B /* PatchworkServerKit in Frameworks */,
-				F07318773025000000FFA544 /* MLXLLM in Frameworks */,
-				F07318783025000000FFA544 /* MLXLMCommon in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -328,8 +324,6 @@
 			packageProductDependencies = (
 				F0872FA6301F718C003F9B3B /* PatchworkServerKit */,
 				F0872FA9301F756A003F9B3B /* PatchworkServerKit */,
-				F07318753025000000FFA544 /* MLXLLM */,
-				F07318763025000000FFA544 /* MLXLMCommon */,
 			);
 			productName = richtext;
 			productReference = F001D308301E8AA900E154BD /* Lush.app */;
@@ -487,9 +481,6 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				F0872FA8301F756A003F9B3B /* XCLocalSwiftPackageReference "PatchworkServerKit" */,
-				F0E8D900301FC271002F3622 /* XCRemoteSwiftPackageReference "Runestone" */,
-				F0E8D901301FC4C4002F3622 /* XCRemoteSwiftPackageReference "TreeSitterLanguages" */,
-				F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = F001D309301E8AA900E154BD /* Products */;
@@ -657,6 +648,8 @@
 			buildSettings = {
 				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=iphoneos*]" = AppIconIOS;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=iphonesimulator*]" = AppIconIOS;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = YES;
 				CODE_SIGN_ENTITLEMENTS = lush/lush.entitlements;
@@ -745,6 +738,8 @@
 			buildSettings = {
 				ARCHS = "$(ARCHS_STANDARD)";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=iphoneos*]" = AppIconIOS;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=iphonesimulator*]" = AppIconIOS;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = YES;
 				CODE_SIGN_ENTITLEMENTS = lush/lush.entitlements;
@@ -1392,44 +1387,7 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/ml-explore/mlx-swift-examples";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.29.1;
-			};
-		};
-		F0E8D900301FC271002F3622 /* XCRemoteSwiftPackageReference "Runestone" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/simonbs/Runestone";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.5.2;
-			};
-		};
-		F0E8D901301FC4C4002F3622 /* XCRemoteSwiftPackageReference "TreeSitterLanguages" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "git@github.com:simonbs/TreeSitterLanguages.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 0.1.10;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
 /* Begin XCSwiftPackageProductDependency section */
-		F07318753025000000FFA544 /* MLXLLM */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
-			productName = MLXLLM;
-		};
-		F07318763025000000FFA544 /* MLXLMCommon */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = F073187B3025399600FFA544 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
-			productName = MLXLMCommon;
-		};
 		F0872FA6301F718C003F9B3B /* PatchworkServerKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = PatchworkServerKit;

@@ -703,14 +703,32 @@ pub fn init_lush_config(doc: &mut Automerge) -> anyhow::Result<()> {
 
 /// `.folders` is an object keyed by numeric index: `{0: url, 1: url}`.
 pub fn config_folders(doc: &Automerge) -> Vec<String> {
-    let Ok(Some((_, folders))) = doc.get(ROOT, "folders") else {
+    config_url_list(doc, "folders")
+}
+
+pub fn config_set_folders(doc: &mut Automerge, urls: &[String]) -> anyhow::Result<()> {
+    config_set_url_list(doc, "folders", urls)
+}
+
+/// `.packages` holds the extra patchwork package lists, same numeric-index
+/// shape as `.folders`.
+pub fn config_packages(doc: &Automerge) -> Vec<String> {
+    config_url_list(doc, "packages")
+}
+
+pub fn config_set_packages(doc: &mut Automerge, urls: &[String]) -> anyhow::Result<()> {
+    config_set_url_list(doc, "packages", urls)
+}
+
+fn config_url_list(doc: &Automerge, key: &str) -> Vec<String> {
+    let Ok(Some((_, list))) = doc.get(ROOT, key) else {
         return Vec::new();
     };
     let mut entries: Vec<(u64, String)> = doc
-        .keys(&folders)
+        .keys(&list)
         .filter_map(|key| {
             let index: u64 = key.parse().ok()?;
-            let url = read_str(doc, &folders, &key)?;
+            let url = read_str(doc, &list, &key)?;
             Some((index, url))
         })
         .collect();
@@ -718,16 +736,16 @@ pub fn config_folders(doc: &Automerge) -> Vec<String> {
     entries.into_iter().map(|entry| entry.1).collect()
 }
 
-pub fn config_set_folders(doc: &mut Automerge, urls: &[String]) -> anyhow::Result<()> {
+fn config_set_url_list(doc: &mut Automerge, key: &str, urls: &[String]) -> anyhow::Result<()> {
     tx(doc.transact_with(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
-            let folders = match t.get(ROOT, "folders")? {
+            let list = match t.get(ROOT, key)? {
                 Some((automerge::Value::Object(ObjType::Map), id)) => id,
-                _ => t.put_object(ROOT, "folders", ObjType::Map)?,
+                _ => t.put_object(ROOT, key, ObjType::Map)?,
             };
             let stale: Vec<String> = t
-                .keys(&folders)
+                .keys(&list)
                 .filter(|key| {
                     key.parse::<usize>()
                         .map(|index| index >= urls.len())
@@ -735,10 +753,97 @@ pub fn config_set_folders(doc: &mut Automerge, urls: &[String]) -> anyhow::Resul
                 })
                 .collect();
             for key in stale {
-                t.delete(&folders, key.as_str())?;
+                t.delete(&list, key.as_str())?;
             }
             for (index, url) in urls.iter().enumerate() {
-                set_text(t, &folders, &index.to_string(), url)?;
+                set_text(t, &list, &index.to_string(), url)?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+/// A saved search. Empty `kind`/`scope` and a zero `within_days` mean "no
+/// filter"; the query may be empty too, in which case the filters alone
+/// select the docs.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SmartNotebook {
+    pub id: String,
+    pub name: String,
+    pub query: String,
+    pub kind: String,
+    pub scope: String,
+    pub within_days: i64,
+    pub show_count: bool,
+    pub notify_on_change: bool,
+}
+
+/// `.smart` is an object keyed by numeric index, like `.folders`.
+pub fn config_smart_notebooks(doc: &Automerge) -> Vec<SmartNotebook> {
+    let Ok(Some((_, smart))) = doc.get(ROOT, "smart") else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(u64, SmartNotebook)> = doc
+        .keys(&smart)
+        .filter_map(|key| {
+            let index: u64 = key.parse().ok()?;
+            let (_, item) = doc.get(&smart, &key).ok()??;
+            Some((
+                index,
+                SmartNotebook {
+                    id: string_at(doc, &item, "id")?,
+                    name: string_at(doc, &item, "name").unwrap_or_default(),
+                    query: string_at(doc, &item, "query").unwrap_or_default(),
+                    kind: string_at(doc, &item, "kind").unwrap_or_default(),
+                    scope: string_at(doc, &item, "scope").unwrap_or_default(),
+                    within_days: int_at(doc, &item, "withinDays").unwrap_or(0),
+                    show_count: bool_at(doc, &item, "showCount").unwrap_or(true),
+                    notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
+                },
+            ))
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    entries.into_iter().map(|entry| entry.1).collect()
+}
+
+pub fn config_set_smart_notebooks(
+    doc: &mut Automerge,
+    folders: &[SmartNotebook],
+) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let smart = match t.get(ROOT, "smart")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "smart", ObjType::Map)?,
+            };
+            let stale: Vec<String> = t
+                .keys(&smart)
+                .filter(|key| {
+                    key.parse::<usize>()
+                        .map(|index| index >= folders.len())
+                        .unwrap_or(true)
+                })
+                .collect();
+            for key in stale {
+                t.delete(&smart, key.as_str())?;
+            }
+            for (index, folder) in folders.iter().enumerate() {
+                let key = index.to_string();
+                let item = match t.get(&smart, key.as_str())? {
+                    Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                    _ => t.put_object(&smart, key.as_str(), ObjType::Map)?,
+                };
+                set_text(t, &item, "id", &folder.id)?;
+                set_text(t, &item, "name", &folder.name)?;
+                set_text(t, &item, "query", &folder.query)?;
+                set_text(t, &item, "kind", &folder.kind)?;
+                set_text(t, &item, "scope", &folder.scope)?;
+                t.put(&item, "withinDays", folder.within_days)?;
+                t.put(&item, "showCount", folder.show_count)?;
+                t.put(&item, "notifyOnChange", folder.notify_on_change)?;
             }
             Ok(())
         },
@@ -1068,6 +1173,17 @@ fn heads_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<Vec<St
     )
 }
 
+fn bool_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<bool> {
+    let (v, _) = doc.get(obj, key).ok().flatten()?;
+    match v {
+        automerge::Value::Scalar(s) => match s.as_ref() {
+            ScalarValue::Boolean(b) => Some(*b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn int_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<i64> {
     let (v, _) = doc.get(obj, key).ok().flatten()?;
     match v {
@@ -1080,6 +1196,222 @@ fn int_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<i64> {
         },
         _ => None,
     }
+}
+
+fn float_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<f64> {
+    let (v, _) = doc.get(obj, key).ok().flatten()?;
+    match v {
+        automerge::Value::Scalar(s) => match s.as_ref() {
+            ScalarValue::F64(f) => Some(*f),
+            ScalarValue::Int(i) => Some(*i as f64),
+            ScalarValue::Uint(u) => Some(*u as f64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// ---- scratchpad ----
+
+/// One thing parked on a pad. `data` carries the kind's payload as JSON:
+/// spans for text, stroke points for ink, an asset url for an image. The
+/// geometry stays in native fields so two people rearranging a pad merge.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PadItem {
+    pub id: String,
+    pub kind: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub data: String,
+    pub origin: Option<String>,
+    pub created: i64,
+}
+
+pub fn init_pad(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let pw = t.put_object(ROOT, "@patchwork", ObjType::Map)?;
+            put_text(t, &pw, "type", "lush:pad")?;
+            put_text(t, &pw, "title", title)?;
+            put_text(t, &ROOT, "title", title)?;
+            let lush = t.put_object(ROOT, "@lush", ObjType::Map)?;
+            put_text(t, &lush, "type", "pad")?;
+            t.put_object(ROOT, "items", ObjType::List)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn note_pad(doc: &Automerge) -> Option<String> {
+    let (_, lush) = doc.get(ROOT, "@lush").ok()??;
+    read_str(doc, &lush, "pad")
+}
+
+pub fn set_note_pad(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let lush = match t.get(ROOT, "@lush")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "@lush", ObjType::Map)?,
+            };
+            set_text(t, &lush, "pad", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn config_pad(doc: &Automerge) -> Option<String> {
+    read_str(doc, &ROOT, "pad")
+}
+
+pub fn config_set_pad(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            set_text(t, &ROOT, "pad", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn pad_items(doc: &Automerge) -> Vec<PadItem> {
+    let Ok(Some((_, items))) = doc.get(ROOT, "items") else {
+        return Vec::new();
+    };
+    (0..doc.length(&items))
+        .filter_map(|i| {
+            let (_, entry) = doc.get(&items, i).ok().flatten()?;
+            Some(PadItem {
+                id: read_str(doc, &entry, "id")?,
+                kind: read_str(doc, &entry, "kind").unwrap_or_else(|| "text".into()),
+                x: float_at(doc, &entry, "x").unwrap_or(8.0),
+                y: float_at(doc, &entry, "y").unwrap_or(8.0),
+                w: float_at(doc, &entry, "w").unwrap_or(184.0),
+                h: float_at(doc, &entry, "h").unwrap_or(0.0),
+                data: string_at(doc, &entry, "data").unwrap_or_default(),
+                origin: read_str(doc, &entry, "origin"),
+                created: int_at(doc, &entry, "created").unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+fn pad_index(doc: &Automerge, items: &automerge::ObjId, id: &str) -> Option<usize> {
+    (0..doc.length(items)).find(|i| {
+        doc.get(items, *i)
+            .ok()
+            .flatten()
+            .and_then(|(_, entry)| read_str(doc, &entry, "id"))
+            .as_deref()
+            == Some(id)
+    })
+}
+
+/// Insert an item, or replace the one already carrying its id.
+pub fn pad_put_item(doc: &mut Automerge, item: &PadItem) -> anyhow::Result<()> {
+    let existing = doc
+        .get(ROOT, "items")?
+        .and_then(|(_, items)| pad_index(doc, &items, &item.id).map(|i| (items, i)));
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let items = match t.get(ROOT, "items")? {
+                Some((automerge::Value::Object(ObjType::List), id)) => id,
+                _ => t.put_object(ROOT, "items", ObjType::List)?,
+            };
+            let entry = match &existing {
+                Some((_, index)) => t.put_object(&items, *index, ObjType::Map)?,
+                None => t.insert_object(&items, t.length(&items), ObjType::Map)?,
+            };
+            put_text(t, &entry, "id", &item.id)?;
+            put_text(t, &entry, "kind", &item.kind)?;
+            t.put(&entry, "x", ScalarValue::F64(item.x))?;
+            t.put(&entry, "y", ScalarValue::F64(item.y))?;
+            t.put(&entry, "w", ScalarValue::F64(item.w))?;
+            t.put(&entry, "h", ScalarValue::F64(item.h))?;
+            put_text(t, &entry, "data", &item.data)?;
+            if let Some(origin) = &item.origin {
+                put_text(t, &entry, "origin", origin)?;
+            }
+            t.put(&entry, "created", ScalarValue::Int(item.created))?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+/// Geometry-only update: dragging and resizing must not rewrite the payload,
+/// so a card someone else is typing in keeps their text while it moves.
+pub fn pad_move_item(
+    doc: &mut Automerge,
+    id: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> anyhow::Result<bool> {
+    let Some((items, index)) = doc
+        .get(ROOT, "items")?
+        .and_then(|(_, items)| pad_index(doc, &items, id).map(|i| (items, i)))
+    else {
+        return Ok(false);
+    };
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            if let Some((_, entry)) = t.get(&items, index)? {
+                t.put(&entry, "x", ScalarValue::F64(x))?;
+                t.put(&entry, "y", ScalarValue::F64(y))?;
+                t.put(&entry, "w", ScalarValue::F64(w))?;
+                t.put(&entry, "h", ScalarValue::F64(h))?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(true)
+}
+
+pub fn pad_set_data(doc: &mut Automerge, id: &str, data: &str) -> anyhow::Result<bool> {
+    let Some((items, index)) = doc
+        .get(ROOT, "items")?
+        .and_then(|(_, items)| pad_index(doc, &items, id).map(|i| (items, i)))
+    else {
+        return Ok(false);
+    };
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            if let Some((_, entry)) = t.get(&items, index)? {
+                set_text(t, &entry, "data", data)?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(true)
+}
+
+pub fn pad_remove_item(doc: &mut Automerge, id: &str) -> anyhow::Result<bool> {
+    let Some((items, index)) = doc
+        .get(ROOT, "items")?
+        .and_then(|(_, items)| pad_index(doc, &items, id).map(|i| (items, i)))
+    else {
+        return Ok(false);
+    };
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            t.delete(&items, index)?;
+            Ok(())
+        },
+    ))?;
+    Ok(true)
 }
 
 pub fn init_draft(doc: &mut Automerge, parent_url: &str, is_main: bool) -> anyhow::Result<()> {

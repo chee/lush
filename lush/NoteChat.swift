@@ -142,6 +142,7 @@ enum NoteChatAssistant {
         case customModelNotConfigured
         case customRuntimeUnavailable
         case generationFailed
+        case promptTooLong
 
         var errorDescription: String? {
             switch self {
@@ -155,6 +156,8 @@ enum NoteChatAssistant {
                 "The selected model is downloaded, but Lush does not have a Core ML runtime adapter for this model yet."
             case .generationFailed:
                 "The local model could not answer about this note."
+            case .promptTooLong:
+                "This note is too long for the on-device model. Pick a larger model above."
             }
         }
     }
@@ -163,12 +166,24 @@ enum NoteChatAssistant {
         let answer: String
         let tool: String?
         let arguments: [String: Any]
+        /// What the model says it is missing, when it was asked without tools.
+        let need: String?
         /// Older chats and models that ignore the tools still send a whole
         /// rewritten note.
         let editedMarkdown: String?
+
+        var needsTools: Bool {
+            need?.isEmpty == false
+        }
     }
 
-    static let maximumRounds = 8
+    /// A small model gains nothing from a long loop — it repeats itself. Size
+    /// is the model's, not the runner's, so this asks the model; anything that
+    /// does not say gets the benefit of the doubt.
+    static func maximumRounds(for choice: ModelChoice) async -> Int {
+        guard let billions = await ModelContextWindow.parameterBillions(for: choice) else { return 8 }
+        return billions < 8 ? 3 : 8
+    }
 
     /// Generate, run whatever tool was called, generate again — until the model
     /// answers or the round budget runs out.
@@ -183,22 +198,64 @@ enum NoteChatAssistant {
         let choice = choice ?? LocalModelSettings.choice(for: .noteChat)
 
         var transcript: [String] = []
-        for round in 0..<maximumRounds {
-            let body = await prompt(
-                question: trimmedQuestion,
-                session: session,
-                transcript: transcript,
-                previousTurns: previousTurns,
-                last: round == maximumRounds - 1
-            )
-            let generated = try await generate(body, choice: choice)
+        var called = Set<String>()
+        let settings = LocalModelSettings.generationSettings(for: .noteChat)
+        var budget = await ModelContextWindow.promptCharacters(
+            for: choice, response: settings.maximumResponseTokens
+        )
+
+        func think(tools: Bool, last: Bool) async throws -> GeneratedReply {
+            while true {
+                let body = await prompt(
+                    question: trimmedQuestion,
+                    session: session,
+                    transcript: transcript,
+                    previousTurns: previousTurns,
+                    tools: tools,
+                    last: last,
+                    budget: budget
+                )
+                do {
+                    return try await generate(body, choice: choice)
+                } catch ChatError.promptTooLong {
+                    // the window was smaller than this model let on; remember
+                    // that and try again rather than losing the turn
+                    ModelContextWindow.remember(overflowAt: budget, for: choice)
+                    guard budget > 2_500 else { throw ChatError.promptTooLong }
+                    budget = budget * 2 / 3
+                }
+            }
+        }
+
+        // First, the note and the question alone. Most of what gets asked is
+        // answerable from the note that is already in front of it, and a model
+        // shown a page of tool syntax will imitate the syntax instead.
+        let opening = try await think(tools: false, last: false)
+        if opening.tool == nil, !opening.needsTools, !opening.answer.isEmpty {
+            return try await reply(from: opening, session: session)
+        }
+        if let need = opening.need, !need.isEmpty {
+            transcript.append("You said you needed: \(limited(need, to: 400))")
+        }
+
+        let rounds = await maximumRounds(for: choice)
+        for round in 0..<rounds {
+            let generated = try await think(tools: true, last: round == rounds - 1)
             guard let tool = generated.tool, !tool.isEmpty else {
                 return try await reply(from: generated, session: session)
             }
+            let call = "\(tool) \(json(generated.arguments))"
+            // a model that asks the same thing twice is stuck, not thorough
+            guard called.insert(call).inserted else {
+                transcript.append("\(call)\n→ already called; the result is above")
+                break
+            }
             let result = await session.run(tool, arguments: generated.arguments)
-            transcript.append("\(tool) \(json(generated.arguments))\n→ \(limited(result, to: 6_000))")
+            transcript.append("\(call)\n→ \(limited(result, to: 4_000))")
         }
-        throw ChatError.generationFailed
+
+        // out of rounds, or going in circles: make it answer with what it has
+        return try await reply(from: try await think(tools: false, last: true), session: session)
     }
 
     private static func prompt(
@@ -206,35 +263,53 @@ enum NoteChatAssistant {
         session: NoteChatSession,
         transcript: [String],
         previousTurns: [NoteChatTurn],
-        last: Bool
+        tools: Bool,
+        last: Bool,
+        budget: Int
     ) async -> String {
         let outline = await MainActor.run { session.outline }
         let title = await MainActor.run { session.title }
         let attachments = await MainActor.run { session.attachments }
+
+        let catalog = tools ? (budget < 14_000 ? NoteChatSession.briefCatalog : NoteChatSession.catalog) : ""
+        let question = limited(question, to: 2_000)
+        // scaffolding, the title line and the closing instructions
+        let spare = max(1_000, budget - catalog.count - question.count - 700)
+        let calls = transcript.isEmpty ? "" : fittedTranscript(transcript, to: spare * 45 / 100)
+        let notes = fit(attachmentsSection(attachments), to: min(spare * 15 / 100, 1_500))
+        let history = fit(historySummary(from: previousTurns), to: min(spare * 15 / 100, 1_500))
+        let blocks = fitOutline(outline, to: spare - calls.count - notes.count - history.count)
+
+        let sections = [
+            "Note title: \(limited(title, to: 300))",
+            "The note, one line per block, numbered for editing:\n\(blocks)",
+            attachments.isEmpty ? nil : "Attachments:\n\(notes)",
+            previousTurns.isEmpty ? nil : "Recent chat:\n\(history)",
+            calls.isEmpty ? nil : "What you have found so far this turn:\n\(calls)",
+            catalog.isEmpty ? nil : "Tools:\n\(catalog)",
+            "Person request:\n\(question)",
+            closing(tools: tools, last: last),
+        ].compactMap { $0 }
+        return sections.joined(separator: "\n\n")
+    }
+
+    /// Without the tools in front of it, the model is asked for an answer and
+    /// nothing else — the one escape hatch is saying what it is missing, which
+    /// is what brings the tools out on the next pass.
+    private static func closing(tools: Bool, last: Bool) -> String {
+        guard tools else {
+            return """
+            Answer the person, using the note above. Return one JSON object and no other text:
+            {"answer": "your reply"}
+            If — and only if — answering is impossible without something the note above \
+            does not contain, say what you are missing instead:
+            {"need": "what you are missing"}
+            """
+        }
         return """
-        Note title: \(limited(title, to: 300))
-
-        The note, one line per block, numbered for editing:
-        \(limited(outline, to: 12_000))
-
-        Attachments:
-        \(attachmentsSection(attachments))
-
-        Tools:
-        \(NoteChatSession.catalog)
-
-        Recent chat:
-        \(historySummary(from: previousTurns))
-
-        Tools you have already called this turn:
-        \(transcript.isEmpty ? "None." : transcript.joined(separator: "\n\n"))
-
-        Person request:
-        \(question)
-
-        Return one JSON object and no other text. Either call one tool:
+        Return one JSON object and no other text. Call one tool:
         {"tool": "name", "arguments": {…}}
-        or answer, once you have everything you need:
+        or, once you have what you need, answer:
         {"answer": "your reply to the person"}
         \(last ? "\nThis is the last round: answer now, do not call another tool." : "")
         """
@@ -279,7 +354,11 @@ enum NoteChatAssistant {
                 temperature: settings.temperature,
                 maximumResponseTokens: settings.maximumResponseTokens
             )
-            raw = try await session.respond(to: body, options: options).content
+            do {
+                raw = try await session.respond(to: body, options: options).content
+            } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
+                throw ChatError.promptTooLong
+            }
         case .mlx:
             let config = LocalModelSettings.mlxConfig(for: .noteChat, choice: choice)
             guard !config.repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -300,6 +379,38 @@ enum NoteChatAssistant {
         }
         guard let generated = parse(raw) else { throw ChatError.generationFailed }
         return generated
+    }
+
+    /// A small model often stops mid-JSON or answers in plain prose. Whatever
+    /// it managed to say is better than an error, so pull the answer out of a
+    /// half-written object, or take the text as the answer.
+    private static func salvage(_ raw: String) -> GeneratedReply? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let key = trimmed.range(of: "\"answer\"") {
+            let rest = trimmed[key.upperBound...].drop { $0 == ":" || $0 == " " || $0 == "\n" }
+            if rest.first == "\"" {
+                var answer = ""
+                var escaped = false
+                for character in rest.dropFirst() {
+                    if escaped {
+                        answer.append(character == "n" ? "\n" : character)
+                        escaped = false
+                    } else if character == "\\" {
+                        escaped = true
+                    } else if character == "\"" {
+                        break
+                    } else {
+                        answer.append(character)
+                    }
+                }
+                if !answer.isEmpty {
+                    return GeneratedReply(answer: answer, tool: nil, arguments: [:], need: nil, editedMarkdown: nil)
+                }
+            }
+        }
+        guard !trimmed.hasPrefix("{"), !trimmed.hasPrefix("[") else { return nil }
+        return GeneratedReply(answer: trimmed, tool: nil, arguments: [:], need: nil, editedMarkdown: nil)
     }
 
     private static func reply(
@@ -333,6 +444,61 @@ enum NoteChatAssistant {
         return lines.isEmpty ? "No previous chat." : lines.joined(separator: "\n")
     }
 
+    private static func fit(_ value: String, to limit: Int) -> String {
+        guard value.count > limit else { return value }
+        return String(value.prefix(max(limit - 20, 0))) + "\n… (trimmed to fit)"
+    }
+
+    /// The outline keeps its first and last blocks when it will not fit whole,
+    /// so the model can still see where the note starts and ends — and is told
+    /// which numbers it is not being shown, rather than guessing.
+    private static func fitOutline(_ outline: String, to limit: Int) -> String {
+        guard outline.count > limit, limit > 400 else {
+            return outline.count > limit ? fit(outline, to: limit) : outline
+        }
+        let lines = outline.components(separatedBy: "\n")
+        var head: [String] = []
+        var tail: [String] = []
+        var used = 0
+        var start = 0
+        var end = lines.count - 1
+        while start <= end {
+            let line = start <= end && head.count <= tail.count ? lines[start] : lines[end]
+            guard used + line.count + 1 <= limit - 60 else { break }
+            used += line.count + 1
+            if head.count <= tail.count {
+                head.append(line)
+                start += 1
+            } else {
+                tail.insert(line, at: 0)
+                end -= 1
+            }
+        }
+        let hidden = end - start + 1
+        guard hidden > 0 else { return outline }
+        return (head + ["… \(hidden) blocks (\(start + 1)–\(end + 1)) not shown …"] + tail)
+            .joined(separator: "\n")
+    }
+
+    /// Newest tool results matter most: older ones shrink to their first line
+    /// before any of them are dropped.
+    private static func fittedTranscript(_ transcript: [String], to limit: Int) -> String {
+        guard !transcript.isEmpty else { return "None." }
+        var kept: [String] = []
+        var used = 0
+        for (offset, entry) in transcript.enumerated().reversed() {
+            let allowance = kept.isEmpty ? limit : max(120, (limit - used) / 2)
+            let text = fit(entry, to: allowance)
+            guard used + text.count <= limit else {
+                kept.insert("… \(offset + 1) earlier tool calls omitted …", at: 0)
+                break
+            }
+            used += text.count
+            kept.insert(text, at: 0)
+        }
+        return kept.joined(separator: "\n\n")
+    }
+
     private static func limited(_ value: String, to maxCharacters: Int) -> String {
         guard value.count > maxCharacters else { return value }
         return String(value.prefix(maxCharacters))
@@ -351,11 +517,13 @@ enum NoteChatAssistant {
         if let direct = decode(trimmed) {
             return direct
         }
-        guard let start = trimmed.firstIndex(of: "{"),
-              let end = trimmed.lastIndex(of: "}"),
-              start <= end
-        else { return nil }
-        return decode(String(trimmed[start...end]))
+        if let start = trimmed.firstIndex(of: "{"),
+           let end = trimmed.lastIndex(of: "}"),
+           start <= end,
+           let embedded = decode(String(trimmed[start...end])) {
+            return embedded
+        }
+        return salvage(trimmed)
     }
 
     private static func decode(_ json: String) -> GeneratedReply? {
@@ -370,6 +538,7 @@ enum NoteChatAssistant {
             answer: value["answer"] as? String ?? value["text"] as? String ?? "",
             tool: tool?.isEmpty == true ? nil : tool,
             arguments: call["arguments"] as? [String: Any] ?? call["parameters"] as? [String: Any] ?? [:],
+            need: value["need"] as? String,
             editedMarkdown: value["editedMarkdown"] as? String
         )
     }
@@ -491,8 +660,6 @@ struct NoteChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("Chat", systemImage: "bubble.left.and.text.bubble.right")
-                    .uiFont(.headline)
                 Spacer()
                 ModelChoiceMenu(operation: .noteChat, selection: $modelChoice)
                     .uiFont(.caption)
@@ -625,12 +792,13 @@ struct NoteChatView: View {
 
         chatTask?.cancel()
         chatTask = Task {
-            let spans = SpanNode.decodeList(await model.spansJSON(for: currentUrl))
+            let snapshot = await model.spansSnapshot(for: currentUrl)
+            let spans = SpanNode.decodeList(snapshot.spansJson)
             let session = NoteChatSession(
                 model: model,
                 url: currentUrl,
                 title: noteName,
-                spans: spans,
+                snapshot: snapshot,
                 attachments: await NoteAttachment.all(in: spans, model: model)
             )
             do {
@@ -705,10 +873,16 @@ struct NoteChatView: View {
             }
             // the markdown round trip loses embeds/tables/columns/context —
             // carry them over from the live document before replacing it
-            let current = SpanNode.decodeList(await model.spansJSON(for: url))
+            let snapshot = await model.spansSnapshot(for: url)
+            let current = SpanNode.decodeList(snapshot.spansJson)
             let spans = NoteChatAssistant.mergingAtomicBlocks(from: current, into: drafted)
             let title = RichText.title(from: spans)
-            await model.updateDocument(url, json: SpanNode.encodeList(spans), title: title)
+            await model.updateDocument(
+                url,
+                json: SpanNode.encodeList(spans),
+                title: title,
+                heads: snapshot.heads.isEmpty ? nil : snapshot.heads
+            )
             applyingTurnId = nil
         }
     }

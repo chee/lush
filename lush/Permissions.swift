@@ -4,6 +4,7 @@ import CoreLocation
 import Contacts
 import EventKit
 import Photos
+import UserNotifications
 #if os(macOS)
 import CoreServices
 #endif
@@ -26,6 +27,7 @@ enum PermissionKind: String, CaseIterable, Identifiable {
     case camera
     case photos
     case appleNotes
+    case notifications
 
     var id: String { rawValue }
 
@@ -40,6 +42,7 @@ enum PermissionKind: String, CaseIterable, Identifiable {
         case .camera: "Camera"
         case .photos: "Photos"
         case .appleNotes: "Apple Notes"
+        case .notifications: "Notifications"
         }
     }
 
@@ -54,6 +57,7 @@ enum PermissionKind: String, CaseIterable, Identifiable {
         case .camera: "Takes photos to attach to a note."
         case .photos: "Attaches pictures from your library."
         case .appleNotes: "Imports your Apple Notes."
+        case .notifications: "Tells you when a smart notebook's count changes."
         }
     }
 
@@ -68,6 +72,7 @@ enum PermissionKind: String, CaseIterable, Identifiable {
         case .camera: "camera"
         case .photos: "photo.on.rectangle"
         case .appleNotes: "note.text"
+        case .notifications: "bell"
         }
     }
 
@@ -90,6 +95,7 @@ enum PermissionKind: String, CaseIterable, Identifiable {
         case .camera: "Privacy_Camera"
         case .photos: "Privacy_Photos"
         case .appleNotes: "Privacy_Automation"
+        case .notifications: "Privacy_Notifications"
         }
     }
 }
@@ -100,6 +106,7 @@ final class PermissionsModel {
     private(set) var states: [PermissionKind: PermissionState] = [:]
     private let locationManager = CLLocationManager()
     private let eventStore = EKEventStore()
+    private var notificationState: PermissionState = .notDetermined
 
     func refresh() {
         var next: [PermissionKind: PermissionState] = [:]
@@ -107,6 +114,18 @@ final class PermissionsModel {
             next[kind] = state(kind)
         }
         states = next
+        Task {
+            notificationState = await Self.notificationState()
+            states[.notifications] = notificationState
+        }
+    }
+
+    private static func notificationState() async -> PermissionState {
+        switch await UNUserNotificationCenter.current().notificationSettings().authorizationStatus {
+        case .authorized, .provisional, .ephemeral: .granted
+        case .denied: .denied
+        default: .notDetermined
+        }
     }
 
     func request(_ kind: PermissionKind) async {
@@ -134,6 +153,8 @@ final class PermissionsModel {
             #if os(macOS)
             _ = await Task.detached { AppleEventPermission.state(for: "com.apple.notes", askUser: true) }.value
             #endif
+        case .notifications:
+            await SmartNotebookAlerts.requestAuthorization()
         }
         refresh()
     }
@@ -141,7 +162,9 @@ final class PermissionsModel {
     func openSystemSettings(_ kind: PermissionKind) {
         #if os(macOS)
         let url = URL(
-            string: "x-apple.systempreferences:com.apple.preference.security?\(kind.privacyAnchor)"
+            string: kind == .notifications
+                ? "x-apple.systempreferences:com.apple.preference.notifications"
+                : "x-apple.systempreferences:com.apple.preference.security?\(kind.privacyAnchor)"
         )
         #else
         let url = URL(string: UIApplication.openSettingsURLString)
@@ -200,6 +223,8 @@ final class PermissionsModel {
             #else
             .unavailable
             #endif
+        case .notifications:
+            notificationState
         }
     }
 
@@ -287,6 +312,7 @@ struct PermissionsSettingsPane: View {
             } footer: {
                 Text("Lush asks for each of these only when you turn it on. Anything you have already refused has to be changed in System Settings.")
             }
+            FocusSettingsSections()
         }
         .formStyle(.grouped)
         .navigationTitle("Permissions")

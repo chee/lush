@@ -7,8 +7,10 @@ struct AgendaScreen: View {
     @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
     @State private var agenda = AgendaStore.shared
-    @State private var links = 0
+    @State private var noteUrls: [String: String] = [:]
     @State private var hovered: String?
+    @State private var highlighted: String?
+    @State private var highlightTask: Task<Void, Never>?
 
     var body: some View {
         Group {
@@ -33,28 +35,47 @@ struct AgendaScreen: View {
             }
         }
         .navigationTitle("Calendar")
-        .task { await agenda.refresh() }
+        .task {
+            noteUrls = CalendarLinks.noteUrlByItem
+            await agenda.refresh()
+        }
         .onReceive(NotificationCenter.default.publisher(for: CalendarLinks.changed)) { _ in
-            links += 1
+            noteUrls = CalendarLinks.noteUrlByItem
         }
     }
 
     private var list: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Agenda.days(agenda.items), id: \.day) { group in
-                    header(group.day)
-                    ForEach(group.items) { item in
-                        row(item, on: group.day)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(Agenda.days(agenda.items), id: \.day) { group in
+                        header(group.day)
+                            .id(group.day)
+                        ForEach(group.items) { item in
+                            row(item, on: group.day)
+                        }
                     }
                 }
+                .padding(.horizontal, 28)
+                .padding(.bottom, 40)
+                .frame(maxWidth: 720)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
-            .padding(.horizontal, 28)
-            .padding(.bottom, 40)
-            .frame(maxWidth: 720)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .onChange(of: agenda.focusDay, initial: true) {
+                guard let day = agenda.focusDay else { return }
+                withAnimation { proxy.scrollTo(day, anchor: .top) }
+                agenda.focusDay = nil
+                guard let item = agenda.focusItem else { return }
+                agenda.focusItem = nil
+                withAnimation { highlighted = item }
+                highlightTask?.cancel()
+                highlightTask = Task {
+                    try? await Task.sleep(for: .seconds(3))
+                    guard !Task.isCancelled else { return }
+                    withAnimation { highlighted = nil }
+                }
+            }
         }
-        .id(links)
     }
 
     private func header(_ day: Date) -> some View {
@@ -73,37 +94,71 @@ struct AgendaScreen: View {
     }
 
     private func row(_ item: AgendaItem, on day: Date) -> some View {
-        let noteUrl = model.noteUrl(for: item)
+        let noteUrl = noteUrls[item.id]
         let key = "\(day.timeIntervalSince1970)|\(item.id)"
         let hovering = hovered == key
-        return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if let time = item.timeText {
-                Text(time)
-                    .font(.system(size: 15).monospacedDigit())
-                    .foregroundStyle(item.color)
-            } else {
-                Capsule()
-                    .fill(item.color)
-                    .frame(width: 3, height: 14)
+        return HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text(item.title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .underline(hovering)
+                        .lineLimit(1)
+                    if noteUrl != nil {
+                        Image(systemName: "doc.richtext")
+                            .font(.system(size: 12))
+                    }
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: item.kind == .reminder ? "checklist" : "clock")
+                    Text(item.rangeText)
+                    if let location = item.location {
+                        Image(systemName: "mappin.and.ellipse")
+                            .padding(.leading, 4)
+                        Text(location).lineLimit(1)
+                    }
+                    if !item.listName.isEmpty {
+                        Text("· \(item.listName)").lineLimit(1)
+                    }
+                }
+                .font(.system(size: 12))
+                .opacity(0.75)
             }
-            if item.kind == .reminder {
-                Image(systemName: "circle")
-                    .font(.system(size: 12))
-                    .foregroundStyle(item.color)
+            Spacer(minLength: 8)
+            if let url = item.calendarAppURL {
+                Button {
+                    ExternalBrowser.open(url)
+                } label: {
+                    Image(systemName: "arrow.up.forward")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(width: 32, height: 32)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7)
+                                .fill(item.color.opacity(0.45))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7)
+                                .strokeBorder(item.color.opacity(0.6), lineWidth: 1)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(item.kind == .reminder ? "Open in Reminders" : "Open in Calendar")
             }
-            Text(item.title)
-                .font(.system(size: 16))
-                .underline(hovering)
-                .lineLimit(1)
-            if noteUrl != nil {
-                Image(systemName: "doc.richtext")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tint)
-            }
-            Spacer(minLength: 0)
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .foregroundStyle(item.color.mix(with: .primary, by: 0.65))
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(item.color.opacity(hovering ? 0.38 : 0.28))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(item.color, lineWidth: highlighted == item.id ? 2 : 0)
+        )
+        .padding(.vertical, 3)
         .contentShape(Rectangle())
         .onHover { inside in
             hovered = inside ? key : (hovered == key ? nil : hovered)
@@ -121,6 +176,10 @@ struct AgendaScreen: View {
                 Button("Delete Note", role: .destructive) { model.deleteNote(noteUrl) }
             } else {
                 Button("New Note") { create(item) }
+            }
+            if let url = item.calendarAppURL {
+                Divider()
+                Button("Open in Calendar") { ExternalBrowser.open(url) }
             }
             if let location = item.location {
                 Text(location)

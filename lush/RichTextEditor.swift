@@ -20,6 +20,7 @@ enum EditorSheet: Identifiable {
     case html(HtmlBlockHandle)
     case info(assetUrl: String, name: String, image: PImage?)
     case patchworkCreate
+    case format
 
     var id: String {
         switch self {
@@ -28,6 +29,7 @@ enum EditorSheet: Identifiable {
         case .html(let handle): "html-\(handle.id)"
         case .info(let url, _, _): "info-\(url)"
         case .patchworkCreate: "patchwork-create"
+        case .format: "format"
         }
     }
 }
@@ -43,11 +45,17 @@ struct StashedCard: Identifiable {
     let location: Int
     let locations: [Int]
     let box: BlockBox
+    let boxes: [BlockBox]
     let attributed: NSAttributedString
     let contentHeight: CGFloat
     let x: CGFloat
     let y: CGFloat
-    var id: ObjectIdentifier { ObjectIdentifier(box) }
+    /// Cards parked on the same point, in document order.
+    let ordinal: Int
+    /// Where it sits, not which block it holds: typing in a card can hand its
+    /// first paragraph a new block, and a card whose identity changed under
+    /// SwiftUI would lose the caret mid-edit.
+    var id: String { "\(x)x\(y)#\(ordinal)" }
 }
 
 /// A stash card drag carries its source paragraph and where inside the card
@@ -130,6 +138,8 @@ final class EditorController {
     var findIndex = 0
     /// Bumped on every storage edit so inspector views recompute.
     var docVersion = 0
+    /// Bumped when a paragraph is parked, to bring the canvas forward.
+    var stashed = 0
     var minimapRows: [MinimapRow] = []
     var minimapDocHeight: CGFloat = 0
     var minimapViewport: MinimapViewport?
@@ -158,33 +168,39 @@ final class EditorController {
     func findPrevious() { core?.stepFind(-1) }
     func scrollTo(location: Int) { core?.scrollTo(location: location) }
 
+    /// Formatting reaches whichever text has focus — the note, or a card on the
+    /// stash canvas.
+    private func format(_ body: @escaping (EditorCore) -> Void) {
+        core?.onFocusedText(body)
+    }
+
     func applyStyle(_ key: String) {
-        core?.applyBlockStyle(BlockValue.fromStyleKey(key))
+        format { $0.applyBlockStyle(BlockValue.fromStyleKey(key)) }
     }
 
     func applyCodeLanguage(_ language: CodeLanguage) {
-        core?.setCodeLanguage(language.id)
+        format { $0.setCodeLanguage(language.id) }
     }
 
-    func toggleStrong() { core?.toggleMark("strong") }
-    func toggleEm() { core?.toggleMark("em") }
-    func toggleCode() { core?.toggleMark("code") }
-    func toggleUnderline() { core?.toggleMark("underline") }
-    func toggleStrikethrough() { core?.toggleMark("strikethrough") }
+    func toggleStrong() { format { $0.toggleMark("strong") } }
+    func toggleEm() { format { $0.toggleMark("em") } }
+    func toggleCode() { format { $0.toggleMark("code") } }
+    func toggleUnderline() { format { $0.toggleMark("underline") } }
+    func toggleStrikethrough() { format { $0.toggleMark("strikethrough") } }
     // The two are exclusive: a run of text sits on one baseline.
-    func toggleSuperscript() { core?.toggleBaseline("superscript") }
-    func toggleSubscript() { core?.toggleBaseline("subscript") }
-    func applyHighlight(_ name: String?) { core?.setHighlight(name) }
-    func applyFontRole(_ role: String?) { core?.setFontRole(role) }
-    func moveItemUp() { core?.moveListItem(by: -1) }
-    func moveItemDown() { core?.moveListItem(by: 1) }
+    func toggleSuperscript() { format { $0.toggleBaseline("superscript") } }
+    func toggleSubscript() { format { $0.toggleBaseline("subscript") } }
+    func applyHighlight(_ name: String?) { format { $0.setHighlight(name) } }
+    func applyFontRole(_ role: String?) { format { $0.setFontRole(role) } }
+    func moveItemUp() { format { $0.moveListItem(by: -1) } }
+    func moveItemDown() { format { $0.moveListItem(by: 1) } }
     func moveCheckedToBottom() { core?.moveCheckedToBottom() }
     func toggleHideChecked() { core?.toggleHideCheckedItems() }
     func deleteChecked() { core?.deleteCheckedItems() }
-    func indent() { _ = core?.nestListItem() }
-    func outdent() { _ = core?.unnestListItem() }
-    func indentBlock() { core?.indentBlock() }
-    func outdentBlock() { core?.outdentBlock() }
+    func indent() { format { _ = $0.nestListItem() } }
+    func outdent() { format { _ = $0.unnestListItem() } }
+    func indentBlock() { format { $0.indentBlock() } }
+    func outdentBlock() { format { $0.outdentBlock() } }
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
@@ -193,6 +209,7 @@ final class EditorController {
 
     #if os(iOS)
     func dismissKeyboard() { core?.endEditing() }
+    func resumeKeyboard() { core?.view?.pSelf.becomeFirstResponder() }
     #endif
 
     func insertPatchworkEmbed(url: String, tool: String?) {
@@ -330,6 +347,17 @@ extension ListMarkerLayoutDelegate {
     }
 }
 
+/// A stash card edits its own copy of the paragraphs it parks on the canvas
+/// and writes them back into the note.
+@MainActor
+protocol StashCardEditing: EditorTextViewLike {
+    func commitToNote()
+    /// Writing the note's storage rebuilds the substituted element standing in
+    /// for the hidden paragraph, so a card gathers its keystrokes before it
+    /// does that rather than doing it on each one.
+    func scheduleCommit()
+}
+
 extension EditorTextViewLike {
     var pSelectionColor: PColor {
         #if os(macOS)
@@ -392,7 +420,18 @@ final class EditorCore {
     /// successor that already claimed the same note.
     private static var presenceOwners: [String: ObjectIdentifier] = [:]
 
-    weak var view: (any EditorTextViewLike)?
+    /// The text an editing command acts on. Normally the note's own view; a
+    /// focused stash card takes it over for the length of a command so every
+    /// command works the same on the canvas as in the note (see onFocusedText).
+    weak var view: (any EditorTextViewLike)? {
+        didSet {
+            if !(view is any StashCardEditing) { noteView = view }
+        }
+    }
+    /// Always the note's own view. Loading, saving and storage attachment read
+    /// or write the whole document and must never see a card's copy of it.
+    weak var noteView: (any EditorTextViewLike)?
+    weak var focusedStashCard: (any StashCardEditing)?
     private var lastCodeSelection = NSRange(location: 0, length: 0)
     let model: NotesModel
     let controller: EditorController
@@ -519,7 +558,7 @@ final class EditorCore {
     }
 
     func attachViewToSharedStorage() {
-        guard let contentStorage = view?.pContentStorage else { return }
+        guard let contentStorage = noteView?.pContentStorage else { return }
         EditorCore.presenceOwners[noteUrl] = ObjectIdentifier(self)
         #if !os(macOS)
         observeStorageEdits()
@@ -556,7 +595,7 @@ final class EditorCore {
 
     func windowBecameKey() {
         #if os(macOS)
-        if let contentStorage = view?.pContentStorage {
+        if let contentStorage = noteView?.pContentStorage {
             let wasStale = contentStorage.textStorage === session.storage
                 && session.storage.textStorageObserver !== contentStorage
             attachViewToSharedStorage()
@@ -583,7 +622,7 @@ final class EditorCore {
             model.presence.leave()
         }
         #if os(macOS)
-        guard let contentStorage = view?.pContentStorage,
+        guard let contentStorage = noteView?.pContentStorage,
               contentStorage.textStorage === session.storage
         else { return }
         contentStorage.textStorage = NSTextStorage()
@@ -778,7 +817,7 @@ final class EditorCore {
 
     private func syncFromSession() {
         attachViewToSharedStorage()
-        guard let view else { return }
+        guard let view = noteView else { return }
         let location = min(view.pSelectedRange.location, layoutStorage.length)
         view.pSelectedRange = NSRange(location: location, length: 0)
         refreshFormattingState()
@@ -895,7 +934,7 @@ final class EditorCore {
     }
 
     private func apply(spans: [SpanNode], focus: Bool = false) {
-        guard let view, view.pStorage != nil else { return }
+        guard let view = noteView, view.pStorage != nil else { return }
         // write out queued typing before it's discarded — the flush's write
         // merges with whatever this apply brings in
         if queuedTextSplice != nil {
@@ -1253,7 +1292,7 @@ final class EditorCore {
         }
         saveTask?.cancel()
         saveTask = nil
-        guard let storage = view?.pStorage else { return }
+        guard let storage = noteView?.pStorage else { return }
         let typing = typingBlock()
         let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
         let json = SpanNode.encodeList(spans)
@@ -2116,6 +2155,7 @@ final class EditorCore {
             ))
         }
         var cards: [StashedCard] = []
+        var ordinals: [String: Int] = [:]
         var i = 0
         while i < items.count {
             let first = items[i]
@@ -2132,18 +2172,23 @@ final class EditorCore {
             let merged = NSMutableAttributedString()
             for item in group { merged.append(item.attributed) }
             let measured = merged.boundingRect(
-                with: CGSize(width: 156, height: 400),
+                with: CGSize(width: 164, height: 600),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 context: nil
             ).height
+            let spot = "\(first.x)x\(first.y)"
+            let ordinal = ordinals[spot] ?? 0
+            ordinals[spot] = ordinal + 1
             cards.append(StashedCard(
                 location: first.location,
                 locations: group.map(\.location),
                 box: first.box,
+                boxes: group.map(\.box),
                 attributed: merged,
                 contentHeight: ceil(measured),
                 x: first.x,
-                y: first.y
+                y: first.y,
+                ordinal: ordinal
             ))
             i = j
         }
@@ -2175,11 +2220,16 @@ final class EditorCore {
             cursor = next
         }
         guard !paragraphLocations.isEmpty else { return }
-        let nextY = (stashedCards().map { $0.y + 90 }.max() ?? 16)
-        let stashValue = JSONValue.object(["x": .number(16), "y": .number(Double(nextY))])
+        // fill the first free row from the top of the canvas: stacking below
+        // the lowest card left a growing empty band up there as cards came back
+        let taken = stashedCards().map(\.y)
+        var nextY: CGFloat = 8
+        while taken.contains(where: { abs($0 - nextY) < 40 }) { nextY += 60 }
+        let stashValue = JSONValue.object(["x": .number(8), "y": .number(Double(nextY))])
         for loc in paragraphLocations {
             setStash(stashValue, forParagraphAt: loc)
         }
+        controller.stashed &+= 1
     }
 
     func moveStash(fromParagraphAt location: Int, to point: CGPoint) {
@@ -2310,31 +2360,140 @@ final class EditorCore {
         scheduleSave()
     }
 
+    /// Run an editing command against whatever text has focus. A stash card
+    /// holds its own copy of the paragraphs it parks on the canvas, so the
+    /// command runs on that copy and the result goes back into the note.
+    func onFocusedText(_ body: (EditorCore) -> Void) {
+        guard let card = focusedStashCard, card !== view else {
+            body(self)
+            return
+        }
+        let note = view
+        view = card
+        body(self)
+        view = note
+        card.scheduleCommit()
+    }
+
+    /// Replace the paragraphs a card stands for with what its editor holds.
+    func updateStashCard(anchoredAt box: BlockBox, with attributed: NSAttributedString) {
+        guard let view = noteView, let storage = view.pStorage,
+              let card = stashedCards().first(where: { $0.boxes.contains { $0 === box } }),
+              let range = paragraphSpan(of: card, in: storage)
+        else { return }
+        let slice = stampedStash(
+            attributed,
+            x: card.x,
+            y: card.y,
+            trailingNewline: (storage.string as NSString).substring(with: range).hasSuffix("\n")
+        )
+        guard !slice.isEqual(to: storage.attributedSubstring(from: range)) else { return }
+        // the storage observer sees a stashed block in the edit and refreshes
+        // the hidden set from there; doing it here as well invalidated the
+        // note's layout twice per keystroke
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: range, with: slice)
+        }
+        scheduleSave()
+    }
+
+    /// The paragraphs of a card as one range: its own, plus the ones that share
+    /// its position and follow it.
+    private func paragraphSpan(of card: StashedCard, in storage: NSTextStorage) -> NSRange? {
+        guard storage.length > 0,
+              let first = card.locations.first, let last = card.locations.last,
+              first < storage.length
+        else { return nil }
+        let str = storage.string as NSString
+        let start = str.paragraphRange(for: NSRange(location: first, length: 0))
+        let end = str.paragraphRange(for: NSRange(location: min(last, storage.length - 1), length: 0))
+        guard NSMaxRange(end) > start.location else { return nil }
+        return NSRange(location: start.location, length: NSMaxRange(end) - start.location)
+    }
+
+    /// Card text on its way back into the note: every paragraph the editor now
+    /// holds — including ones typed inside the card — parks at the card's spot.
+    private func stampedStash(
+        _ attributed: NSAttributedString,
+        x: CGFloat,
+        y: CGFloat,
+        trailingNewline: Bool
+    ) -> NSAttributedString {
+        let stash = JSONValue.object(["x": .number(Double(x)), "y": .number(Double(y))])
+        let out = NSMutableAttributedString(attributedString: attributed)
+        var restamp: [(NSRange, [NSAttributedString.Key: Any])] = []
+        out.enumerateAttributes(in: NSRange(location: 0, length: out.length)) { attrs, range, _ in
+            // paragraphs already parked here keep their block object: the card
+            // is found again by that identity, and a fresh one would orphan it
+            guard let box = attrs[.amBlock] as? BlockBox, !box.value.isAtomic,
+                  box.value.attrs["stash"] != stash,
+                  attrs[.attachment] == nil, attrs[.amTableBox] == nil,
+                  attrs[.amColumnsBox] == nil, attrs[.amDisplayOnly] == nil
+            else { return }
+            var block = box.value
+            block.attrs["stash"] = stash
+            restamp.append((
+                range,
+                RichText.attributes(block: block, marks: RichText.marks(from: attrs, block: box.value))
+            ))
+        }
+        for (range, attrs) in restamp {
+            out.setAttributes(attrs, range: range)
+        }
+        // paragraph parity with the range being replaced, so emptying a card
+        // leaves an empty stashed paragraph rather than swallowing the next one
+        if trailingNewline {
+            if !out.string.hasSuffix("\n") {
+                var block = BlockValue.paragraph
+                block.attrs["stash"] = stash
+                let attrs = out.length > 0
+                    ? out.attributes(at: out.length - 1, effectiveRange: nil)
+                    : RichText.attributes(block: block, marks: [:])
+                out.append(NSAttributedString(string: "\n", attributes: attrs))
+            }
+        } else if out.string.hasSuffix("\n") {
+            out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1))
+        }
+        return out
+    }
+
     /// Insert a new blank paragraph at the end of the doc, pre-stashed at the given canvas point.
     func addBlankCardToCanvas(at canvasPoint: CGPoint) {
-        guard let view, let storage = view.pStorage else { return }
+        addCardToCanvas(at: canvasPoint, text: nil)
+    }
+
+    /// Park text on the canvas: it joins the document as hidden paragraphs at
+    /// the end, which is where every stashed paragraph lives.
+    func addCardToCanvas(at canvasPoint: CGPoint, text: NSAttributedString?) {
+        guard let view = noteView, let storage = view.pStorage else { return }
         var block = BlockValue.paragraph
-        block.attrs["stash"] = .object([
-            "x": .number(Double(canvasPoint.x)),
-            "y": .number(Double(canvasPoint.y))
+        let stash = JSONValue.object([
+            "x": .number(Double(max(0, canvasPoint.x))),
+            "y": .number(Double(max(0, canvasPoint.y)))
         ])
+        block.attrs["stash"] = stash
         let attrs = RichText.attributes(block: block, marks: [:])
         let insertAt = storage.length
         let savedSelection = view.pSelectedRange
         let str = storage.string as NSString
+        let body = NSMutableAttributedString()
+        if let text, text.length > 0 {
+            body.append(stampedStash(text, x: canvasPoint.x, y: canvasPoint.y, trailingNewline: true))
+        } else {
+            body.append(NSAttributedString(string: "\n", attributes: attrs))
+        }
         view.pPerformStorageEdit { storage in
-            let prefix = (insertAt > 0 && str.character(at: insertAt - 1) != 0x0A)
-                ? NSAttributedString(string: "\n", attributes: attrs)
-                : nil
-            let line = NSAttributedString(string: "\n", attributes: attrs)
             let insertion = NSMutableAttributedString()
-            if let prefix { insertion.append(prefix) }
-            insertion.append(line)
+            if insertAt > 0, str.character(at: insertAt - 1) != 0x0A {
+                insertion.append(NSAttributedString(string: "\n", attributes: attrs))
+            }
+            insertion.append(body)
             storage.insert(insertion, at: insertAt)
         }
         view.pSelectedRange = NSRange(location: min(savedSelection.location, storage.length), length: 0)
         rebuildHiddenRanges()
         scheduleSave()
+        controller.stashed &+= 1
     }
 
     // MARK: minimap
@@ -2529,6 +2688,15 @@ final class EditorCore {
     private func invalidateRendering() {
         guard let textLayoutManager = view?.pTextLayoutManager else { return }
         textLayoutManager.invalidateRenderingAttributes(for: textLayoutManager.documentRange)
+        renderInvalidated()
+    }
+
+    /// Invalidating only marks attributes stale — the validator doesn't run
+    /// until the viewport lays out again, so a match painted while typing
+    /// stays invisible until some other edit forces a pass.
+    private func renderInvalidated() {
+        view?.pTextLayoutManager?.textViewportLayoutController.layoutViewport()
+        refreshEditorDisplay()
     }
 
     private func invalidateRendering(ranges: [NSRange]) {
@@ -2549,6 +2717,7 @@ final class EditorCore {
             else { continue }
             textLayoutManager.invalidateRenderingAttributes(for: textRange)
         }
+        renderInvalidated()
     }
 
     // MARK: formatting
@@ -2691,8 +2860,8 @@ final class EditorCore {
         let typingAttributes: [NSAttributedString.Key: Any]
     }
 
-    private func undoSnapshot() -> UndoSnapshot? {
-        guard let view, let storage = view.pStorage else { return nil }
+    private func undoSnapshot(of target: (any EditorTextViewLike)? = nil) -> UndoSnapshot? {
+        guard let view = target ?? view, let storage = view.pStorage else { return nil }
         return UndoSnapshot(
             attributed: NSAttributedString(attributedString: storage),
             selection: view.pSelectedRange,
@@ -2700,10 +2869,17 @@ final class EditorCore {
         )
     }
 
-    private func restoreUndoSnapshot(_ snapshot: UndoSnapshot, actionName: String) {
-        guard let view, let current = undoSnapshot() else { return }
-        view.pUndoManager?.registerUndo(withTarget: self) { target in
-            target.restoreUndoSnapshot(current, actionName: actionName)
+    /// The view is carried along: a snapshot taken in a stash card must not be
+    /// restored into the note when the caret has moved on.
+    private func restoreUndoSnapshot(
+        _ snapshot: UndoSnapshot,
+        actionName: String,
+        in view: any EditorTextViewLike
+    ) {
+        guard let current = undoSnapshot(of: view) else { return }
+        view.pUndoManager?.registerUndo(withTarget: self) { [weak view] target in
+            guard let view else { return }
+            target.restoreUndoSnapshot(current, actionName: actionName, in: view)
         }
         view.pUndoManager?.setActionName(actionName)
         view.pPerformStorageEdit { storage in
@@ -2719,7 +2895,11 @@ final class EditorCore {
         updateGlobalMatches()
         scheduleMinimapUpdate()
         refreshEditorDisplay()
-        scheduleSave()
+        if let card = view as? any StashCardEditing {
+            card.commitToNote()
+        } else {
+            scheduleSave()
+        }
     }
 
     private func registerUndo(from before: UndoSnapshot?, actionName: String) {
@@ -2728,8 +2908,9 @@ final class EditorCore {
               view.pUndoManager?.isUndoing != true,
               view.pUndoManager?.isRedoing != true
         else { return }
-        view.pUndoManager?.registerUndo(withTarget: self) { target in
-            target.restoreUndoSnapshot(before, actionName: actionName)
+        view.pUndoManager?.registerUndo(withTarget: self) { [weak view] target in
+            guard let view else { return }
+            target.restoreUndoSnapshot(before, actionName: actionName, in: view)
         }
         view.pUndoManager?.setActionName(actionName)
     }
@@ -2750,6 +2931,32 @@ final class EditorCore {
               box.value.type == "todo-list-item"
         else { return nil }
         return index
+    }
+
+    /// A click on a calendar box: its trailing glyph opens Calendar.app, the
+    /// rest of the box goes to that day in Lush's own Calendar view.
+    @discardableResult
+    func calendarEmbedHit(at point: CGPoint) -> Bool {
+        guard let storage = view?.pStorage,
+              let charIndex = attachmentIndex(at: point),
+              let box = storage.attribute(.amBlock, at: charIndex, effectiveRange: nil) as? BlockBox,
+              box.value.type == "calendar-event"
+        else { return false }
+        let attachment = storage.attribute(.attachment, at: charIndex, effectiveRange: nil) as? NSTextAttachment
+        let ideal = attachment?.bounds.width ?? 420
+        let padding = view?.pTextContainer?.lineFragmentPadding ?? 5
+        let available = (view?.pTextContainer?.size.width ?? ideal) - padding * 2
+        let width = available > 40 ? min(ideal, available) : ideal
+        let zone = CalendarEventInlineView.buttonZone * width / max(ideal, 1)
+        if point.x >= padding + width - zone, let url = box.value.calendarAppURL {
+            ExternalBrowser.open(url)
+        } else {
+            AppRouter.shared.pending = .calendar(
+                day: box.value.calendarEventDay,
+                item: box.value.attrs["event"]?.stringValue
+            )
+        }
+        return true
     }
 
     /// The attachment character whose laid-out rect contains this point in
@@ -3755,7 +3962,7 @@ func editorPlainText(_ slice: NSAttributedString) -> String {
 
 #if os(macOS)
 
-final class EditorTextView: NSTextView, EditorTextViewLike {
+class EditorTextView: NSTextView, EditorTextViewLike {
     weak var core: EditorCore?
 
     private var windowKeyObserver: (any NSObjectProtocol)?
@@ -4024,13 +4231,20 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
         return nil
     }
 
+    /// A card coming back from the stash is a move — the badgeless one, and the
+    /// operation its drag source offers.
+    private func textDragOperation(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let text = dragString(sender.draggingPasteboard) else { return .copy }
+        return text.hasPrefix(StashDrag.prefix) ? .move : .copy
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if isTextOnlyDrag(sender) { return .copy }
+        if isTextOnlyDrag(sender) { return textDragOperation(sender) }
         return super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if isTextOnlyDrag(sender) { return .copy }
+        if isTextOnlyDrag(sender) { return textDragOperation(sender) }
         return super.draggingUpdated(sender)
     }
 
@@ -4117,6 +4331,9 @@ final class EditorTextView: NSTextView, EditorTextViewLike {
             if event.clickCount == 1,
                let todo = core.todoBoxHit(at: containerPoint),
                core.toggleTodo(at: todo) {
+                return
+            }
+            if event.clickCount == 1, core.calendarEmbedHit(at: containerPoint) {
                 return
             }
             if let charIndex = core.attachmentIndex(at: containerPoint),
@@ -4391,6 +4608,430 @@ struct RichTextEditor: NSViewRepresentable {
                 replacement: replacementString ?? ""
             )
             return true
+        }
+    }
+}
+
+// MARK: - stash card editing
+
+/// A stash card is a real editor over a copy of the paragraphs it parks: the
+/// same text view class as the note, so clicks, keys, menus and formatting all
+/// behave the same. Every event runs with the core pointed at this view, and
+/// what the card holds afterwards goes back into the note.
+final class StashCardTextView: EditorTextView, StashCardEditing {
+    /// The block the card's first paragraph carries. Identity, not an index:
+    /// paragraphs move around as the note is edited.
+    var anchor: BlockBox?
+
+    /// Called when the card stops being edited, by escape or by a click landing
+    /// somewhere else.
+    var onExit: (() -> Void)?
+
+    private let cardUndoManager = UndoManager()
+    override var undoManager: UndoManager? { cardUndoManager }
+    private var commitTask: Task<Void, Never>?
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { core?.focusedStashCard = self }
+        return became
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            if core?.focusedStashCard === self { core?.focusedStashCard = nil }
+            commitToNote()
+            onExit?()
+        }
+        return resigned
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        window?.makeFirstResponder(nil)
+    }
+
+    func scheduleCommit() {
+        commitTask?.cancel()
+        commitTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.commitToNote()
+        }
+    }
+
+    func commitToNote() {
+        commitTask?.cancel()
+        commitTask = nil
+        guard let core, let anchor else { return }
+        core.updateStashCard(anchoredAt: anchor, with: attributedString())
+    }
+
+    private func focused(_ body: () -> Void) {
+        guard let core, core.focusedStashCard === self else {
+            body()
+            return
+        }
+        core.onFocusedText { _ in body() }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        focused { super.mouseDown(with: event) }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        focused { super.keyDown(with: event) }
+    }
+
+    /// Menu and key-equivalent actions — paste, undo, the edit menu — arrive
+    /// through the responder chain rather than as key events.
+    override func tryToPerform(_ action: Selector, with object: Any?) -> Bool {
+        var handled = false
+        focused { handled = super.tryToPerform(action, with: object) }
+        return handled
+    }
+
+    // the card is 184 points wide; the note's centring insets have no place here
+    override func pApplyMaxWidth() {}
+    override func pApplyTypewriterPadding(_ enabled: Bool) {}
+}
+
+struct StashCardEditor: NSViewRepresentable {
+    let card: StashedCard
+    let core: EditorCore
+    /// Editing is a mode the card is put into by a click on its text.
+    let editing: Bool
+    /// Where that click landed, in window coordinates, so the caret starts
+    /// under it rather than at the top of the card.
+    let caret: CGPoint?
+    let onExit: () -> Void
+    /// What the text actually took to lay out — the card is that tall.
+    let onHeight: (CGFloat) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(core: core) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = StashCardTextView(usingTextLayoutManager: true)
+        textView.core = core
+        textView.anchor = card.box
+        textView.delegate = context.coordinator
+        textView.textLayoutManager?.delegate = context.coordinator.markers
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
+        textView.textContainer?.widthTracksTextView = true
+        textView.isRichText = true
+        textView.allowsUndo = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 2, height: 2)
+        textView.autoresizingMask = [.width]
+        textView.isVerticallyResizable = true
+        textView.minSize = .zero
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textStorage?.setAttributedString(card.attributed)
+        textView.typingAttributes = RichText.attributes(block: card.box.value, marks: [:])
+        context.coordinator.markers.driveTypingAttributes(from: textView)
+        context.coordinator.markers.driveSelection(from: textView)
+
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = false
+        scroll.documentView = textView
+        return scroll
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let textView = nsView.documentView as? StashCardTextView else { return }
+        textView.anchor = card.box
+        textView.onExit = onExit
+        context.coordinator.onHeight = { [self] in reportHeight(of: $0) }
+        let focused = textView.window?.firstResponder === textView
+        // reseeding under the caret would eat the edit that produced this
+        // update; a card being typed in is already the source of truth
+        if !focused, !textView.attributedString().isEqual(to: card.attributed) {
+            textView.textStorage?.setAttributedString(card.attributed)
+        }
+        // moving focus resigns another view, which reports back into SwiftUI
+        // state — doing that inside a view update is a cycle
+        let caret = caret
+        let editing = editing
+        Task { @MainActor in
+            guard let window = textView.window else { return }
+            let focused = window.firstResponder === textView
+            if editing, !focused {
+                window.makeFirstResponder(textView)
+                if let caret, textView.textStorage?.length ?? 0 > 0 {
+                    let point = textView.convert(caret, from: nil)
+                    let index = min(
+                        textView.characterIndexForInsertion(at: point),
+                        textView.textStorage?.length ?? 0
+                    )
+                    textView.setSelectedRange(NSRange(location: index, length: 0))
+                }
+            } else if !editing, focused {
+                window.makeFirstResponder(nil)
+            }
+        }
+        reportHeight(of: textView)
+    }
+
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        (nsView.documentView as? StashCardTextView)?.commitToNote()
+    }
+
+    private func reportHeight(of textView: NSTextView) {
+        guard let layout = textView.textLayoutManager else { return }
+        layout.ensureLayout(for: layout.documentRange)
+        let height = ceil(layout.usageBoundsForTextContainer.height)
+        + textView.textContainerInset.height * 2
+        let onHeight = onHeight
+        Task { @MainActor in onHeight(height) }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        let core: EditorCore
+        let markers = ListMarkerLayoutDelegate()
+        var onHeight: ((NSTextView) -> Void)?
+
+        init(core: EditorCore) {
+            self.core = core
+        }
+
+        func undoManager(for view: NSTextView) -> UndoManager? {
+            view.undoManager
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let view = notification.object as? StashCardTextView else { return }
+            view.scheduleCommit()
+            onHeight?(view)
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            core.onFocusedText { $0.refreshFormattingState() }
+        }
+
+        func textView(_ view: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                return core.handleReturn()
+            }
+            if commandSelector == #selector(NSResponder.insertLineBreak(_:))
+                || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+                if core.blockAtSelection().type == "code-block" {
+                    return core.leaveCodeBlock()
+                }
+                core.insertSoftLineBreak()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                return core.nestListItem()
+            }
+            if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                return core.unnestListItem()
+            }
+            return false
+        }
+
+        /// No splice pipeline here: the card's text lands in the note as a
+        /// paragraph replacement, which the whole-doc save picks up.
+        func textView(
+            _ textView: NSTextView,
+            shouldChangeTextIn affectedCharRange: NSRange,
+            replacementString: String?
+        ) -> Bool {
+            if replacementString == " ",
+               affectedCharRange.length == 0,
+               core.handleMarkdownTrigger(at: affectedCharRange.location) {
+                return false
+            }
+            return true
+        }
+    }
+}
+
+/// The canvas takes dropped text as a new card. Text dragged out of the note
+/// leaves it: the drop answers `.move`, which is the note's cue as the drag
+/// source to remove what was dragged.
+struct StashDropTarget: NSViewRepresentable {
+    let core: EditorCore
+
+    func makeNSView(context: Context) -> Drop {
+        let view = Drop()
+        view.core = core
+        view.registerForDraggedTypes([
+            .string,
+            NSPasteboard.PasteboardType(RichTextClipboard.spansTypeIdentifier),
+        ])
+        return view
+    }
+
+    func updateNSView(_ nsView: Drop, context: Context) {
+        nsView.core = core
+    }
+
+    final class Drop: NSView {
+        weak var core: EditorCore?
+
+        // the canvas places cards from its top-left, and so does this
+        override var isFlipped: Bool { true }
+
+        private func operation(_ sender: NSDraggingInfo) -> NSDragOperation {
+            let pasteboard = sender.draggingPasteboard
+            if let text = pasteboard.string(forType: .string),
+               text.hasPrefix(StashDrag.prefix) {
+                return []
+            }
+            guard payload(from: pasteboard) != nil else { return [] }
+            return sender.draggingSource is EditorTextView ? .move : .copy
+        }
+
+        private func payload(from pasteboard: NSPasteboard) -> NSAttributedString? {
+            guard let core else { return nil }
+            if let json = pasteboard.string(
+                forType: NSPasteboard.PasteboardType(RichTextClipboard.spansTypeIdentifier)
+            ), let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
+                return attributed
+            }
+            guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return nil }
+            return NSAttributedString(
+                string: text,
+                attributes: RichText.attributes(block: .paragraph, marks: [:])
+            )
+        }
+
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            operation(sender)
+        }
+
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+            operation(sender)
+        }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            guard let core, let text = payload(from: sender.draggingPasteboard) else { return false }
+            core.addCardToCanvas(
+                at: convert(sender.draggingLocation, from: nil),
+                text: text
+            )
+            return true
+        }
+    }
+}
+
+/// One drag for a card, tracked by hand: it slides around the canvas, and the
+/// moment the pointer reaches the note it becomes a document drag the editor
+/// can take. SwiftUI can't hand a gesture over to a drag session mid-flight,
+/// which is why the tracking loop lives here.
+struct StashCardGrab: NSViewRepresentable {
+    let location: Int
+    let attributed: NSAttributedString
+    let onMove: (CGSize) -> Void
+    let onDrop: (CGSize) -> Void
+    let onClick: (CGPoint) -> Void
+
+    func makeNSView(context: Context) -> Grab { Grab() }
+
+    func updateNSView(_ nsView: Grab, context: Context) {
+        nsView.location = location
+        nsView.attributed = attributed
+        nsView.onMove = onMove
+        nsView.onDrop = onDrop
+        nsView.onClick = onClick
+    }
+
+    final class Grab: NSView, NSDraggingSource {
+        var location = 0
+        var attributed = NSAttributedString()
+        var onMove: ((CGSize) -> Void)?
+        var onDrop: ((CGSize) -> Void)?
+        var onClick: ((CGPoint) -> Void)?
+
+        override func resetCursorRects() {
+            addCursorRect(bounds, cursor: .openHand)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            let start = event.locationInWindow
+            var translation = CGSize.zero
+            while let next = window?.nextEvent(
+                matching: [.leftMouseDragged, .leftMouseUp],
+                until: .distantFuture,
+                inMode: .eventTracking,
+                dequeue: true
+            ) {
+                guard next.type == .leftMouseDragged else {
+                    // a click, not a drag: the card opens for editing
+                    if abs(translation.width) < 3, abs(translation.height) < 3 {
+                        onClick?(next.locationInWindow)
+                        return
+                    }
+                    break
+                }
+                let point = next.locationInWindow
+                translation = CGSize(width: point.x - start.x, height: start.y - point.y)
+                if overTheNote(point) {
+                    // the card keeps its place on the canvas unless the drop
+                    // lands somewhere that takes it
+                    onMove?(.zero)
+                    dragToNote(with: next)
+                    return
+                }
+                onMove?(translation)
+            }
+            onDrop?(translation)
+        }
+
+        private func overTheNote(_ windowPoint: CGPoint) -> Bool {
+            var hit = window?.contentView?.hitTest(windowPoint)
+            while let view = hit {
+                if view is EditorTextView { return !(view is StashCardTextView) }
+                hit = view.superview
+            }
+            guard let scroll = enclosingScrollView else { return false }
+            return !scroll.bounds.contains(scroll.convert(windowPoint, from: nil))
+        }
+
+        private func dragToNote(with event: NSEvent) {
+            let item = NSPasteboardItem()
+            item.setString(StashDrag(location: location, grab: .zero).text, forType: .string)
+            let dragItem = NSDraggingItem(pasteboardWriter: item)
+            dragItem.setDraggingFrame(bounds, contents: cardImage())
+            beginDraggingSession(with: [dragItem], event: event, source: self)
+        }
+
+        /// What travels with the pointer is the card itself, drawn.
+        private func cardImage() -> NSImage {
+            let size = bounds.size
+            let image = NSImage(size: size)
+            guard size.width > 1, size.height > 1 else { return image }
+            image.lockFocusFlipped(true)
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                let card = NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5)
+                let shape = NSBezierPath(roundedRect: card, xRadius: 6, yRadius: 6)
+                NSColor.textBackgroundColor.withAlphaComponent(0.95).setFill()
+                shape.fill()
+                NSColor.separatorColor.setStroke()
+                shape.stroke()
+                attributed.draw(
+                    with: card.insetBy(dx: 8, dy: 8),
+                    options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine]
+                )
+            }
+            image.unlockFocus()
+            return image
+        }
+
+        /// Move, not copy: the paragraph goes back to the note rather than
+        /// being duplicated, and the pointer shows no badge.
+        func draggingSession(
+            _ session: NSDraggingSession,
+            sourceOperationMaskFor context: NSDraggingContext
+        ) -> NSDragOperation {
+            .move
         }
     }
 }
@@ -4793,6 +5434,7 @@ struct RichTextEditor: UIViewRepresentable {
                core.toggleTodo(at: todo) {
                 return
             }
+            if core.calendarEmbedHit(at: containerPoint) { return }
             guard let charIndex = core.attachmentIndex(at: containerPoint) else { return }
             core.openAttachment(at: charIndex)
         }
@@ -4871,13 +5513,18 @@ struct RichTextEditor: UIViewRepresentable {
 /// Slim bar above the keyboard. Formatting lives behind "Aa".
 struct FormatAccessoryBar: View {
     let controller: EditorController
-    @State private var showFormat = false
 
     var body: some View {
         HStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 22) {
-                    Button { showFormat = true } label: {
+                    // the bar rides the keyboard, so the sheet is presented by
+                    // the screen instead — dismissing the keyboard takes the
+                    // bar and anything it presents with it
+                    Button {
+                        controller.dismissKeyboard()
+                        controller.sheet = .format
+                    } label: {
                         Text("Aa")
                             .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(Color.primary)
@@ -4966,14 +5613,6 @@ struct FormatAccessoryBar: View {
         .font(.system(size: 20))
         .frame(maxHeight: .infinity)
         .background(.bar)
-        .sheet(isPresented: $showFormat) {
-            FormatSheet(controller: controller)
-        }
-        .onChange(of: showFormat) { _, shown in
-            if shown, let textView = controller.core?.view as? EditorTextView {
-                textView.scrollSelectionAboveSheet(height: 320)
-            }
-        }
     }
 
     private func barButton(_ symbol: String, action: @escaping () -> Void) -> some View {
@@ -5118,6 +5757,12 @@ struct FormatSheet: View {
         }
         .presentationDetents([.height(controller.isCodeBlockActive ? 316 : 264)])
         .presentationDragIndicator(.visible)
+        .onAppear {
+            if let textView = controller.core?.view as? EditorTextView {
+                textView.scrollSelectionAboveSheet(height: controller.isCodeBlockActive ? 316 : 264)
+            }
+        }
+        .onDisappear { controller.resumeKeyboard() }
     }
 
     @ViewBuilder

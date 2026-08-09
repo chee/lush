@@ -53,6 +53,10 @@ actor SpotlightIndex {
         index.deleteSearchableItems(withIdentifiers: [url]) { _ in }
     }
 
+    func reset() {
+        indexedDigests.removeAll()
+    }
+
     private static func plainText(from spans: [SpanNode]) -> String {
         var parts: [String] = []
         for span in spans {

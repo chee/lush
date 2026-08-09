@@ -22,13 +22,6 @@ struct NewItemMenuItems: View {
             }
         }
         .keyboardShortcut(shortcuts ? KeyboardShortcut("n", modifiers: .command) : nil)
-        Button("Folder") {
-            if let target {
-                model.createSubfolder(in: target)
-            } else {
-                model.createFolder()
-            }
-        }
         Button("Script") {
             if let target {
                 model.createScript(in: target)
@@ -37,6 +30,13 @@ struct NewItemMenuItems: View {
             }
         }
         .keyboardShortcut(shortcuts ? KeyboardShortcut("n", modifiers: [.command, .shift]) : nil)
+        Button("Folder") {
+            if let target {
+                model.createSubfolder(in: target)
+            } else {
+                model.createFolder()
+            }
+        }
         if PatchworkWeb.available {
             Button("Patchwork Doc…") {
                 AppRouter.shared.pending = .createPatchwork(
@@ -45,6 +45,13 @@ struct NewItemMenuItems: View {
                     folderUrl: folderUrl ?? model.folderUrl
                 )
             }
+        }
+        Divider()
+        Button("Notebook") {
+            Task { await model.createNotebook() }
+        }
+        Button("Smart Notebook…") {
+            AppRouter.shared.pending = .newSmartNotebook
         }
     }
 }

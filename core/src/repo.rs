@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::IntoFuture,
     path::{Path, PathBuf},
     sync::{
@@ -266,13 +266,16 @@ impl PartialEq for WsTransport {
     }
 }
 
-async fn accept_iroh_peer(
-    endpoint: Arc<iroh::Endpoint>,
-    node: Arc<Core>,
-    signer: MemorySigner,
-    peer_id: PeerId,
-    ephemeral: EphHandler,
-) {
+/// A dialer only knows our iroh node id, not our subduction peer id, so it
+/// addresses the handshake to a discovery audience hashed from that node id.
+fn iroh_audience(node_id: &iroh::EndpointId) -> Audience {
+    Audience::discover(node_id.to_string().as_bytes())
+}
+
+async fn accept_iroh_peer(endpoint: Arc<iroh::Endpoint>, repo: Arc<Repo>) {
+    let signer = repo.signer.clone();
+    let peer_id = PeerId::from(repo.signer.verifying_key());
+    let audience = Some(iroh_audience(&endpoint.id()));
     let nonce_cache = NonceCache::default();
     loop {
         match subduction_iroh::server::accept_one(
@@ -280,7 +283,7 @@ async fn accept_iroh_peer(
             &signer,
             &nonce_cache,
             peer_id,
-            None,
+            audience,
             HANDSHAKE_MAX_DRIFT,
         )
         .await
@@ -288,14 +291,19 @@ async fn accept_iroh_peer(
             Ok(result) => {
                 tokio::spawn(result.listener_task);
                 tokio::spawn(result.sender_task);
-                let mapped = result
-                    .authenticated
-                    .map(|c| MessageTransport::new(WsTransport::Iroh(c)));
+                let mut node_id = None;
+                let mapped = result.authenticated.map(|c| {
+                    node_id = Some(c.quic_connection().remote_id().to_string());
+                    MessageTransport::new(WsTransport::Iroh(c))
+                });
                 let peer = mapped.peer_id();
-                if let Err(e) = node.add_connection(mapped).await {
+                if let Err(e) = repo.core.add_connection(mapped).await {
                     tracing::warn!(error = %e, "iroh: add_connection failed");
-                } else {
-                    ephemeral.subscribe_peer(peer).await;
+                    continue;
+                }
+                repo.ephemeral.subscribe_peer(peer).await;
+                if let Some(node_id) = node_id {
+                    repo.note_iroh_peer_seen(node_id, peer);
                 }
             }
             Err(subduction_iroh::error::AcceptError::NoIncoming) => break,
@@ -601,6 +609,7 @@ pub enum RepoEvent {
     Disconnected,
     SyncEvent(String),
     Ephemeral(DocId, Vec<u8>),
+    PeersChanged,
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +683,52 @@ pub struct Repo {
     send_changes: AtomicBool,
     local_port: Option<u16>,
     iroh_endpoint: Option<Arc<iroh::Endpoint>>,
+    peers_path: PathBuf,
+    peers: std::sync::Mutex<Peers>,
+}
+
+/// Peers we sync with, keyed by iroh node id, valued by their subduction peer
+/// id where we know it. `added` are dialed on every launch; `seen` are peers
+/// who dialed us — offered in the UI as suggestions, not dialed back.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Peers {
+    #[serde(default)]
+    added: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    seen: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohPeerEntry {
+    pub node_id: String,
+    pub peer_id: Option<String>,
+    pub added: bool,
+}
+
+/// `<iroh node id>:<subduction peer id>`, both hex. A bare node id still works
+/// — then the dialer has to fall back to a discovery audience.
+fn parse_friend_code(code: &str) -> Result<(iroh::EndpointId, Option<PeerId>)> {
+    let code = code.trim();
+    let (node, peer) = code.split_once(':').unwrap_or((code, ""));
+    let node_id = node
+        .trim()
+        .parse()
+        .map_err(|e| anyhow!("invalid iroh node id: {e}"))?;
+    if peer.trim().is_empty() {
+        return Ok((node_id, None));
+    }
+    let bytes: [u8; 32] = hex::decode(peer.trim())
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| anyhow!("invalid peer id: expected 64 hex characters"))?;
+    Ok((node_id, Some(PeerId::new(bytes))))
+}
+
+fn load_peers(path: &Path) -> Peers {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn load_or_create_iroh_key(path: &Path) -> Result<iroh::SecretKey> {
@@ -1121,30 +1176,140 @@ impl Repo {
         self.iroh_endpoint.as_ref().map(|ep| ep.id().to_string())
     }
 
-    pub async fn add_iroh_peer(self: &Arc<Self>, node_id_str: String) -> Result<()> {
+    /// What you hand a friend: both of this device's public keys, the iroh one
+    /// that says where to dial and the subduction one that says who will answer.
+    pub fn iroh_friend_code(&self) -> Option<String> {
+        let peer_id = PeerId::from(self.signer.verifying_key());
+        self.iroh_endpoint
+            .as_ref()
+            .map(|ep| format!("{}:{peer_id}", ep.id()))
+    }
+
+    /// Every peer we know about. Not-added peers are ones who dialed us — the
+    /// UI offers them as suggestions.
+    pub fn iroh_peers(&self) -> Vec<IrohPeerEntry> {
+        let peers = self.peers.lock().unwrap();
+        let entry = |added: bool| {
+            move |(node_id, peer_id): (&String, &Option<String>)| IrohPeerEntry {
+                node_id: node_id.clone(),
+                peer_id: peer_id.clone(),
+                added,
+            }
+        };
+        peers
+            .added
+            .iter()
+            .map(entry(true))
+            .chain(peers.seen.iter().map(entry(false)))
+            .collect()
+    }
+
+    pub fn forget_iroh_peer(&self, node_id: &str) {
+        let mut peers = self.peers.lock().unwrap();
+        let changed = peers.added.remove(node_id).is_some() | peers.seen.remove(node_id).is_some();
+        if changed {
+            self.write_peers(&peers);
+            drop(peers);
+            let _ = self.events.send(RepoEvent::PeersChanged);
+        }
+    }
+
+    /// A peer dialed us. The handshake already proved which subduction key they
+    /// hold, so the suggestion carries a full friend code.
+    fn note_iroh_peer_seen(&self, node_id: String, peer_id: PeerId) {
+        let mut peers = self.peers.lock().unwrap();
+        let peer_id = Some(peer_id.to_string());
+        if let Some(known) = peers.added.get_mut(&node_id) {
+            if *known == peer_id {
+                return;
+            }
+            *known = peer_id;
+        } else if peers.seen.get(&node_id) == Some(&peer_id) {
+            return;
+        } else {
+            peers.seen.insert(node_id.clone(), peer_id);
+        }
+        self.write_peers(&peers);
+        drop(peers);
+        tracing::info!(peer = %node_id, "iroh: peer dialed us");
+        let _ = self.events.send(RepoEvent::PeersChanged);
+    }
+
+    fn write_peers(&self, peers: &Peers) {
+        match serde_json::to_vec_pretty(peers) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&self.peers_path, json) {
+                    tracing::warn!(error = %e, "iroh: writing peer list failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "iroh: encoding peer list failed"),
+        }
+    }
+
+    pub async fn add_iroh_peer(self: &Arc<Self>, code: String) -> Result<()> {
+        let (node_id, expected) = parse_friend_code(&code)?;
+        let peer_id = self.dial_iroh_peer(node_id, expected).await?;
+        {
+            let mut peers = self.peers.lock().unwrap();
+            let node_id = node_id.to_string();
+            peers.seen.remove(&node_id);
+            peers.added.insert(node_id, Some(peer_id.to_string()));
+            self.write_peers(&peers);
+        }
+        let _ = self.events.send(RepoEvent::PeersChanged);
+        Ok(())
+    }
+
+    /// Dials `node_id` and returns the subduction identity that answered. When
+    /// the friend code named one, a different answer is an error — the code
+    /// says who should be at that address.
+    async fn dial_iroh_peer(
+        self: &Arc<Self>,
+        node_id: iroh::EndpointId,
+        expected: Option<PeerId>,
+    ) -> Result<PeerId> {
         let ep = self
             .iroh_endpoint
             .as_ref()
             .ok_or_else(|| anyhow!("iroh endpoint not running"))?;
-        let node_id: iroh::EndpointId = node_id_str
-            .parse()
-            .map_err(|e| anyhow!("invalid iroh node id: {e}"))?;
+        if node_id == ep.id() {
+            return Err(anyhow!("that's this device's own node id"));
+        }
         let addr = iroh::EndpointAddr::from(node_id);
-        let audience = Audience::discover(node_id_str.as_bytes());
-        let result = subduction_iroh::client::connect(ep, addr, &self.signer, audience).await?;
+        let audience = expected.map_or_else(|| iroh_audience(&node_id), Audience::known);
+        let result = subduction_iroh::client::connect(ep, addr, &self.signer, audience)
+            .await
+            .map_err(|e| match e {
+                subduction_iroh::error::ConnectError::Handshake(_) => anyhow!(
+                    "{node_id} refused the handshake — the friend code may name the wrong peer or be out of date"
+                ),
+                e => anyhow!(e),
+            })?;
         let node = self.core.clone();
         tokio::spawn(result.listener_task);
         tokio::spawn(result.sender_task);
-        let mapped = result
-            .authenticated
-            .map(|c| MessageTransport::new(WsTransport::Iroh(c)));
+        let mut quic = None;
+        let mapped = result.authenticated.map(|c| {
+            quic = Some(c.clone());
+            MessageTransport::new(WsTransport::Iroh(c))
+        });
         let peer = mapped.peer_id();
+        if let Some(expected) = expected {
+            if peer != expected {
+                if let Some(quic) = quic {
+                    quic.close();
+                }
+                return Err(anyhow!(
+                    "{node_id} answered as {peer}, not {expected} as the friend code says"
+                ));
+            }
+        }
         node.add_connection(mapped)
             .await
             .map_err(|e| anyhow!("add_connection failed: {e}"))?;
         self.ephemeral.subscribe_peer(peer).await;
-        tracing::info!(peer = %node_id_str, "iroh: dialed peer");
-        Ok(())
+        tracing::info!(node_id = %node_id, peer = %peer, "iroh: dialed peer");
+        Ok(peer)
     }
 
     /// Raw stored blobs for a doc, each a loadable automerge chunk. Serves the
@@ -1183,6 +1348,7 @@ impl Repo {
         let outbox_dir = data_dir.join("outbox");
         std::fs::create_dir_all(&outbox_dir).context("creating outbox dir")?;
         let iroh_key = load_or_create_iroh_key(&data_dir.join("iroh.key"))?;
+        let peers_path = data_dir.join("iroh-peers.json");
         let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
         let storage =
             FsStorage::new(data_dir.join("sedimentree")).context("opening sedimentree storage")?;
@@ -1318,6 +1484,8 @@ impl Repo {
             send_changes: AtomicBool::new(true),
             local_port,
             iroh_endpoint,
+            peers: std::sync::Mutex::new(load_peers(&peers_path)),
+            peers_path,
         });
 
         tracing::info!(
@@ -1374,16 +1542,26 @@ impl Repo {
         }
 
         if let Some(iroh_ep) = repo.iroh_endpoint.clone() {
-            let node = repo.core.clone();
-            let signer = repo.signer.clone();
-            let peer_id = PeerId::from(repo.signer.verifying_key());
-            tokio::spawn(accept_iroh_peer(
-                iroh_ep,
-                node,
-                signer,
-                peer_id,
-                repo.ephemeral.clone(),
-            ));
+            tokio::spawn(accept_iroh_peer(iroh_ep, repo.clone()));
+            let dialer = repo.clone();
+            tokio::spawn(async move {
+                for peer in dialer.iroh_peers() {
+                    if !peer.added {
+                        continue;
+                    }
+                    let code = match &peer.peer_id {
+                        Some(peer_id) => format!("{}:{peer_id}", peer.node_id),
+                        None => peer.node_id.clone(),
+                    };
+                    let dial = async {
+                        let (node_id, expected) = parse_friend_code(&code)?;
+                        dialer.dial_iroh_peer(node_id, expected).await
+                    };
+                    if let Err(e) = dial.await {
+                        tracing::warn!(peer = %peer.node_id, error = %e, "iroh: dialing saved peer failed");
+                    }
+                }
+            });
         }
 
         {
@@ -2278,6 +2456,82 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn friend_codes_carry_both_public_keys() {
+        let node = "5b47d9301f15173c1b34348ae976282d0274ac413f364595bcfab257b86d2f99";
+        let peer = "1".repeat(64);
+        let (parsed_node, parsed_peer) = parse_friend_code(&format!(" {node}:{peer}\n")).unwrap();
+        assert_eq!(parsed_node.to_string(), node);
+        assert_eq!(parsed_peer.unwrap().to_string(), peer);
+
+        assert_eq!(parse_friend_code(node).unwrap().1, None);
+        assert!(parse_friend_code(&format!("{node}:beep")).is_err());
+        assert!(parse_friend_code("beep").is_err());
+    }
+
+    /// Dialing by node id goes through iroh discovery, so the endpoint being
+    /// dialed has to have published its address before the test can find it.
+    async fn wait_until_dialable(repo: &Repo) {
+        timeout(
+            Duration::from_secs(20),
+            repo.iroh_endpoint.as_ref().unwrap().online(),
+        )
+        .await
+        .expect("iroh endpoint should come online");
+    }
+
+    /// Needs the network: dialing by node id goes through iroh discovery.
+    #[tokio::test]
+    #[ignore]
+    async fn iroh_peers_handshake_and_remember_each_other() {
+        let (_dir_a, a) = test_repo().await;
+        let (_dir_b, b) = test_repo().await;
+        wait_until_dialable(&a).await;
+        wait_until_dialable(&b).await;
+
+        a.add_iroh_peer(b.iroh_friend_code().unwrap()).await.unwrap();
+        assert_eq!(
+            a.iroh_peers()
+                .into_iter()
+                .map(|peer| (format!("{}:{}", peer.node_id, peer.peer_id.unwrap()), peer.added))
+                .collect::<Vec<_>>(),
+            vec![(b.iroh_friend_code().unwrap(), true)]
+        );
+
+        let a_code = a.iroh_friend_code().unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let seen: Vec<_> = b
+                    .iroh_peers()
+                    .into_iter()
+                    .filter(|peer| !peer.added)
+                    .filter_map(|peer| Some(format!("{}:{}", peer.node_id, peer.peer_id?)))
+                    .collect();
+                if seen == vec![a_code.clone()] {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("b should see a's full friend code as a suggestion");
+    }
+
+    /// The friend code names who should answer; anyone else is refused.
+    #[tokio::test]
+    #[ignore]
+    async fn dialing_refuses_a_peer_id_the_code_did_not_name() {
+        let (_dir_a, a) = test_repo().await;
+        let (_dir_b, b) = test_repo().await;
+        wait_until_dialable(&a).await;
+        wait_until_dialable(&b).await;
+        let wrong = format!("{}:{}", b.iroh_node_id().unwrap(), "2".repeat(64));
+
+        let error = a.add_iroh_peer(wrong).await.unwrap_err().to_string();
+        assert!(error.contains("refused the handshake"), "{error}");
+        assert!(a.iroh_peers().is_empty());
     }
 
     #[test]

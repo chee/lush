@@ -16,6 +16,7 @@ struct AgendaItem: Identifiable, Equatable {
     var listName: String
     var color: Color
     var location: String?
+    var colorHex: String?
     var isCompleted = false
 
     var timeText: String? {
@@ -43,6 +44,7 @@ extension AgendaItem {
         isAllDay = event.isAllDay
         listName = event.calendar?.title ?? ""
         color = Agenda.color(event.calendar)
+        colorHex = Agenda.hex(event.calendar)
         location = event.location?.trimmingCharacters(in: .whitespacesAndNewlines).presence
     }
 
@@ -58,6 +60,7 @@ extension AgendaItem {
         isAllDay = due.hour == nil
         listName = reminder.calendar?.title ?? ""
         color = Agenda.color(reminder.calendar)
+        colorHex = Agenda.hex(reminder.calendar)
         location = nil
         isCompleted = reminder.isCompleted
     }
@@ -76,6 +79,50 @@ enum Agenda {
     static func color(_ calendar: EKCalendar?) -> Color {
         guard let cgColor = calendar?.cgColor else { return .secondary }
         return Color(cgColor: cgColor)
+    }
+
+    static let dayFormat: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    /// `lush://calendar?date=2026-08-10&event=<id>` — the day to scroll to and
+    /// the item to pick out once it is on screen.
+    static func url(day: Date?, item: String?) -> URL? {
+        var components = URLComponents()
+        components.scheme = "lush"
+        components.host = "calendar"
+        var query: [URLQueryItem] = []
+        if let day { query.append(URLQueryItem(name: "date", value: dayFormat.string(from: day))) }
+        if let item { query.append(URLQueryItem(name: "event", value: item)) }
+        components.queryItems = query.isEmpty ? nil : query
+        return components.url
+    }
+
+    static func hex(_ calendar: EKCalendar?) -> String? {
+        guard let sRGB = CGColorSpace(name: CGColorSpace.sRGB),
+              let converted = calendar?.cgColor?.converted(to: sRGB, intent: .defaultIntent, options: nil),
+              let parts = converted.components, parts.count >= 3
+        else { return nil }
+        return String(
+            format: "#%02X%02X%02X",
+            Int((parts[0] * 255).rounded()),
+            Int((parts[1] * 255).rounded()),
+            Int((parts[2] * 255).rounded())
+        )
+    }
+
+    static func color(hex: String) -> Color? {
+        var value = hex
+        if value.hasPrefix("#") { value.removeFirst() }
+        guard value.count == 6, let packed = Int(value, radix: 16) else { return nil }
+        return Color(
+            red: Double((packed >> 16) & 0xFF) / 255,
+            green: Double((packed >> 8) & 0xFF) / 255,
+            blue: Double(packed & 0xFF) / 255
+        )
     }
 
     /// Every day in the window gets a section, empty or not, and an item that
@@ -138,6 +185,10 @@ final class AgendaStore {
     static let shared = AgendaStore()
 
     private(set) var items: [AgendaItem] = []
+    /// Set by a link into the Calendar view: the day to scroll to, and the
+    /// item to pick out when it gets there.
+    var focusDay: Date?
+    var focusItem: String?
     private(set) var access = EKEventStore.authorizationStatus(for: .event)
     private(set) var reminderAccess = EKEventStore.authorizationStatus(for: .reminder)
 
@@ -229,6 +280,14 @@ enum CalendarLinks {
 
     static var noteUrls: [String] { Array(map.keys) }
 
+    static var noteUrlByItem: [String: String] {
+        var result: [String: String] = [:]
+        for (note, items) in map {
+            for item in items where result[item] == nil { result[item] = note }
+        }
+        return result
+    }
+
     static func notes(for itemId: String) -> [String] {
         map.compactMap { $0.value.contains(itemId) ? $0.key : nil }
     }
@@ -265,7 +324,30 @@ extension BlockValue {
         if item.isAllDay { attrs["allDay"] = .bool(true) }
         if !item.listName.isEmpty { attrs["calendar"] = .string(item.listName) }
         if let location = item.location { attrs["location"] = .string(location) }
+        if let hex = item.colorHex { attrs["color"] = .string(hex) }
         return BlockValue(type: "calendar-event", attrs: attrs, isEmbed: true)
+    }
+
+    var calendarEventColor: Color {
+        attrs["color"]?.stringValue.flatMap(Agenda.color(hex:)) ?? .accentColor
+    }
+
+    var calendarEventDay: Date? {
+        calendarEventStart.map { Calendar.current.startOfDay(for: $0) }
+    }
+
+    /// Opens the item in Calendar.app — the specific event when its identifier
+    /// survived, otherwise the day it sits on.
+    var calendarAppURL: URL? {
+        guard let start = calendarEventStart else { return nil }
+        #if os(macOS)
+        if attrs["kind"]?.stringValue != AgendaItem.Kind.reminder.rawValue,
+           let identifier = attrs["event"]?.stringValue?.split(separator: "|").first,
+           let escaped = String(identifier).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+            return URL(string: "ical://ekevent/\(escaped)?method=show&options=more")
+        }
+        #endif
+        return URL(string: "calshow:\(Int(start.timeIntervalSinceReferenceDate))")
     }
 
     var calendarEventTitle: String? {
@@ -298,6 +380,85 @@ extension BlockValue {
         if let calendar = attrs["calendar"]?.stringValue { parts.append(calendar) }
         parts.append(attrs["kind"]?.stringValue == AgendaItem.Kind.reminder.rawValue ? "reminder" : "calendar event")
         return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+}
+
+struct CalendarEventInlineView: View {
+    let block: BlockValue
+
+    private var isReminder: Bool {
+        block.attrs["kind"]?.stringValue == AgendaItem.Kind.reminder.rawValue
+    }
+
+    private var whenText: String {
+        guard let start = block.calendarEventStart else { return "" }
+        let day = start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+        if block.attrs["allDay"]?.boolValue == true { return "\(day) · all day" }
+        let from = start.formatted(date: .omitted, time: .shortened)
+        guard let end = block.calendarEventEnd, end > start else { return "\(day) · \(from)" }
+        return "\(day) · \(from) – \(end.formatted(date: .omitted, time: .shortened))"
+    }
+
+    var body: some View {
+        let tint = block.calendarEventColor
+        return HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(block.calendarEventTitle ?? "Calendar Item")
+                    .font(.system(size: max(11, RichText.bodySize - 1), weight: .semibold))
+                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Image(systemName: isReminder ? "checklist" : "clock")
+                    Text(whenText)
+                    if let location = block.attrs["location"]?.stringValue {
+                        Image(systemName: "mappin.and.ellipse")
+                            .padding(.leading, 4)
+                        Text(location).lineLimit(1)
+                    }
+                    if let calendar = block.attrs["calendar"]?.stringValue {
+                        Text("· \(calendar)").lineLimit(1)
+                    }
+                }
+                .font(.system(size: max(10, RichText.bodySize - 3)))
+                .opacity(0.75)
+            }
+            Spacer(minLength: 8)
+            if block.calendarAppURL != nil {
+                Image(systemName: "arrow.up.forward")
+                    .font(.system(size: max(13, RichText.bodySize - 1), weight: .semibold))
+                    .frame(width: 32, height: 32)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(tint.opacity(0.45))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .strokeBorder(tint.opacity(0.6), lineWidth: 1)
+                    )
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .foregroundStyle(tint.mix(with: .primary, by: 0.65))
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(tint.opacity(0.28))
+        )
+    }
+
+    /// The trailing zone of the drawn box, where the Calendar.app glyph sits.
+    static let buttonZone: CGFloat = 48
+}
+
+extension AgendaItem {
+    var calendarAppURL: URL? {
+        #if os(macOS)
+        if kind == .event,
+           let identifier = id.split(separator: "|").first,
+           let escaped = String(identifier).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+            return URL(string: "ical://ekevent/\(escaped)?method=show&options=more")
+        }
+        #endif
+        return URL(string: "calshow:\(Int(start.timeIntervalSinceReferenceDate))")
     }
 }
 

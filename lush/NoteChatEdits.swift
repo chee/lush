@@ -20,6 +20,11 @@ enum NoteChatOp: Codable, Equatable {
     case setType(block: Int, style: String)
     case mark(block: Int, text: String, mark: String, value: String?)
     case insertTable(after: Int, header: Bool, rows: [[String]])
+    case insertColumns(after: Int, columns: [String])
+    case insertEmbed(after: Int, url: String)
+    case moveBlock(block: Int, after: Int)
+    case setCodeLanguage(block: Int, language: String)
+    case setIndent(block: Int, level: Int)
 
     var summary: String {
         switch self {
@@ -37,10 +42,23 @@ enum NoteChatOp: Codable, Equatable {
             "mark \(NoteChatEdits.short(text)) in block \(block) as \(value.map { "\(mark) \($0)" } ?? mark)"
         case .insertTable(let after, _, let rows):
             "insert a \(rows.count)×\(rows.map(\.count).max() ?? 0) table after block \(after)"
+        case .insertColumns(let after, let columns):
+            "insert \(columns.count) columns after block \(after)"
+        case .insertEmbed(let after, let url):
+            "embed \(NoteChatEdits.short(url, limit: 40)) after block \(after)"
+        case .moveBlock(let block, let after):
+            "move block \(block) after block \(after)"
+        case .setCodeLanguage(let block, let language):
+            "set block \(block) to \(language)"
+        case .setIndent(let block, let level):
+            "indent block \(block) to level \(level)"
         }
     }
 
     static func list(from value: Any?) -> [NoteChatOp] {
+        if let one = value as? [String: Any] {
+            return [NoteChatOp(json: one)].compactMap { $0 }
+        }
         guard let raw = value as? [[String: Any]] else { return [] }
         return raw.compactMap(NoteChatOp.init(json:))
     }
@@ -64,13 +82,35 @@ enum NoteChatOp: Codable, Equatable {
             guard let text = json["text"] as? String, let mark = json["mark"] as? String else { return nil }
             self = .mark(block: block, text: text, mark: mark, value: json["value"] as? String)
         case "insert_table":
-            let after = (json["after"] as? Int) ?? (json["after"] as? NSNumber)?.intValue ?? block
             let rows = (json["rows"] as? [[Any]])?.map { $0.map { "\($0)" } } ?? []
             guard !rows.isEmpty else { return nil }
-            self = .insertTable(after: after, header: json["header"] as? Bool ?? true, rows: rows)
+            self = .insertTable(
+                after: NoteChatOp.number(json["after"]) ?? block,
+                header: json["header"] as? Bool ?? true,
+                rows: rows
+            )
+        case "insert_columns":
+            let columns = (json["columns"] as? [Any])?.map { "\($0)" } ?? []
+            guard columns.count > 1 else { return nil }
+            self = .insertColumns(after: NoteChatOp.number(json["after"]) ?? block, columns: columns)
+        case "insert_embed":
+            guard let url = json["url"] as? String, !url.isEmpty else { return nil }
+            self = .insertEmbed(after: NoteChatOp.number(json["after"]) ?? block, url: url)
+        case "move_block":
+            guard let after = NoteChatOp.number(json["after"]) else { return nil }
+            self = .moveBlock(block: block, after: after)
+        case "set_code_language":
+            guard let language = json["language"] as? String, !language.isEmpty else { return nil }
+            self = .setCodeLanguage(block: block, language: language)
+        case "set_indent":
+            self = .setIndent(block: block, level: NoteChatOp.number(json["level"]) ?? 0)
         default:
             return nil
         }
+    }
+
+    private static func number(_ value: Any?) -> Int? {
+        (value as? Int) ?? (value as? NSNumber)?.intValue
     }
 }
 
@@ -206,6 +246,45 @@ enum NoteChatEdits {
                     hasHeader: header
                 )
                 edits.append((entry.end, 0, RichText.tableSpans(grid), order))
+            case .insertColumns(let number, let columns):
+                guard let entry = block(number) else { continue }
+                let spans = RichText.columnsSpans(columns.map { RichTextClipboard.spans(fromMarkdown: $0) })
+                edits.append((entry.end, 0, spans, order))
+            case .insertEmbed(let number, let url):
+                guard let entry = block(number) else { continue }
+                edits.append((entry.end, 0, [.block(.embed(url: url))], order))
+            case .moveBlock(let number, let target):
+                guard let entry = block(number), let destination = block(target) else { continue }
+                guard !(destination.start >= entry.start && destination.start < entry.end) else {
+                    failures.append("block \(target) is inside block \(number)")
+                    continue
+                }
+                // already there: removing and reinserting at the same index
+                // would race with itself
+                guard destination.end != entry.start else { continue }
+                let moving = Array(spans[entry.start..<entry.end]).map { span -> SpanNode in
+                    guard case .block(var moved) = span else { return span }
+                    moved.parents = destination.block.parents
+                        + moved.parents.dropFirst(entry.block.parents.count)
+                    return .block(moved)
+                }
+                edits.append((entry.start, entry.end - entry.start, [], order))
+                edits.append((destination.end, 0, moving, order))
+            case .setCodeLanguage(let number, let language):
+                guard let entry = block(number) else { continue }
+                var retyped = entry.block
+                retyped.type = "code-block"
+                retyped.attrs["language"] = .string(language)
+                edits.append((entry.start, 1, [.block(retyped)], order))
+            case .setIndent(let number, let level):
+                guard let entry = block(number) else { continue }
+                var indented = entry.block
+                if level <= 0 {
+                    indented.attrs.removeValue(forKey: "indent")
+                } else {
+                    indented.attrs["indent"] = .int(Int64(min(level, 8)))
+                }
+                edits.append((entry.start, 1, [.block(indented)], order))
             }
         }
 

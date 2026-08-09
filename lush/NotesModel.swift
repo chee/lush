@@ -90,6 +90,11 @@ final class NotesModel {
     var folderUrl: String?
     var folderTitle: String = ""
     var connected = false
+    var irohPeers: [IrohPeer] = []
+
+    func refreshPeers() {
+        irohPeers = core?.irohPeers() ?? []
+    }
     var selectedNoteUrl: String? {
         didSet {
             UserDefaults.standard.set(selectedNoteUrl, forKey: Self.lastOpenNoteKey)
@@ -218,10 +223,17 @@ final class NotesModel {
     private static let folderContentWidgetKind = "FolderContentWidget"
 
     private(set) var accountUrl: String? = LushShared.accountUrl
+    private(set) var accountUrls: [String] = LushShared.accountUrls
+    private(set) var accountNames: [String: String] = LushShared.accountNames
     private(set) var accountConfigUrl: String?
+    private(set) var accountModuleSettingsUrl: String? = PatchworkWeb.accountModuleUrl
+    private(set) var packageListUrls: [String] = PatchworkWeb.moduleUrls
     private(set) var inboxUrl: String?
     private(set) var contactName: String?
     private(set) var contactAvatarData: Data?
+    var smartNotebooks: [SmartNotebook] = SmartNotebookStore.load()
+    var smartHits: [String: [SearchHit]] = [:]
+    @ObservationIgnored var smartHitTasks: [String: Task<Void, Never>] = [:]
 
     var loggedIn: Bool { accountUrl != nil }
 
@@ -229,7 +241,9 @@ final class NotesModel {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("automerge:") { return trimmed }
         if trimmed.hasPrefix("account:") {
-            return "automerge:" + String(trimmed.dropFirst("account:".count))
+            let rest = trimmed.dropFirst("account:".count)
+            guard let id = rest.split(separator: "/").last, !id.isEmpty else { return nil }
+            return "automerge:" + id
         }
         return nil
     }
@@ -241,13 +255,34 @@ final class NotesModel {
             return false
         }
         status = "Logging in…"
+        // Folders and the scratchpad made before logging in belong to her, not
+        // to this install: they're folded into the account she signs into.
+        let localFolders = loggedIn ? [] : rootFolderUrls
+        let localScratchpad = loggedIn ? nil : quickNoteUrl
         do {
-            let state = try await Task.detached {
+            var state = try await Task.detached {
                 try core.loginAccount(accountUrl: normalized)
             }.value
+            if !localFolders.isEmpty || localScratchpad != nil {
+                let account = state.accountUrl
+                let merged = await Task.detached { () -> [String]? in
+                    try? core.adoptLocalDocs(
+                        accountUrl: account,
+                        folderUrls: localFolders,
+                        scratchpadUrl: localScratchpad
+                    )
+                }.value
+                if let merged { state.folders = merged }
+            }
+            if accountUrl != state.accountUrl { clearAccountState() }
             accountUrl = state.accountUrl
             LushShared.accountUrl = state.accountUrl
+            if !accountUrls.contains(state.accountUrl) {
+                accountUrls.append(state.accountUrl)
+                LushShared.accountUrls = accountUrls
+            }
             await applyAccount(state)
+            if let localScratchpad { setQuickNote(localScratchpad) }
             status = ""
             appendSyncEvent("Logged in: \(state.accountUrl)")
             return true
@@ -258,20 +293,54 @@ final class NotesModel {
     }
 
     func logOut() {
+        clearAccountState()
         accountUrl = nil
+        LushShared.accountUrl = nil
+        appendSyncEvent("Logged out")
+    }
+
+    /// Forget an account entirely. Logs out first when it's the active one.
+    func forgetAccount(_ url: String) {
+        if accountUrl == url { logOut() }
+        accountUrls.removeAll { $0 == url }
+        LushShared.accountUrls = accountUrls
+        accountNames.removeValue(forKey: url)
+        LushShared.accountNames = accountNames
+    }
+
+    func accountName(_ url: String) -> String? {
+        url == accountUrl ? (contactName ?? accountNames[url]) : accountNames[url]
+    }
+
+    /// Everything derived from the account: its config and what the config
+    /// carries. Cleared before another account's state lands so one account's
+    /// notebooks and packages can never be pushed into another's config.
+    private func clearAccountState() {
         accountConfigUrl = nil
+        accountModuleSettingsUrl = nil
+        PatchworkWeb.accountModuleUrl = nil
         inboxUrl = nil
         contactName = nil
         contactAvatarData = nil
         presenceContactUrl = nil
         presence.leave()
-        LushShared.accountUrl = nil
-        appendSyncEvent("Logged out")
+        smartNotebooks = []
+        SmartNotebookStore.save([])
+        applyPackageLists([])
+        setQuickNote(nil)
+        rootFolderUrls = []
+        persistRoots()
+        folderUrl = nil
+        refreshNotes()
     }
 
     private func applyAccount(_ state: AccountState) async {
         accountConfigUrl = state.configUrl
         inboxUrl = state.inbox
+        accountModuleSettingsUrl = state.moduleSettingsUrl
+        PatchworkWeb.accountModuleUrl = state.moduleSettingsUrl
+        loadSmartNotebooks()
+        loadPackageLists()
         if !state.folders.isEmpty, state.folders != rootFolderUrls {
             rootFolderUrls = state.folders
             persistRoots()
@@ -286,6 +355,10 @@ final class NotesModel {
         presenceContactUrl = contactUrl
         let info = await Task.detached { core.contactInfo(url: contactUrl) }.value
         contactName = info?.name
+        if let name = info?.name, !name.isEmpty {
+            accountNames[state.accountUrl] = name
+            LushShared.accountNames = accountNames
+        }
         if let avatarUrl = info?.avatarUrl {
             contactAvatarData = await assetBytes(avatarUrl)
         }
@@ -296,6 +369,37 @@ final class NotesModel {
         guard let core, let configUrl = accountConfigUrl else { return }
         let urls = rootFolderUrls
         Task.detached { try? core.setConfigFolders(configUrl: configUrl, urls: urls) }
+    }
+
+    /// The extra package lists live in the synced config when logged in; the
+    /// local mirror in PatchworkWeb is what the embeds actually read.
+    func loadPackageLists() {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        Task { @MainActor in
+            let state = await Task.detached { core.configState(configUrl: configUrl) }.value
+            guard let state else { return }
+            if state.packages.isEmpty, !self.packageListUrls.isEmpty {
+                self.syncConfigPackages()
+            } else if state.packages != self.packageListUrls {
+                self.applyPackageLists(state.packages)
+            }
+        }
+    }
+
+    func setPackageLists(_ urls: [String]) {
+        applyPackageLists(urls)
+        syncConfigPackages()
+    }
+
+    private func applyPackageLists(_ urls: [String]) {
+        packageListUrls = urls
+        PatchworkWeb.setModuleUrls(urls)
+    }
+
+    private func syncConfigPackages() {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let urls = packageListUrls
+        Task.detached { try? core.setConfigPackages(configUrl: configUrl, urls: urls) }
     }
 
     func setInbox(_ url: String) {
@@ -558,6 +662,20 @@ final class NotesModel {
         }
     }
 
+    /// Top-level notebooks have no parent folder to hold their name, so their
+    /// title is written into the folder doc itself.
+    func renameNode(_ node: FolderNode, to name: String) {
+        if let parent = node.parentUrl {
+            renameEntry(parentUrl: parent, url: node.url, to: name)
+            return
+        }
+        guard let core else { return }
+        Task.detached { [core, weak self, node, name] in
+            try? core.renameNote(url: node.url, title: name)
+            await MainActor.run { [weak self] in self?.refreshNotes() }
+        }
+    }
+
     func renameEntry(parentUrl: String?, url: String, to name: String) {
         guard let core, let parent = parentUrl ?? folderUrl else { return }
         Task.detached { [core, weak self, parent, url, name] in
@@ -709,6 +827,28 @@ final class NotesModel {
         }
     }
 
+    /// A fresh folder doc pinned to the sidebar as its own top-level notebook.
+    @discardableResult
+    func createNotebook(named name: String = "New Notebook") async -> String? {
+        guard let core else { return nil }
+        do {
+            let url = try await Task.detached { [core, name] in
+                let url = try core.ensureFolder(existingUrl: nil)
+                try core.renameNote(url: url, title: name)
+                return url
+            }.value
+            rootFolderUrls.append(url)
+            persistRoots()
+            syncConfigFolders()
+            folderUrl = url
+            refreshNotes()
+            return url
+        } catch {
+            status = "Couldn't create notebook: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
     func addRootFolder(_ url: String) async {
         guard let core else { return }
         guard !rootFolderUrls.contains(url) else { return }
@@ -828,6 +968,21 @@ final class NotesModel {
                 self.writeWidgetSnapshot()
             }
         }
+    }
+
+    func reindexAll() {
+        guard let core else { return }
+        Task { [spotlightIndex] in
+            let urls = await Task.detached { core.noteEmbeddingDigests().keys }.value
+            for url in urls {
+                await Task.detached { core.removeNoteEmbeddings(url: url) }.value
+            }
+            await spotlightIndex.reset()
+        }
+        spotlightBackfilled.removeAll()
+        let richNotes = notes.filter { $0.kind == "rich" }
+        backfillSemanticIndex(for: richNotes)
+        backfillSpotlightIndex(for: richNotes)
     }
 
     func forceSync() {
@@ -990,11 +1145,24 @@ final class NotesModel {
         return folders
     }
 
-    func clearStorage() {
+    /// The two seeds and the peer list are this device's identity: erase them
+    /// and every friend code you handed out points at a stranger.
+    static let identityFiles = ["identity.seed", "iroh.key", "iroh-peers.json"]
+
+    func clearStorage(keepingIdentity: Bool = false) {
         let dataDir = LushShared.coreDataDirectory()
         do {
-            try FileManager.default.removeItem(at: dataDir)
-            appendSyncEvent("Cleared local storage — quitting")
+            if keepingIdentity {
+                let kept = Set(Self.identityFiles)
+                for name in try FileManager.default.contentsOfDirectory(atPath: dataDir.path)
+                where !kept.contains(name) {
+                    try FileManager.default.removeItem(at: dataDir.appendingPathComponent(name))
+                }
+                appendSyncEvent("Cleared local storage, kept this device's identity — quitting")
+            } else {
+                try FileManager.default.removeItem(at: dataDir)
+                appendSyncEvent("Cleared local storage — quitting")
+            }
         } catch {
             appendSyncEvent("Clear failed: \(error.localizedDescription)")
             return
@@ -1078,6 +1246,13 @@ final class NotesModel {
                 let state = await Task.detached { core.configState(configUrl: configUrl) }.value
                 guard let self, let state else { return }
                 self.inboxUrl = state.inbox
+                if state.smart != self.smartNotebooks {
+                    self.smartNotebooks = state.smart
+                    SmartNotebookStore.save(state.smart)
+                }
+                if state.packages != self.packageListUrls {
+                    self.applyPackageLists(state.packages)
+                }
                 if !state.folders.isEmpty, state.folders != self.rootFolderUrls {
                     self.rootFolderUrls = state.folders
                     self.persistRoots()
@@ -1879,10 +2054,13 @@ final class NotesModel {
         return await task.value
     }
 
+    /// A quoted phrase means the user wants that text and nothing like it, so
+    /// the semantic pass sits out.
     func search(_ query: String) async -> [SearchHit] {
         guard let core, !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
         let exact = await Task.detached { core.searchNotes(query: query) }.value
         if Task.isCancelled { return [] }
+        if query.contains("\"") { return exact }
         let seen = Set(exact.map(\.url))
         return await exact + semanticSearch.search(query, excluding: seen)
     }
@@ -2432,6 +2610,17 @@ final class NotesModel {
         UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
     }
 
+    func reorderPin(_ url: String, adjacentTo targetUrl: String) {
+        guard url != targetUrl,
+              let source = pinnedUrls.firstIndex(of: url),
+              let target = pinnedUrls.firstIndex(of: targetUrl)
+        else { return }
+        pinnedUrls.remove(at: source)
+        let adjusted = pinnedUrls.firstIndex(of: targetUrl) ?? target
+        pinnedUrls.insert(url, at: source < target ? min(adjusted + 1, pinnedUrls.count) : adjusted)
+        UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+    }
+
     var pinnedNodes: [FolderNode] {
         pinnedUrls.compactMap { node(for: $0) }
     }
@@ -2819,6 +3008,12 @@ private final class DelegateBridge: CoreDelegate {
     func onEphemeralMessage(url: String, payload: Data) {
         Task { @MainActor [model] in
             model?.ephemeralMessageReceived(url: url, payload: payload)
+        }
+    }
+
+    func onPeersChanged() {
+        Task { @MainActor [model] in
+            model?.refreshPeers()
         }
     }
 }

@@ -151,6 +151,8 @@ struct FontChooser: View {
     @State private var family: String
     @State private var adjustment: FontAdjustment
     @State private var search = ""
+    @State private var browsing = false
+    @State private var showSpecimen = true
 
     init(role: String, label: String) {
         self.role = role
@@ -175,51 +177,27 @@ struct FontChooser: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    preview
-                }
-                Section("Size") {
-                    HStack {
-                        Slider(value: $adjustment.scale, in: 0.7...1.4, step: 0.01)
-                        Text(scalePercent)
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Button("Reset") { adjustment.scale = 1 }
-                            .disabled(adjustment.scale == 1)
-                    }
-                }
-                Section("Weights") {
-                    weightPicker("Normal", selection: $adjustment.regularWeight)
-                    weightPicker("Bold", selection: $adjustment.boldWeight)
-                    Text("Automatic uses the family's own regular and bold faces. A variable family can take any weight; others snap to the nearest face.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Section("Specimen") {
-                    FontSpecimen(
-                        overrideRole: role,
-                        overrideFamily: family,
-                        overrideAdjustment: adjustment
-                    )
-                }
-                Section("Family") {
-                    familyRow(EditorSettings.systemFontFamily)
-                    ForEach(families, id: \.self) { name in
-                        familyRow(name)
-                    }
+            HStack(alignment: .top, spacing: 0) {
+                settings
+                if showSpecimen {
+                    Divider()
+                    specimen
                 }
             }
-            .searchable(text: $search, prompt: "Filter families")
             .navigationTitle("\(label) Font")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+                ToolbarItem {
+                    Toggle(isOn: $showSpecimen) {
+                        Label("Specimen", systemImage: "text.alignleft")
+                    }
+                }
             }
         }
         #if os(macOS)
-        .frame(width: 520, height: 640)
+        .frame(width: showSpecimen ? 800 : 480, height: 560)
         #endif
         .onChange(of: family) {
             FontRole.setFamily(family, role: role)
@@ -228,6 +206,87 @@ struct FontChooser: View {
         .onChange(of: adjustment) {
             EditorSettings.setAdjustment(adjustment, family: family, role: role)
         }
+    }
+
+    private var settings: some View {
+        Form {
+            Section {
+                preview
+            }
+            Section("Family") {
+                familyField
+            }
+            Section("Size") {
+                HStack {
+                    Slider(value: $adjustment.scale, in: 0.7...1.4, step: 0.01)
+                    Text(scalePercent)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Button("Reset") { adjustment.scale = 1 }
+                        .disabled(adjustment.scale == 1)
+                }
+            }
+            Section("Weights") {
+                weightPicker("Normal", selection: $adjustment.regularWeight)
+                weightPicker("Bold", selection: $adjustment.boldWeight)
+                Text("Automatic uses the family's own regular and bold faces. A variable family can take any weight; others snap to the nearest face.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(minWidth: 360)
+    }
+
+    private var specimen: some View {
+        ScrollView {
+            FontSpecimen(
+                overrideRole: role,
+                overrideFamily: family,
+                overrideAdjustment: adjustment
+            )
+            .padding(16)
+        }
+        .frame(width: 300)
+    }
+
+    private var familyField: some View {
+        Button {
+            browsing = true
+        } label: {
+            HStack {
+                Text(FontRole.displayName(family))
+                    .font(font())
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down")
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $browsing) {
+            familyBrowser
+        }
+    }
+
+    private var familyBrowser: some View {
+        VStack(spacing: 0) {
+            TextField("Filter families", text: $search)
+                .textFieldStyle(.roundedBorder)
+                .padding(8)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    familyRow(EditorSettings.systemFontFamily)
+                    ForEach(families, id: \.self) { name in
+                        familyRow(name)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .frame(width: 300, height: 380)
     }
 
     private var preview: some View {
@@ -252,6 +311,7 @@ struct FontChooser: View {
     private func familyRow(_ name: String) -> some View {
         Button {
             family = name
+            browsing = false
         } label: {
             HStack {
                 Text(FontRole.displayName(name))
@@ -266,6 +326,9 @@ struct FontChooser: View {
                         .foregroundStyle(.tint)
                 }
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)

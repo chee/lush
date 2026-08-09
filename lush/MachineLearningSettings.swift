@@ -4,6 +4,7 @@ import SwiftUI
 /// then pick a provider, and only name a model when they want something other
 /// than that provider's default.
 struct MachineLearningSettingsPane: View {
+    @Environment(NotesModel.self) private var model
     @State private var selectedOperation: LocalModelOperation = .attachmentSummary
 
     var body: some View {
@@ -43,6 +44,12 @@ struct MachineLearningSettingsPane: View {
             #if os(macOS)
             AgentSettingsSection()
             #endif
+
+            Section {
+                Button("Regenerate Search Index") { model.reindexAll() }
+            } footer: {
+                Text("Clears all semantic embeddings and rebuilds the search index from scratch.")
+            }
         }
         .formStyle(.grouped)
         .navigationTitle("Machine Learning")
@@ -602,6 +609,12 @@ struct OpenRouterModelButton: View {
         Task {
             do {
                 models = try await OpenRouterModelCatalog.fetch()
+                for model in models {
+                    guard let contextLength = model.contextLength else { continue }
+                    ModelContextWindow.record(
+                        contextLength, for: ModelChoice(backend: .openRouter, model: model.id)
+                    )
+                }
             } catch {
                 catalogError = error.localizedDescription
             }

@@ -289,4 +289,6 @@ private final class DelegateBridge: CoreDelegate {
     }
 
     func onEphemeralMessage(url: String, payload: Data) {}
+
+    func onPeersChanged() {}
 }

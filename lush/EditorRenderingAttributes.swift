@@ -15,25 +15,22 @@ final class EditorRenderingAttributes {
     var focusDimEnabled = false
     var focusParagraph: NSRange?
 
-    static var matchColor: PColor {
+    /// The accent is a dynamic colour; asking it for an alpha variant without
+    /// first resolving it into a real colour space can paint nothing at all.
+    static func tint(_ alpha: CGFloat) -> PColor {
         #if os(macOS)
-        PColor.findHighlightColor.withAlphaComponent(0.4)
+        let resolved = PColor.pTint.usingColorSpace(.sRGB) ?? PColor.pTint
         #else
-        PColor.systemYellow.withAlphaComponent(0.4)
+        let resolved = PColor.pTint
         #endif
+        return resolved.withAlphaComponent(alpha)
     }
 
-    static var currentMatchColor: PColor {
-        #if os(macOS)
-        PColor.findHighlightColor
-        #else
-        PColor.systemYellow
-        #endif
-    }
+    static var matchColor: PColor { tint(0.3) }
 
-    static var globalMatchColor: PColor {
-        PColor.pTint.withAlphaComponent(0.18)
-    }
+    static var currentMatchColor: PColor { tint(0.65) }
+
+    static var globalMatchColor: PColor { tint(0.18) }
 
     var validator: (NSTextLayoutManager, NSTextLayoutFragment) -> Void {
         { [weak self] textLayoutManager, fragment in

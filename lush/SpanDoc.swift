@@ -567,7 +567,7 @@ enum EditorSettings {
     private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
     static let typewriterModeKey = "editorTypewriterMode"
-    static let maxNoteWidthKey = "editorMaxNoteWidth"
+    static let maxNoteCharactersKey = "editorMaxNoteCharacters"
     static let minimapKey = "editorMinimapVisible"
     static let zenModeKey = "editorZenMode"
 
@@ -684,15 +684,26 @@ enum EditorSettings {
         UserDefaults.standard.bool(forKey: typewriterModeKey)
     }
 
-    /// Widest a note's text may get before it stops growing and centres. Zero
-    /// fills the editor.
-    static var maxNoteWidth: Double {
-        UserDefaults.standard.double(forKey: maxNoteWidthKey)
+    /// How many characters wide a note's text may get before it stops growing
+    /// and centres. Zero fills the editor.
+    static var maxNoteCharacters: Int {
+        UserDefaults.standard.integer(forKey: maxNoteCharactersKey)
     }
 
-    static func setMaxNoteWidth(_ width: Double) {
-        UserDefaults.standard.set(width, forKey: maxNoteWidthKey)
+    static func setMaxNoteCharacters(_ characters: Int) {
+        UserDefaults.standard.set(characters, forKey: maxNoteCharactersKey)
         NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    /// The character measure in points, at the body font and size. Zero when
+    /// notes fill the editor.
+    static var maxNoteWidth: CGFloat {
+        let characters = maxNoteCharacters
+        guard characters > 0 else { return 0 }
+        let advance = ("0" as NSString)
+            .size(withAttributes: [.font: font(ofSize: bodySize)])
+            .width
+        return CGFloat(characters) * advance
     }
 
     static var minimapVisible: Bool {
@@ -1215,8 +1226,6 @@ enum RichText {
                 sawAnything = true
                 if b.type == "context" {
                     out.append(contextLine(for: b))
-                } else if b.type == "calendar-event" {
-                    out.append(calendarLine(for: b))
                 } else if b.isEmbedBlock {
                     out.append(embedAttachment(for: b, cache: cache))
                 }
@@ -1256,53 +1265,6 @@ enum RichText {
             line.append(NSAttributedString(string: "Logline", attributes: attrs))
         }
         return line
-    }
-
-    /// A note about a calendar item shows the item itself as a display line
-    /// that links back to the Calendar view.
-    static func calendarLine(for block: BlockValue) -> NSAttributedString {
-        var attrs = contextDisplayAttributes(for: block)
-        attrs[.font] = EditorSettings.font(ofSize: max(11, bodySize - 2))
-        if let url = URL(string: "lush://calendar") {
-            attrs[.link] = url
-            attrs[.foregroundColor] = PColor.pTint
-        }
-        let line = NSMutableAttributedString()
-        let symbol = block.attrs["kind"]?.stringValue == "reminder" ? "☑︎ " : "🗓 "
-        line.append(NSAttributedString(string: symbol, attributes: attrs))
-        var titleAttrs = attrs
-        titleAttrs[.font] = EditorSettings.styled(
-            EditorSettings.font(ofSize: max(11, bodySize - 2)),
-            bold: true,
-            italic: false
-        )
-        line.append(NSAttributedString(
-            string: block.calendarEventTitle ?? "Calendar Item",
-            attributes: titleAttrs
-        ))
-        for part in calendarLineParts(for: block) {
-            line.append(NSAttributedString(string: " · \(part)", attributes: attrs))
-        }
-        return line
-    }
-
-    private static func calendarLineParts(for block: BlockValue) -> [String] {
-        var parts: [String] = []
-        if let start = block.calendarEventStart {
-            parts.append(start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day()))
-            if block.attrs["allDay"]?.boolValue == true {
-                parts.append("all day")
-            } else {
-                var time = start.formatted(date: .omitted, time: .shortened)
-                if let end = block.calendarEventEnd, end > start {
-                    time += " – \(end.formatted(date: .omitted, time: .shortened))"
-                }
-                parts.append(time)
-            }
-        }
-        if let location = block.attrs["location"]?.stringValue { parts.append(location) }
-        if let calendar = block.attrs["calendar"]?.stringValue { parts.append(calendar) }
-        return parts
     }
 
     private static func contextLineParts(for block: BlockValue) -> [(text: String, isLocation: Bool)] {
@@ -1382,6 +1344,10 @@ enum RichText {
             attachment = liveBox(width: 460, height: 220)
         } else if block.type == "context" {
             attachment = liveBox(width: 460, height: 28)
+        } else if block.type == "calendar-event" {
+            let drawn = calendarEventImage(for: block)
+            let size = drawn?.size ?? CGSize(width: 420, height: 58)
+            attachment = imageBox(drawn, bounds: CGRect(origin: .zero, size: size), ideal: size)
         } else if let url, cache.patchworkDocs.contains(url) {
             attachment = liveBox(width: 460, height: 300)
         } else if let url, let image = cache.images[url] {
@@ -1418,6 +1384,33 @@ enum RichText {
             string.append(NSAttributedString(string: "  \(displayName)", attributes: nameAttrs))
         }
         return string
+    }
+
+    /// The calendar box is drawn rather than hosted: an image attachment is
+    /// the one embed the editor renders everywhere — including exports, the
+    /// dock tile, and history snapshots.
+    @MainActor
+    static func calendarEventImage(for block: BlockValue) -> PImage? {
+        let renderer = ImageRenderer(
+            content: CalendarEventInlineView(block: block)
+                .frame(width: 420)
+                .environment(\.colorScheme, currentColorScheme)
+        )
+        renderer.scale = 2
+        #if os(macOS)
+        return renderer.nsImage
+        #else
+        return renderer.uiImage
+        #endif
+    }
+
+    @MainActor
+    private static var currentColorScheme: ColorScheme {
+        #if os(macOS)
+        NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .dark : .light
+        #else
+        UITraitCollection.current.userInterfaceStyle == .dark ? .dark : .light
+        #endif
     }
 
     static func fitted(_ original: CGSize) -> CGSize {

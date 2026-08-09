@@ -17,8 +17,9 @@ final class AppRouter {
         case folder(String)
         case search(String)
         case createPatchwork(preferredType: String?, toolId: String?, folderUrl: String?)
+        case newSmartNotebook
         case share(String)
-        case calendar
+        case calendar(day: Date?, item: String?)
     }
 
     var pending: Action?
@@ -59,7 +60,12 @@ final class AppRouter {
             let folder = components?.queryItems?.first(where: { $0.name == "folder" })?.value
             pending = .createPatchwork(preferredType: type, toolId: toolId, folderUrl: folder)
         case "calendar":
-            pending = .calendar
+            let raw = components?.queryItems?.first(where: { $0.name == "date" })?.value
+            let day = raw.flatMap { Agenda.dayFormat.date(from: $0) ?? Agenda.iso.date(from: $0) }
+            pending = .calendar(
+                day: day,
+                item: components?.queryItems?.first(where: { $0.name == "event" })?.value
+            )
         case "share":
             if let id = components?.queryItems?.first(where: { $0.name == "id" })?.value {
                 pending = .share(id)

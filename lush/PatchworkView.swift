@@ -106,6 +106,7 @@ enum PatchworkWeb {
     }
 
     private static let moduleUrlsKey = "patchworkModuleUrls"
+    private static let accountModuleUrlKey = "patchworkAccountModuleUrl"
 
     static var moduleUrls: [String] {
         UserDefaults.standard.stringArray(forKey: moduleUrlsKey) ?? []
@@ -114,6 +115,13 @@ enum PatchworkWeb {
     @MainActor
     static func setModuleUrls(_ urls: [String]) {
         UserDefaults.standard.set(urls, forKey: moduleUrlsKey)
+    }
+
+    /// The account's own `.moduleSettingsUrl`, remembered so embeds can load it
+    /// before the next login refreshes it.
+    static var accountModuleUrl: String? {
+        get { UserDefaults.standard.string(forKey: accountModuleUrlKey) }
+        set { UserDefaults.standard.set(newValue, forKey: accountModuleUrlKey) }
     }
 
     @MainActor
@@ -166,9 +174,14 @@ enum PatchworkWeb {
         let modules = ((try? JSONSerialization.data(withJSONObject: moduleUrls))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]")
             .replacingOccurrences(of: "</", with: "<\\/")
+        let accountModule = (accountModuleUrl
+            .flatMap { try? JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed) }
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "null")
+            .replacingOccurrences(of: "</", with: "<\\/")
         return """
         <script>window.__patchwork_CONFIG = {"publicEndpoint": "\(endpoint)", \
-        "signerSeedHex": "\(signerSeedHex)", "moduleUrls": \(modules)\(localPort)};</script>
+        "signerSeedHex": "\(signerSeedHex)", "moduleUrls": \(modules), \
+        "accountModuleUrl": \(accountModule)\(localPort)};</script>
         """
     }
 
@@ -517,7 +530,12 @@ enum PatchworkWeb {
       registerRepoProviderElement(repo)
       registerPatchworkViewElement({ repo })
 
+      // system is the bundled base package; account is the logged in user's
+      // own module settings doc, so she gets the tools patchwork gives her
       const sources = { system: "/modules.json" }
+      if (isValidAutomergeUrl(config.accountModuleUrl ?? "")) {
+        sources.account = config.accountModuleUrl
+      }
       for (const [index, moduleUrl] of (config.moduleUrls ?? []).entries()) {
         if (isValidAutomergeUrl(moduleUrl)) {
           sources[`user${index}`] = moduleUrl

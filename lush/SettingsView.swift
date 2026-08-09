@@ -1,31 +1,40 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 import Intents
 import CoreLocation
 
 struct SettingsView: View {
+    @ScaledMetric(relativeTo: .body) private var markSize: CGFloat = 32
+
     var body: some View {
         #if os(macOS)
         TabView {
-            Tab("Patchwork", systemImage: "shippingbox") {
+            Tab {
                 PatchworkSettingsPane()
+            } label: {
+                Label {
+                    Text("Patchwork")
+                } icon: {
+                    // the tab bar sizes the icon itself, so the margin the mark
+                    // lacks and an SF Symbol has is baked into the svg
+                    Image("PatchworkMark")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 18, height: 18)
+                }
             }
-            Tab("Lush", systemImage: "leaf") {
-                LushSettingsPane()
-            }
-            Tab("Focus", systemImage: "moon") {
-                FocusSettingsPane()
-            }
-            Tab("Permissions", systemImage: "hand.raised") {
-                PermissionsSettingsPane()
+            Tab("Editor", systemImage: "textformat") {
+                EditorSettingsPane()
             }
             Tab("Machine Learning", systemImage: "sparkles.tv") {
                 MachineLearningSettingsPane()
             }
-            Tab("Sync", systemImage: "arrow.triangle.2.circlepath") {
-                SyncSettingsPane()
+            Tab("System", systemImage: "apple.logo") {
+                SystemSettingsPane()
             }
         }
         .frame(width: 620, height: 620)
@@ -34,7 +43,14 @@ struct SettingsView: View {
             NavigationLink {
                 PatchworkSettingsPane()
             } label: {
-                Label("Patchwork", systemImage: "shippingbox")
+                Label {
+                    Text("Patchwork")
+                } icon: {
+                    Image("PatchworkMark")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: markSize, height: markSize)
+                }
             }
             NavigationLink {
                 EditorSettingsPane()
@@ -42,38 +58,47 @@ struct SettingsView: View {
                 Label("Editor", systemImage: "textformat")
             }
             NavigationLink {
-                CalendarSettingsPane()
+                SystemSettingsPane()
             } label: {
-                Label("Calendar", systemImage: "calendar")
-            }
-            NavigationLink {
-                CaptureSettingsPane()
-            } label: {
-                Label("Capture", systemImage: "tray.and.arrow.down")
-            }
-            NavigationLink {
-                FocusSettingsPane()
-            } label: {
-                Label("Focus", systemImage: "moon")
-            }
-            NavigationLink {
-                PermissionsSettingsPane()
-            } label: {
-                Label("Permissions", systemImage: "hand.raised")
+                Label("System", systemImage: "apple.logo")
             }
             NavigationLink {
                 MachineLearningSettingsPane()
             } label: {
                 Label("Machine Learning", systemImage: "sparkles.tv")
             }
-            NavigationLink {
-                SyncSettingsPane()
-            } label: {
-                Label("Sync", systemImage: "arrow.triangle.2.circlepath")
-            }
         }
         .navigationTitle("Settings")
         #endif
+    }
+}
+
+/// A pane split into segments, so related settings stay together without
+/// growing the tab bar.
+struct SettingsSubtabs<Content: View>: View {
+    let titles: [String]
+    let content: (String) -> Content
+    @State private var selection: String
+
+    init(_ titles: [String], @ViewBuilder content: @escaping (String) -> Content) {
+        self.titles = titles
+        self.content = content
+        _selection = State(initialValue: titles[0])
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("Section", selection: $selection) {
+                ForEach(titles, id: \.self) { title in
+                    Text(title).tag(title)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            content(selection)
+        }
     }
 }
 
@@ -189,12 +214,8 @@ struct AgentSettingsSection: View {
 
 struct SyncSettingsPane: View {
     @Environment(NotesModel.self) private var model
-    @State private var folderText = ""
-    @State private var copiedUrl: String?
-    @State private var peerText = ""
     @State private var peerError: String?
-    @State private var copiedNodeId = false
-    @State private var copiedLocalPort = false
+    @State private var addingPeer = false
     @State private var showingClearConfirm = false
     @State private var backgroundSync = LushShared.helperEnabled
     @State private var backgroundMenuBar = LushShared.helperShowsMenuBar
@@ -215,17 +236,10 @@ struct SyncSettingsPane: View {
                     LabeledContent("Local (HTTP)") {
                         HStack(spacing: 8) {
                             Text(httpUrl)
-                                .font(.caption.monospaced())
+                                .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
-                            Button(copiedLocalPort ? "Copied" : "Copy") {
-                                Clipboard.copy(httpUrl)
-                                copiedLocalPort = true
-                                Task {
-                                    try? await Task.sleep(for: .seconds(2))
-                                    copiedLocalPort = false
-                                }
-                            }
+                            CopyButton(value: httpUrl)
                         }
                     }
                 }
@@ -254,41 +268,37 @@ struct SyncSettingsPane: View {
             }
             #endif
             Section {
-                if let nodeId = model.core?.irohNodeId() {
+                if let code = model.core?.irohFriendCode() {
                     HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("This device")
-                            Text(nodeId)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
+                        DocumentLabel(title: "This device", url: code, symbol: "laptopcomputer")
                         Spacer()
-                        Button(copiedNodeId ? "Copied" : "Copy") {
-                            Clipboard.copy(nodeId)
-                            copiedNodeId = true
-                            Task {
-                                try? await Task.sleep(for: .seconds(2))
-                                copiedNodeId = false
+                        CopyButton(value: code)
+                    }
+                    ForEach(model.irohPeers.filter(\.added), id: \.nodeId) { peer in
+                        HStack {
+                            DocumentLabel(title: shortNodeId(peer.nodeId), url: peer.code, symbol: "person.crop.circle")
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                model.core?.forgetIrohPeer(nodeId: peer.nodeId)
+                                model.refreshPeers()
                             }
+                            .buttonStyle(.borderless)
                         }
                     }
-                    TextField("friend's node id", text: $peerText)
-                        .font(.body.monospaced())
-                    Button("Add Peer") {
-                        let nodeId = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !nodeId.isEmpty else { return }
-                        do {
-                            try model.core?.addIrohPeer(nodeId: nodeId)
-                            peerText = ""
-                            peerError = nil
-                        } catch {
-                            peerError = error.localizedDescription
+                    ForEach(model.irohPeers.filter { !$0.added }, id: \.nodeId) { peer in
+                        HStack {
+                            DocumentLabel(title: shortNodeId(peer.nodeId), url: "wants to sync with you", symbol: "person.crop.circle.badge.questionmark")
+                            Spacer()
+                            Button("Add") { add(peer.code) }
+                                .buttonStyle(.borderless)
+                            Button("Ignore") {
+                                model.core?.forgetIrohPeer(nodeId: peer.nodeId)
+                                model.refreshPeers()
+                            }
+                            .buttonStyle(.borderless)
                         }
                     }
-                    .disabled(
-                        peerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
+                    Button("Add Peer…") { addingPeer = true }
                     if let peerError {
                         Text(peerError)
                             .uiFont(.caption)
@@ -301,7 +311,7 @@ struct SyncSettingsPane: View {
             } header: {
                 Text("Peers (iroh)")
             } footer: {
-                Text("Share this device's node id and add a friend's; the rust subduction cores then sync directly via iroh.")
+                Text("Share this device's friend code and add a friend's; the rust subduction cores then sync directly via iroh. The code is two public keys — where to dial, and who should answer.")
             }
             Section {
                 Button("Force Resync") {
@@ -315,17 +325,20 @@ struct SyncSettingsPane: View {
                     isPresented: $showingClearConfirm,
                     titleVisibility: .visible
                 ) {
-                    Button("Clear and Quit", role: .destructive) {
+                    Button("Clear, Keep Identity") {
+                        model.clearStorage(keepingIdentity: true)
+                    }
+                    Button("Clear Everything", role: .destructive) {
                         model.clearStorage()
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("The app will quit and re-sync everything from the server on next launch.")
+                    Text("The app will quit and re-sync everything from the server on next launch. Clearing everything also erases this device's keys and peers — your friend code changes, and anyone holding the old one can't reach you.")
                 }
             } header: {
                 Text("Diagnostics")
             } footer: {
-                Text("Force Resync re-fetches all root folders from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch.")
+                Text("Force Resync re-fetches all root folders from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend code still works.")
             }
             if !model.syncLog.isEmpty {
                 Section("Sync Log") {
@@ -346,6 +359,30 @@ struct SyncSettingsPane: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Sync")
+        .task { model.refreshPeers() }
+        .sheet(isPresented: $addingPeer) {
+            AddItemSheet(
+                title: "Add Peer",
+                placeholder: "friend code",
+                prompt: "Paste a friend's code to sync with them directly."
+            ) { code in
+                add(code)
+            }
+        }
+    }
+
+    private func add(_ code: String) {
+        do {
+            try model.core?.addIrohPeer(code: code)
+            peerError = nil
+        } catch {
+            peerError = error.localizedDescription
+        }
+        model.refreshPeers()
+    }
+
+    private func shortNodeId(_ nodeId: String) -> String {
+        nodeId.count > 16 ? "\(nodeId.prefix(8))…\(nodeId.suffix(4))" : nodeId
     }
 
     private func folderName(_ url: String) -> String {
@@ -353,43 +390,16 @@ struct SyncSettingsPane: View {
     }
 }
 
-enum LushSettingsSection: String, CaseIterable, Identifiable {
-    case editor
-    case calendar
-    case capture
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .editor: "Editor"
-        case .calendar: "Calendar"
-        case .capture: "Capture"
-        }
-    }
-}
-
-struct LushSettingsPane: View {
-    @State private var section = LushSettingsSection.editor
-
+struct EditorSettingsPane: View {
     var body: some View {
-        VStack(spacing: 0) {
-            Picker("Section", selection: $section) {
-                ForEach(LushSettingsSection.allCases) { section in
-                    Text(section.title).tag(section)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
+        SettingsSubtabs(["Fonts", "Page", "Logline"]) { section in
             switch section {
-            case .editor: EditorSettingsPane()
-            case .calendar: CalendarSettingsPane()
-            case .capture: CaptureSettingsPane()
+            case "Page": PageSettingsPane()
+            case "Logline": LoglineSettingsPane()
+            default: FontsSettingsPane()
             }
         }
-        .navigationTitle("Lush")
+        .navigationTitle("Editor")
     }
 }
 
@@ -409,107 +419,147 @@ struct CalendarSettingsPane: View {
     }
 }
 
-struct EditorSettingsPane: View {
-    @State private var fontSize = EditorSettings.bodySize
-    @State private var limitWidth = EditorSettings.maxNoteWidth > 0
-    @State private var maxWidth = EditorSettings.maxNoteWidth > 0 ? EditorSettings.maxNoteWidth : 700
+struct FontsSettingsPane: View {
+    @State private var fontSize = Int(EditorSettings.bodySize)
 
     var body: some View {
         Form {
-            FontSettingsSections()
             Section("Base Size") {
-                HStack {
-                    Text("Size")
-                    Slider(value: $fontSize, in: 11...24, step: 1)
-                        .onChange(of: fontSize) {
-                            EditorSettings.setBodySize(fontSize)
-                        }
-                    Text("\(Int(fontSize))pt")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                Stepper(value: $fontSize, in: 9...32) {
+                    LabeledContent("Size", value: "\(fontSize) pt")
+                }
+                .onChange(of: fontSize) {
+                    EditorSettings.setBodySize(Double(fontSize))
                 }
             }
-            Section("Width") {
-                Toggle("Limit note width", isOn: $limitWidth)
-                    .onChange(of: limitWidth) {
-                        EditorSettings.setMaxNoteWidth(limitWidth ? maxWidth : 0)
-                    }
-                if limitWidth {
-                    HStack {
-                        Text("Maximum")
-                        Slider(value: $maxWidth, in: 320...1200, step: 20)
-                            .onChange(of: maxWidth) {
-                                EditorSettings.setMaxNoteWidth(maxWidth)
-                            }
-                        Text("\(Int(maxWidth))pt")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
+            FontSettingsSections()
         }
         .formStyle(.grouped)
-        .navigationTitle("Editor")
+        .navigationTitle("Fonts")
     }
 }
 
-struct CaptureSettingsPane: View {
-    @Environment(ContextTracker.self) private var contextTracker
-    @State private var autoInsertLogline = EditorSettings.autoInsertLogline
-    @State private var places = SavedPlaces.all
-    @State private var placeName = ""
-    @State private var contactPickerPresented = false
-    @State private var mapPickerPresented = false
-    @State private var importingMine = false
-    @State private var importStatus: String?
+struct PageSettingsPane: View {
+    @State private var limitWidth = EditorSettings.maxNoteCharacters > 0
+    @State private var characters = EditorSettings.maxNoteCharacters > 0
+        ? EditorSettings.maxNoteCharacters
+        : 72
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Limit note width", isOn: $limitWidth)
+                    .onChange(of: limitWidth) {
+                        EditorSettings.setMaxNoteCharacters(limitWidth ? characters : 0)
+                    }
+                if limitWidth {
+                    Stepper(value: $characters, in: 20...160, step: 4) {
+                        LabeledContent("Measure", value: "\(characters) characters")
+                    }
+                    .onChange(of: characters) {
+                        EditorSettings.setMaxNoteCharacters(characters)
+                    }
+                }
+            } header: {
+                Text("Width")
+            } footer: {
+                Text("A note stops growing at the measure and centres itself. The measure is in characters of the body font, so it follows the base size.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Page")
+    }
+}
+
+struct SystemSettingsPane: View {
+    var body: some View {
+        SettingsSubtabs(["Permissions", "Import", "Calendar"]) { section in
+            switch section {
+            case "Import": ImportSettingsPane()
+            case "Calendar": CalendarSettingsPane()
+            default: PermissionsSettingsPane()
+            }
+        }
+        .navigationTitle("System")
+    }
+}
+
+struct ImportSettingsPane: View {
     @AppStorage(NotesModel.importAsNotesKey) private var importTextFilesAsNotes = true
 
     var body: some View {
         Form {
-            Section("Import") {
+            Section {
                 Picker("Markdown, text and RTF files", selection: $importTextFilesAsNotes) {
                     Text("Become Lush notes").tag(true)
                     Text("Stay as files").tag(false)
                 }
+            } header: {
+                Text("Import")
+            } footer: {
                 Text("Applies to the share extension and shortcuts. Dragging a file in asks each time.")
-                    .uiFont(.caption)
-                    .foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Import")
+    }
+}
+
+struct LoglineSettingsPane: View {
+    @Environment(ContextTracker.self) private var contextTracker
+    @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var places = SavedPlaces.all
+    @State private var namingHere = false
+    @State private var contactPickerPresented = false
+    @State private var mapPickerPresented = false
+    @State private var importingMine = false
+    @State private var importStatus: String?
+
+    var body: some View {
+        Form {
             Section {
                 Toggle("Add logline when context changes", isOn: $autoInsertLogline)
                     .onChange(of: autoInsertLogline) {
                         EditorSettings.setAutoInsertLogline(autoInsertLogline)
                     }
+            }
+            Section {
                 ForEach($places) { $place in
                     HStack {
-                        Image(systemName: "mappin.and.ellipse")
-                            .foregroundStyle(.secondary)
-                        TextField("Name", text: $place.name)
-                            .textFieldStyle(.plain)
-                            .onSubmit { savePlaces() }
-                        Spacer()
-                        Button("Remove") {
-                            places.removeAll { $0.id == place.id }
-                            savePlaces()
+                        Label {
+                            TextField("Name", text: $place.name)
+                                .textFieldStyle(.plain)
+                                .onSubmit { savePlaces() }
+                        } icon: {
+                            Image(systemName: "mappin.and.ellipse")
+                                .foregroundStyle(.secondary)
+                        }
+                        RowMenu {
+                            Button("Remove", role: .destructive) {
+                                places.removeAll { $0.id == place.id }
+                                savePlaces()
+                            }
                         }
                     }
                 }
-                HStack {
-                    TextField("Name", text: $placeName)
-                    Button("Add Here") { addPlace() }
-                        .disabled(placeName.trimmingCharacters(in: .whitespaces).isEmpty
-                            || contextTracker.snapshot.latitude == nil)
-                }
-                HStack {
+                Menu("Add Place…") {
+                    Button("Where I Am Now…") { namingHere = true }
+                        .disabled(currentCoordinate == nil)
+                    Button("On a Map…") { mapPickerPresented = true }
+                    Button("From Contacts…") { contactPickerPresented = true }
                     #if os(macOS)
-                    Button("Import Home & Work") { importMyAddresses() }
+                    Button("Home & Work from My Card") { importMyAddresses() }
                         .disabled(importingMine)
                     #endif
-                    Button("From Contacts…") { contactPickerPresented = true }
-                    Button("On a Map…") { mapPickerPresented = true }
-                    if importingMine {
+                }
+                .fixedSize()
+                if importingMine {
+                    HStack(spacing: 6) {
                         ProgressView()
                             .controlSize(.small)
+                        Text("Looking up addresses…")
+                            .uiFont(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 if let importStatus {
@@ -518,13 +568,22 @@ struct CaptureSettingsPane: View {
                         .foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Logline")
+                Text("Places")
             } footer: {
                 Text("A logline near a saved place uses its name — \"Home, London, England\" instead of the street. Addresses from Contacts are looked up once; only the coordinates are kept.")
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Capture")
+        .navigationTitle("Logline")
+        .sheet(isPresented: $namingHere) {
+            AddItemSheet(
+                title: "Add Place",
+                placeholder: "Name",
+                prompt: "Saves where you are now under a name.",
+                monospaced: false,
+                add: addPlace
+            )
+        }
         .sheet(isPresented: $contactPickerPresented) {
             ContactPlacePicker { found in
                 add(found)
@@ -547,14 +606,9 @@ struct CaptureSettingsPane: View {
         return CLLocationCoordinate2D(latitude: lat, longitude: lon)
     }
 
-    private func addPlace() {
+    private func addPlace(_ name: String) {
         guard let here = currentCoordinate else { return }
-        add([SavedPlace(
-            name: placeName.trimmingCharacters(in: .whitespaces),
-            latitude: here.latitude,
-            longitude: here.longitude
-        )])
-        placeName = ""
+        add([SavedPlace(name: name, latitude: here.latitude, longitude: here.longitude)])
     }
 
     private func add(_ found: [SavedPlace]) {
@@ -596,129 +650,167 @@ struct CaptureSettingsPane: View {
 }
 
 struct PatchworkSettingsPane: View {
+    var body: some View {
+        SettingsSubtabs(["Account", "Packages", "Sync"]) { section in
+            switch section {
+            case "Packages": PackagesSettingsPane()
+            case "Sync": SyncSettingsPane()
+            default: AccountSettingsPane()
+            }
+        }
+        .navigationTitle("Patchwork")
+    }
+}
+
+/// A document url under its name, sized like a subtitle rather than a wall of
+/// monospace.
+struct DocumentLabel: View {
+    var title: String?
+    let url: String
+    let symbol: String
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 1) {
+                if let title {
+                    Text(title)
+                }
+                Text(url)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+        } icon: {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+struct CopyButton: View {
+    let value: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            Clipboard.copy(value)
+            copied = true
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                copied = false
+            }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// Adding to a list happens in a sheet, so a list row is always a thing you
+/// have, never a place to type.
+struct AddItemSheet: View {
+    let title: String
+    let placeholder: String
+    var prompt: String?
+    var monospaced = true
+    var secure = false
+    var accepts: (String) -> Bool = { !$0.isEmpty }
+    let add: (String) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.headline)
+            if let prompt {
+                Text(prompt)
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            field
+                .textFieldStyle(.roundedBorder)
+                .font(monospaced ? .system(.body, design: .monospaced) : .body)
+                .textContentType(secure ? .password : nil)
+                #if !os(macOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                #endif
+                .onSubmit(submit)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Add", action: submit)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!accepts(trimmed))
+            }
+        }
+        #if os(macOS)
+        .padding(20)
+        .frame(width: 440)
+        #else
+        .padding(28)
+        #endif
+    }
+
+    @ViewBuilder private var field: some View {
+        if secure {
+            SecureField(placeholder, text: $text)
+        } else {
+            TextField(placeholder, text: $text)
+        }
+    }
+
+    private var trimmed: String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func submit() {
+        guard accepts(trimmed) else { return }
+        add(trimmed)
+        dismiss()
+    }
+}
+
+struct RowMenu<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        Menu {
+            content
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .foregroundStyle(.secondary)
+    }
+}
+
+struct AccountSettingsPane: View {
     @Environment(NotesModel.self) private var model
-    @State private var moduleText = ""
-    @State private var moduleUrls = PatchworkWeb.moduleUrls
-    @State private var accountText = ""
-    @State private var folderText = ""
     @State private var loggingIn = false
+    @State private var loggingInSheet = false
+    @State private var addingFolder = false
 
     var body: some View {
         Form {
             Section {
-                if model.loggedIn {
-                    HStack(spacing: 8) {
-                        if let data = model.contactAvatarData, let image = PImage(data: data) {
-                            Image(pImage: image)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 28, height: 28)
-                                .clipShape(Circle())
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.contactName ?? "Logged in")
-                            Text(model.accountUrl ?? "")
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                        Spacer()
-                        Button("Log Out") { model.logOut() }
-                    }
-                } else {
-                    TextField("account:… or automerge:… account url", text: $accountText)
-                        .font(.body.monospaced())
-                    Button(loggingIn ? "Logging in…" : "Log In") {
-                        let url = accountText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard NotesModel.normalizedAccountUrl(url) != nil else { return }
-                        loggingIn = true
-                        Task {
-                            if await model.logIn(accountUrl: url) {
-                                accountText = ""
-                            }
-                            loggingIn = false
-                        }
-                    }
-                    .disabled(
-                        loggingIn
-                            || NotesModel.normalizedAccountUrl(accountText) == nil
-                    )
+                ForEach(model.accountUrls, id: \.self) { url in
+                    accountRow(url)
                 }
+                Button(loggingIn ? "Logging In…" : "Add Account…") { loggingInSheet = true }
+                    .disabled(loggingIn)
             } header: {
-                Text("Account")
+                Text("Accounts")
             } footer: {
-                Text("Log in with a Patchwork account doc. Your folders and inbox sync across devices through the account's lush config doc.")
-            }
-            Section {
-                ForEach(model.rootFolderUrls, id: \.self) { url in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.node(for: url)?.displayName ?? "Folder")
-                            Text(url)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                        Spacer()
-                        if model.loggedIn {
-                            Button(model.inboxUrl == url ? "Inbox ✓" : "Make Inbox") {
-                                model.setInbox(url)
-                            }
-                            .disabled(model.inboxUrl == url)
-                        }
-                        Button("Remove") {
-                            model.removeRootFolder(url)
-                        }
-                        .disabled(model.rootFolderUrls.count == 1)
-                    }
-                }
-                TextField("automerge:… folder url", text: $folderText)
-                    .font(.body.monospaced())
-                Button("Add Folder") {
-                    let url = folderText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !url.isEmpty else { return }
-                    folderText = ""
-                    Task { await model.addRootFolder(url) }
-                }
-                .disabled(folderText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            } header: {
-                Text("Folders")
-            } footer: {
-                Text("The folders shown in the sidebar. New notes from the widget or shortcuts land in the inbox folder. When logged in this list lives in your account's lush config and syncs across devices.")
-            }
-            Section {
-                ForEach(moduleUrls, id: \.self) { url in
-                    HStack {
-                        Text(url)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Button("Remove") {
-                            moduleUrls.removeAll { $0 == url }
-                            PatchworkWeb.setModuleUrls(moduleUrls)
-                        }
-                    }
-                }
-                TextField("automerge:… module settings url", text: $moduleText)
-                    .font(.body.monospaced())
-                Button("Add Modules") {
-                    let url = moduleText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard url.hasPrefix("automerge:"), !moduleUrls.contains(url) else { return }
-                    moduleUrls.append(url)
-                    PatchworkWeb.setModuleUrls(moduleUrls)
-                    moduleText = ""
-                }
-                .disabled(
-                    !moduleText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        .hasPrefix("automerge:")
-                )
-            } header: {
-                Text("Modules")
-            } footer: {
-                Text("Paste module settings doc URLs; their datatypes and tools show up when embedding Patchwork documents. Takes effect for newly opened embeds.")
+                Text("Log in with a Patchwork account doc. Your notebooks, inbox and packages sync across devices through the account's lush config doc. Switching accounts swaps all of it.")
             }
             Section {
                 if let url = model.effectiveQuickNoteUrl {
@@ -739,20 +831,179 @@ struct PatchworkSettingsPane: View {
             } footer: {
                 Text("The Quick Note opens from the widget and Shortcuts. Set one from a note's context menu.")
             }
+            Section {
+                ForEach(model.rootFolderUrls, id: \.self) { url in
+                    HStack {
+                        Label(
+                            model.node(for: url)?.displayName ?? "Notebook",
+                            systemImage: model.inboxUrl == url ? "tray" : "folder"
+                        )
+                        Spacer()
+                        if model.inboxUrl == url {
+                            Text("Inbox")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(.quaternary, in: Capsule())
+                        }
+                        RowMenu {
+                            if model.loggedIn, model.inboxUrl != url {
+                                Button("Make Inbox") { model.setInbox(url) }
+                            }
+                            Button("Copy URL") { Clipboard.copy(url) }
+                            Button("Remove", role: .destructive) {
+                                model.removeRootFolder(url)
+                            }
+                            .disabled(model.rootFolderUrls.count == 1)
+                        }
+                    }
+                }
+                Button("Add Notebook…") { addingFolder = true }
+            } header: {
+                Text("Notebooks")
+            } footer: {
+                Text("The top-level folders shown in the sidebar. New notes from the widget or shortcuts land in the inbox folder. When logged in this list lives in your account's lush config and syncs across devices.")
+            }
         }
         .formStyle(.grouped)
-        .navigationTitle("Patchwork")
+        .navigationTitle("Account")
+        .sheet(isPresented: $loggingInSheet) {
+            AddItemSheet(
+                title: "Log In",
+                placeholder: "account:name/… or automerge:…",
+                prompt: "Paste the url of your Patchwork account doc.",
+                secure: true,
+                accepts: { NotesModel.normalizedAccountUrl($0) != nil },
+                add: logIn
+            )
+        }
+        .sheet(isPresented: $addingFolder) {
+            AddItemSheet(
+                title: "Add Notebook",
+                placeholder: "automerge:…",
+                prompt: "Paste the url of a Patchwork folder doc."
+            ) { url in
+                Task { await model.addRootFolder(url) }
+            }
+        }
+    }
+
+    @ViewBuilder private func accountRow(_ url: String) -> some View {
+        let active = model.accountUrl == url
+        HStack(spacing: 10) {
+            if active, let data = model.contactAvatarData, let image = PImage(data: data) {
+                Image(pImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 32, height: 32)
+                    .clipShape(Circle())
+            } else {
+                Image(systemName: "person.crop.circle")
+                    .font(.largeTitle)
+                    .foregroundStyle(active ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(model.accountName(url) ?? "Account")
+                Text(url)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            if active {
+                Button("Log Out") { model.logOut() }
+            } else {
+                Button(loggingIn ? "Switching…" : "Switch") { logIn(url) }
+                    .disabled(loggingIn)
+            }
+            RowMenu {
+                Button("Copy Account URL") { Clipboard.copy(url) }
+                Button("Forget", role: .destructive) { model.forgetAccount(url) }
+            }
+        }
+    }
+
+    private func logIn(_ url: String) {
+        loggingIn = true
+        Task {
+            _ = await model.logIn(accountUrl: url)
+            loggingIn = false
+        }
     }
 }
 
+struct PackagesSettingsPane: View {
+    @Environment(NotesModel.self) private var model
+    @State private var adding = false
 
-struct FocusSettingsPane: View {
+    private var moduleUrls: [String] { model.packageListUrls }
+
+    var body: some View {
+        Form {
+            Section {
+                Label {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("System")
+                        Text("Built into Lush")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "shippingbox")
+                        .foregroundStyle(.secondary)
+                }
+                if let url = model.accountModuleSettingsUrl {
+                    HStack {
+                        DocumentLabel(title: "User", url: url, symbol: "shippingbox")
+                        Spacer()
+                        RowMenu {
+                            Button("Copy URL") { Clipboard.copy(url) }
+                        }
+                    }
+                }
+                ForEach(moduleUrls, id: \.self) { url in
+                    HStack {
+                        DocumentLabel(url: url, symbol: "shippingbox")
+                        Spacer()
+                        RowMenu {
+                            Button("Copy URL") { Clipboard.copy(url) }
+                            Button("Remove", role: .destructive) {
+                                model.setPackageLists(moduleUrls.filter { $0 != url })
+                            }
+                        }
+                    }
+                }
+                Button("Add Package List…") { adding = true }
+            } header: {
+                Text("Package Lists")
+            } footer: {
+                Text("A package list's datatypes and tools show up when embedding Patchwork documents. The System list ships with Lush and the User list comes from your Patchwork account; neither can be removed. Added lists live in your account's lush config and sync across devices when logged in. Takes effect for newly opened embeds.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Packages")
+        .sheet(isPresented: $adding) {
+            AddItemSheet(
+                title: "Add Package List",
+                placeholder: "automerge:…",
+                prompt: "Paste the url of a package list doc.",
+                accepts: { $0.hasPrefix("automerge:") && !moduleUrls.contains($0) }
+            ) { url in
+                model.setPackageLists(moduleUrls + [url])
+            }
+        }
+    }
+}
+
+struct FocusSettingsSections: View {
     @Environment(NotesModel.self) private var model
 
     private var focus: FocusModes { model.focus }
 
     var body: some View {
-        Form {
+        Group {
             Section {
                 if let state = focus.state {
                     if state.shownFolderUrls.isEmpty {
@@ -772,6 +1023,7 @@ struct FocusSettingsPane: View {
                     Text("No Focus is filtering Lush.")
                         .foregroundStyle(.secondary)
                 }
+                Button("Open Focus Settings") { openFocusSettings() }
             } header: {
                 Text("Current Focus")
             } footer: {
@@ -793,8 +1045,6 @@ struct FocusSettingsPane: View {
                 Text("Focus Access")
             }
         }
-        .formStyle(.grouped)
-        .navigationTitle("Focus")
     }
 
     private static var focusSettingsPath: String {
@@ -802,6 +1052,17 @@ struct FocusSettingsPane: View {
         "System Settings › Focus › a Focus"
         #else
         "Settings › Focus › a Focus"
+        #endif
+    }
+
+    private func openFocusSettings() {
+        #if os(macOS)
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Focus-Settings.extension")
+        else { return }
+        NSWorkspace.shared.open(url)
+        #else
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
         #endif
     }
 

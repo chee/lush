@@ -486,6 +486,22 @@ fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -571,7 +587,16 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 public protocol CoreProtocol: AnyObject, Sendable {
     
-    func addIrohPeer(nodeId: String) throws 
+    func addIrohPeer(code: String) throws 
+    
+    /**
+     * Fold pre-login local docs into the account just signed into: every
+     * local root folder that holds something is linked into the account's
+     * root folder and appended to the lush config's `.folders`, and the
+     * scratchpad note is linked into the account root unless one of those
+     * folders already holds it. Returns the merged folder list.
+     */
+    func adoptLocalDocs(accountUrl: String, folderUrls: [String], scratchpadUrl: String?) throws  -> [String]
     
     func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String]) throws  -> [String]
     
@@ -632,6 +657,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Create a note inside a specific folder doc.
      */
     func createNoteIn(folderUrl: String, title: String) throws  -> String
+    
+    /**
+     * A pad with nothing pointing at it yet — for a device with no account,
+     * where the caller remembers the url itself.
+     */
+    func createPad(title: String) throws  -> String
     
     func createScriptIn(folderUrl: String, name: String) throws  -> String
     
@@ -694,6 +725,16 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func ensureFolder(existingUrl: String?) throws  -> String
     
     /**
+     * The note's scratchpad, made on first use and linked at `@lush.pad`.
+     */
+    func ensureNotePad(url: String) throws  -> String
+    
+    /**
+     * The app-wide pocket pad, made on first use and recorded in the config.
+     */
+    func ensurePocketPad(configUrl: String) throws  -> String
+    
+    /**
      * Entries of any folder doc we hold locally (no waiting, no network).
      */
     func folderEntriesOf(url: String) async  -> [NoteInfo]
@@ -702,7 +743,16 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func folderUrl()  -> String?
     
+    func forgetIrohPeer(nodeId: String) 
+    
+    /**
+     * This device's friend code: iroh node id and subduction peer id.
+     */
+    func irohFriendCode()  -> String?
+    
     func irohNodeId()  -> String?
+    
+    func irohPeers()  -> [IrohPeer]
     
     func isApplyingIncoming()  -> Bool
     
@@ -773,6 +823,11 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func noteModified(url: String)  -> Int64
     
+    /**
+     * The note's own scratchpad, if it has one yet.
+     */
+    func notePad(url: String)  -> String?
+    
     func notePreview(url: String) async  -> String
     
     func noteSpansJson(url: String) async throws  -> String
@@ -794,6 +849,16 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * locally (immediately for docs we already have).
      */
     func openNote(url: String) async throws 
+    
+    func padItems(url: String)  -> [PadItem]
+    
+    func padMoveItem(url: String, itemId: String, x: Double, y: Double, w: Double, h: Double) throws 
+    
+    func padPutItem(url: String, item: PadItem) throws 
+    
+    func padRemoveItem(url: String, itemId: String) throws 
+    
+    func padSetData(url: String, itemId: String, data: String) throws 
     
     func pendingChangeCount(url: String)  -> UInt32
     
@@ -861,6 +926,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func setConfigFolders(configUrl: String, urls: [String]) throws 
     
     func setConfigInbox(configUrl: String, url: String) throws 
+    
+    func setConfigPackages(configUrl: String, urls: [String]) throws 
+    
+    func setConfigSmartNotebooks(configUrl: String, folders: [SmartNotebook]) throws 
     
     func setDelegate(delegate: CoreDelegate) 
     
@@ -983,11 +1052,28 @@ public convenience init(dataDir: String, serverUrl: String?)throws  {
     
 
     
-open func addIrohPeer(nodeId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+open func addIrohPeer(code: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_add_iroh_peer(self.uniffiClonePointer(),
-        FfiConverterString.lower(nodeId),$0
+        FfiConverterString.lower(code),$0
     )
 }
+}
+    
+    /**
+     * Fold pre-login local docs into the account just signed into: every
+     * local root folder that holds something is linked into the account's
+     * root folder and appended to the lush config's `.folders`, and the
+     * scratchpad note is linked into the account root unless one of those
+     * folders already holds it. Returns the merged folder list.
+     */
+open func adoptLocalDocs(accountUrl: String, folderUrls: [String], scratchpadUrl: String?)throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_adopt_local_docs(self.uniffiClonePointer(),
+        FfiConverterString.lower(accountUrl),
+        FfiConverterSequenceString.lower(folderUrls),
+        FfiConverterOptionString.lower(scratchpadUrl),$0
+    )
+})
 }
     
 open func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String])throws  -> [String]  {
@@ -1173,6 +1259,18 @@ open func createNoteIn(folderUrl: String, title: String)throws  -> String  {
 })
 }
     
+    /**
+     * A pad with nothing pointing at it yet — for a device with no account,
+     * where the caller remembers the url itself.
+     */
+open func createPad(title: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_create_pad(self.uniffiClonePointer(),
+        FfiConverterString.lower(title),$0
+    )
+})
+}
+    
 open func createScriptIn(folderUrl: String, name: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_create_script_in(self.uniffiClonePointer(),
@@ -1352,6 +1450,28 @@ open func ensureFolder(existingUrl: String?)throws  -> String  {
 }
     
     /**
+     * The note's scratchpad, made on first use and linked at `@lush.pad`.
+     */
+open func ensureNotePad(url: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_ensure_note_pad(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+    /**
+     * The app-wide pocket pad, made on first use and recorded in the config.
+     */
+open func ensurePocketPad(configUrl: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_ensure_pocket_pad(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),$0
+    )
+})
+}
+    
+    /**
      * Entries of any folder doc we hold locally (no waiting, no network).
      */
 open func folderEntriesOf(url: String)async  -> [NoteInfo]  {
@@ -1397,9 +1517,33 @@ open func folderUrl() -> String?  {
 })
 }
     
+open func forgetIrohPeer(nodeId: String)  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_forget_iroh_peer(self.uniffiClonePointer(),
+        FfiConverterString.lower(nodeId),$0
+    )
+}
+}
+    
+    /**
+     * This device's friend code: iroh node id and subduction peer id.
+     */
+open func irohFriendCode() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_iroh_friend_code(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func irohNodeId() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_iroh_node_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func irohPeers() -> [IrohPeer]  {
+    return try!  FfiConverterSequenceTypeIrohPeer.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_iroh_peers(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1568,6 +1712,17 @@ open func noteModified(url: String) -> Int64  {
 })
 }
     
+    /**
+     * The note's own scratchpad, if it has one yet.
+     */
+open func notePad(url: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_note_pad(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
 open func notePreview(url: String)async  -> String  {
     return
         try!  await uniffiRustCallAsync(
@@ -1696,6 +1851,51 @@ open func openNote(url: String)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+open func padItems(url: String) -> [PadItem]  {
+    return try!  FfiConverterSequenceTypePadItem.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_pad_items(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+open func padMoveItem(url: String, itemId: String, x: Double, y: Double, w: Double, h: Double)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_pad_move_item(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(itemId),
+        FfiConverterDouble.lower(x),
+        FfiConverterDouble.lower(y),
+        FfiConverterDouble.lower(w),
+        FfiConverterDouble.lower(h),$0
+    )
+}
+}
+    
+open func padPutItem(url: String, item: PadItem)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_pad_put_item(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterTypePadItem_lower(item),$0
+    )
+}
+}
+    
+open func padRemoveItem(url: String, itemId: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_pad_remove_item(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(itemId),$0
+    )
+}
+}
+    
+open func padSetData(url: String, itemId: String, data: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_pad_set_data(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(itemId),
+        FfiConverterString.lower(data),$0
+    )
+}
 }
     
 open func pendingChangeCount(url: String) -> UInt32  {
@@ -1870,6 +2070,22 @@ open func setConfigInbox(configUrl: String, url: String)throws   {try rustCallWi
     uniffi_lush_core_fn_method_core_set_config_inbox(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),
         FfiConverterString.lower(url),$0
+    )
+}
+}
+    
+open func setConfigPackages(configUrl: String, urls: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_packages(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterSequenceString.lower(urls),$0
+    )
+}
+}
+    
+open func setConfigSmartNotebooks(configUrl: String, folders: [SmartNotebook])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_smart_notebooks(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterSequenceTypeSmartNotebook.lower(folders),$0
     )
 }
 }
@@ -2074,16 +2290,18 @@ public struct AccountState {
     public var accountUrl: String
     public var contactUrl: String?
     public var rootFolderUrl: String?
+    public var moduleSettingsUrl: String?
     public var configUrl: String?
     public var folders: [String]
     public var inbox: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(accountUrl: String, contactUrl: String?, rootFolderUrl: String?, configUrl: String?, folders: [String], inbox: String?) {
+    public init(accountUrl: String, contactUrl: String?, rootFolderUrl: String?, moduleSettingsUrl: String?, configUrl: String?, folders: [String], inbox: String?) {
         self.accountUrl = accountUrl
         self.contactUrl = contactUrl
         self.rootFolderUrl = rootFolderUrl
+        self.moduleSettingsUrl = moduleSettingsUrl
         self.configUrl = configUrl
         self.folders = folders
         self.inbox = inbox
@@ -2106,6 +2324,9 @@ extension AccountState: Equatable, Hashable {
         if lhs.rootFolderUrl != rhs.rootFolderUrl {
             return false
         }
+        if lhs.moduleSettingsUrl != rhs.moduleSettingsUrl {
+            return false
+        }
         if lhs.configUrl != rhs.configUrl {
             return false
         }
@@ -2122,6 +2343,7 @@ extension AccountState: Equatable, Hashable {
         hasher.combine(accountUrl)
         hasher.combine(contactUrl)
         hasher.combine(rootFolderUrl)
+        hasher.combine(moduleSettingsUrl)
         hasher.combine(configUrl)
         hasher.combine(folders)
         hasher.combine(inbox)
@@ -2140,6 +2362,7 @@ public struct FfiConverterTypeAccountState: FfiConverterRustBuffer {
                 accountUrl: FfiConverterString.read(from: &buf), 
                 contactUrl: FfiConverterOptionString.read(from: &buf), 
                 rootFolderUrl: FfiConverterOptionString.read(from: &buf), 
+                moduleSettingsUrl: FfiConverterOptionString.read(from: &buf), 
                 configUrl: FfiConverterOptionString.read(from: &buf), 
                 folders: FfiConverterSequenceString.read(from: &buf), 
                 inbox: FfiConverterOptionString.read(from: &buf)
@@ -2150,6 +2373,7 @@ public struct FfiConverterTypeAccountState: FfiConverterRustBuffer {
         FfiConverterString.write(value.accountUrl, into: &buf)
         FfiConverterOptionString.write(value.contactUrl, into: &buf)
         FfiConverterOptionString.write(value.rootFolderUrl, into: &buf)
+        FfiConverterOptionString.write(value.moduleSettingsUrl, into: &buf)
         FfiConverterOptionString.write(value.configUrl, into: &buf)
         FfiConverterSequenceString.write(value.folders, into: &buf)
         FfiConverterOptionString.write(value.inbox, into: &buf)
@@ -2627,12 +2851,18 @@ public func FfiConverterTypeCloneResult_lower(_ value: CloneResult) -> RustBuffe
 public struct ConfigState {
     public var folders: [String]
     public var inbox: String?
+    public var smart: [SmartNotebook]
+    public var packages: [String]
+    public var pad: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(folders: [String], inbox: String?) {
+    public init(folders: [String], inbox: String?, smart: [SmartNotebook], packages: [String], pad: String?) {
         self.folders = folders
         self.inbox = inbox
+        self.smart = smart
+        self.packages = packages
+        self.pad = pad
     }
 }
 
@@ -2649,12 +2879,24 @@ extension ConfigState: Equatable, Hashable {
         if lhs.inbox != rhs.inbox {
             return false
         }
+        if lhs.smart != rhs.smart {
+            return false
+        }
+        if lhs.packages != rhs.packages {
+            return false
+        }
+        if lhs.pad != rhs.pad {
+            return false
+        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(folders)
         hasher.combine(inbox)
+        hasher.combine(smart)
+        hasher.combine(packages)
+        hasher.combine(pad)
     }
 }
 
@@ -2668,13 +2910,19 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
         return
             try ConfigState(
                 folders: FfiConverterSequenceString.read(from: &buf), 
-                inbox: FfiConverterOptionString.read(from: &buf)
+                inbox: FfiConverterOptionString.read(from: &buf), 
+                smart: FfiConverterSequenceTypeSmartNotebook.read(from: &buf), 
+                packages: FfiConverterSequenceString.read(from: &buf), 
+                pad: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: ConfigState, into buf: inout [UInt8]) {
         FfiConverterSequenceString.write(value.folders, into: &buf)
         FfiConverterOptionString.write(value.inbox, into: &buf)
+        FfiConverterSequenceTypeSmartNotebook.write(value.smart, into: &buf)
+        FfiConverterSequenceString.write(value.packages, into: &buf)
+        FfiConverterOptionString.write(value.pad, into: &buf)
     }
 }
 
@@ -3066,6 +3314,96 @@ public func FfiConverterTypeEmbeddingChunk_lower(_ value: EmbeddingChunk) -> Rus
 }
 
 
+/**
+ * An iroh peer. `added` peers are dialed on launch; the rest dialed us and
+ * are offered as suggestions.
+ */
+public struct IrohPeer {
+    public var nodeId: String
+    /**
+     * Their friend code, if their subduction peer id is known — otherwise
+     * just the node id.
+     */
+    public var code: String
+    public var added: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nodeId: String, 
+        /**
+         * Their friend code, if their subduction peer id is known — otherwise
+         * just the node id.
+         */code: String, added: Bool) {
+        self.nodeId = nodeId
+        self.code = code
+        self.added = added
+    }
+}
+
+#if compiler(>=6)
+extension IrohPeer: Sendable {}
+#endif
+
+
+extension IrohPeer: Equatable, Hashable {
+    public static func ==(lhs: IrohPeer, rhs: IrohPeer) -> Bool {
+        if lhs.nodeId != rhs.nodeId {
+            return false
+        }
+        if lhs.code != rhs.code {
+            return false
+        }
+        if lhs.added != rhs.added {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nodeId)
+        hasher.combine(code)
+        hasher.combine(added)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIrohPeer: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IrohPeer {
+        return
+            try IrohPeer(
+                nodeId: FfiConverterString.read(from: &buf), 
+                code: FfiConverterString.read(from: &buf), 
+                added: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IrohPeer, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.nodeId, into: &buf)
+        FfiConverterString.write(value.code, into: &buf)
+        FfiConverterBool.write(value.added, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIrohPeer_lift(_ buf: RustBuffer) throws -> IrohPeer {
+    return try FfiConverterTypeIrohPeer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIrohPeer_lower(_ value: IrohPeer) -> RustBuffer {
+    return FfiConverterTypeIrohPeer.lower(value)
+}
+
+
 public struct NoteInfo {
     public var url: String
     public var name: String
@@ -3211,6 +3549,137 @@ public func FfiConverterTypeNoteSpansSnapshot_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeNoteSpansSnapshot_lower(_ value: NoteSpansSnapshot) -> RustBuffer {
     return FfiConverterTypeNoteSpansSnapshot.lower(value)
+}
+
+
+/**
+ * One thing parked on a pad. `data` carries the kind's payload as JSON:
+ * spans for text, stroke points for ink, an asset url for an image. The
+ * geometry stays in native fields so two people rearranging a pad merge.
+ */
+public struct PadItem {
+    public var id: String
+    public var kind: String
+    public var x: Double
+    public var y: Double
+    public var w: Double
+    public var h: Double
+    public var data: String
+    public var origin: String?
+    public var created: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, kind: String, x: Double, y: Double, w: Double, h: Double, data: String, origin: String?, created: Int64) {
+        self.id = id
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.data = data
+        self.origin = origin
+        self.created = created
+    }
+}
+
+#if compiler(>=6)
+extension PadItem: Sendable {}
+#endif
+
+
+extension PadItem: Equatable, Hashable {
+    public static func ==(lhs: PadItem, rhs: PadItem) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.x != rhs.x {
+            return false
+        }
+        if lhs.y != rhs.y {
+            return false
+        }
+        if lhs.w != rhs.w {
+            return false
+        }
+        if lhs.h != rhs.h {
+            return false
+        }
+        if lhs.data != rhs.data {
+            return false
+        }
+        if lhs.origin != rhs.origin {
+            return false
+        }
+        if lhs.created != rhs.created {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(kind)
+        hasher.combine(x)
+        hasher.combine(y)
+        hasher.combine(w)
+        hasher.combine(h)
+        hasher.combine(data)
+        hasher.combine(origin)
+        hasher.combine(created)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePadItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PadItem {
+        return
+            try PadItem(
+                id: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                x: FfiConverterDouble.read(from: &buf), 
+                y: FfiConverterDouble.read(from: &buf), 
+                w: FfiConverterDouble.read(from: &buf), 
+                h: FfiConverterDouble.read(from: &buf), 
+                data: FfiConverterString.read(from: &buf), 
+                origin: FfiConverterOptionString.read(from: &buf), 
+                created: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PadItem, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterDouble.write(value.x, into: &buf)
+        FfiConverterDouble.write(value.y, into: &buf)
+        FfiConverterDouble.write(value.w, into: &buf)
+        FfiConverterDouble.write(value.h, into: &buf)
+        FfiConverterString.write(value.data, into: &buf)
+        FfiConverterOptionString.write(value.origin, into: &buf)
+        FfiConverterInt64.write(value.created, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePadItem_lift(_ buf: RustBuffer) throws -> PadItem {
+    return try FfiConverterTypePadItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePadItem_lower(_ value: PadItem) -> RustBuffer {
+    return FfiConverterTypePadItem.lower(value)
 }
 
 
@@ -3376,6 +3845,129 @@ public func FfiConverterTypeSearchHit_lower(_ value: SearchHit) -> RustBuffer {
 }
 
 
+/**
+ * A saved search. Empty `kind`/`scope` and a zero `within_days` mean "no
+ * filter"; the query may be empty too, in which case the filters alone
+ * select the docs.
+ */
+public struct SmartNotebook {
+    public var id: String
+    public var name: String
+    public var query: String
+    public var kind: String
+    public var scope: String
+    public var withinDays: Int64
+    public var showCount: Bool
+    public var notifyOnChange: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, query: String, kind: String, scope: String, withinDays: Int64, showCount: Bool, notifyOnChange: Bool) {
+        self.id = id
+        self.name = name
+        self.query = query
+        self.kind = kind
+        self.scope = scope
+        self.withinDays = withinDays
+        self.showCount = showCount
+        self.notifyOnChange = notifyOnChange
+    }
+}
+
+#if compiler(>=6)
+extension SmartNotebook: Sendable {}
+#endif
+
+
+extension SmartNotebook: Equatable, Hashable {
+    public static func ==(lhs: SmartNotebook, rhs: SmartNotebook) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.query != rhs.query {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.scope != rhs.scope {
+            return false
+        }
+        if lhs.withinDays != rhs.withinDays {
+            return false
+        }
+        if lhs.showCount != rhs.showCount {
+            return false
+        }
+        if lhs.notifyOnChange != rhs.notifyOnChange {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(query)
+        hasher.combine(kind)
+        hasher.combine(scope)
+        hasher.combine(withinDays)
+        hasher.combine(showCount)
+        hasher.combine(notifyOnChange)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSmartNotebook: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SmartNotebook {
+        return
+            try SmartNotebook(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                query: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                scope: FfiConverterString.read(from: &buf), 
+                withinDays: FfiConverterInt64.read(from: &buf), 
+                showCount: FfiConverterBool.read(from: &buf), 
+                notifyOnChange: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SmartNotebook, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.query, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.scope, into: &buf)
+        FfiConverterInt64.write(value.withinDays, into: &buf)
+        FfiConverterBool.write(value.showCount, into: &buf)
+        FfiConverterBool.write(value.notifyOnChange, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSmartNotebook_lift(_ buf: RustBuffer) throws -> SmartNotebook {
+    return try FfiConverterTypeSmartNotebook.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSmartNotebook_lower(_ value: SmartNotebook) -> RustBuffer {
+    return FfiConverterTypeSmartNotebook.lower(value)
+}
+
+
 public struct StorageChunk {
     public var digest: String
     public var bytes: Data
@@ -3534,6 +4126,8 @@ public protocol CoreDelegate: AnyObject, Sendable {
     
     func onEphemeralMessage(url: String, payload: Data) 
     
+    func onPeersChanged() 
+    
 }
 
 
@@ -3633,6 +4227,28 @@ fileprivate struct UniffiCallbackInterfaceCoreDelegate {
                 return uniffiObj.onEphemeralMessage(
                      url: try FfiConverterString.lift(url),
                      payload: try FfiConverterData.lift(payload)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onPeersChanged: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCoreDelegate.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onPeersChanged(
                 )
             }
 
@@ -4158,6 +4774,31 @@ fileprivate struct FfiConverterSequenceTypeEmbeddingChunk: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeIrohPeer: FfiConverterRustBuffer {
+    typealias SwiftType = [IrohPeer]
+
+    public static func write(_ value: [IrohPeer], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeIrohPeer.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [IrohPeer] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [IrohPeer]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeIrohPeer.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeNoteInfo: FfiConverterRustBuffer {
     typealias SwiftType = [NoteInfo]
 
@@ -4175,6 +4816,31 @@ fileprivate struct FfiConverterSequenceTypeNoteInfo: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeNoteInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePadItem: FfiConverterRustBuffer {
+    typealias SwiftType = [PadItem]
+
+    public static func write(_ value: [PadItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePadItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PadItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PadItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePadItem.read(from: &buf))
         }
         return seq
     }
@@ -4225,6 +4891,31 @@ fileprivate struct FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeSearchHit.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSmartNotebook: FfiConverterRustBuffer {
+    typealias SwiftType = [SmartNotebook]
+
+    public static func write(_ value: [SmartNotebook], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSmartNotebook.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SmartNotebook] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SmartNotebook]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSmartNotebook.read(from: &buf))
         }
         return seq
     }
@@ -4342,7 +5033,10 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_add_iroh_peer() != 53581) {
+    if (uniffi_lush_core_checksum_method_core_add_iroh_peer() != 44741) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 17495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_apply_note_mark() != 29508) {
@@ -4396,6 +5090,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_create_note_in() != 47187) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_create_pad() != 4007) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_create_script_in() != 25586) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4447,6 +5144,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_ensure_folder() != 6376) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_ensure_note_pad() != 47232) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_ensure_pocket_pad() != 52874) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_folder_entries_of() != 11978) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4456,7 +5159,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_folder_url() != 41616) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_forget_iroh_peer() != 29223) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_iroh_friend_code() != 24179) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_iroh_node_id() != 63944) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_iroh_peers() != 22743) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_is_applying_incoming() != 54539) {
@@ -4504,6 +5216,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_note_modified() != 42759) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_note_pad() != 50991) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_note_preview() != 55716) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4523,6 +5238,21 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_open_note() != 44259) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pad_items() != 39030) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pad_move_item() != 56856) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pad_put_item() != 43064) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pad_remove_item() != 10462) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_pad_set_data() != 20753) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_pending_change_count() != 1569) {
@@ -4579,6 +5309,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_config_inbox() != 3370) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_set_config_packages() != 53257) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_smart_notebooks() != 30305) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4628,6 +5364,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_coredelegate_on_ephemeral_message() != 44822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_coredelegate_on_peers_changed() != 58468) {
         return InitializationResult.apiChecksumMismatch
     }
 

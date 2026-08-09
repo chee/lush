@@ -132,11 +132,23 @@ pub struct StorageChunk {
     pub bytes: Vec<u8>,
 }
 
+/// An iroh peer. `added` peers are dialed on launch; the rest dialed us and
+/// are offered as suggestions.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IrohPeer {
+    pub node_id: String,
+    /// Their friend code, if their subduction peer id is known — otherwise
+    /// just the node id.
+    pub code: String,
+    pub added: bool,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AccountState {
     pub account_url: String,
     pub contact_url: Option<String>,
     pub root_folder_url: Option<String>,
+    pub module_settings_url: Option<String>,
     pub config_url: Option<String>,
     pub folders: Vec<String>,
     pub inbox: Option<String>,
@@ -152,6 +164,9 @@ pub struct ContactInfo {
 pub struct ConfigState {
     pub folders: Vec<String>,
     pub inbox: Option<String>,
+    pub smart: Vec<shapes::SmartNotebook>,
+    pub packages: Vec<String>,
+    pub pad: Option<String>,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -196,6 +211,7 @@ pub trait CoreDelegate: Send + Sync {
     fn on_connection_changed(&self, connected: bool);
     fn on_sync_event(&self, message: String);
     fn on_ephemeral_message(&self, url: String, payload: Vec<u8>);
+    fn on_peers_changed(&self);
 }
 
 #[derive(uniffi::Object)]
@@ -268,6 +284,7 @@ fn edit_counts(change: &Change) -> (u64, u64) {
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const LINK_TIMEOUT: Duration = Duration::from_secs(5);
 const HISTORY_CACHE_DOCS: usize = 8;
+const ADOPTED_FOLDER_TITLE: &str = "📦 Lush items from before you logged in";
 
 impl Core {
     fn start_index_updates(self: &Arc<Self>) {
@@ -436,6 +453,7 @@ impl Core {
                     Ok(RepoEvent::Ephemeral(id, payload)) => {
                         delegate.on_ephemeral_message(id.to_url(), payload)
                     }
+                    Ok(RepoEvent::PeersChanged) => delegate.on_peers_changed(),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("delegate missed {n} events");
                         delegate.on_sync_event(format!(
@@ -645,11 +663,35 @@ impl Core {
         self.repo.local_http_url()
     }
 
-    pub fn add_iroh_peer(&self, node_id: String) -> Result<(), CoreError> {
+    pub fn add_iroh_peer(&self, code: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         self.runtime
-            .block_on(async move { repo.add_iroh_peer(node_id).await })?;
+            .block_on(async move { repo.add_iroh_peer(code).await })?;
         Ok(())
+    }
+
+    pub fn iroh_peers(&self) -> Vec<IrohPeer> {
+        self.repo
+            .iroh_peers()
+            .into_iter()
+            .map(|peer| IrohPeer {
+                code: match &peer.peer_id {
+                    Some(peer_id) => format!("{}:{peer_id}", peer.node_id),
+                    None => peer.node_id.clone(),
+                },
+                node_id: peer.node_id,
+                added: peer.added,
+            })
+            .collect()
+    }
+
+    /// This device's friend code: iroh node id and subduction peer id.
+    pub fn iroh_friend_code(&self) -> Option<String> {
+        self.repo.iroh_friend_code()
+    }
+
+    pub fn forget_iroh_peer(&self, node_id: String) {
+        self.repo.forget_iroh_peer(&node_id);
     }
 
     pub fn doc_storage_chunks(&self, url: String) -> Vec<StorageChunk> {
@@ -883,11 +925,12 @@ impl Core {
                 if !repo.wait_for_doc(account, OPEN_TIMEOUT).await {
                     anyhow::bail!("account doc not found locally or on the server");
                 }
-                let (contact_url, root_folder_url, mut config_url) = repo
+                let (contact_url, root_folder_url, module_settings_url, mut config_url) = repo
                     .read_doc(account, |doc| {
                         Ok((
                             shapes::account_field(doc, "contactUrl"),
                             shapes::account_field(doc, "rootFolderUrl"),
+                            shapes::account_field(doc, "moduleSettingsUrl"),
                             shapes::account_tools_lush(doc),
                         ))
                     })
@@ -953,12 +996,130 @@ impl Core {
                     account_url: account_url.clone(),
                     contact_url,
                     root_folder_url,
+                    module_settings_url,
                     config_url: Some(config_url),
                     folders,
                     inbox,
                 })
             })?;
             Ok(state)
+        })
+    }
+
+    /// Fold pre-login local docs into the account just signed into: one folder
+    /// holding every local root folder that has something in it, plus the
+    /// pocket pad unless one of those folders already holds it. That folder
+    /// goes to the top of the account's root folder and is appended to the
+    /// lush config's `.folders`. Returns the merged folder list.
+    pub fn adopt_local_docs(
+        &self,
+        account_url: String,
+        folder_urls: Vec<String>,
+        scratchpad_url: Option<String>,
+    ) -> Result<Vec<String>, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let folders = self.runtime.block_on(async move {
+                let account = DocId::from_url(&account_url)?;
+                let (root_url, config_url) = repo
+                    .read_doc(account, |doc| {
+                        Ok((
+                            shapes::account_field(doc, "rootFolderUrl"),
+                            shapes::account_tools_lush(doc),
+                        ))
+                    })
+                    .await?;
+                let (Some(root_url), Some(config_url)) = (root_url, config_url) else {
+                    anyhow::bail!("account has no root folder or lush config");
+                };
+                let root = DocId::from_url(&root_url)?;
+                repo.ensure_doc(root).await?;
+                if !repo.wait_for_doc(root, OPEN_TIMEOUT).await {
+                    anyhow::bail!("account root folder not found locally or on the server");
+                }
+                let config = DocId::from_url(&config_url)?;
+                let mut folders = repo
+                    .read_doc(config, |doc| Ok(shapes::config_folders(doc)))
+                    .await?;
+                let mut linked: HashSet<String> = repo
+                    .read_doc(root, |doc| shapes::folder_entries(doc))
+                    .await?
+                    .into_iter()
+                    .map(|entry| entry.url)
+                    .collect();
+                linked.insert(root_url.clone());
+                let mut adopted: Vec<shapes::DocLink> = Vec::new();
+                let mut held: HashSet<String> = HashSet::new();
+                for url in folder_urls {
+                    if linked.contains(&url) || folders.contains(&url) {
+                        continue;
+                    }
+                    let Ok(id) = DocId::from_url(&url) else { continue };
+                    let Ok((title, entries)) = repo
+                        .read_doc(id, |doc| Ok((shapes::doc_title(doc), shapes::folder_entries(doc)?)))
+                        .await
+                    else {
+                        continue;
+                    };
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    held.extend(entries.into_iter().map(|entry| entry.url));
+                    linked.insert(url.clone());
+                    adopted.push(shapes::DocLink {
+                        name: title,
+                        kind: "folder".into(),
+                        url,
+                        lush: None,
+                    });
+                }
+                if let Some(url) = scratchpad_url {
+                    if !linked.contains(&url) && !held.contains(&url) {
+                        if let Ok(id) = DocId::from_url(&url) {
+                            if let Ok((name, kind)) = repo
+                                .read_doc(id, |doc| {
+                                    Ok((shapes::doc_title(doc), shapes::doc_patchwork_type(doc)))
+                                })
+                                .await
+                            {
+                                adopted.push(shapes::DocLink {
+                                    name,
+                                    kind: kind.unwrap_or_else(|| "rich".into()),
+                                    url,
+                                    lush: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if adopted.is_empty() {
+                    return Ok(folders);
+                }
+                let title = ADOPTED_FOLDER_TITLE.to_string();
+                let adopted_folder = repo
+                    .create_doc(|doc| shapes::init_folder(doc, ADOPTED_FOLDER_TITLE))
+                    .await?;
+                for link in adopted.into_iter().rev() {
+                    repo.change_doc(adopted_folder, move |doc| {
+                        shapes::add_folder_entry(doc, &link)
+                    })
+                    .await?;
+                }
+                let link = shapes::DocLink {
+                    name: title,
+                    kind: "folder".into(),
+                    url: adopted_folder.to_url(),
+                    lush: None,
+                };
+                repo.change_doc(root, move |doc| shapes::add_folder_entry(doc, &link))
+                    .await?;
+                folders.push(adopted_folder.to_url());
+                let urls = folders.clone();
+                repo.change_doc(config, move |doc| shapes::config_set_folders(doc, &urls))
+                    .await?;
+                Ok::<_, anyhow::Error>(folders)
+            })?;
+            Ok(folders)
         })
     }
 
@@ -989,6 +1150,9 @@ impl Core {
                 Ok(ConfigState {
                     folders: shapes::config_folders(doc),
                     inbox: shapes::config_inbox(doc),
+                    smart: shapes::config_smart_notebooks(doc),
+                    packages: shapes::config_packages(doc),
+                    pad: shapes::config_pad(doc),
                 })
             })
             .await
@@ -1013,6 +1177,42 @@ impl Core {
         })
     }
 
+    pub fn set_config_packages(
+        &self,
+        config_url: String,
+        urls: Vec<String>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| shapes::config_set_packages(doc, &urls))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_config_smart_notebooks(
+        &self,
+        config_url: String,
+        folders: Vec<shapes::SmartNotebook>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::config_set_smart_notebooks(doc, &folders)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
     pub fn set_config_inbox(&self, config_url: String, url: String) -> Result<(), CoreError> {
         guarded(|| {
             let repo = self.repo.clone();
@@ -1020,6 +1220,161 @@ impl Core {
                 let id = DocId::from_url(&config_url)?;
                 repo.change_doc(id, move |doc| shapes::config_set_inbox(doc, &url))
                     .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    // ---- scratchpads ----
+
+    /// The note's own scratchpad, if it has one yet.
+    pub fn note_pad(&self, url: String) -> Option<String> {
+        let id = DocId::from_url(&url).ok()?;
+        let repo = self.repo.clone();
+        self.runtime
+            .block_on(async move { repo.read_doc(id, |doc| Ok(shapes::note_pad(doc))).await.ok() })
+            .flatten()
+    }
+
+    /// The note's scratchpad, made on first use and linked at `@lush.pad`.
+    pub fn ensure_note_pad(&self, url: String) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let pad = self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                let (existing, title) = repo
+                    .read_doc(id, |doc| Ok((shapes::note_pad(doc), shapes::doc_title(doc))))
+                    .await?;
+                if let Some(existing) = existing {
+                    return Ok::<_, anyhow::Error>(existing);
+                }
+                let pad = repo
+                    .create_doc(|doc| shapes::init_pad(doc, &format!("{title} scratchpad")))
+                    .await?;
+                let pad_url = pad.to_url();
+                let linked = pad_url.clone();
+                repo.change_doc(id, move |doc| shapes::set_note_pad(doc, &linked))
+                    .await?;
+                Ok(pad_url)
+            })?;
+            Ok(pad)
+        })
+    }
+
+    /// The app-wide pocket pad, made on first use and recorded in the config.
+    pub fn ensure_pocket_pad(&self, config_url: String) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let pad = self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                if let Some(existing) = repo.read_doc(id, |doc| Ok(shapes::config_pad(doc))).await? {
+                    return Ok::<_, anyhow::Error>(existing);
+                }
+                let pad = repo
+                    .create_doc(|doc| shapes::init_pad(doc, "Pocket Pad"))
+                    .await?;
+                let pad_url = pad.to_url();
+                let linked = pad_url.clone();
+                repo.change_doc(id, move |doc| shapes::config_set_pad(doc, &linked))
+                    .await?;
+                Ok(pad_url)
+            })?;
+            Ok(pad)
+        })
+    }
+
+    /// A pad with nothing pointing at it yet — for a device with no account,
+    /// where the caller remembers the url itself.
+    pub fn create_pad(&self, title: String) -> Result<String, CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let pad = repo.create_doc(|doc| shapes::init_pad(doc, &title)).await?;
+                Ok::<_, anyhow::Error>(pad.to_url())
+            })?;
+            Ok(url)
+        })
+    }
+
+    pub fn pad_items(&self, url: String) -> Vec<shapes::PadItem> {
+        let Ok(id) = DocId::from_url(&url) else {
+            return Vec::new();
+        };
+        let repo = self.repo.clone();
+        self.runtime
+            .block_on(async move { repo.read_doc(id, |doc| Ok(shapes::pad_items(doc))).await })
+            .unwrap_or_default()
+    }
+
+    pub fn pad_put_item(&self, url: String, item: shapes::PadItem) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                repo.change_doc(id, move |doc| shapes::pad_put_item(doc, &item))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn pad_move_item(
+        &self,
+        url: String,
+        item_id: String,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::pad_move_item(doc, &item_id, x, y, w, h)?;
+                    Ok(())
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn pad_set_data(
+        &self,
+        url: String,
+        item_id: String,
+        data: String,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::pad_set_data(doc, &item_id, &data)?;
+                    Ok(())
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn pad_remove_item(&self, url: String, item_id: String) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::pad_remove_item(doc, &item_id)?;
+                    Ok(())
+                })
+                .await?;
                 Ok::<_, anyhow::Error>(())
             })?;
             Ok(())
