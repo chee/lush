@@ -1916,7 +1916,7 @@ mod tests {
             &mut doc,
             "automerge:orig",
             "automerge:clone",
-            &[head.clone()],
+            std::slice::from_ref(&head),
         )
         .unwrap();
         let (_, clones) = doc.get(ROOT, "clones").unwrap().unwrap();
@@ -1931,8 +1931,8 @@ mod tests {
             head
         );
 
-        draft_record_merge(&mut doc, "automerge:orig", &[head.clone()]).unwrap();
-        draft_record_merge(&mut doc, "automerge:missing", &[head.clone()]).unwrap();
+        draft_record_merge(&mut doc, "automerge:orig", std::slice::from_ref(&head)).unwrap();
+        draft_record_merge(&mut doc, "automerge:missing", std::slice::from_ref(&head)).unwrap();
         let shape = draft_shape(&doc).unwrap();
         assert_eq!(shape.clones.len(), 1);
         assert_eq!(shape.clones[0].original_url, "automerge:orig");
@@ -2193,9 +2193,7 @@ mod title_tests {
                 nested("heading", json!([])),
                 SpanJson::Text {
                     value: "Grocery".into(),
-                    marks: Some(
-                        serde_json::from_value(json!({ "strong": true })).unwrap()
-                    ),
+                    marks: Some(serde_json::from_value(json!({ "strong": true })).unwrap()),
                 },
                 text(" list for Tuesday"),
                 block("paragraph"),

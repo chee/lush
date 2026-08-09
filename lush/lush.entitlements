@@ -10,8 +10,6 @@
 	<string>default</string>
 	<key>com.apple.developer.maps</key>
 	<true/>
-	<key>com.apple.developer.usernotifications.communication</key>
-	<true/>
 	<key>com.apple.developer.weatherkit</key>
 	<true/>
 	<key>com.apple.developer.wifi-aware</key>

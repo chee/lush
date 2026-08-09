@@ -225,7 +225,7 @@ final class PadStore {
 
     // MARK: making items
 
-    static let cardWidth: CGFloat = 260
+    nonisolated static let cardWidth: CGFloat = 260
 
     func textItem(
         spans: [SpanNode],

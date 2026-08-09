@@ -3912,7 +3912,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         return true
     }
 
-    static func pngData(_ image: NSImage) -> Data? {
+    nonisolated static func pngData(_ image: NSImage) -> Data? {
         guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else {
             return nil
         }
@@ -4347,12 +4347,12 @@ struct RichTextEditor: NSViewRepresentable {
             if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
                 return core.unnestListItem()
             }
-            if commandSelector == Selector(("moveToBeginningOfLine:"))
-                || commandSelector == Selector(("moveToBeginningOfParagraph:")) {
+            if commandSelector == #selector(NSStandardKeyBindingResponding.moveToBeginningOfLine(_:))
+                || commandSelector == #selector(NSStandardKeyBindingResponding.moveToBeginningOfParagraph(_:)) {
                 return core.moveToBlockquoteSoftLineBoundary(end: false)
             }
-            if commandSelector == Selector(("moveToEndOfLine:"))
-                || commandSelector == Selector(("moveToEndOfParagraph:")) {
+            if commandSelector == #selector(NSStandardKeyBindingResponding.moveToEndOfLine(_:))
+                || commandSelector == #selector(NSStandardKeyBindingResponding.moveToEndOfParagraph(_:)) {
                 return core.moveToBlockquoteSoftLineBoundary(end: true)
             }
             return false

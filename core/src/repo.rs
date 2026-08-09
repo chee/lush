@@ -11,10 +11,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use async_tungstenite::{
-    tokio::TokioAdapter,
-    tungstenite::protocol::WebSocketConfig,
-};
+use async_tungstenite::{tokio::TokioAdapter, tungstenite::protocol::WebSocketConfig};
 use automerge::{Automerge, ChangeHash, Fragment as AutomergeFragment, ReadDoc};
 use future_form::Sendable;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
@@ -141,7 +138,7 @@ impl PartialEq for PrefetchTransport {
 /// and HTTP long-poll peers for Pushwork compatibility.
 #[derive(Debug, Clone)]
 pub enum WsTransport {
-    Dialed(TokioWebSocketClient<MemorySigner>),
+    Dialed(Box<TokioWebSocketClient<MemorySigner>>),
     Accepted(WebSocket<TokioAdapter<TcpStream>, Sendable>),
     Iroh(IrohTransport),
     HttpLongPoll(HttpLongPollTransport),
@@ -186,7 +183,7 @@ impl Transport<Sendable> for WsTransport {
     fn send_bytes(&self, bytes: &[u8]) -> BoxFuture<'_, Result<(), Self::SendError>> {
         match self {
             Self::Dialed(ws) => {
-                let fut = Transport::<Sendable>::send_bytes(ws, bytes);
+                let fut = Transport::<Sendable>::send_bytes(ws.as_ref(), bytes);
                 Box::pin(async move { fut.await.map_err(TransportSendError::Ws) })
             }
             Self::Accepted(ws) => {
@@ -210,7 +207,7 @@ impl Transport<Sendable> for WsTransport {
 
     fn recv_bytes(&self) -> BoxFuture<'_, Result<Vec<u8>, Self::RecvError>> {
         match self {
-            Self::Dialed(ws) => Transport::<Sendable>::recv_bytes(ws)
+            Self::Dialed(ws) => Transport::<Sendable>::recv_bytes(ws.as_ref())
                 .map(|r| r.map_err(TransportRecvError::Ws))
                 .boxed(),
             Self::Accepted(ws) => Transport::<Sendable>::recv_bytes(ws)
@@ -247,7 +244,7 @@ impl Transport<Sendable> for WsTransport {
 
     fn disconnect(&self) -> BoxFuture<'_, Result<(), Self::DisconnectionError>> {
         match self {
-            Self::Dialed(ws) => Transport::<Sendable>::disconnect(ws)
+            Self::Dialed(ws) => Transport::<Sendable>::disconnect(ws.as_ref())
                 .map(|r| r.map_err(TransportDisconnectError::Ws))
                 .boxed(),
             Self::Accepted(ws) => Transport::<Sendable>::disconnect(ws)
@@ -413,9 +410,7 @@ async fn accept_local_http_peer(
 
             let (mut parts, body) = resp.into_parts();
             if let Some(origin) = allowed_origin {
-                parts
-                    .headers
-                    .insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                parts.headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
                 parts
                     .headers
                     .insert(hyper::header::VARY, HeaderValue::from_static("Origin"));
@@ -861,7 +856,7 @@ fn ingest_loose_batch(
     stored_fragments: &HashSet<ChangeHash>,
     out: &mut Ingested,
 ) {
-    let batch: Vec<_> = pending.drain(..).collect();
+    let batch = std::mem::take(pending);
     let Some(head) = batch.last().map(|fragment| fragment.head) else {
         return;
     };
@@ -1707,7 +1702,12 @@ impl Repo {
                 return 0;
             }
             let collected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                state.doc.fragments(0..).into_iter().map(|f| f.head).collect()
+                state
+                    .doc
+                    .fragments(0..)
+                    .into_iter()
+                    .map(|f| f.head)
+                    .collect()
             }));
             match collected {
                 Ok(live) => live,
@@ -1720,16 +1720,18 @@ impl Repo {
         if live.is_empty() {
             return 0;
         }
-        let commits =
-            match <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, sid)
-                .await
-            {
-                Ok(commits) => commits,
-                Err(e) => {
-                    tracing::warn!(error = %e, "loading loose commits failed");
-                    return 0;
-                }
-            };
+        let commits = match <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(
+            &self.storage,
+            sid,
+        )
+        .await
+        {
+            Ok(commits) => commits,
+            Err(e) => {
+                tracing::warn!(error = %e, "loading loose commits failed");
+                return 0;
+            }
+        };
         let absorbed: Vec<_> = commits
             .into_iter()
             .map(|commit| commit.head())
@@ -1851,7 +1853,7 @@ impl Repo {
                     let mut dialed = None;
                     let transport = authenticated.map(|c| {
                         dialed = Some(c.clone());
-                        MessageTransport::new(WsTransport::Dialed(c))
+                        MessageTransport::new(WsTransport::Dialed(Box::new(c)))
                     });
                     if let Err(e) = self.core.add_connection(transport).await {
                         tracing::error!(error = %e, "failed to register connection");
@@ -2389,17 +2391,19 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
-            if state.doc.get_heads() == heads {
-                f(&mut state.doc)?
-            } else {
-                let mut fork = state.doc.fork_at(&heads)?;
-                let before = fork.get_heads();
-                let value = f(&mut fork)?;
-                if fork.get_heads() != before {
-                    state.doc.merge(&mut fork)?;
+            catching(|| {
+                if state.doc.get_heads() == heads {
+                    f(&mut state.doc)
+                } else {
+                    let mut fork = state.doc.fork_at(&heads)?;
+                    let before = fork.get_heads();
+                    let value = f(&mut fork)?;
+                    if fork.get_heads() != before {
+                        state.doc.merge(&mut fork)?;
+                    }
+                    Ok(value)
                 }
-                value
-            }
+            })?
         };
         if self.save_doc(id).await? {
             self.request_sync(id).await;
@@ -2422,17 +2426,19 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
-            if heads.is_empty() || state.doc.get_heads() == heads {
-                f(&mut state.doc)?
-            } else {
-                let mut fork = state.doc.fork_at(&heads)?;
-                let before = fork.get_heads();
-                let value = f(&mut fork)?;
-                if fork.get_heads() != before {
-                    state.doc.merge(&mut fork)?;
+            catching(|| {
+                if heads.is_empty() || state.doc.get_heads() == heads {
+                    f(&mut state.doc)
+                } else {
+                    let mut fork = state.doc.fork_at(&heads)?;
+                    let before = fork.get_heads();
+                    let value = f(&mut fork)?;
+                    if fork.get_heads() != before {
+                        state.doc.merge(&mut fork)?;
+                    }
+                    Ok(value)
                 }
-                value
-            }
+            })?
         };
         self.schedule_save_doc(id).await;
         Ok(value)
@@ -2696,11 +2702,16 @@ mod tests {
         wait_until_dialable(&a).await;
         wait_until_dialable(&b).await;
 
-        a.add_iroh_peer(b.iroh_friend_code().unwrap()).await.unwrap();
+        a.add_iroh_peer(b.iroh_friend_code().unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             a.iroh_peers()
                 .into_iter()
-                .map(|peer| (format!("{}:{}", peer.node_id, peer.peer_id.unwrap()), peer.added))
+                .map(|peer| (
+                    format!("{}:{}", peer.node_id, peer.peer_id.unwrap()),
+                    peer.added
+                ))
                 .collect::<Vec<_>>(),
             vec![(b.iroh_friend_code().unwrap(), true)]
         );
@@ -2925,7 +2936,13 @@ mod tests {
         assert_eq!(state.doc.get_heads(), source.get_heads());
         assert_eq!(state.stored_commits.len(), commit_heads.len());
         assert_eq!(state.stored_fragments.len(), fragment_heads.len());
-        let repeated = ingest(&state.doc, sid, &state.stored_commits, &state.stored_fragments, false)
+        let repeated = ingest(
+            &state.doc,
+            sid,
+            &state.stored_commits,
+            &state.stored_fragments,
+            false,
+        )
         .unwrap();
         assert!(repeated.commits.is_empty());
         assert!(repeated.fragments.is_empty());

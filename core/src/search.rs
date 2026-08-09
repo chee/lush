@@ -653,14 +653,16 @@ impl FilterSql {
             index += 1;
         }
         if let Some(from) = filter.when_from.as_deref().filter(|s| !s.is_empty()) {
-            sql.conds
-                .push_str(&format!(" AND d.when_day <> '' AND d.when_day >= ?{index} "));
+            sql.conds.push_str(&format!(
+                " AND d.when_day <> '' AND d.when_day >= ?{index} "
+            ));
             sql.args.push(from.to_string());
             index += 1;
         }
         if let Some(to) = filter.when_to.as_deref().filter(|s| !s.is_empty()) {
-            sql.conds
-                .push_str(&format!(" AND d.when_day <> '' AND d.when_day <= ?{index} "));
+            sql.conds.push_str(&format!(
+                " AND d.when_day <> '' AND d.when_day <= ?{index} "
+            ));
             sql.args.push(to.to_string());
         }
         sql
@@ -812,11 +814,16 @@ mod tests {
     }
 
     fn fixture() -> SearchIndex {
-        let dir = std::env::temp_dir().join(format!("lush-search-{:?}", std::thread::current().id()));
+        let dir =
+            std::env::temp_dir().join(format!("lush-search-{:?}", std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&dir);
         let index = SearchIndex::open(&dir).unwrap();
-        index.upsert(indexed("note", "cake", &["baking"], "2026-08-09")).unwrap();
-        index.upsert(indexed("deep", "cake", &["baking", "party"], "2026-09-01")).unwrap();
+        index
+            .upsert(indexed("note", "cake", &["baking"], "2026-08-09"))
+            .unwrap();
+        index
+            .upsert(indexed("deep", "cake", &["baking", "party"], "2026-09-01"))
+            .unwrap();
         index.upsert(indexed("outside", "cake", &[], "")).unwrap();
         index
             .set_parents(&HashMap::from([
@@ -836,7 +843,10 @@ mod tests {
             scope: Some("work".into()),
             ..Default::default()
         };
-        assert_eq!(urls(index.search("cake", &filter).unwrap()), ["deep", "note"]);
+        assert_eq!(
+            urls(index.search("cake", &filter).unwrap()),
+            ["deep", "note"]
+        );
     }
 
     #[test]

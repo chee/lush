@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         fresh.wait_for_doc(asset, Duration::from_secs(20)).await,
         "asset arrived"
     );
-    let spans = fresh.read_doc(note, |d| shapes::spans_to_json(d)).await?;
+    let spans = fresh.read_doc(note, shapes::spans_to_json).await?;
     println!("note spans: {}", serde_json::to_string(&spans)?);
     let bytes = fresh
         .read_doc(asset, |d| Ok(shapes::file_bytes(d)))

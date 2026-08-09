@@ -213,8 +213,10 @@ extension NotesModel {
         smartHitTasks[folder.id]?.cancel()
         smartHitTasks[folder.id] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(600))
-            guard !Task.isCancelled, let hits = await self?.smartNotebookHits(folder) else { return }
-            self?.smartHits[folder.id] = hits
+            guard !Task.isCancelled, let self, self.startupSettled else { return }
+            let hits = await self.smartNotebookHits(folder)
+            guard !Task.isCancelled else { return }
+            self.smartHits[folder.id] = hits
             await SmartNotebookAlerts.counted(folder, count: hits.count)
         }
     }

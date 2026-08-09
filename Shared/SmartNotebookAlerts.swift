@@ -4,6 +4,7 @@ import UserNotifications
 /// Local notifications for smart notebooks that asked to hear about changes.
 /// The last count lives in the group container, so Lush and the helper measure
 /// the change against the same number whichever of them is running.
+@MainActor
 enum SmartNotebookAlerts {
     static func authorized() async -> Bool {
         await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .authorized

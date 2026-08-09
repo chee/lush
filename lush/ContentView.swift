@@ -1044,7 +1044,7 @@ struct ContentView: View {
         tag.contains("\u{1}") || tag.hasPrefix("pinned:") || tag.hasPrefix("smarthit:")
     }
 
-    private static func sidebarUrl(_ tag: String) -> String {
+    nonisolated private static func sidebarUrl(_ tag: String) -> String {
         if tag.hasPrefix("pinned:") { return String(tag.dropFirst(7)) }
         if let sep = tag.lastIndex(of: "\u{1}") { return String(tag[tag.index(after: sep)...]) }
         if tag.hasPrefix("smarthit:") { return String(tag.dropFirst(9)) }
@@ -4145,7 +4145,7 @@ struct SidebarSelectionRow: View {
     private var fill: Color {
         switch state {
         case .clicked: Color.accentColor.opacity(scheme == .dark ? 0.40 : 0.28)
-        case .echo: Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+        case .echo: Color.secondary.opacity(scheme == .dark ? 0.24 : 0.16)
         case .none: .clear
         }
     }
@@ -4162,8 +4162,9 @@ enum SidebarDragKind {
     case item
 }
 
+@MainActor
 enum SidebarDrag {
-    nonisolated(unsafe) static var kind: SidebarDragKind?
+    static var kind: SidebarDragKind?
 
     static func provider(_ payload: String, kind: SidebarDragKind) -> NSItemProvider {
         Self.kind = kind
@@ -4186,8 +4187,9 @@ enum DropMark {
 /// One mark for the whole sidebar. Rows that miss their `dropExited` cannot
 /// leave a stale line behind, since only the row named here draws anything.
 @Observable
+@MainActor
 final class SidebarDropHighlight {
-    nonisolated(unsafe) static let shared = SidebarDropHighlight()
+    static let shared = SidebarDropHighlight()
 
     private var row: String?
     private var mark: DropMark?
@@ -4214,7 +4216,7 @@ private struct SidebarReorderTarget: ViewModifier {
     let row: String
     let kind: SidebarDragKind
     var pinnedMark: DropMark?
-    let handle: @MainActor (String, Bool) -> Void
+    let handle: @MainActor @Sendable (String, Bool) -> Void
 
     @State private var height: CGFloat = 0
 
@@ -4235,7 +4237,7 @@ private struct SidebarReorderTarget: ViewModifier {
                     kind: kind,
                     pinnedMark: pinnedMark,
                     height: height,
-                    handle: handle
+                    handle: { payload, after in handle(payload, after) }
                 )
             )
     }
@@ -4246,7 +4248,7 @@ private struct SidebarReorderDrop: DropDelegate {
     let kind: SidebarDragKind
     let pinnedMark: DropMark?
     let height: CGFloat
-    let handle: @MainActor (String, Bool) -> Void
+    let handle: @MainActor @Sendable (String, Bool) -> Void
 
     private func landing(_ info: DropInfo) -> DropMark {
         pinnedMark ?? (info.location.y > height / 2 ? .after : .before)

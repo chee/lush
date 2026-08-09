@@ -181,10 +181,13 @@ final class NotesModel {
     private let semanticSearch = SemanticSearchIndex()
     private let spotlightIndex = SpotlightIndex()
     private var semanticIndexTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var semanticIndexTokens: [String: UUID] = [:]
     @ObservationIgnored private var spotlightIndexTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var spotlightIndexTokens: [String: UUID] = [:]
     @ObservationIgnored private var spotlightBackfilled: Set<String> = []
     @ObservationIgnored private var calendarNotesReindexed = false
     private var previewUpdateTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var previewUpdateTokens: [String: UUID] = [:]
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var noteWriteTasks: [String: Task<[String]?, Never>] = [:]
     @ObservationIgnored private var noteObservers: [UUID: @MainActor (String) -> Void] = [:]
@@ -213,6 +216,7 @@ final class NotesModel {
     /// Notes whose preview + thumbnail have been read from the core. A refresh
     /// must not re-read the whole tree; docChanged drops the entries it stales.
     @ObservationIgnored private var metaFetched: Set<String> = []
+    @ObservationIgnored private var contextMetaLoading: Set<String> = []
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
     @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
@@ -1265,6 +1269,7 @@ final class NotesModel {
         guard !startupSettled else { return }
         startupSettled = true
         drainStartupWaiters()
+        Task { [weak self] in await self?.checkSmartNotebooks() }
         if deferredStartupRefresh {
             deferredStartupRefresh = false
             refreshNotes()
@@ -1418,8 +1423,13 @@ final class NotesModel {
     }
 
     func loadContextMeta(url: String) async {
-        guard noteRow(for: url).contextMeta == nil, let core else { return }
-        let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
+        guard noteRow(for: url).contextMeta == nil,
+              !contextMetaLoading.contains(url),
+              let core
+        else { return }
+        contextMetaLoading.insert(url)
+        defer { contextMetaLoading.remove(url) }
+        guard let json = try? await core.noteSpansJson(url: url) else { return }
         let spans = await Task.detached { SpanNode.decodeList(json) }.value
         let fmt = ISO8601DateFormatter()
         var meta = NoteContextMeta()
@@ -1693,11 +1703,14 @@ final class NotesModel {
     private func purgeNoteState(_ url: String) {
         semanticIndexTasks[url]?.cancel()
         semanticIndexTasks[url] = nil
+        semanticIndexTokens[url] = nil
         spotlightIndexTasks[url]?.cancel()
         spotlightIndexTasks[url] = nil
+        spotlightIndexTokens[url] = nil
         spotlightBackfilled.remove(url)
         previewUpdateTasks[url]?.cancel()
         previewUpdateTasks[url] = nil
+        previewUpdateTokens[url] = nil
         noteWriteTasks[url]?.cancel()
         noteWriteTasks[url] = nil
         clearRow(url)
@@ -2431,14 +2444,19 @@ final class NotesModel {
 
     private func scheduleFileSemanticIndex(url: String, name: String? = nil) {
         semanticIndexTasks[url]?.cancel()
+        let token = UUID()
+        semanticIndexTokens[url] = token
         semanticIndexTasks[url] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(900))
             guard !Task.isCancelled else { return }
-            await self?.indexFileSemantically(url: url, name: name)
+            await self?.indexFileSemantically(url: url, name: name, token: token)
+            guard let self, self.semanticIndexTokens[url] == token else { return }
+            self.semanticIndexTasks[url] = nil
+            self.semanticIndexTokens[url] = nil
         }
     }
 
-    private func indexFileSemantically(url: String, name: String?) async {
+    private func indexFileSemantically(url: String, name: String?, token: UUID) async {
         guard let core else { return }
         let (resolvedName, text) = await Task.detached {
             let n = name ?? core.assetInfo(url: url)?.name ?? ""
@@ -2454,8 +2472,8 @@ final class NotesModel {
             }
             return (n, parts.joined(separator: "\n"))
         }.value
+        guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
         await semanticSearch.indexFile(url: url, name: resolvedName, text: text)
-        semanticIndexTasks[url] = nil
     }
 
     /// Only notes this launch hasn't queued yet — docChanged keeps changed
@@ -2469,56 +2487,69 @@ final class NotesModel {
 
     private func scheduleSemanticIndex(url: String, name: String? = nil) {
         semanticIndexTasks[url]?.cancel()
+        let token = UUID()
+        semanticIndexTokens[url] = token
         semanticIndexTasks[url] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(900))
             guard !Task.isCancelled else { return }
-            await self?.indexSemantically(url: url, name: name)
+            await self?.indexSemantically(url: url, name: name, token: token)
+            guard let self, self.semanticIndexTokens[url] == token else { return }
+            self.semanticIndexTasks[url] = nil
+            self.semanticIndexTokens[url] = nil
         }
     }
 
-    private func indexSemantically(url: String, name: String?) async {
+    private func indexSemantically(url: String, name: String?, token: UUID) async {
         guard let core else { return }
         var resolvedName = name ?? node(for: url)?.displayName
         if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
         try? await core.openNote(url: url)
-        let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
+        guard let json = try? await core.noteSpansJson(url: url) else { return }
         let eventIds = await Task.detached { CalendarLinks.eventIds(in: SpanNode.decodeList(json)) }.value
+        guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
         CalendarLinks.set(eventIds, for: url)
         await semanticSearch.index(url: url, name: resolvedName ?? "", spansJson: json)
-        semanticIndexTasks[url] = nil
     }
 
     private func scheduleSpotlightIndex(url: String, name: String? = nil) {
         spotlightIndexTasks[url]?.cancel()
+        let token = UUID()
+        spotlightIndexTokens[url] = token
         spotlightIndexTasks[url] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(1200))
             guard !Task.isCancelled else { return }
-            await self?.indexForSpotlight(url: url, name: name)
+            await self?.indexForSpotlight(url: url, name: name, token: token)
+            guard let self, self.spotlightIndexTokens[url] == token else { return }
+            self.spotlightIndexTasks[url] = nil
+            self.spotlightIndexTokens[url] = nil
         }
     }
 
-    private func indexForSpotlight(url: String, name: String?) async {
+    private func indexForSpotlight(url: String, name: String?, token: UUID) async {
         guard let core else { return }
         var resolvedName = name ?? node(for: url)?.displayName
         if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
         try? await core.openNote(url: url)
-        let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
+        guard let json = try? await core.noteSpansJson(url: url) else { return }
+        guard spotlightIndexTokens[url] == token, !Task.isCancelled else { return }
         await spotlightIndex.index(url: url, title: resolvedName ?? "", spansJson: json)
-        spotlightIndexTasks[url] = nil
     }
 
     private func schedulePreviewUpdate(url: String) {
         previewUpdateTasks[url]?.cancel()
+        let token = UUID()
+        previewUpdateTokens[url] = token
         previewUpdateTasks[url] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled, let self, let core = self.core else { return }
             let preview = await core.notePreview(url: url)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, self.previewUpdateTokens[url] == token else { return }
             self.setPreview(url, preview)
             #if os(macOS)
             if url == self.selectedNoteUrl { self.updateDockTilePreview() }
             #endif
             self.previewUpdateTasks[url] = nil
+            self.previewUpdateTokens[url] = nil
         }
     }
 

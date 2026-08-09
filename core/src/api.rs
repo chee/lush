@@ -277,7 +277,7 @@ struct CachedDocHistory {
 }
 
 fn normalized_heads(mut heads: Vec<ChangeHash>) -> Vec<ChangeHash> {
-    heads.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    heads.sort_by_key(|a| a.to_string());
     heads
 }
 
@@ -405,12 +405,7 @@ type IndexSlots = std::sync::Mutex<HashMap<DocId, IndexSlot>>;
 /// Serialize index updates per doc: while one runs, a new DocChanged sets
 /// `again` instead of racing a second task. The rerun reads the doc's latest
 /// state, so the newest write always lands last and the index can't go stale.
-fn schedule_index_doc(
-    repo: Arc<Repo>,
-    index: Arc<SearchIndex>,
-    slots: Arc<IndexSlots>,
-    id: DocId,
-) {
+fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<IndexSlots>, id: DocId) {
     {
         let mut map = slots.lock().unwrap();
         let slot = map.entry(id).or_default();
@@ -477,11 +472,7 @@ impl std::io::Write for OsLogWriter {
         if !line.is_empty() {
             if let Ok(message) = std::ffi::CString::new(line) {
                 unsafe {
-                    libc::syslog(
-                        libc::LOG_NOTICE,
-                        b"%s\0".as_ptr() as *const libc::c_char,
-                        message.as_ptr(),
-                    );
+                    libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr());
                 }
             }
         }
@@ -884,7 +875,7 @@ impl Core {
             return Vec::new();
         };
         let repo = self.repo.clone();
-        self.run(async move { repo.read_doc(id, |doc| shapes::folder_entries(doc)).await })
+        self.run(async move { repo.read_doc(id, shapes::folder_entries).await })
             .await
             .ok()
             .and_then(Result::ok)
@@ -914,7 +905,7 @@ impl Core {
             return Vec::new();
         };
         let repo = self.repo.clone();
-        self.run(async move { repo.read_doc(id, |doc| shapes::folder_entries(doc)).await })
+        self.run(async move { repo.read_doc(id, shapes::folder_entries).await })
             .await
             .ok()
             .and_then(Result::ok)
@@ -998,7 +989,7 @@ impl Core {
                 if folder == to {
                     anyhow::bail!("can't move a folder inside itself");
                 }
-                if let Ok(entries) = repo.read_doc(folder, |d| shapes::folder_entries(d)).await {
+                if let Ok(entries) = repo.read_doc(folder, shapes::folder_entries).await {
                     for entry in entries.iter().filter(|e| e.kind == "folder") {
                         if let Ok(id) = DocId::from_url(&entry.url) {
                             stack.push(id);
@@ -1167,7 +1158,7 @@ impl Core {
                     .read_doc(config, |doc| Ok(shapes::config_folders(doc)))
                     .await?;
                 let mut linked: HashSet<String> = repo
-                    .read_doc(root, |doc| shapes::folder_entries(doc))
+                    .read_doc(root, shapes::folder_entries)
                     .await?
                     .into_iter()
                     .map(|entry| entry.url)
@@ -1179,9 +1170,13 @@ impl Core {
                     if linked.contains(&url) || folders.contains(&url) {
                         continue;
                     }
-                    let Ok(id) = DocId::from_url(&url) else { continue };
+                    let Ok(id) = DocId::from_url(&url) else {
+                        continue;
+                    };
                     let Ok((title, entries)) = repo
-                        .read_doc(id, |doc| Ok((shapes::doc_title(doc), shapes::folder_entries(doc)?)))
+                        .read_doc(id, |doc| {
+                            Ok((shapes::doc_title(doc), shapes::folder_entries(doc)?))
+                        })
                         .await
                     else {
                         continue;
@@ -1194,8 +1189,10 @@ impl Core {
                         if !held.insert(entry.url.clone()) || entry.kind != "folder" {
                             continue;
                         }
-                        let Ok(id) = DocId::from_url(&entry.url) else { continue };
-                        if let Ok(children) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
+                        let Ok(id) = DocId::from_url(&entry.url) else {
+                            continue;
+                        };
+                        if let Ok(children) = repo.read_doc(id, shapes::folder_entries).await {
                             stack.extend(children);
                         }
                     }
@@ -1211,7 +1208,9 @@ impl Core {
                     if linked.contains(&url) || held.contains(&url) {
                         continue;
                     }
-                    let Ok(id) = DocId::from_url(&url) else { continue };
+                    let Ok(id) = DocId::from_url(&url) else {
+                        continue;
+                    };
                     let Ok((name, kind)) = repo
                         .read_doc(id, |doc| {
                             Ok((shapes::doc_title(doc), shapes::doc_patchwork_type(doc)))
@@ -1408,7 +1407,11 @@ impl Core {
         let id = DocId::from_url(&url).ok()?;
         let repo = self.repo.clone();
         self.runtime
-            .block_on(async move { repo.read_doc(id, |doc| Ok(shapes::note_pad(doc))).await.ok() })
+            .block_on(async move {
+                repo.read_doc(id, |doc| Ok(shapes::note_pad(doc)))
+                    .await
+                    .ok()
+            })
             .flatten()
     }
 
@@ -1419,7 +1422,9 @@ impl Core {
             let pad = self.runtime.block_on(async move {
                 let id = DocId::from_url(&url)?;
                 let (existing, title) = repo
-                    .read_doc(id, |doc| Ok((shapes::note_pad(doc), shapes::doc_title(doc))))
+                    .read_doc(id, |doc| {
+                        Ok((shapes::note_pad(doc), shapes::doc_title(doc)))
+                    })
                     .await?;
                 if let Some(existing) = existing {
                     return Ok::<_, anyhow::Error>(existing);
@@ -1443,7 +1448,8 @@ impl Core {
             let repo = self.repo.clone();
             let pad = self.runtime.block_on(async move {
                 let id = DocId::from_url(&config_url)?;
-                if let Some(existing) = repo.read_doc(id, |doc| Ok(shapes::config_pad(doc))).await? {
+                if let Some(existing) = repo.read_doc(id, |doc| Ok(shapes::config_pad(doc))).await?
+                {
                     return Ok::<_, anyhow::Error>(existing);
                 }
                 let pad = repo
@@ -1788,8 +1794,7 @@ impl Core {
         self.run(async move {
             repo.ensure_doc(id).await?;
             if repo.wait_for_doc(id, OPEN_TIMEOUT).await {
-                repo.change_doc(id, |doc| shapes::normalize_strings(doc))
-                    .await?;
+                repo.change_doc(id, shapes::normalize_strings).await?;
             }
             // Not awaited: the search index is one mutex, and at startup the
             // prefetch walk holds it for every note on disk. The caller wants
@@ -1828,12 +1833,10 @@ impl Core {
                         if !repo.wait_for_doc(id, PREFETCH_TIMEOUT).await {
                             return Vec::new();
                         }
-                        let _ = repo
-                            .change_doc(id, |doc| shapes::normalize_strings(doc))
-                            .await;
+                        let _ = repo.change_doc(id, shapes::normalize_strings).await;
                         index_doc(repo.clone(), index, id).await;
                         let mut children: Vec<String> = repo
-                            .read_doc(id, |doc| shapes::folder_entries(doc))
+                            .read_doc(id, shapes::folder_entries)
                             .await
                             .map(|entries| entries.into_iter().map(|e| e.url).collect())
                             .unwrap_or_default();
@@ -2039,7 +2042,7 @@ impl Core {
         let json = self
             .run(async move {
                 let id = DocId::from_url(&url)?;
-                let spans = repo.read_doc(id, |doc| shapes::spans_to_json(doc)).await?;
+                let spans = repo.read_doc(id, shapes::spans_to_json).await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&spans)?)
             })
             .await??;
@@ -2180,6 +2183,7 @@ impl Core {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_note_mark(
         &self,
         url: String,
@@ -2888,5 +2892,3 @@ mod tests {
         assert_eq!(title, "host");
     }
 }
-
-
