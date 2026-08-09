@@ -217,9 +217,6 @@ struct SyncSettingsPane: View {
     @State private var peerError: String?
     @State private var addingPeer = false
     @State private var showingClearConfirm = false
-    @State private var backgroundSync = LushShared.helperEnabled
-    @State private var backgroundMenuBar = LushShared.helperShowsMenuBar
-
     var body: some View {
         Form {
             Section("Sync") {
@@ -244,23 +241,7 @@ struct SyncSettingsPane: View {
                     }
                 }
             }
-            #if os(macOS)
-            Section("Background") {
-                Toggle("Keep syncing when Lush is closed", isOn: $backgroundSync)
-                    .onChange(of: backgroundSync) { _, enabled in
-                        HelperControl.setEnabled(enabled)
-                        if !enabled { backgroundMenuBar = false }
-                    }
-                Toggle("Show menu bar item when Lush is closed", isOn: $backgroundMenuBar)
-                    .onChange(of: backgroundMenuBar) { _, shown in
-                        LushShared.helperShowsMenuBar = shown
-                    }
-                    .disabled(!backgroundSync)
-                Text("A small helper keeps your notes syncing after you quit Lush. It hands the core back the moment Lush opens again.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            #else
+            #if !os(macOS)
             Section("Background") {
                 Text("Lush syncs in the background when iOS grants it time — more often the more you use the app. Background App Refresh must be on in Settings.")
                     .font(.caption)
@@ -795,9 +776,10 @@ struct RowMenu<Content: View>: View {
 
 struct AccountSettingsPane: View {
     @Environment(NotesModel.self) private var model
-    @State private var loggingIn = false
     @State private var loggingInSheet = false
     @State private var addingFolder = false
+
+    private var loggingIn: Bool { model.loggingInUrl != nil }
 
     var body: some View {
         Form {
@@ -807,10 +789,14 @@ struct AccountSettingsPane: View {
                 }
                 Button(loggingIn ? "Logging In…" : "Add Account…") { loggingInSheet = true }
                     .disabled(loggingIn)
+                if let error = model.loginError {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
             } header: {
                 Text("Accounts")
             } footer: {
-                Text("Log in with a Patchwork account doc. Your notebooks, inbox and packages sync across devices through the account's lush config doc. Switching accounts swaps all of it.")
+                Text("Log in with a Patchwork account doc to sync your notebooks and settings")
             }
             Section {
                 if let url = model.effectiveQuickNoteUrl {
@@ -862,8 +848,6 @@ struct AccountSettingsPane: View {
                 Button("Add Notebook…") { addingFolder = true }
             } header: {
                 Text("Notebooks")
-            } footer: {
-                Text("The top-level folders shown in the sidebar. New notes from the widget or shortcuts land in the inbox folder. When logged in this list lives in your account's lush config and syncs across devices.")
             }
         }
         .formStyle(.grouped)
@@ -872,7 +856,7 @@ struct AccountSettingsPane: View {
             AddItemSheet(
                 title: "Log In",
                 placeholder: "account:name/… or automerge:…",
-                prompt: "Paste the url of your Patchwork account doc.",
+                prompt: "Paste your Patchwork account url.",
                 secure: true,
                 accepts: { NotesModel.normalizedAccountUrl($0) != nil },
                 add: logIn
@@ -882,7 +866,7 @@ struct AccountSettingsPane: View {
             AddItemSheet(
                 title: "Add Notebook",
                 placeholder: "automerge:…",
-                prompt: "Paste the url of a Patchwork folder doc."
+                prompt: "Paste a Patchwork folder url."
             ) { url in
                 Task { await model.addRootFolder(url) }
             }
@@ -915,7 +899,7 @@ struct AccountSettingsPane: View {
             if active {
                 Button("Log Out") { model.logOut() }
             } else {
-                Button(loggingIn ? "Switching…" : "Switch") { logIn(url) }
+                Button(model.loggingInUrl == url ? "Switching…" : "Switch") { logIn(url) }
                     .disabled(loggingIn)
             }
             RowMenu {
@@ -926,11 +910,7 @@ struct AccountSettingsPane: View {
     }
 
     private func logIn(_ url: String) {
-        loggingIn = true
-        Task {
-            _ = await model.logIn(accountUrl: url)
-            loggingIn = false
-        }
+        Task { _ = await model.logIn(accountUrl: url) }
     }
 }
 
@@ -978,9 +958,7 @@ struct PackagesSettingsPane: View {
                 Button("Add Package List…") { adding = true }
             } header: {
                 Text("Package Lists")
-            } footer: {
-                Text("A package list's datatypes and tools show up when embedding Patchwork documents. The System list ships with Lush and the User list comes from your Patchwork account; neither can be removed. Added lists live in your account's lush config and sync across devices when logged in. Takes effect for newly opened embeds.")
-            }
+            } 
         }
         .formStyle(.grouped)
         .navigationTitle("Packages")

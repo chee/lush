@@ -133,6 +133,9 @@ struct MenuBarCaptureView: View {
                 menuAction("Open Lush", systemImage: "arrow.up.forward.app") {
                     openLush()
                 }
+                menuAction("Quit", systemImage: "power") {
+                    LushAppDelegate.reallyQuit()
+                }
             }
         }
     }
@@ -287,6 +290,7 @@ struct MenuBarCaptureView: View {
 
     private func openLush() {
         dismiss()
+        NSApp.setActivationPolicy(.regular)
         openWindow(id: "main")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             NSApp.unhide(nil)

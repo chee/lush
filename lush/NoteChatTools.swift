@@ -120,7 +120,21 @@ enum NoteChatAction: Codable, Equatable {
                 return error.localizedDescription
             }
         case .linkEvent(let url, _, let events):
-            CalendarLinks.set(events.map(\.id), for: url)
+            let items = AgendaStore.shared.items
+            let snapshot = await model.spansSnapshot(for: url)
+            var spans = SpanNode.decodeList(snapshot.spansJson)
+            let linked = Set(CalendarLinks.eventIds(in: spans))
+            let fresh = events.compactMap { event in
+                linked.contains(event.id) ? nil : items.first { $0.id == event.id }
+            }
+            guard !fresh.isEmpty else { return nil }
+            spans += fresh.map { SpanNode.block(.calendarEventBlock($0)) }
+            await model.updateDocument(
+                url,
+                json: SpanNode.encodeList(spans),
+                title: RichText.title(from: spans),
+                heads: snapshot.heads.isEmpty ? nil : snapshot.heads
+            )
             return nil
         case .createFolder(let name, let parentUrl):
             guard let core = model.core else { return "Lush is still starting." }

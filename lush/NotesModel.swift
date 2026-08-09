@@ -22,6 +22,8 @@ final class NotesModel {
     /// The frontmost note's editor, for inspector tabs that talk to it.
     weak var activeEditor: EditorController?
     let presence = PresenceManager()
+    /// Note scratchpads and the pocket pad.
+    let pads = PadStore()
     /// The logged-in account's contact doc url — the presence identity key.
     private(set) var presenceContactUrl: String?
     private(set) var applyingIncomingChanges = UserDefaults.standard.object(forKey: applyIncomingKey) as? Bool ?? true
@@ -90,6 +92,8 @@ final class NotesModel {
     var folderUrl: String?
     var folderTitle: String = ""
     var connected = false
+    private(set) var storageLoaded = false
+    private(set) var startupSettled = false
     var irohPeers: [IrohPeer] = []
 
     func refreshPeers() {
@@ -169,11 +173,13 @@ final class NotesModel {
     @ObservationIgnored private var noteObservers: [UUID: @MainActor (String) -> Void] = [:]
     @ObservationIgnored private var delegateBridge: DelegateBridge?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var maintenanceTask: Task<Void, Never>?
     @ObservationIgnored private var documentHistoryCache: [String: DocumentHistorySummary] = [:]
     @ObservationIgnored private var snapshotCache: [HistorySnapshotKey: NoteSpansSnapshot] = [:]
     @ObservationIgnored private var renderedSnapshotCache: [HistorySnapshotKey: NSAttributedString] = [:]
     private(set) var thumbnails: [String: Data] = [:]
     @ObservationIgnored private var pendingRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingSmartNotebookCheckTask: Task<Void, Never>?
     private var lastKnownCounts: [String: Int] = [:]
     private static let patchworkDocUrlsKey = "patchworkDocUrls"
     private static let launchSnapshotFileName = "LaunchStateSnapshot.json"
@@ -198,6 +204,7 @@ final class NotesModel {
             selectedNoteUrl = saved.selectedNoteUrl
         }
         Self.bootLog("model init")
+        pads.attach(self)
     }
 
     /// Open editors register here to hear about local and remote changes.
@@ -224,6 +231,10 @@ final class NotesModel {
 
     private(set) var accountUrl: String? = LushShared.accountUrl
     private(set) var accountUrls: [String] = LushShared.accountUrls
+    /// Login progress and its last failure live on the model, not in a settings
+    /// view that gets torn down whenever she navigates away mid-login.
+    private(set) var loggingInUrl: String?
+    private(set) var loginError: String?
     private(set) var accountNames: [String: String] = LushShared.accountNames
     private(set) var accountConfigUrl: String?
     private(set) var accountModuleSettingsUrl: String? = PatchworkWeb.accountModuleUrl
@@ -249,27 +260,35 @@ final class NotesModel {
     }
 
     func logIn(accountUrl url: String) async -> Bool {
-        guard let core else { return false }
         guard let normalized = Self.normalizedAccountUrl(url) else {
-            status = "Login failed: expected an automerge: or account: URL"
+            loginError = "Expected an automerge: or account: URL"
             return false
         }
+        if core == nil { await start() }
+        guard let core else {
+            loginError = "Lush hasn't opened its storage yet"
+            return false
+        }
+        loggingInUrl = normalized
+        loginError = nil
+        defer { loggingInUrl = nil }
         status = "Logging in…"
         // Folders and the scratchpad made before logging in belong to her, not
         // to this install: they're folded into the account she signs into.
         let localFolders = loggedIn ? [] : rootFolderUrls
         let localScratchpad = loggedIn ? nil : quickNoteUrl
+        let localDocs = loggedIn ? [] : ([localScratchpad].compactMap { $0 } + CalendarLinks.noteUrls)
         do {
             var state = try await Task.detached {
                 try core.loginAccount(accountUrl: normalized)
             }.value
-            if !localFolders.isEmpty || localScratchpad != nil {
+            if !localFolders.isEmpty || !localDocs.isEmpty {
                 let account = state.accountUrl
                 let merged = await Task.detached { () -> [String]? in
                     try? core.adoptLocalDocs(
                         accountUrl: account,
                         folderUrls: localFolders,
-                        scratchpadUrl: localScratchpad
+                        docUrls: localDocs
                     )
                 }.value
                 if let merged { state.folders = merged }
@@ -287,7 +306,9 @@ final class NotesModel {
             appendSyncEvent("Logged in: \(state.accountUrl)")
             return true
         } catch {
-            status = "Login failed: \(error.localizedDescription)"
+            status = ""
+            loginError = error.localizedDescription
+            appendSyncEvent("Login failed: \(error.localizedDescription)")
             return false
         }
     }
@@ -566,6 +587,7 @@ final class NotesModel {
                 core.prefetchNotes(urls: Array(saved.dropFirst()))
                 refreshNotes()
                 startPolling()
+                startMaintenancePolling()
                 Self.bootLog("startup UI state queued")
                 appendSyncEvent("Started: \(saved.count) root folder(s)")
                 if let account = accountUrl {
@@ -585,6 +607,7 @@ final class NotesModel {
                 status = ""
                 refreshNotes()
                 startPolling()
+                startMaintenancePolling()
                 Self.bootLog("fresh startup UI state queued")
                 appendSyncEvent("Started: new folder created")
             }
@@ -778,6 +801,7 @@ final class NotesModel {
                 self.folderNodeCache = newCache
                 self.writeWidgetSnapshot()
             }
+            core.setSearchParents(parents: await self.notebookTree.parents)
         }
     }
 
@@ -929,6 +953,7 @@ final class NotesModel {
                 self.folderTitle = folderTitle
                 self.folderTree = tree
                 self.folderNodeCache = newCache
+                self.storageLoaded = true
                 if let selected = self.selectedNoteUrl, self.node(for: selected) == nil {
                     self.selectedNoteUrl = nil
                 }
@@ -1037,10 +1062,11 @@ final class NotesModel {
         appendSyncEvent("Background sync finished")
     }
 
-    /// Flush and close the core so the helper can open the same storage.
     func releaseCore() {
         pollTask?.cancel()
         pollTask = nil
+        maintenanceTask?.cancel()
+        maintenanceTask = nil
         activeEditor?.core?.pushNow()
         presence.leave()
         core?.shutdown()
@@ -1078,6 +1104,28 @@ final class NotesModel {
                 }
                 elapsed += Int(interval.components.seconds)
                 if elapsed >= 60 { interval = .seconds(30) }
+            }
+        }
+    }
+
+    private func startMaintenancePolling() {
+        maintenanceTask?.cancel()
+        maintenanceTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if !self.folderTree.isEmpty { break }
+                try? await Task.sleep(for: .seconds(2))
+            }
+            // Wait for note docs to finish loading into the Rust search index
+            // before allowing smart notebook checks — prevents spurious boot
+            // notifications caused by incomplete search results.
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in self?.startupSettled = true }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard let self, !Task.isCancelled else { break }
+                await self.drainSharedIntake()
             }
         }
     }
@@ -1232,6 +1280,7 @@ final class NotesModel {
     private var pendingRefreshUrls: Set<String> = []
 
     func docChanged(url: String) {
+        pads.docChanged(url: url)
         folderNodeCache.removeValue(forKey: url)
         documentHistoryCache.removeValue(forKey: url)
         thumbnails.removeValue(forKey: url)
@@ -1264,11 +1313,19 @@ final class NotesModel {
             scheduleSemanticIndex(url: url)
             scheduleSpotlightIndex(url: url)
         }
+        if startupSettled, smartNotebooks.contains(where: \.notifyOnChange), pendingSmartNotebookCheckTask == nil {
+            pendingSmartNotebookCheckTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                guard let self else { return }
+                await self.checkSmartNotebooks()
+                self.pendingSmartNotebookCheckTask = nil
+            }
+        }
         pendingRefreshUrls.insert(url)
-        pendingRefreshTask?.cancel()
+        if pendingRefreshTask == nil {
         pendingRefreshTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(150))
-            guard !Task.isCancelled, let self else { return }
+            guard let self else { return }
             let urls = self.pendingRefreshUrls
             self.pendingRefreshUrls = []
             let needsFullRefresh = urls.contains(where: {
@@ -1292,6 +1349,8 @@ final class NotesModel {
                 self.saveLaunchSnapshot()
                 self.writeWidgetSnapshot()
             }
+            self.pendingRefreshTask = nil
+        }
         }
     }
 
@@ -2056,13 +2115,17 @@ final class NotesModel {
 
     /// A quoted phrase means the user wants that text and nothing like it, so
     /// the semantic pass sits out.
-    func search(_ query: String) async -> [SearchHit] {
+    func search(_ query: String, in scope: String? = nil) async -> [SearchHit] {
         guard let core, !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
-        let exact = await Task.detached { core.searchNotes(query: query) }.value
+        let liveUrls = Set(notes.map(\.url))
+        let filter = SearchFilter(scope: scope, tags: [], whenFrom: nil, whenTo: nil)
+        let exact = await Task.detached { core.searchNotes(query: query, filter: filter) }.value
+            .filter { liveUrls.contains($0.url) }
         if Task.isCancelled { return [] }
         if query.contains("\"") { return exact }
         let seen = Set(exact.map(\.url))
-        return await exact + semanticSearch.search(query, excluding: seen)
+        return await exact + semanticSearch.search(query, excluding: seen, in: scope)
+            .filter { liveUrls.contains($0.url) }
     }
 
     /// Notes the index has never seen — everything else is kept current by
@@ -2074,20 +2137,42 @@ final class NotesModel {
             for note in notes where !known.contains(note.url) {
                 self.scheduleSemanticIndex(url: note.url, name: note.name)
             }
-            self.reindexCalendarNotes()
+            await self.reindexCalendarNotes(notes)
         }
     }
 
     /// Notes about calendar items index the event's date, place and calendar
     /// alongside the text, so a note about a meeting last month is findable
     /// long after it left the Calendar view.
-    private func reindexCalendarNotes() {
+    ///
+    /// The event links are read back out of the notes first. They live in
+    /// UserDefaults, which doesn't sync, so on a second device the only record
+    /// of them is the calendar-event blocks in the notes themselves — and a
+    /// note whose blocks arrived while the app was closed is never re-indexed.
+    private func reindexCalendarNotes(_ notes: [NoteInfo]) async {
         guard !calendarNotesReindexed else { return }
         calendarNotesReindexed = true
+        await rebuildCalendarLinks(notes)
         for url in CalendarLinks.noteUrls {
             scheduleSemanticIndex(url: url)
             scheduleSpotlightIndex(url: url)
         }
+    }
+
+    private func rebuildCalendarLinks(_ notes: [NoteInfo]) async {
+        guard let core else { return }
+        let urls = notes.map(\.url)
+        let links = await Task.detached { [core, urls] () -> [String: [String]] in
+            var links: [String: [String]] = [:]
+            for url in urls {
+                try? await core.openNote(url: url)
+                guard let json = try? await core.noteSpansJson(url: url) else { continue }
+                let ids = CalendarLinks.eventIds(in: SpanNode.decodeList(json))
+                if !ids.isEmpty { links[url] = ids }
+            }
+            return links
+        }.value
+        CalendarLinks.replace(links, scanned: Set(urls))
     }
 
     private func backfillFileSemanticIndex(for files: [NoteInfo]) {
@@ -2834,7 +2919,7 @@ final class NotesModel {
 
     static let noteImportExtensions: Set<String> = ["md", "markdown", "mdown", "txt", "text", "rtf"]
 
-    static let importAsNotesKey = "importTextFilesAsNotes"
+    nonisolated static let importAsNotesKey = "importTextFilesAsNotes"
 
     nonisolated static var importsTextFilesAsNotes: Bool {
         UserDefaults.standard.object(forKey: importAsNotesKey) as? Bool ?? true

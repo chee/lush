@@ -271,7 +271,7 @@ enum NoteChatAssistant {
         let title = await MainActor.run { session.title }
         let attachments = await MainActor.run { session.attachments }
 
-        let catalog = tools ? (budget < 14_000 ? NoteChatSession.briefCatalog : NoteChatSession.catalog) : ""
+        let catalog = tools ? await MainActor.run { budget < 14_000 ? NoteChatSession.briefCatalog : NoteChatSession.catalog } : ""
         let question = limited(question, to: 2_000)
         // scaffolding, the title line and the closing instructions
         let spare = max(1_000, budget - catalog.count - question.count - 700)

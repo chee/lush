@@ -51,7 +51,7 @@ struct AgendaScreen: View {
                     ForEach(Agenda.days(agenda.items), id: \.day) { group in
                         header(group.day)
                             .id(group.day)
-                        ForEach(group.items) { item in
+                        ForEach(group.items, id: \.rowKey) { item in
                             row(item, on: group.day)
                         }
                     }
@@ -94,8 +94,8 @@ struct AgendaScreen: View {
     }
 
     private func row(_ item: AgendaItem, on day: Date) -> some View {
-        let noteUrl = noteUrls[item.id]
-        let key = "\(day.timeIntervalSince1970)|\(item.id)"
+        let noteUrl = noteUrls[item.id] ?? item.seriesId.flatMap { noteUrls[$0] }
+        let key = "\(day.timeIntervalSince1970)|\(item.rowKey)"
         let hovering = hovered == key
         return HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
@@ -125,26 +125,24 @@ struct AgendaScreen: View {
                 .opacity(0.75)
             }
             Spacer(minLength: 8)
-            if let url = item.calendarAppURL {
-                Button {
-                    ExternalBrowser.open(url)
-                } label: {
-                    Image(systemName: "arrow.up.forward")
-                        .font(.system(size: 14, weight: .semibold))
-                        .frame(width: 32, height: 32)
-                        .background(
-                            RoundedRectangle(cornerRadius: 7)
-                                .fill(item.color.opacity(0.45))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 7)
-                                .strokeBorder(item.color.opacity(0.6), lineWidth: 1)
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(item.kind == .reminder ? "Open in Reminders" : "Open in Calendar")
+            Button {
+                item.openExternally()
+            } label: {
+                Image(systemName: "arrow.up.forward")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 32, height: 32)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(item.color.opacity(0.45))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .strokeBorder(item.color.opacity(0.6), lineWidth: 1)
+                    )
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help(item.kind == .reminder ? "Open in Reminders" : "Open in Calendar")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -172,14 +170,20 @@ struct AgendaScreen: View {
                 Button("Open Note") { open(noteUrl) }
                 Button("Copy Note URL") { Clipboard.copy(noteUrl) }
                 Button("New Note") { create(item) }
+                if item.isRecurring, noteUrls[item.seriesId ?? ""] == nil {
+                    Button("New Note for the Whole Series") { create(item, series: true) }
+                }
                 Divider()
                 Button("Delete Note", role: .destructive) { model.deleteNote(noteUrl) }
             } else {
                 Button("New Note") { create(item) }
+                if item.isRecurring {
+                    Button("New Note for the Whole Series") { create(item, series: true) }
+                }
             }
-            if let url = item.calendarAppURL {
-                Divider()
-                Button("Open in Calendar") { ExternalBrowser.open(url) }
+            Divider()
+            Button(item.kind == .reminder ? "Open in Reminders" : "Open in Calendar") {
+                item.openExternally()
             }
             if let location = item.location {
                 Text(location)
@@ -199,9 +203,9 @@ struct AgendaScreen: View {
         }
     }
 
-    private func create(_ item: AgendaItem) {
+    private func create(_ item: AgendaItem, series: Bool = false) {
         Task {
-            if let url = await model.createNote(for: item, snap: contextTracker.snapshot) {
+            if let url = await model.createNote(for: item, series: series, snap: contextTracker.snapshot) {
                 open(url)
             }
         }

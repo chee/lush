@@ -12,8 +12,9 @@ fn main() -> anyhow::Result<()> {
         .create_note("surface note".into())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     core.update_note_spans(
-        note1,
+        note1.clone(),
         r#"[{"type":"block","value":{"type":"paragraph","parents":[],"attrs":{},"isEmbed":false}},{"type":"text","value":"the walrus lives on the surface"}]"#.into(),
+        None,
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
     let sub = core
         .create_subfolder("deeper".into())
@@ -24,17 +25,35 @@ fn main() -> anyhow::Result<()> {
         .create_note("hidden note".into())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     core.update_note_spans(
-        note2,
+        note2.clone(),
         r#"[{"type":"block","value":{"type":"paragraph","parents":[],"attrs":{},"isEmbed":false}},{"type":"text","value":"a walrus hiding in a subfolder"}]"#.into(),
+        None,
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
     // back to root, search recursively
     core.ensure_folder(Some(root.clone()))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let hits = core.search_notes("walrus".into());
+    let hits = core.search_notes("walrus".into(), None);
     for h in &hits {
         println!("hit: {} | {} | {}", h.name, h.url, h.snippet);
     }
     assert_eq!(hits.len(), 2, "expected hits from root and subfolder");
+    core.set_search_parents(std::collections::HashMap::from([
+        (note1.clone(), root.clone()),
+        (sub.clone(), root.clone()),
+        (note2.clone(), sub.clone()),
+    ]));
+    let scoped = core.search_notes(
+        "walrus".into(),
+        Some(lush_core::api::SearchFilter {
+            scope: Some(sub.clone()),
+            ..Default::default()
+        }),
+    );
+    assert_eq!(
+        scoped.iter().map(|h| h.url.clone()).collect::<Vec<_>>(),
+        vec![note2.clone()],
+        "a scoped search sees only the subfolder"
+    );
     let entries = block_on(core.list_notes());
     println!(
         "root entries: {:?}",

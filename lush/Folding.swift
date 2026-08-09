@@ -23,8 +23,8 @@ struct HeadingFoldKey: Hashable {
     }
 }
 
-/// Collapses folded sections and stashed blocks to zero height by
-/// substituting empty display paragraphs. The storage — and so the automerge
+/// Collapses folded sections to zero height by substituting empty display
+/// paragraphs. The storage — and so the automerge
 /// round-trip — is untouched; only layout sees the substitution.
 final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
     var foldedHeadings: Set<HeadingFoldKey> = []
@@ -41,10 +41,6 @@ final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
             location = NSMaxRange(paragraph)
             guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox
             else { continue }
-            if box.value.attrs["stash"] != nil {
-                ranges.append(paragraph)
-                continue
-            }
             if hideCheckedTodos, box.value.isChecked {
                 let depth = box.value.parents.count
                 var end = NSMaxRange(paragraph)
@@ -90,9 +86,8 @@ final class FoldingContentDelegate: NSObject, NSTextContentStorageDelegate {
     /// The substituted paragraph must keep the backing range's exact length:
     /// UITextInput and accessibility read `attributedString(in:)` across the
     /// whole document, and any presentation/backing length divergence sends
-    /// TextKit's offset mapping out of bounds (boot NSRangeException on iOS
-    /// when the open note has stashed paragraphs). Hiding is purely
-    /// stylistic — same characters, ~zero size.
+    /// TextKit's offset mapping out of bounds. Hiding is purely stylistic —
+    /// same characters, ~zero size.
     func textContentStorage(
         _ textContentStorage: NSTextContentStorage,
         textParagraphWith range: NSRange

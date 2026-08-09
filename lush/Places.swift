@@ -92,13 +92,15 @@ enum ContactPlaces {
     }
 
     static func geocode(_ address: ContactAddress) async -> SavedPlace? {
-        guard let placemark = try? await CLGeocoder().geocodePostalAddress(address.postal).first,
-              let location = placemark.location
+        let addressString = CNPostalAddressFormatter.string(from: address.postal, style: .mailingAddress)
+        guard let request = MKGeocodingRequest(addressString: addressString),
+              let item = try? await request.mapItems.first
         else { return nil }
+        let coord = item.location.coordinate
         return SavedPlace(
             name: address.placeName,
-            latitude: location.coordinate.latitude,
-            longitude: location.coordinate.longitude
+            latitude: coord.latitude,
+            longitude: coord.longitude
         )
     }
 

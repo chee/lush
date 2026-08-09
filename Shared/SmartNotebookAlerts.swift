@@ -2,8 +2,8 @@ import Foundation
 import UserNotifications
 
 /// Local notifications for smart notebooks that asked to hear about changes.
-/// The last count is kept in defaults so a change is measured across launches,
-/// and so turning the alert on doesn't fire on the first count.
+/// The last count lives in the group container, so Lush and the helper measure
+/// the change against the same number whichever of them is running.
 enum SmartNotebookAlerts {
     static func authorized() async -> Bool {
         await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .authorized
@@ -17,9 +17,10 @@ enum SmartNotebookAlerts {
 
     static func counted(_ folder: SmartNotebook, count: Int) async {
         let key = "smartCount:\(folder.id)"
-        let previous = UserDefaults.standard.object(forKey: key) as? Int
-        UserDefaults.standard.set(count, forKey: key)
+        let previous = LushShared.defaults.object(forKey: key) as? Int
+        LushShared.defaults.set(count, forKey: key)
         guard folder.notifyOnChange, let previous, previous != count else { return }
+        if await !authorized(), await !requestAuthorization() { return }
         let content = UNMutableNotificationContent()
         content.title = folder.displayName
         content.body = count > previous
@@ -32,6 +33,6 @@ enum SmartNotebookAlerts {
     }
 
     static func forget(id: String) {
-        UserDefaults.standard.removeObject(forKey: "smartCount:\(id)")
+        LushShared.defaults.removeObject(forKey: "smartCount:\(id)")
     }
 }

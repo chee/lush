@@ -169,6 +169,18 @@ pub struct ConfigState {
     pub pad: Option<String>,
 }
 
+/// Narrows a search without touching the query text. Every field is optional;
+/// an all-empty filter matches everything. `scope` is a folder url and covers
+/// the whole subtree under it. `when_from`/`when_to` are inclusive `YYYY-MM-DD`
+/// bounds and only ever match docs that carry a day at all.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct SearchFilter {
+    pub scope: Option<String>,
+    pub tags: Vec<String>,
+    pub when_from: Option<String>,
+    pub when_to: Option<String>,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SearchHit {
     pub url: String,
@@ -1007,15 +1019,16 @@ impl Core {
     }
 
     /// Fold pre-login local docs into the account just signed into: one folder
-    /// holding every local root folder that has something in it, plus the
-    /// pocket pad unless one of those folders already holds it. That folder
-    /// goes to the top of the account's root folder and is appended to the
-    /// lush config's `.folders`. Returns the merged folder list.
+    /// holding every local root folder that has something in it, plus any loose
+    /// doc — the pocket pad, notes tied to calendar items — no adopted folder
+    /// already holds. That folder goes to the top of the account's root folder
+    /// and is appended to the lush config's `.folders`. Returns the merged
+    /// folder list.
     pub fn adopt_local_docs(
         &self,
         account_url: String,
         folder_urls: Vec<String>,
-        scratchpad_url: Option<String>,
+        doc_urls: Vec<String>,
     ) -> Result<Vec<String>, CoreError> {
         guarded(|| {
             let repo = self.repo.clone();
@@ -1064,7 +1077,16 @@ impl Core {
                     if entries.is_empty() {
                         continue;
                     }
-                    held.extend(entries.into_iter().map(|entry| entry.url));
+                    let mut stack = entries;
+                    while let Some(entry) = stack.pop() {
+                        if !held.insert(entry.url.clone()) || entry.kind != "folder" {
+                            continue;
+                        }
+                        let Ok(id) = DocId::from_url(&entry.url) else { continue };
+                        if let Ok(children) = repo.read_doc(id, |doc| shapes::folder_entries(doc)).await {
+                            stack.extend(children);
+                        }
+                    }
                     linked.insert(url.clone());
                     adopted.push(shapes::DocLink {
                         name: title,
@@ -1073,24 +1095,26 @@ impl Core {
                         lush: None,
                     });
                 }
-                if let Some(url) = scratchpad_url {
-                    if !linked.contains(&url) && !held.contains(&url) {
-                        if let Ok(id) = DocId::from_url(&url) {
-                            if let Ok((name, kind)) = repo
-                                .read_doc(id, |doc| {
-                                    Ok((shapes::doc_title(doc), shapes::doc_patchwork_type(doc)))
-                                })
-                                .await
-                            {
-                                adopted.push(shapes::DocLink {
-                                    name,
-                                    kind: kind.unwrap_or_else(|| "rich".into()),
-                                    url,
-                                    lush: None,
-                                });
-                            }
-                        }
+                for url in doc_urls {
+                    if linked.contains(&url) || held.contains(&url) {
+                        continue;
                     }
+                    let Ok(id) = DocId::from_url(&url) else { continue };
+                    let Ok((name, kind)) = repo
+                        .read_doc(id, |doc| {
+                            Ok((shapes::doc_title(doc), shapes::doc_patchwork_type(doc)))
+                        })
+                        .await
+                    else {
+                        continue;
+                    };
+                    held.insert(url.clone());
+                    adopted.push(shapes::DocLink {
+                        name,
+                        kind: kind.unwrap_or_else(|| "rich".into()),
+                        url,
+                        lush: None,
+                    });
                 }
                 if adopted.is_empty() {
                     return Ok(folders);
@@ -1658,12 +1682,22 @@ impl Core {
 
     /// Full-text search across every locally indexed note. The index is local
     /// to this device and is updated as prefetched docs land or change.
-    pub fn search_notes(&self, query: String) -> Vec<SearchHit> {
+    pub fn search_notes(&self, query: String, filter: Option<SearchFilter>) -> Vec<SearchHit> {
         let query = query.trim().to_string();
         if query.is_empty() {
             return Vec::new();
         }
-        self.index.search(&query).unwrap_or_default()
+        self.index
+            .search(&query, &filter.unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Hands the index the folder tree as child -> parent edges, so a scoped
+    /// search can narrow inside SQL instead of throwing away rows the limit
+    /// already cut. Folder membership lives on the folder docs, so only a
+    /// caller that has walked the tree knows this.
+    pub fn set_search_parents(&self, parents: HashMap<String, String>) {
+        let _ = self.index.set_parents(&parents);
     }
 
     pub async fn note_preview(&self, url: String) -> String {
@@ -2133,9 +2167,10 @@ impl Core {
         vector: Vec<f32>,
         limit: u32,
         excluding: Vec<String>,
+        filter: Option<SearchFilter>,
     ) -> Vec<SearchHit> {
         self.index
-            .semantic_search(&vector, limit, &excluding)
+            .semantic_search(&vector, limit, &excluding, &filter.unwrap_or_default())
             .unwrap_or_default()
     }
 

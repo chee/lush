@@ -904,6 +904,43 @@ pub fn doc_title(doc: &Automerge) -> String {
     read_str(doc, &ROOT, "name").unwrap_or_default()
 }
 
+/// Root `tags`, a list of strings, lowercased and stripped of a leading `#`.
+/// Nothing writes it yet; the index carries the concept so the filters have
+/// something to read once something does.
+pub fn doc_tags(doc: &Automerge) -> Vec<String> {
+    let Ok(Some((_, tags))) = doc.get(ROOT, "tags") else {
+        return Vec::new();
+    };
+    (0..doc.length(&tags))
+        .filter_map(|i| match doc.get(&tags, i) {
+            Ok(Some((automerge::Value::Object(ObjType::Text), id))) => doc.text(&id).ok(),
+            Ok(Some((automerge::Value::Scalar(s), _))) => s.to_str().map(str::to_string),
+            _ => None,
+        })
+        .map(|tag| tag.trim().trim_start_matches('#').to_lowercase())
+        .filter(|tag| !tag.is_empty() && !tag.contains(' '))
+        .collect()
+}
+
+/// Root `when`: the day the doc is about, as `YYYY-MM-DD`. Anything longer (a
+/// full timestamp) keeps its date part so ordering and range tests still work.
+pub fn doc_when(doc: &Automerge) -> String {
+    let raw = read_str(doc, &ROOT, "when").unwrap_or_default();
+    let day = raw.trim().chars().take(10).collect::<String>();
+    let valid = day.len() == 10
+        && day.as_bytes()[4] == b'-'
+        && day.as_bytes()[7] == b'-'
+        && day
+            .chars()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if valid {
+        day
+    } else {
+        String::new()
+    }
+}
+
 pub fn set_note_title(doc: &mut Automerge, title: &str) -> anyhow::Result<()> {
     if doc_title(doc) == title {
         return Ok(());
@@ -1952,5 +1989,41 @@ mod embed_resize_tests {
         assert!(json.contains("\"embed\""), "embed block vanished: {json}");
         assert!(json.contains("automerge:abc"), "embed url vanished: {json}");
         assert!(json.contains("420"), "width attr missing: {json}");
+    }
+}
+
+#[cfg(test)]
+mod pad_tests {
+    use super::*;
+
+    fn item(id: &str) -> PadItem {
+        PadItem {
+            id: id.into(),
+            kind: "text".into(),
+            x: 8.0,
+            y: 8.0,
+            w: 184.0,
+            h: 40.0,
+            data: "[]".into(),
+            origin: None,
+            created: 1,
+        }
+    }
+
+    #[test]
+    fn items_move_and_edit_by_id() {
+        let mut doc = Automerge::new();
+        init_pad(&mut doc, "pad").unwrap();
+        pad_put_item(&mut doc, &item("a")).unwrap();
+        pad_put_item(&mut doc, &item("b")).unwrap();
+        assert!(pad_move_item(&mut doc, "b", 100.0, 200.0, 300.0, 400.0).unwrap());
+        assert!(pad_set_data(&mut doc, "b", "[1]").unwrap());
+        let items = pad_items(&doc);
+        assert_eq!(items.len(), 2);
+        let b = items.iter().find(|i| i.id == "b").unwrap();
+        assert_eq!((b.x, b.y, b.w, b.h), (100.0, 200.0, 300.0, 400.0));
+        assert_eq!(b.data, "[1]");
+        assert!(pad_remove_item(&mut doc, "a").unwrap());
+        assert_eq!(pad_items(&doc).len(), 1);
     }
 }

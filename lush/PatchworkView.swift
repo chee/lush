@@ -908,6 +908,8 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
             return respond(url: url, data: Data(PatchworkWeb.shellJS.utf8), mime: "text/javascript")
         case "app.css":
             return try await serveBundleCSS(url: url)
+        case "packages/@inkandswitch/patchwork-plugins.js":
+            return try await servePluginsShim(path: path, url: url)
         default:
             return try await serveBundleFile(path: path, url: url)
         }
@@ -982,7 +984,51 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
         return respond(url: url, data: data, mime: mime)
     }
 
-    private static func mimeType(for pathExtension: String) -> String {
+    /// patchwork-elements inlines its own copy of patchwork-plugins, so the
+    /// bundle ships two plugin registries: the shell and every module register
+    /// into the one the bare specifier points at, while <patchwork-view> reads
+    /// its own and finds no tool for any id — a full tool menu over a document
+    /// that won't open. Serve the specifier from the element's copy instead, so
+    /// there is one registry again. Falls back to the bundle's own file when
+    /// the chunk isn't shaped as expected or the duplication is gone.
+    private func servePluginsShim(path: String, url: URL) async throws -> (Data, URLResponse) {
+        let shim = await Task.detached(priority: .userInitiated) { Self.pluginsShim() }.value
+        guard let shim else { return try await serveBundleFile(path: path, url: url) }
+        return respond(url: url, data: Data(shim.utf8), mime: "text/javascript")
+    }
+
+    nonisolated private static func pluginsShim() -> String? {
+        guard let base = PatchworkWeb.webRoot else { return nil }
+        let packages = base.appendingPathComponent("packages/@inkandswitch")
+        guard let elements = try? String(
+            contentsOf: packages.appendingPathComponent("patchwork-elements.js"),
+            encoding: .utf8
+        ),
+            let plugins = try? String(
+                contentsOf: packages.appendingPathComponent("patchwork-plugins.js"),
+                encoding: .utf8
+            ),
+            let chunk = elements.firstMatch(of: /from "[^"]*\/(assets\/[^"]+)"/)?.1,
+            let source = try? String(
+                contentsOf: base.appendingPathComponent(String(chunk)),
+                encoding: .utf8
+            ),
+            source.contains("var PluginRegistry"),
+            let namespace = source.firstMatch(of: /dist_exports as (\w+)/)?.1,
+            let exported = plugins.firstMatch(of: /export \{([^}]*)\}/)?.1
+        else { return nil }
+        let names = exported
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+        return """
+        import { \(namespace) as plugins } from "/\(chunk)"
+        export const { \(names) } = plugins
+        """
+    }
+
+    nonisolated private static func mimeType(for pathExtension: String) -> String {
         switch pathExtension.lowercased() {
         case "html": "text/html; charset=utf-8"
         case "js", "mjs": "text/javascript"
@@ -1067,7 +1113,7 @@ final class PatchworkContextBridge: NSObject, WKScriptMessageHandler {
                 """,
                 arguments: ["toolId": toolId ?? NSNull(), "docUrl": docUrl],
                 in: nil,
-                in: .page
+                contentWorld: .page
             )
         }
     }
@@ -1489,10 +1535,12 @@ struct PatchworkPickerView: UIViewRepresentable {
     var preferredType: String?
     var preferredToolId: String?
 
+    @MainActor
     func makeCoordinator() -> MutablePickerBridge {
         MutablePickerBridge(onPick: onPick)
     }
 
+    @MainActor
     func makeUIView(context: Context) -> WKWebView {
         makePickerWebView(
             preferredType: preferredType,
@@ -1501,6 +1549,7 @@ struct PatchworkPickerView: UIViewRepresentable {
         )
     }
 
+    @MainActor
     func updateUIView(_ uiView: WKWebView, context: Context) {
         context.coordinator.onPick = onPick
     }
@@ -1694,8 +1743,10 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
     var onTraits: (@MainActor @Sendable (Bool) -> Void)? = nil
     var onTools: @MainActor @Sendable ([ToolChoice], String?) -> Void
 
+    @MainActor
     func makeCoordinator() -> PatchworkBoxCoordinator { PatchworkBoxCoordinator() }
 
+    @MainActor
     func makeUIView(context: Context) -> WKWebView {
         let coord = context.coordinator
         let host = PatchworkWebViewHost(messageHandler: coord.bridge)
@@ -1712,6 +1763,7 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         return host.webView
     }
 
+    @MainActor
     func updateUIView(_ uiView: WKWebView, context: Context) {
         let coord = context.coordinator
         coord.bridge.onTools = onTools

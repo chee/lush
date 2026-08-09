@@ -8,6 +8,13 @@ struct AgendaItem: Identifiable, Equatable {
     }
 
     var id: String
+    /// EventKit's own per-item identifier. A feed can give two genuinely
+    /// different events one UID — the same holiday under its Spanish and its
+    /// Catalan name — and `eventIdentifier` doesn't separate them either, since
+    /// it is only `<store UUID>:<that same UID>`. This does.
+    var calendarItemId: String
+    var seriesId: String?
+    var recurrenceText: String?
     var kind: Kind
     var title: String
     var start: Date
@@ -18,6 +25,10 @@ struct AgendaItem: Identifiable, Equatable {
     var location: String?
     var colorHex: String?
     var isCompleted = false
+
+    var isRecurring: Bool { seriesId != nil }
+
+    var rowKey: String { "\(id)|\(calendarItemId)" }
 
     var timeText: String? {
         guard !isAllDay else { return nil }
@@ -33,10 +44,21 @@ struct AgendaItem: Identifiable, Equatable {
 }
 
 extension AgendaItem {
+    /// Identity comes from the CalDAV UID, which every device sees the same
+    /// way — `eventIdentifier` is local to one EventKit store, so a note
+    /// linked on the laptop pointed at nothing on the phone. Every occurrence
+    /// of a series shares that UID, so the note is pinned to the occurrence by
+    /// its original start: `occurrenceDate` survives rescheduling one instance,
+    /// `startDate` does not.
     init?(_ event: EKEvent) {
         guard let start = event.startDate else { return nil }
-        let base = event.eventIdentifier ?? event.calendarItemIdentifier
-        id = "\(base)|\(Agenda.iso.string(from: start))"
+        let uid = event.calendarItemExternalIdentifier
+            ?? event.eventIdentifier
+            ?? event.calendarItemIdentifier
+        id = "\(uid)|\(Agenda.iso.string(from: event.occurrenceDate ?? start))"
+        calendarItemId = event.calendarItemIdentifier
+        seriesId = event.hasRecurrenceRules ? uid : nil
+        recurrenceText = event.recurrenceRules?.first.map(Agenda.recurrenceText)
         kind = .event
         title = event.title ?? "Untitled Event"
         self.start = start
@@ -52,7 +74,10 @@ extension AgendaItem {
         guard let due = reminder.dueDateComponents,
               let start = Calendar.current.date(from: due)
         else { return nil }
-        id = "reminder:\(reminder.calendarItemIdentifier)"
+        id = Agenda.reminderPrefix + (reminder.calendarItemExternalIdentifier ?? reminder.calendarItemIdentifier)
+        calendarItemId = reminder.calendarItemIdentifier
+        seriesId = nil
+        recurrenceText = nil
         kind = .reminder
         title = reminder.title ?? "Untitled Reminder"
         self.start = start
@@ -73,8 +98,75 @@ extension String {
 enum Agenda {
     static let iso = ISO8601DateFormatter()
     static let sidebarTag = "agenda:calendar"
+    static let reminderPrefix = "reminder:"
     static let dayInIconKey = "calendarIconShowsDay"
     static let horizonDays = 14
+
+    #if os(macOS)
+    /// Moves Calendar to a day. The date is given as an offset from the
+    /// script's own `current date` so it never has to be spelled out in a
+    /// locale's format; noon keeps a second of drift from landing on the day
+    /// either side. Returns once Calendar has arrived.
+    static func showDay(_ date: Date) {
+        let noon = Foundation.Calendar.current.date(bySettingHour: 12, minute: 0, second: 0, of: date) ?? date
+        let source = """
+        tell application "Calendar"
+            activate
+            view calendar at ((current date) + \(Int(noon.timeIntervalSinceNow)))
+        end tell
+        """
+        guard let script = NSAppleScript(source: source) else { return }
+        var errorInfo: NSDictionary?
+        script.executeAndReturnError(&errorInfo)
+    }
+    #endif
+
+    /// `<uid>|<occurrence>`, or a bare uid for a series or a reminder.
+    static func eventKey(_ id: String) -> (uid: String, occurrence: Date?) {
+        guard let separator = id.lastIndex(of: "|") else { return (id, nil) }
+        return (
+            String(id[id.startIndex..<separator]),
+            iso.date(from: String(id[id.index(after: separator)...]))
+        )
+    }
+
+    /// The form Calendar's occurrence links take, always in UTC.
+    static let occurrenceStamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return formatter
+    }()
+
+    /// An identifier is `<uuid>:<uid>` and a Google uid is an email address —
+    /// Calendar wants those colons and at-signs intact, and only the slash a
+    /// detached occurrence carries has to go.
+    static func escapePath(_ component: String) -> String {
+        component.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
+        ) ?? component
+    }
+
+    /// The iOS form escapes the uid down to the unreserved set.
+    static func escapeStrict(_ component: String) -> String {
+        component.addingPercentEncoding(
+            withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        ) ?? component
+    }
+
+    static func recurrenceText(_ rule: EKRecurrenceRule) -> String {
+        let unit: String
+        switch rule.frequency {
+        case .daily: unit = "day"
+        case .weekly: unit = "week"
+        case .monthly: unit = "month"
+        case .yearly: unit = "year"
+        @unknown default: unit = "time"
+        }
+        guard rule.interval > 1 else { return "every \(unit)" }
+        return "every \(rule.interval) \(unit)s"
+    }
 
     static func color(_ calendar: EKCalendar?) -> Color {
         guard let cgColor = calendar?.cgColor else { return .secondary }
@@ -195,6 +287,90 @@ final class AgendaStore {
     private let store = EKEventStore()
     private var observer: NSObjectProtocol?
 
+    /// `eventIdentifier` is `<store UUID>:<external UID>` — only the half after
+    /// the colon travels, so a note written on another device has to find the
+    /// event again through the UID they share. A clean series comes back as
+    /// just its master; detached occurrences come back alongside it, and the
+    /// one starting nearest the occurrence the note was taken at is the one
+    /// she meant.
+    func localEvent(uid: String, occurrence: Date?) -> EKEvent? {
+        guard access == .fullAccess else { return nil }
+        let events = items(for: uid).compactMap { $0 as? EKEvent }
+        guard let occurrence, events.count > 1 else { return events.first }
+        func gap(_ event: EKEvent) -> TimeInterval {
+            let start = event.occurrenceDate ?? event.startDate ?? .distantPast
+            return abs(start.timeIntervalSince(occurrence))
+        }
+        return events.min { gap($0) < gap($1) }
+    }
+
+    /// Notes written before links moved to the shared UID stored this device's
+    /// `eventIdentifier` instead — but that is `<store UUID>:<uid>`, so the uid
+    /// is still in there and those notes keep working without being rewritten.
+    private func items(for uid: String) -> [EKCalendarItem] {
+        let found = store.calendarItems(withExternalIdentifier: uid)
+        guard found.isEmpty, let colon = uid.firstIndex(of: ":") else { return found }
+        return store.calendarItems(withExternalIdentifier: String(uid[uid.index(after: colon)...]))
+    }
+
+    /// Opens the item where the note means it. Everything is built from the
+    /// event this device found, so it works wherever the note was written. A
+    /// detached occurrence carries `/RID=` on its UID; Calendar wants the master
+    /// it broke off from, with the date doing the work of picking the instance.
+    @discardableResult
+    func openExternally(for id: String) -> Bool {
+        if id.hasPrefix(Agenda.reminderPrefix) {
+            let uuid = String(id.dropFirst(Agenda.reminderPrefix.count))
+            guard let url = URL(string: "x-apple-reminderkit://REMCDReminder/\(uuid)") else { return false }
+            ExternalBrowser.open(url)
+            return true
+        }
+        let key = Agenda.eventKey(id)
+        let master = key.uid.components(separatedBy: "/RID=").first ?? key.uid
+        guard let event = localEvent(uid: master, occurrence: key.occurrence),
+              let identifier = event.eventIdentifier
+        else { return false }
+        #if os(macOS)
+        // The event link travels to where the event *starts*, which for a
+        // series is its first occurrence — years back from the one the note is
+        // about. The occurrence link goes the other way: it picks its date out
+        // of whatever Calendar already shows, but won't travel to it. So a
+        // series is scripted to the day first, then sent the link that selects
+        // it once it is there.
+        guard let occurrence = key.occurrence, event.hasRecurrenceRules else {
+            guard let url = URL(
+                string: "ical://ekevent/\(Agenda.escapePath(identifier))?method=show&options=more"
+            ) else { return false }
+            ExternalBrowser.open(url)
+            return true
+        }
+        let stamp = Agenda.occurrenceStamp.string(from: occurrence)
+        guard let select = URL(
+            string: "ical://occurrence/\(stamp)/\(event.calendarItemIdentifier)?method=show&options=more"
+        ) else { return false }
+        // Scripting Calendar blocks until it has launched and navigated, which
+        // is far too long to hold the main actor. The script is built and run
+        // entirely on this task, never shared across threads.
+        Task.detached {
+            Agenda.showDay(occurrence)
+            await MainActor.run { ExternalBrowser.open(select) }
+        }
+        return true
+        #else
+        // iOS carries the occurrence in the link itself and needs none of this.
+        guard let uuid = identifier.components(separatedBy: ":").first,
+              let external = event.calendarItemExternalIdentifier
+        else { return false }
+        let when = key.occurrence ?? event.occurrenceDate ?? event.startDate ?? Date()
+        let seconds = Int(when.timeIntervalSinceReferenceDate)
+        guard let url = URL(
+            string: "x-apple-calevent://\(uuid)/\(Agenda.escapeStrict(external))?o=\(seconds)"
+        ) else { return false }
+        ExternalBrowser.open(url)
+        return true
+        #endif
+    }
+
     var today: [AgendaItem] {
         items.filter { Calendar.current.isDateInToday($0.start) }
     }
@@ -244,22 +420,34 @@ final class AgendaStore {
         let calendar = Calendar.current
         let from = calendar.startOfDay(for: Date())
         let to = calendar.date(byAdding: .day, value: Agenda.horizonDays, to: from) ?? from
+        let shownIds = Set(NotesModel.shared.focus.state?.shownCalendarIds ?? [])
         var next: [AgendaItem] = []
         if access == .fullAccess {
-            let predicate = store.predicateForEvents(withStart: from, end: to, calendars: nil)
+            let ekCalendars: [EKCalendar]? = shownIds.isEmpty
+                ? nil
+                : store.calendars(for: .event).filter { shownIds.contains($0.calendarIdentifier) }
+            let predicate = store.predicateForEvents(withStart: from, end: to, calendars: ekCalendars)
             next += store.events(matching: predicate).compactMap(AgendaItem.init)
         }
         if reminderAccess == .fullAccess {
-            next += await reminders(from: from, to: to)
+            next += await reminders(from: from, to: to, shownIds: shownIds)
         }
         items = next.sorted { $0.start < $1.start }
     }
 
-    private func reminders(from: Date, to: Date) async -> [AgendaItem] {
+    private func reminders(from: Date, to: Date, shownIds: Set<String>) async -> [AgendaItem] {
+        let ekCalendars: [EKCalendar]?
+        if shownIds.isEmpty {
+            ekCalendars = nil
+        } else {
+            let filtered = store.calendars(for: .reminder).filter { shownIds.contains($0.calendarIdentifier) }
+            guard !filtered.isEmpty else { return [] }
+            ekCalendars = filtered
+        }
         let predicate = store.predicateForIncompleteReminders(
             withDueDateStarting: from,
             ending: to,
-            calendars: nil
+            calendars: ekCalendars
         )
         return await withCheckedContinuation { continuation in
             store.fetchReminders(matching: predicate) { reminders in
@@ -292,6 +480,26 @@ enum CalendarLinks {
         map.compactMap { $0.value.contains(itemId) ? $0.key : nil }
     }
 
+    /// A note pinned to this occurrence wins; a note kept for the whole series
+    /// stands in when the occurrence has none of its own.
+    static func notes(for item: AgendaItem) -> [String] {
+        let occurrence = notes(for: item.id)
+        guard occurrence.isEmpty, let seriesId = item.seriesId else { return occurrence }
+        return notes(for: seriesId)
+    }
+
+    /// The map is a cache of what the notes themselves say, so it can always be
+    /// rebuilt from their spans — which is how it reaches a second device,
+    /// where the notes sync but this index never did. Only the notes actually
+    /// read are replaced; the rest keep whatever they had.
+    static func replace(_ links: [String: [String]], scanned: Set<String>) {
+        var next = map.filter { !scanned.contains($0.key) }
+        next.merge(links) { _, new in new }
+        guard next != map else { return }
+        UserDefaults.standard.set(next, forKey: key)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
     static func set(_ itemIds: [String], for noteUrl: String) {
         var next = map
         if itemIds.isEmpty {
@@ -313,13 +521,17 @@ enum CalendarLinks {
 }
 
 extension BlockValue {
-    static func calendarEventBlock(_ item: AgendaItem) -> BlockValue {
+    static func calendarEventBlock(_ item: AgendaItem, series: Bool = false) -> BlockValue {
         var attrs: [String: JSONValue] = [
-            "event": .string(item.id),
+            "event": .string(series ? (item.seriesId ?? item.id) : item.id),
             "kind": .string(item.kind.rawValue),
             "title": .string(item.title),
             "start": .string(Agenda.iso.string(from: item.start)),
         ]
+        if series {
+            attrs["series"] = .bool(true)
+            if let text = item.recurrenceText { attrs["repeat"] = .string(text) }
+        }
         if let end = item.end { attrs["end"] = .string(Agenda.iso.string(from: end)) }
         if item.isAllDay { attrs["allDay"] = .bool(true) }
         if !item.listName.isEmpty { attrs["calendar"] = .string(item.listName) }
@@ -336,18 +548,16 @@ extension BlockValue {
         calendarEventStart.map { Calendar.current.startOfDay(for: $0) }
     }
 
-    /// Opens the item in Calendar.app — the specific event when its identifier
-    /// survived, otherwise the day it sits on.
-    var calendarAppURL: URL? {
-        guard let start = calendarEventStart else { return nil }
-        #if os(macOS)
-        if attrs["kind"]?.stringValue != AgendaItem.Kind.reminder.rawValue,
-           let identifier = attrs["event"]?.stringValue?.split(separator: "|").first,
-           let escaped = String(identifier).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
-            return URL(string: "ical://ekevent/\(escaped)?method=show&options=more")
-        }
-        #endif
-        return URL(string: "calshow:\(Int(start.timeIntervalSinceReferenceDate))")
+    /// Whether the trailing glyph is worth drawing. Cheap enough for a view
+    /// body — finding the item costs an EventKit lookup, so that waits for the
+    /// click.
+    var opensExternally: Bool { type == "calendar-event" }
+
+    @MainActor
+    @discardableResult
+    func openExternally() -> Bool {
+        guard opensExternally, let id = attrs["event"]?.stringValue else { return false }
+        return AgendaStore.shared.openExternally(for: id)
     }
 
     var calendarEventTitle: String? {
@@ -378,6 +588,7 @@ extension BlockValue {
         }
         if let location = attrs["location"]?.stringValue { parts.append(location) }
         if let calendar = attrs["calendar"]?.stringValue { parts.append(calendar) }
+        if let repeats = attrs["repeat"]?.stringValue { parts.append(repeats) }
         parts.append(attrs["kind"]?.stringValue == AgendaItem.Kind.reminder.rawValue ? "reminder" : "calendar event")
         return parts.filter { !$0.isEmpty }.joined(separator: " · ")
     }
@@ -392,6 +603,9 @@ struct CalendarEventInlineView: View {
 
     private var whenText: String {
         guard let start = block.calendarEventStart else { return "" }
+        if block.attrs["series"]?.boolValue == true {
+            return block.attrs["repeat"]?.stringValue ?? "repeating"
+        }
         let day = start.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
         if block.attrs["allDay"]?.boolValue == true { return "\(day) · all day" }
         let from = start.formatted(date: .omitted, time: .shortened)
@@ -422,7 +636,7 @@ struct CalendarEventInlineView: View {
                 .opacity(0.75)
             }
             Spacer(minLength: 8)
-            if block.calendarAppURL != nil {
+            if block.opensExternally {
                 Image(systemName: "arrow.up.forward")
                     .font(.system(size: max(13, RichText.bodySize - 1), weight: .semibold))
                     .frame(width: 32, height: 32)
@@ -450,43 +664,35 @@ struct CalendarEventInlineView: View {
 }
 
 extension AgendaItem {
-    var calendarAppURL: URL? {
-        #if os(macOS)
-        if kind == .event,
-           let identifier = id.split(separator: "|").first,
-           let escaped = String(identifier).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
-            return URL(string: "ical://ekevent/\(escaped)?method=show&options=more")
-        }
-        #endif
-        return URL(string: "calshow:\(Int(start.timeIntervalSinceReferenceDate))")
-    }
+    @MainActor
+    func openExternally() { AgendaStore.shared.openExternally(for: id) }
 }
 
 extension NotesModel {
     func noteUrl(for item: AgendaItem) -> String? {
-        CalendarLinks.notes(for: item.id).first
+        CalendarLinks.notes(for: item).first
     }
 
     @discardableResult
-    func createNote(for item: AgendaItem, snap: ContextSnapshot? = nil) async -> String? {
+    func createNote(for item: AgendaItem, series: Bool = false, snap: ContextSnapshot? = nil) async -> String? {
         guard let core else { return nil }
         guard let folder = folderUrl ?? inboxUrl ?? rootFolderUrls.first else {
             status = "Couldn't create note: no folder yet"
             return nil
         }
         do {
-            let url = try await Task.detached { [core, folder, item, snap] () -> String in
+            let url = try await Task.detached { [core, folder, item, series, snap] () -> String in
                 let url = try core.createNoteIn(folderUrl: folder, title: item.title)
                 let initial: [SpanNode] = [
                     .block(.creationBlock(snap: snap)),
-                    .block(.calendarEventBlock(item)),
+                    .block(.calendarEventBlock(item, series: series)),
                     .block(.heading(level: 1)),
                     .text(item.title, [:]),
                 ]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
                 return url
             }.value
-            CalendarLinks.set([item.id], for: url)
+            CalendarLinks.set([series ? (item.seriesId ?? item.id) : item.id], for: url)
             pendingFocusUrl = url
             selectedNoteUrl = url
             refreshNotes()

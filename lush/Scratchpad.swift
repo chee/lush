@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Scratchpads are documents of their own: a note keeps one at `@lush.pad`, and
 /// the account keeps the pocket pad. Text parked on a pad has left the note —
@@ -8,19 +9,24 @@ import SwiftUI
 enum PadKind: String {
     case text
     case ink
+    case image
 }
 
 extension PadItem {
     var padKind: PadKind { PadKind(rawValue: kind) ?? .text }
 
-    var origin_: String? { origin?.isEmpty == false ? origin : nil }
-
     var rect: CGRect {
         CGRect(x: x, y: y, width: max(60, w), height: max(0, h))
     }
 
+    /// What this item is as note content: a text card's own spans, and an
+    /// image card as the embed block that stands for its asset doc.
     var spans: [SpanNode] {
-        padKind == .text ? SpanNode.decodeList(data) : []
+        switch padKind {
+        case .text: SpanNode.decodeList(data)
+        case .image: [.block(BlockValue.embed(url: data))]
+        case .ink: []
+        }
     }
 
     var stroke: InkStroke? {
@@ -37,11 +43,13 @@ final class PadStore {
     /// Bumped when a pad's contents change, for views that render from
     /// attributed strings rather than the items themselves.
     private(set) var version = 0
+    /// The pen is out. The iOS inspector sheet stops taking drags while it is,
+    /// or a stroke downward dismisses the sheet instead of drawing.
+    var drawing = false
 
     let cache = AssetCache()
     @ObservationIgnored weak var model: NotesModel?
     @ObservationIgnored private var loading: Set<String> = []
-    @ObservationIgnored private var ensuring: Set<String> = []
 
     private static let localPocketKey = "pocketPadUrl"
 
@@ -68,8 +76,8 @@ final class PadStore {
     func ensureNotePad(for noteUrl: String) async -> String? {
         if let known = notePads[noteUrl] { return known }
         guard let core = model?.core else { return nil }
-        let url = await Task.detached { try? core.ensureNotePad(url: noteUrl) }.value
-        guard let url else { return nil }
+        let made: String? = await Task.detached { try? core.ensureNotePad(url: noteUrl) }.value
+        guard let url = made else { return nil }
         notePads[noteUrl] = url
         load(url)
         return url
@@ -82,11 +90,12 @@ final class PadStore {
         if let pocketPadUrl { return pocketPadUrl }
         guard let core = model?.core else { return nil }
         if let configUrl = model?.accountConfigUrl {
-            if let url = await Task.detached({ try? core.ensurePocketPad(configUrl: configUrl) }).value {
-                pocketPadUrl = url
-                track(url)
-                load(url)
-                return url
+            let made: String? = await Task.detached { try? core.ensurePocketPad(configUrl: configUrl) }.value
+            if let made {
+                pocketPadUrl = made
+                track(made)
+                load(made)
+                return made
             }
         }
         if let stored = UserDefaults.standard.string(forKey: Self.localPocketKey) {
@@ -95,9 +104,8 @@ final class PadStore {
             load(stored)
             return stored
         }
-        guard let url = await Task.detached({ try? core.createPad(title: "Pocket Pad") }).value else {
-            return nil
-        }
+        let made: String? = await Task.detached { try? core.createPad(title: "Pocket Pad") }.value
+        guard let url = made else { return nil }
         UserDefaults.standard.set(url, forKey: Self.localPocketKey)
         pocketPadUrl = url
         load(url)
@@ -186,12 +194,14 @@ final class PadStore {
 
     // MARK: making items
 
+    static let cardWidth: CGFloat = 260
+
     func textItem(
         spans: [SpanNode],
         origin: String?,
         in padUrl: String,
         at point: CGPoint? = nil,
-        width: CGFloat = 184
+        width: CGFloat = PadStore.cardWidth
     ) -> PadItem {
         let height = RichText.measuredHeight(of: spans, width: width - 16, cache: cache)
         let y = point?.y ?? freeRow(in: padUrl, height: height)
@@ -201,11 +211,89 @@ final class PadStore {
             x: max(0, point?.x ?? 8),
             y: max(0, y),
             w: width,
-            h: min(max(28, ceil(height) + 22), 320),
+            h: min(max(72, ceil(height) + 28), 420),
             data: SpanNode.encodeList(spans),
             origin: origin,
             created: Int64(Date().timeIntervalSince1970)
         )
+    }
+
+    /// Pictures on a pad are asset docs like anywhere else — the item only
+    /// holds the url, so putting one back in the note is the same embed.
+    func imageItem(
+        assetUrl: String,
+        size: CGSize,
+        origin: String?,
+        in padUrl: String,
+        at point: CGPoint? = nil
+    ) -> PadItem {
+        let fitted = RichText.fitted(size)
+        let y = point?.y ?? freeRow(in: padUrl, height: fitted.height)
+        return PadItem(
+            id: UUID().uuidString,
+            kind: PadKind.image.rawValue,
+            x: max(0, point?.x ?? 8),
+            y: max(0, y),
+            w: max(80, fitted.width),
+            h: max(60, fitted.height + 14),
+            data: assetUrl,
+            origin: origin,
+            created: Int64(Date().timeIntervalSince1970)
+        )
+    }
+
+    /// Take dropped or pasted bytes, make the asset doc, park it on the pad.
+    func addFile(
+        data: Data,
+        name: String,
+        fileExtension: String,
+        to padUrl: String,
+        at point: CGPoint?,
+        origin: String?
+    ) async {
+        guard let model else { return }
+        let mime = UTType(filenameExtension: fileExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+        guard let assetUrl = await model.createAsset(
+            data: data,
+            name: name,
+            fileExtension: fileExtension,
+            mimeType: mime
+        ) else { return }
+        if let image = PImage(data: data) {
+            cache.images[assetUrl] = image
+            add(
+                imageItem(
+                    assetUrl: assetUrl,
+                    size: image.size,
+                    origin: origin,
+                    in: padUrl,
+                    at: point
+                ),
+                to: padUrl
+            )
+        } else {
+            cache.names[assetUrl] = name
+            add(
+                textItem(
+                    spans: [.block(BlockValue.embed(url: assetUrl))],
+                    origin: origin,
+                    in: padUrl,
+                    at: point
+                ),
+                to: padUrl
+            )
+        }
+    }
+
+    /// Plain text arriving from outside: one paragraph per line.
+    static func spans(fromPlainText text: String) -> [SpanNode] {
+        var spans: [SpanNode] = []
+        for line in text.components(separatedBy: "\n") {
+            spans.append(.block(BlockValue.paragraph))
+            if !line.isEmpty { spans.append(.text(line, [:])) }
+        }
+        return spans
     }
 
     func inkItem(stroke: InkStroke, origin: String?) -> PadItem {
@@ -459,12 +547,12 @@ enum Freehand {
         let taper = min(total / 3, size * 3)
         return points.indices.map { i in
             let speed = i == 0 ? 0 : lengths[i] - lengths[i - 1]
-            let thinning = max(0.35, 1 - min(1, speed / 12) * 0.45)
-            var radius = size / 2 * (0.35 + 0.65 * points[i].pressure) * thinning
+            let thinning = max(0.55, 1 - min(1, speed / 14) * 0.4)
+            var radius = size / 2 * (0.55 + 0.9 * points[i].pressure) * thinning
             if taper > 0.001 {
                 let fromStart = min(1, lengths[i] / taper)
                 let fromEnd = min(1, (total - lengths[i]) / taper)
-                radius *= sqrt(min(fromStart, fromEnd)) * 0.7 + 0.3
+                radius *= sqrt(min(fromStart, fromEnd)) * 0.55 + 0.45
             }
             return max(0.2, radius)
         }

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use crate::api::{EmbeddingChunk, RecentNote, SearchHit};
+use crate::api::{EmbeddingChunk, RecentNote, SearchFilter, SearchHit};
 use crate::shapes;
 
 /// Cosine below this is noise rather than a weak match.
@@ -42,6 +42,18 @@ pub struct IndexedDoc {
     pub modified: i64,
     /// File docs only: whether `@computervision` has been written yet.
     pub has_vision: bool,
+    pub tags: Vec<String>,
+    /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
+    pub when: String,
+}
+
+/// Tags are stored as one space-delimited string wrapped in spaces, so
+/// `LIKE '% cake %'` is an exact tag match rather than a prefix collision.
+fn encode_tags(tags: &[String]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    format!(" {} ", tags.join(" "))
 }
 
 /// Open the db and touch its schema so a corrupt file surfaces here rather
@@ -110,6 +122,12 @@ impl SearchIndex {
                 vector BLOB NOT NULL,
                 PRIMARY KEY (url, chunk)
             );
+            CREATE TABLE IF NOT EXISTS search_parents (
+                url TEXT PRIMARY KEY NOT NULL,
+                parent TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS search_parents_parent
+                ON search_parents(parent);
             "#,
         )?;
         // Pre-existing databases were created without `modified`; the error on
@@ -129,9 +147,19 @@ impl SearchIndex {
             "ALTER TABLE search_docs ADD COLUMN vision_attempted INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN when_day TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS search_docs_modified
-                ON search_docs(modified DESC);",
+                ON search_docs(modified DESC);
+             CREATE INDEX IF NOT EXISTS search_docs_when
+                ON search_docs(when_day) WHERE when_day <> '';",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -142,21 +170,25 @@ impl SearchIndex {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
                 body = excluded.body,
                 modified = excluded.modified,
-                has_vision = excluded.has_vision",
+                has_vision = excluded.has_vision,
+                tags = excluded.tags,
+                when_day = excluded.when_day",
             params![
                 doc.url,
                 doc.kind,
                 doc.title,
                 doc.body,
                 doc.modified,
-                doc.has_vision
+                doc.has_vision,
+                encode_tags(&doc.tags),
+                doc.when
             ],
         )?;
         tx.execute(
@@ -178,6 +210,24 @@ impl SearchIndex {
                      VALUES (?1, ?2, ?3)",
                     params![doc.url, doc.title, asset_url],
                 )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces the whole parent map in one go. Folder membership lives in the
+    /// folder docs, not the notes, so only a full tree walk knows it; the walker
+    /// hands the finished edges over rather than the index guessing at them.
+    pub fn set_parents(&self, parents: &HashMap<String, String>) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM search_parents", [])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT OR REPLACE INTO search_parents(url, parent) VALUES (?1, ?2)")?;
+            for (url, parent) in parents {
+                stmt.execute(params![url, parent])?;
             }
         }
         tx.commit()?;
@@ -293,18 +343,23 @@ impl SearchIndex {
         vector: &[f32],
         limit: u32,
         excluding: &[String],
+        filter: &SearchFilter,
     ) -> Result<Vec<SearchHit>> {
         if vector.is_empty() {
             return Ok(Vec::new());
         }
         let excluded: HashSet<&str> = excluding.iter().map(String::as_str).collect();
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT e.url, d.name, e.text, e.vector
+        let sql = FilterSql::build(filter, "e.url", 1);
+        let mut stmt = conn.prepare(&format!(
+            "{}SELECT e.url, n.name, e.text, e.vector
              FROM embeddings e
-             JOIN embedding_docs d ON d.url = e.url",
-        )?;
-        let mut rows = stmt.query([])?;
+             JOIN embedding_docs n ON n.url = e.url
+             LEFT JOIN search_docs d ON d.url = e.url{}
+             WHERE 1 = 1{}",
+            sql.cte, sql.join, sql.conds
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(sql.args.iter()))?;
         let mut best: HashMap<String, (f32, String, String)> = HashMap::new();
         while let Some(row) = rows.next()? {
             let url: String = row.get(0)?;
@@ -361,20 +416,53 @@ impl SearchIndex {
         Ok(out)
     }
 
-    pub fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
+    /// Everything a filter can narrow, resolved to a url set. Only worth the
+    /// scan when a filter is actually set — it exists so a hit on an asset can
+    /// check the notes that embed it against the same filter as the asset.
+    fn filtered_urls(conn: &Connection, filter: &SearchFilter) -> Result<Option<HashSet<String>>> {
+        let sql = FilterSql::build(filter, "d.url", 1);
+        if sql.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(&format!(
+            "{}SELECT d.url FROM search_docs d{} WHERE 1 = 1{}",
+            sql.cte, sql.join, sql.conds
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(sql.args.iter()))?;
+        let mut out = HashSet::new();
+        while let Some(row) = rows.next()? {
+            out.insert(row.get(0)?);
+        }
+        Ok(Some(out))
+    }
+
+    pub fn search(&self, query: &str, filter: &SearchFilter) -> Result<Vec<SearchHit>> {
         let Some(parsed) = parse_query(query) else {
             return Ok(Vec::new());
         };
         let term = parsed.snippet_term(query).to_string();
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT url, kind, title, body
-             FROM search_docs_fts
-             WHERE search_docs_fts MATCH ?1
-             ORDER BY rank
+        let allowed = Self::filtered_urls(&conn, filter)?;
+        // Narrowing has to happen inside the query: the limit is applied by
+        // rank, so a filter run afterwards would keep only the survivors of the
+        // top 200 rather than the top 200 of the folder.
+        let sql = FilterSql::build(filter, "f.url", 2);
+        let mut stmt = conn.prepare(&format!(
+            "{}SELECT f.url, f.kind, f.title, f.body
+             FROM (
+                SELECT url, kind, title, body, rank AS ranking
+                FROM search_docs_fts
+                WHERE search_docs_fts MATCH ?1
+             ) f
+             LEFT JOIN search_docs d ON d.url = f.url{}
+             WHERE 1 = 1{}
+             ORDER BY f.ranking
              LIMIT 200",
-        )?;
-        let mut rows = stmt.query(params![parsed.fts])?;
+            sql.cte, sql.join, sql.conds
+        ))?;
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&parsed.fts];
+        args.extend(sql.args.iter().map(|a| a as &dyn rusqlite::ToSql));
+        let mut rows = stmt.query(args.as_slice())?;
         let mut hits = Vec::new();
         let mut seen_notes = std::collections::HashSet::new();
         while let Some(row) = rows.next()? {
@@ -411,6 +499,9 @@ impl SearchIndex {
                 while let Some(linked) = linked_rows.next()? {
                     let note_url: String = linked.get(0)?;
                     let note_name: String = linked.get(1)?;
+                    if allowed.as_ref().is_some_and(|set| !set.contains(&note_url)) {
+                        continue;
+                    }
                     if seen_notes.insert(note_url.clone()) {
                         hits.push(SearchHit {
                             url: note_url,
@@ -447,7 +538,73 @@ pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
         links,
         modified: shapes::doc_modified(doc),
         has_vision,
+        tags: shapes::doc_tags(doc),
+        when: shapes::doc_when(doc),
     }
+}
+
+/// The SQL for a `SearchFilter`, split into the pieces a query needs to splice
+/// in. `first` is the number the caller's own placeholders have already used up.
+struct FilterSql {
+    cte: String,
+    join: String,
+    conds: String,
+    args: Vec<String>,
+}
+
+impl FilterSql {
+    /// `url_column` is whatever the query calls the doc url, so the scope join
+    /// can attach to the fts table, `embeddings`, or `search_docs` alike.
+    fn build(filter: &SearchFilter, url_column: &str, first: usize) -> Self {
+        let mut sql = FilterSql {
+            cte: String::new(),
+            join: String::new(),
+            conds: String::new(),
+            args: Vec::new(),
+        };
+        let mut index = first;
+        if let Some(scope) = filter.scope.as_deref().filter(|s| !s.is_empty()) {
+            sql.cte = format!(
+                "WITH RECURSIVE scope(url) AS (
+                    SELECT ?{index}
+                    UNION
+                    SELECT p.url FROM search_parents p JOIN scope s ON p.parent = s.url
+                 ) "
+            );
+            sql.join = format!(" JOIN scope ON scope.url = {url_column} ");
+            sql.args.push(scope.to_string());
+            index += 1;
+        }
+        for tag in filter.tags.iter().filter(|t| !t.is_empty()) {
+            sql.conds
+                .push_str(&format!(" AND d.tags LIKE ?{index} ESCAPE '\\' "));
+            sql.args.push(format!("% {} %", escape_like(tag)));
+            index += 1;
+        }
+        if let Some(from) = filter.when_from.as_deref().filter(|s| !s.is_empty()) {
+            sql.conds
+                .push_str(&format!(" AND d.when_day <> '' AND d.when_day >= ?{index} "));
+            sql.args.push(from.to_string());
+            index += 1;
+        }
+        if let Some(to) = filter.when_to.as_deref().filter(|s| !s.is_empty()) {
+            sql.conds
+                .push_str(&format!(" AND d.when_day <> '' AND d.when_day <= ?{index} "));
+            sql.args.push(to.to_string());
+        }
+        sql
+    }
+
+    fn is_empty(&self) -> bool {
+        self.args.is_empty()
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// A query is loose words plus any double-quoted phrases. Loose words match by
@@ -559,5 +716,86 @@ mod tests {
     #[test]
     fn punctuation_only_query_matches_nothing() {
         assert!(parse_query("\"\" ...").is_none());
+    }
+
+    fn indexed(url: &str, title: &str, tags: &[&str], when: &str) -> IndexedDoc {
+        IndexedDoc {
+            url: url.into(),
+            kind: "rich".into(),
+            title: title.into(),
+            body: "cake recipe".into(),
+            links: Vec::new(),
+            modified: 0,
+            has_vision: false,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            when: when.into(),
+        }
+    }
+
+    fn urls(hits: Vec<SearchHit>) -> Vec<String> {
+        let mut out: Vec<String> = hits.into_iter().map(|h| h.url).collect();
+        out.sort();
+        out
+    }
+
+    fn fixture() -> SearchIndex {
+        let dir = std::env::temp_dir().join(format!("lush-search-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let index = SearchIndex::open(&dir).unwrap();
+        index.upsert(indexed("note", "cake", &["baking"], "2026-08-09")).unwrap();
+        index.upsert(indexed("deep", "cake", &["baking", "party"], "2026-09-01")).unwrap();
+        index.upsert(indexed("outside", "cake", &[], "")).unwrap();
+        index
+            .set_parents(&HashMap::from([
+                ("note".into(), "work".into()),
+                ("sub".into(), "work".into()),
+                ("deep".into(), "sub".into()),
+                ("outside".into(), "home".into()),
+            ]))
+            .unwrap();
+        index
+    }
+
+    #[test]
+    fn scope_reaches_the_whole_subtree() {
+        let index = fixture();
+        let filter = SearchFilter {
+            scope: Some("work".into()),
+            ..Default::default()
+        };
+        assert_eq!(urls(index.search("cake", &filter).unwrap()), ["deep", "note"]);
+    }
+
+    #[test]
+    fn an_empty_filter_keeps_everything() {
+        let index = fixture();
+        let all = urls(index.search("cake", &SearchFilter::default()).unwrap());
+        assert_eq!(all, ["deep", "note", "outside"]);
+    }
+
+    #[test]
+    fn tags_are_matched_whole_and_together() {
+        let index = fixture();
+        let one = SearchFilter {
+            tags: vec!["bak".into()],
+            ..Default::default()
+        };
+        assert!(index.search("cake", &one).unwrap().is_empty());
+        let both = SearchFilter {
+            tags: vec!["baking".into(), "party".into()],
+            ..Default::default()
+        };
+        assert_eq!(urls(index.search("cake", &both).unwrap()), ["deep"]);
+    }
+
+    #[test]
+    fn when_bounds_are_inclusive_and_skip_dayless_docs() {
+        let index = fixture();
+        let filter = SearchFilter {
+            when_from: Some("2026-08-09".into()),
+            when_to: Some("2026-08-31".into()),
+            ..Default::default()
+        };
+        assert_eq!(urls(index.search("cake", &filter).unwrap()), ["note"]);
     }
 }

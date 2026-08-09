@@ -1,6 +1,7 @@
 import Foundation
 import AppIntents
 import Intents
+import EventKit
 
 /// What a system Focus is currently doing to Lush. The user configures it per
 /// Focus under Settings › Focus › Focus Filters › Lush; the system performs the
@@ -9,9 +10,10 @@ struct FocusFilterState: Codable, Equatable {
     var shownFolderUrls: [String] = []
     var inboxUrl: String?
     var quickNoteUrl: String?
+    var shownCalendarIds: [String] = []
 
     var isEmpty: Bool {
-        shownFolderUrls.isEmpty && inboxUrl == nil && quickNoteUrl == nil
+        shownFolderUrls.isEmpty && inboxUrl == nil && quickNoteUrl == nil && shownCalendarIds.isEmpty
     }
 }
 
@@ -140,6 +142,43 @@ struct LushNoteQuery: EntityStringQuery {
     }
 }
 
+struct LushCalendarEntity: AppEntity {
+    static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Calendar")
+    static let defaultQuery = LushCalendarQuery()
+
+    let id: String
+    let name: String
+
+    var displayRepresentation: DisplayRepresentation {
+        DisplayRepresentation(title: "\(name)")
+    }
+}
+
+struct LushCalendarQuery: EntityStringQuery {
+    func entities(for identifiers: [String]) async throws -> [LushCalendarEntity] {
+        let all = Self.all()
+        return identifiers.compactMap { id in all.first { $0.id == id } }
+    }
+
+    func entities(matching string: String) async throws -> [LushCalendarEntity] {
+        let all = Self.all()
+        let query = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return all }
+        return all.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    func suggestedEntities() async throws -> [LushCalendarEntity] { Self.all() }
+
+    private static func all() -> [LushCalendarEntity] {
+        let store = EKEventStore()
+        var seen = Set<String>()
+        return (store.calendars(for: .event) + store.calendars(for: .reminder)).compactMap { cal in
+            guard seen.insert(cal.calendarIdentifier).inserted else { return nil }
+            return LushCalendarEntity(id: cal.calendarIdentifier, name: cal.title)
+        }
+    }
+}
+
 /// Configured per system Focus in Settings › Focus › Focus Filters › Lush.
 /// There are no Lush-side focus modes: the Focus is the mode, and this is what
 /// it carries.
@@ -156,11 +195,15 @@ struct LushFocusFilter: SetFocusFilterIntent {
     @Parameter(title: "Quick Note")
     var quickNote: LushNoteEntity?
 
+    @Parameter(title: "Calendars")
+    var calendars: [LushCalendarEntity]?
+
     var displayRepresentation: DisplayRepresentation {
         var parts: [String] = []
         if let folders, !folders.isEmpty { parts.append("\(folders.count) folders") }
         if let inbox { parts.append("inbox: \(inbox.name)") }
         if let quickNote { parts.append("quick note: \(quickNote.name)") }
+        if let calendars, !calendars.isEmpty { parts.append("\(calendars.count) calendars") }
         return DisplayRepresentation(
             title: "Lush",
             subtitle: parts.isEmpty ? "Everything" : "\(parts.joined(separator: ", "))"
@@ -171,7 +214,8 @@ struct LushFocusFilter: SetFocusFilterIntent {
         FocusFilterState(
             shownFolderUrls: (folders ?? []).compactMap { $0.isInbox ? nil : $0.url },
             inboxUrl: inbox.flatMap { $0.isInbox ? nil : $0.url },
-            quickNoteUrl: quickNote?.id
+            quickNoteUrl: quickNote?.id,
+            shownCalendarIds: (calendars ?? []).map(\.id)
         )
     }
 

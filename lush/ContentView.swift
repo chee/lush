@@ -49,6 +49,7 @@ struct ContentView: View {
     @State private var searchPresented = false
     @State private var searchHits: [SearchHit] = []
     @State private var searchTask: Task<Void, Never>?
+    @State private var searchScope: String?
     @State private var renamingUrl: String?
     @State private var renameText = ""
     @FocusState private var sidebarFocused: Bool
@@ -62,8 +63,9 @@ struct ContentView: View {
     @State private var collapsedSections: Set<String> = []
     @State private var rightSidebarVisible = false
     @State private var rightSidebarTab: RightSidebarTab = .history
-    @State private var rightSidebarWidth: CGFloat = 280
-    @State private var rightSidebarDragStart: CGFloat?
+    @AppStorage("rightSidebarWidth") private var rightSidebarWidth: Double = 280
+    @State private var rightSidebarDragStart: Double?
+    @State private var rightSidebarLiveWidth: Double?
     @State private var selectedHistoryEntry: DocHistoryEntry?
 
     private static let expandedKey = "expandedFolders"
@@ -91,10 +93,10 @@ struct ContentView: View {
                 Task { await model.selectFolder(url) }
             }
         }
-        .onChange(of: model.activeEditor?.stashed) { _, stashed in
-            guard let stashed, stashed > 0 else { return }
+        .onChange(of: model.activeEditor?.padded) { _, padded in
+            guard let padded, padded > 0 else { return }
             rightSidebarVisible = true
-            rightSidebarTab = .canvas
+            rightSidebarTab = .pad
         }
         .onOpenURL { url in
             if url.scheme == "lush" {
@@ -362,6 +364,7 @@ struct ContentView: View {
                     sectionRows(section)
                 }
             } else {
+                if let searchScope { searchScopeRow(searchScope) }
                 saveSearchRow
                 ForEach(searchHits, id: \.url) { hit in
                     searchHitRow(hit)
@@ -407,6 +410,9 @@ struct ContentView: View {
         .onChange(of: searchText) {
             model.searchQuery = searchText
             runSearch()
+        }
+        .onChange(of: searchPresented) {
+            if !searchPresented { searchScope = nil }
         }
         .onChange(of: model.notes) {
             if !searchText.isEmpty { runSearch(selectTop: false) }
@@ -467,7 +473,7 @@ struct ContentView: View {
             return
         }
         searchTask = Task {
-            let hits = await model.search(query)
+            let hits = await model.search(query, in: searchScope)
             guard !Task.isCancelled else { return }
             searchHits = hits
             guard selectTop, let first = hits.first else { return }
@@ -480,6 +486,14 @@ struct ContentView: View {
         searchPresented = true
         searchFocused = true
         sidebarFocused = true
+    }
+
+    /// Points the sidebar search at one notebook. The field opens empty rather
+    /// than re-running whatever was last typed, since the folder is the point.
+    private func searchInFolder(_ url: String) {
+        searchScope = url
+        focusNotesSearch()
+        if !searchText.isEmpty { runSearch(selectTop: false) }
     }
 
     @ViewBuilder
@@ -742,9 +756,35 @@ struct ContentView: View {
             }
     }
 
+    /// Only ever shown while a scope is set, so it doubles as the reminder that
+    /// the hit list is not the whole library.
+    private func searchScopeRow(_ scope: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 10, weight: .semibold))
+            Text(model.node(for: scope)?.displayName ?? "Notebook")
+                .lineLimit(1)
+            Button {
+                searchScope = nil
+                runSearch(selectTop: false)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .help("Search everywhere")
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(Self.selectionTint)
+        .padding(.vertical, 4)
+        .listRowInsets(sidebarRowInsets(depth: 0))
+    }
+
     private var saveSearchRow: some View {
         Button {
-            smartEditor = SmartNotebookEdit(folder: newSmartNotebook(query: searchText), isNew: true)
+            smartEditor = SmartNotebookEdit(
+                folder: newSmartNotebook(query: searchText, scope: searchScope ?? ""),
+                isNew: true
+            )
         } label: {
             Label("Save as Smart Notebook", systemImage: "folder.badge.gearshape")
                 .font(.body.weight(.medium))
@@ -918,6 +958,7 @@ struct ContentView: View {
             }
             Button("Folder") { model.createSubfolder(in: node.url) }
         }
+        Button("Search in \(node.displayName)") { searchInFolder(node.url) }
         if !model.rootFolderUrls.contains(node.url) {
             Button("Pin Folder to Sidebar") {
                 Task { await model.addRootFolder(node.url) }
@@ -1014,24 +1055,30 @@ struct ContentView: View {
     }
 
     private var rightSidebarDivider: some View {
-        Divider()
+        Color.clear
+            .frame(width: 10)
             .overlay {
-                Color.clear
-                    .frame(width: 8)
-                    .contentShape(Rectangle())
-                    .onHover { inside in
-                        if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-                    }
-                    .gesture(
-                        DragGesture(minimumDistance: 1)
-                            .onChanged { drag in
-                                let start = rightSidebarDragStart ?? rightSidebarWidth
-                                rightSidebarDragStart = start
-                                rightSidebarWidth = min(520, max(240, start - drag.translation.width))
-                            }
-                            .onEnded { _ in rightSidebarDragStart = nil }
-                    )
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(width: 1)
             }
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { drag in
+                        let start = rightSidebarDragStart ?? rightSidebarWidth
+                        rightSidebarDragStart = start
+                        rightSidebarLiveWidth = min(1100, max(240, (start - drag.translation.width).rounded()))
+                    }
+                    .onEnded { _ in
+                        rightSidebarDragStart = nil
+                        if let width = rightSidebarLiveWidth { rightSidebarWidth = width }
+                        rightSidebarLiveWidth = nil
+                    }
+            )
     }
 
     @ViewBuilder
@@ -1068,7 +1115,7 @@ struct ContentView: View {
                     selectedEntry: $selectedHistoryEntry
                 )
                 .environment(model)
-                .frame(width: rightSidebarWidth)
+                .frame(width: CGFloat(rightSidebarLiveWidth ?? rightSidebarWidth))
             }
         }
         .navigationTitle("")
@@ -1110,7 +1157,8 @@ struct ContentView: View {
             text: $searchText,
             isPresented: $searchPresented,
             placement: .toolbar,
-            prompt: "Search notes"
+            prompt: searchScope.flatMap { model.node(for: $0)?.displayName }
+                .map { "Search \($0)" } ?? "Search notes"
         )
         .searchFocused($searchFocused)
     }
@@ -1544,7 +1592,7 @@ struct FolderScreen: View {
             model.searchQuery = searchText
             searchTask?.cancel()
             searchTask = Task {
-                let hits = await model.search(searchText)
+                let hits = await model.search(searchText, in: folderUrl)
                 guard !Task.isCancelled else { return }
                 searchHits = hits
             }
@@ -1595,7 +1643,7 @@ struct FolderScreen: View {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
                         .font(.system(size: 15))
-                    TextField("Search notes", text: $searchText)
+                    TextField(folderUrl == nil ? "Search notes" : "Search \(title)", text: $searchText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     if !searchText.isEmpty {
@@ -1874,7 +1922,7 @@ struct RecentsScreen: View {
 
 enum RightSidebarTab: String, CaseIterable, Identifiable {
     case outline = "Outline"
-    case canvas = "Canvas"
+    case pad = "Scratchpad"
     case history = "History"
     case info = "Info"
     case chat = "Chat"
@@ -1885,7 +1933,7 @@ enum RightSidebarTab: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .outline: "list.bullet.indent"
-        case .canvas: "square.grid.3x3.topleft.filled"
+        case .pad: "scribble.variable"
         case .history: "clock.arrow.circlepath"
         case .info: "info.circle"
         case .chat: "bubble.left"
@@ -1952,7 +2000,8 @@ struct RightSidebarView: View {
             switch tab {
             // a controller outlives its editor — the focused scene value holds
             // the last one — so the live core, not the controller, is the test
-            case .outline, .canvas: model.activeEditor?.core != nil
+            case .outline: model.activeEditor?.core != nil
+            case .pad: true
             case .history, .info, .chat: node != nil
             case .tools: node != nil && PatchworkWeb.available
             }
@@ -1973,8 +2022,9 @@ struct RightSidebarView: View {
             switch selectedTab {
             case .outline:
                 OutlineListView(controller: model.activeEditor)
-            case .canvas:
-                CanvasStashView(controller: model.activeEditor)
+            case .pad:
+                ScratchpadView(controller: model.activeEditor, noteUrl: model.activeEditor?.core?.noteUrl)
+                    .environment(model)
             case .history:
                 historyView
             case .info:
@@ -3200,12 +3250,12 @@ struct NoteDetail: View {
         .onChange(of: model.searchQuery) {
             editor.core?.updateGlobalMatches()
         }
-        .onChange(of: editor.stashed) {
-            guard editor.stashed > 0 else { return }
+        .onChange(of: editor.padded) {
+            guard editor.padded > 0 else { return }
             #if os(macOS)
             rightSidebarVisible?.wrappedValue = true
             #else
-            inspectorTab = .canvas
+            inspectorTab = .pad
             showingInspector = true
             #endif
         }
@@ -3274,6 +3324,7 @@ struct NoteDetail: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+            .interactiveDismissDisabled(model.pads.drawing)
         }
         #else
         noteEditorBase
@@ -3497,216 +3548,6 @@ private struct MinimapView: View {
             )
         }
         .frame(width: 22)
-    }
-}
-
-private struct CanvasStashView: View {
-    let controller: EditorController?
-
-    var body: some View {
-        if let controller, let core = controller.core {
-            let _ = controller.docVersion
-            let cards = core.stashedCards()
-            ScrollView([.vertical, .horizontal]) {
-                ZStack(alignment: .topLeading) {
-                    canvas(cards: cards, core: core)
-                    if cards.isEmpty {
-                        Text("Drop text here, or Format → Stash Paragraph to Canvas. Double-click for an empty card, click a card to edit it, drag one onto the note to put it back.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(24)
-                            .frame(width: 260)
-                            .allowsHitTesting(false)
-                    }
-                    ForEach(cards) { card in
-                        StashCardView(card: card, core: core)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
-        } else {
-            ContentUnavailableView("No Note Open", systemImage: "square.grid.3x1.folder.badge.plus")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-
-    private func canvas(cards: [StashedCard], core: EditorCore) -> some View {
-        let sized = Color.clear
-            .frame(
-                width: max(280, (cards.map(\.x).max() ?? 0) + 200),
-                height: max(400, (cards.map { $0.y + $0.contentHeight }.max() ?? 0) + 120)
-            )
-            .contentShape(Rectangle())
-            .gesture(
-                SpatialTapGesture(count: 2)
-                    .onEnded { value in
-                        core.addBlankCardToCanvas(at: value.location)
-                    }
-            )
-        #if os(macOS)
-        return sized.background(StashDropTarget(core: core))
-        #else
-        return sized
-        #endif
-    }
-}
-
-private struct StashSnippetView {
-    let attributed: NSAttributedString
-
-    @MainActor
-    final class Coordinator {
-        let markers = ListMarkerLayoutDelegate()
-    }
-
-    @MainActor
-    func makeCoordinator() -> Coordinator { Coordinator() }
-}
-
-#if os(macOS)
-extension StashSnippetView: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSTextView {
-        let textView = NSTextView(usingTextLayoutManager: true)
-        textView.textLayoutManager?.delegate = context.coordinator.markers
-        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
-        textView.textContainer?.widthTracksTextView = true
-        textView.isEditable = false
-        textView.isSelectable = false
-        textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 4, height: 0)
-        textView.textStorage?.setAttributedString(attributed)
-        return textView
-    }
-
-    func updateNSView(_ nsView: NSTextView, context: Context) {
-        if nsView.attributedString() != attributed {
-            nsView.textStorage?.setAttributedString(attributed)
-        }
-    }
-}
-#else
-extension StashSnippetView: UIViewRepresentable {
-    func makeUIView(context: Context) -> UITextView {
-        let textView = UITextView(usingTextLayoutManager: true)
-        textView.textLayoutManager?.delegate = context.coordinator.markers
-        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
-        textView.isEditable = false
-        textView.isSelectable = false
-        textView.isScrollEnabled = false
-        textView.backgroundColor = .clear
-        textView.textContainerInset = UIEdgeInsets(top: 0, left: 4, bottom: 0, right: 4)
-        textView.textStorage.setAttributedString(attributed)
-        return textView
-    }
-
-    func updateUIView(_ uiView: UITextView, context: Context) {
-        if !uiView.textStorage.isEqual(to: attributed) {
-            uiView.textStorage.setAttributedString(attributed)
-        }
-    }
-}
-#endif
-
-private struct StashCardView: View {
-    let card: StashedCard
-    let core: EditorCore
-    @State private var dragOffset: CGSize = .zero
-    @State private var editing = false
-    @State private var caret: CGPoint?
-    @State private var height: CGFloat?
-
-    private var paper: Color {
-        #if os(macOS)
-        Color(nsColor: .textBackgroundColor)
-        #else
-        Color(uiColor: .systemBackground)
-        #endif
-    }
-
-    /// The whole card is one grab, text included: drag it around the canvas, or
-    /// onto the note to drop it in. A click instead opens it for editing, and
-    /// the card wears an accent ring until escape or a click elsewhere.
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Capsule()
-                .fill(Color.secondary.opacity(0.2))
-                .frame(width: 20, height: 3)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .allowsHitTesting(false)
-            text
-                .frame(height: min(max(height ?? card.contentHeight, 18), 240))
-        }
-        .padding(8)
-        // an overlay takes the card's size instead of arguing with it: as a
-        // sibling the grab claimed height of its own and the card resized
-        // whenever the canvas did
-        .overlay { if !editing { grab } }
-        .frame(width: 184, alignment: .leading)
-        .background(paper, in: RoundedRectangle(cornerRadius: 6))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(
-                    editing ? Color.accentColor : Color.secondary.opacity(0.18),
-                    lineWidth: editing ? 2 : 1
-                )
-        )
-        .shadow(color: .black.opacity(0.16), radius: 5, y: 3)
-        .offset(x: card.x + dragOffset.width, y: card.y + dragOffset.height)
-        .contextMenu {
-            Button("Return to Note") { core.unstashInPlace(at: card.location) }
-        }
-    }
-
-    private func moved(by translation: CGSize) {
-        core.moveStash(card, to: CGPoint(
-            x: card.x + translation.width,
-            y: card.y + translation.height
-        ))
-        dragOffset = .zero
-    }
-
-    private var grab: some View {
-        #if os(macOS)
-        StashCardGrab(
-            location: card.location,
-            attributed: card.attributed,
-            onMove: { dragOffset = $0 },
-            onDrop: { moved(by: $0) },
-            onClick: { point in
-                caret = point
-                editing = true
-            }
-        )
-        #else
-        Color.clear
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture()
-                    .onChanged { dragOffset = $0.translation }
-                    .onEnded { moved(by: $0.translation) }
-            )
-            .onDrag {
-                NSItemProvider(object: StashDrag(location: card.location, grab: .zero).text as NSString)
-            }
-        #endif
-    }
-
-    private var text: some View {
-        #if os(macOS)
-        StashCardEditor(
-            card: card,
-            core: core,
-            editing: editing,
-            caret: caret,
-            onExit: { editing = false },
-            onHeight: { height = $0 }
-        )
-        #else
-        StashSnippetView(attributed: card.attributed)
-            .allowsHitTesting(false)
-            .clipped()
-        #endif
     }
 }
 
@@ -4506,6 +4347,7 @@ struct PatchworkDetail: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+            .interactiveDismissDisabled(model.pads.drawing)
         }
         #endif
     }

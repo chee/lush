@@ -17,22 +17,28 @@ private extension NSResponder {
 final class LushAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         LushShared.migrateDefaults()
-        HelperControl.registerIfEnabled()
-        HelperControl.stopAndWait()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = LushServicesProvider.shared
     }
 
-    /// Flush, then hand the core back to the helper before we go — it can't
-    /// open the storage until this process has closed it.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        NotesModel.shared.releaseCore()
-        HelperControl.start {
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
-        return .terminateLater
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.hide(nil)
+        return .terminateCancel
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    static func reallyQuit() {
+        NotesModel.shared.activeEditor?.core?.pushNow()
+        NotesModel.shared.presence.leave()
+        NotesModel.shared.core?.shutdown()
+        NSApp.setActivationPolicy(.accessory)
+        exit(0)
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -291,10 +297,14 @@ struct FormatCommands: Commands {
                 editor?.core?.toggleFoldAtSelection()
             }
             .keyboardShortcut("-", modifiers: [.command, .option])
-            Button("Stash Paragraph to Canvas") {
-                editor?.core?.stashSelection()
+            Button("Send to Note Scratchpad") {
+                editor?.core?.sendSelectionToPad(pocket: false)
             }
             .keyboardShortcut("s", modifiers: [.command, .control])
+            Button("Send to Pocket Pad") {
+                editor?.core?.sendSelectionToPad(pocket: true)
+            }
+            .keyboardShortcut("s", modifiers: [.command, .control, .option])
             Divider()
             Button("Attach Image…") { editor?.attachImageFromPanel() }
                 .keyboardShortcut("a", modifiers: [.command, .shift])

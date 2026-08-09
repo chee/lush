@@ -41,52 +41,6 @@ struct OutlineItem: Identifiable {
     var id: Int { location }
 }
 
-struct StashedCard: Identifiable {
-    let location: Int
-    let locations: [Int]
-    let box: BlockBox
-    let boxes: [BlockBox]
-    let attributed: NSAttributedString
-    let contentHeight: CGFloat
-    let x: CGFloat
-    let y: CGFloat
-    /// Cards parked on the same point, in document order.
-    let ordinal: Int
-    /// Where it sits, not which block it holds: typing in a card can hand its
-    /// first paragraph a new block, and a card whose identity changed under
-    /// SwiftUI would lose the caret mid-edit.
-    var id: String { "\(x)x\(y)#\(ordinal)" }
-}
-
-/// A stash card drag carries its source paragraph and where inside the card
-/// the pointer grabbed it, so a drop back on the canvas lands the card under
-/// the cursor instead of jumping its corner there.
-struct StashDrag {
-    static let prefix = "lush-stash:"
-    let location: Int
-    let grab: CGSize
-
-    var text: String {
-        "\(Self.prefix)\(location):\(Double(grab.width)):\(Double(grab.height))"
-    }
-
-    init(location: Int, grab: CGSize) {
-        self.location = location
-        self.grab = grab
-    }
-
-    init?(_ text: String) {
-        guard text.hasPrefix(Self.prefix) else { return nil }
-        let parts = text.dropFirst(Self.prefix.count).split(separator: ":")
-        guard let location = Int(parts.first ?? "") else { return nil }
-        self.location = location
-        grab = CGSize(
-            width: parts.count > 1 ? Double(parts[1]) ?? 0 : 0,
-            height: parts.count > 2 ? Double(parts[2]) ?? 0 : 0
-        )
-    }
-}
-
 enum MinimapKind {
     case heading, code, quote, embed, text
 }
@@ -138,8 +92,10 @@ final class EditorController {
     var findIndex = 0
     /// Bumped on every storage edit so inspector views recompute.
     var docVersion = 0
-    /// Bumped when a paragraph is parked, to bring the canvas forward.
-    var stashed = 0
+    /// Bumped when a paragraph is parked, to bring the scratchpad forward.
+    var padded = 0
+    /// Which pad the last parked paragraph went to.
+    var paddedPocket = false
     var minimapRows: [MinimapRow] = []
     var minimapDocHeight: CGFloat = 0
     var minimapViewport: MinimapViewport?
@@ -169,7 +125,7 @@ final class EditorController {
     func scrollTo(location: Int) { core?.scrollTo(location: location) }
 
     /// Formatting reaches whichever text has focus — the note, or a card on the
-    /// stash canvas.
+    /// scratchpad.
     private func format(_ body: @escaping (EditorCore) -> Void) {
         core?.onFocusedText(body)
     }
@@ -347,14 +303,12 @@ extension ListMarkerLayoutDelegate {
     }
 }
 
-/// A stash card edits its own copy of the paragraphs it parks on the canvas
-/// and writes them back into the note.
+/// A pad card edits the spans a scratchpad holds and writes them back to it.
 @MainActor
-protocol StashCardEditing: EditorTextViewLike {
-    func commitToNote()
-    /// Writing the note's storage rebuilds the substituted element standing in
-    /// for the hidden paragraph, so a card gathers its keystrokes before it
-    /// does that rather than doing it on each one.
+protocol PadCardEditing: EditorTextViewLike {
+    func commit()
+    /// Writing to the pad doc on every keystroke would be a change per
+    /// character, so a card gathers them first.
     func scheduleCommit()
 }
 
@@ -421,17 +375,17 @@ final class EditorCore {
     private static var presenceOwners: [String: ObjectIdentifier] = [:]
 
     /// The text an editing command acts on. Normally the note's own view; a
-    /// focused stash card takes it over for the length of a command so every
-    /// command works the same on the canvas as in the note (see onFocusedText).
+    /// focused pad card takes it over for the length of a command so every
+    /// command works the same on a pad as in the note (see onFocusedText).
     weak var view: (any EditorTextViewLike)? {
         didSet {
-            if !(view is any StashCardEditing) { noteView = view }
+            if !(view is any PadCardEditing) { noteView = view }
         }
     }
     /// Always the note's own view. Loading, saving and storage attachment read
     /// or write the whole document and must never see a card's copy of it.
     weak var noteView: (any EditorTextViewLike)?
-    weak var focusedStashCard: (any StashCardEditing)?
+    weak var focusedPadCard: (any PadCardEditing)?
     private var lastCodeSelection = NSRange(location: 0, length: 0)
     let model: NotesModel
     let controller: EditorController
@@ -563,8 +517,7 @@ final class EditorCore {
         #if !os(macOS)
         observeStorageEdits()
         registerPresenceObserver()
-        return
-        #endif
+        #else
         if contentStorage.textStorage !== session.storage {
             contentStorage.textStorage = session.storage
         } else if session.storage.textStorageObserver !== contentStorage {
@@ -582,6 +535,7 @@ final class EditorCore {
         }
         observeStorageEdits()
         registerPresenceObserver()
+        #endif
     }
 
     private func registerPresenceObserver() {
@@ -651,7 +605,6 @@ final class EditorCore {
                 // invalidateLayout here.
                 guard !self.isApplyingDocumentState else { return }
                 let editedLocation = storage.editedRange.location
-                let editTouchedStash = self.editedRangeHasStash(storage, storage.editedRange)
                 guard let textLayoutManager = self.view?.pTextLayoutManager else { return }
                 Task { @MainActor in
                     invalidateOrderedListRun(
@@ -675,13 +628,11 @@ final class EditorCore {
                     self.scheduleMinimapUpdate()
                     // Only typing inside a folded heading can change the
                     // hidden set from here (its key stops matching, so the
-                    // section reappears); stash edits rebuild explicitly and
-                    // remote reloads refresh in apply(). With nothing folded
-                    // and nothing hidden there is nothing to recompute, so
-                    // the common keystroke skips the whole-document walk —
-                    // unless the edit itself introduced a stashed block (undo
-                    // of an unstash, paste of stashed text).
-                    if !self.folding.foldedHeadings.isEmpty || !self.folding.hiddenRanges.isEmpty || editTouchedStash {
+                    // section reappears); remote reloads refresh in apply().
+                    // With nothing folded and nothing hidden there is nothing
+                    // to recompute, so the common keystroke skips the
+                    // whole-document walk.
+                    if !self.folding.foldedHeadings.isEmpty || !self.folding.hiddenRanges.isEmpty {
                         let hiddenBefore = self.folding.hiddenRanges
                         self.folding.refresh(storage: storage)
                         if hiddenBefore != self.folding.hiddenRanges {
@@ -691,19 +642,6 @@ final class EditorCore {
                 }
             }
         }
-    }
-
-    private func editedRangeHasStash(_ storage: NSTextStorage, _ range: NSRange) -> Bool {
-        let clamped = NSIntersectionRange(range, NSRange(location: 0, length: storage.length))
-        guard clamped.length > 0 else { return false }
-        var found = false
-        storage.enumerateAttribute(.amBlock, in: clamped) { value, _, stop in
-            if let box = value as? BlockBox, box.value.attrs["stash"] != nil {
-                found = true
-                stop.pointee = true
-            }
-        }
-        return found
     }
 
     private weak var contextTracker: ContextTracker?
@@ -874,6 +812,30 @@ final class EditorCore {
                 }
             }
         }
+    }
+
+    /// The media a copied selection stands for, so a paste outside this app
+    /// gets the picture and not a blank line where an image was.
+    func copiedMedia(in attributed: NSAttributedString) -> (images: [PImage], files: [URL]) {
+        var seen: Set<String> = []
+        var images: [PImage] = []
+        var files: [URL] = []
+        attributed.enumerateAttribute(
+            .amBlock,
+            in: NSRange(location: 0, length: attributed.length)
+        ) { value, _, _ in
+            guard let box = value as? BlockBox,
+                  box.value.isEmbedBlock,
+                  let url = box.value.embedUrl,
+                  seen.insert(url).inserted
+            else { return }
+            if let image = cache.images[url] {
+                images.append(image)
+            } else if let file = cache.fileURLs[url] {
+                files.append(file)
+            }
+        }
+        return (images, files)
     }
 
     func isPatchworkDoc(_ url: String) -> Bool {
@@ -1541,8 +1503,7 @@ final class EditorCore {
 
     // MARK: folding
 
-    /// Rebuild the substituted elements after fold state or stash attrs
-    /// change. Pass `previous` when the storage was already edited on the way
+    /// Rebuild the substituted elements after fold state changes. Pass `previous` when the storage was already edited on the way
     /// here — the edit observer refreshes `folding.hiddenRanges` eagerly,
     /// which would otherwise lose the ranges that need un-substituting.
     func rebuildHiddenRanges(previous: [NSRange]? = nil) {
@@ -1635,7 +1596,7 @@ final class EditorCore {
             }
             cursor = paragraph.location - 1
         }
-        // stash-hidden text has no fold to open — typing there would edit
+        // hidden text with no fold to open — typing there would edit
         // invisible content, so snap the caret past the hidden range
         if let range = folding.hiddenRanges.first(where: { NSLocationInRange(caret, $0) }) {
             view.pSelectedRange = NSRange(location: min(NSMaxRange(range), storage.length), length: 0)
@@ -2123,248 +2084,103 @@ final class EditorCore {
         return result
     }
 
-    // MARK: canvas stash
+    // MARK: scratchpad
 
-    func stashedCards() -> [StashedCard] {
-        guard let storage = view?.pStorage, storage.length > 0 else { return [] }
+    /// Cut the selected paragraphs out of the note and hand back their spans
+    /// for a pad to keep. Nothing is left behind: the pad holds the text now.
+    func cutSelectionToPad() -> [SpanNode]? {
+        guard let view, let storage = view.pStorage, storage.length > 0 else { return nil }
         let str = storage.string as NSString
-        struct Item {
-            let paragraphEnd: Int
-            let location: Int
-            let box: BlockBox
-            let attributed: NSAttributedString
-            let x: CGFloat
-            let y: CGFloat
-        }
-        var items: [Item] = []
-        var location = 0
-        while location < storage.length {
-            let paragraph = str.paragraphRange(for: NSRange(location: location, length: 0))
-            if paragraph.length == 0 { break }
-            location = NSMaxRange(paragraph)
-            guard let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
-                  case .object(let stash)? = box.value.attrs["stash"]
-            else { continue }
-            items.append(Item(
-                paragraphEnd: NSMaxRange(paragraph),
-                location: paragraph.location,
-                box: box,
-                attributed: storage.attributedSubstring(from: paragraph),
-                x: CGFloat(stash["x"]?.doubleValue ?? 20),
-                y: CGFloat(stash["y"]?.doubleValue ?? 20)
-            ))
-        }
-        var cards: [StashedCard] = []
-        var ordinals: [String: Int] = [:]
-        var i = 0
-        while i < items.count {
-            let first = items[i]
-            var group = [items[i]]
-            var j = i + 1
-            while j < items.count {
-                let prev = group.last!
-                let curr = items[j]
-                guard curr.x == first.x, curr.y == first.y,
-                      curr.location == prev.paragraphEnd else { break }
-                group.append(curr)
-                j += 1
-            }
-            let merged = NSMutableAttributedString()
-            for item in group { merged.append(item.attributed) }
-            let measured = merged.boundingRect(
-                with: CGSize(width: 164, height: 600),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                context: nil
-            ).height
-            let spot = "\(first.x)x\(first.y)"
-            let ordinal = ordinals[spot] ?? 0
-            ordinals[spot] = ordinal + 1
-            cards.append(StashedCard(
-                location: first.location,
-                locations: group.map(\.location),
-                box: first.box,
-                boxes: group.map(\.box),
-                attributed: merged,
-                contentHeight: ceil(measured),
-                x: first.x,
-                y: first.y,
-                ordinal: ordinal
-            ))
-            i = j
-        }
-        return cards
-    }
-
-    /// Hide the selected paragraphs from the note and place them on the canvas.
-    /// Multiple selected paragraphs land at the same position and appear as one card.
-    /// The text never leaves the doc, so concurrent edits keep merging while stashed.
-    func stashSelection() {
-        guard let view, let storage = view.pStorage, storage.length > 0 else { return }
         let selection = view.pSelectedRange
-        let str = storage.string as NSString
-        if selection.location >= storage.length, str.hasSuffix("\n") { return }
-        var paragraphLocations: [Int] = []
-        let rangeEnd = selection.length > 0 ? NSMaxRange(selection) : selection.location + 1
-        var cursor = min(selection.location, storage.length - 1)
-        while cursor < storage.length {
-            let paragraph = str.paragraphRange(for: NSRange(location: max(0, cursor), length: 0))
-            if paragraph.length == 0 { break }
-            if let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox,
-               !box.value.isAtomic,
-               box.value.attrs["stash"] == nil {
-                paragraphLocations.append(paragraph.location)
+        guard selection.location < storage.length else { return nil }
+        let end = selection.length > 0 ? NSMaxRange(selection) - 1 : selection.location
+        let first = str.paragraphRange(for: NSRange(location: selection.location, length: 0))
+        let last = str.paragraphRange(for: NSRange(location: min(end, storage.length - 1), length: 0))
+        var range = NSRange(location: first.location, length: NSMaxRange(last) - first.location)
+        guard range.length > 0 else { return nil }
+        // an atomic block is a thing, not a paragraph — take it whole or not at all
+        var takeable = true
+        storage.enumerateAttribute(.amBlock, in: range) { value, _, _ in
+            if let box = value as? BlockBox, box.value.isAtomic, selection.length == 0 {
+                takeable = false
             }
-            let next = NSMaxRange(paragraph)
-            if next >= rangeEnd { break }
-            if next <= cursor { break }
-            cursor = next
         }
-        guard !paragraphLocations.isEmpty else { return }
-        // fill the first free row from the top of the canvas: stacking below
-        // the lowest card left a growing empty band up there as cards came back
-        let taken = stashedCards().map(\.y)
-        var nextY: CGFloat = 8
-        while taken.contains(where: { abs($0 - nextY) < 40 }) { nextY += 60 }
-        let stashValue = JSONValue.object(["x": .number(8), "y": .number(Double(nextY))])
-        for loc in paragraphLocations {
-            setStash(stashValue, forParagraphAt: loc)
-        }
-        controller.stashed &+= 1
-    }
-
-    func moveStash(fromParagraphAt location: Int, to point: CGPoint) {
-        guard let card = stashedCards().first(where: { $0.location == location }) else { return }
-        moveStash(card, to: point)
-    }
-
-    func moveStash(_ card: StashedCard, to point: CGPoint) {
-        let newStash = JSONValue.object([
-            "x": .number(Double(max(0, point.x))),
-            "y": .number(Double(max(0, point.y))),
-        ])
-        guard let storage = view?.pStorage else { return }
-        // a remote reload mid-drag rebuilds every block, so the cached
-        // locations would now point at whatever paragraph sits there. Bail
-        // unless the anchor block is still this exact card.
-        guard card.location < storage.length,
-              (storage.attribute(.amBlock, at: card.location, effectiveRange: nil) as? BlockBox) === card.box
-        else { return }
-        for loc in card.locations {
-            guard loc < storage.length,
-                  let box = storage.attribute(.amBlock, at: loc, effectiveRange: nil) as? BlockBox,
-                  box.value.attrs["stash"] != nil
-            else { continue }
-            box.value.attrs["stash"] = newStash
-        }
-        controller.docVersion &+= 1
-        scheduleSave()
-    }
-
-    /// Return stashed paragraph(s) to the note in place.
-    func unstashInPlace(at location: Int) {
-        let card = stashedCards().first(where: { $0.location == location })
-        for loc in card?.locations ?? [location] {
-            setStash(nil, forParagraphAt: loc)
-        }
-    }
-
-    /// Return a stashed paragraph at a drop point: a splice move.
-    /// For multi-paragraph cards, unstashes all in place instead of moving.
-    func unstash(fromParagraphAt sourceLocation: Int, toDropIndex dropIndex: Int) {
-        guard let view, let storage = view.pStorage, storage.length > 0 else { return }
-        let card = stashedCards().first(where: { $0.location == sourceLocation })
-        if let card, card.locations.count > 1 {
-            for loc in card.locations { setStash(nil, forParagraphAt: loc) }
-            return
-        }
-        let str = storage.string as NSString
-        let source = str.paragraphRange(for: NSRange(location: min(sourceLocation, storage.length - 1), length: 0))
-        guard source.length > 0,
-              let box = storage.attribute(.amBlock, at: source.location, effectiveRange: nil) as? BlockBox,
-              box.value.attrs["stash"] != nil
-        else { return }
-        if NSLocationInRange(dropIndex, source) {
-            setStash(nil, forParagraphAt: source.location)
-            return
-        }
-        let droppingAtEnd = dropIndex >= storage.length && !str.hasSuffix("\n")
-        if droppingAtEnd, NSMaxRange(source) >= storage.length {
-            setStash(nil, forParagraphAt: source.location)
-            return
-        }
+        guard takeable else { return nil }
+        let slice = storage.attributedSubstring(from: range)
+        let spans = RichText.spans(from: slice)
+        guard !spans.isEmpty else { return nil }
         let undo = undoSnapshot()
         let hiddenBefore = folding.hiddenRanges
+        // the note keeps a paragraph where the text was when it would
+        // otherwise end up with none at all
+        let replacement = NSMutableAttributedString()
+        if range.location == 0, NSMaxRange(range) >= storage.length {
+            replacement.append(NSAttributedString(
+                string: "\n",
+                attributes: RichText.attributes(block: .paragraph, marks: [:])
+            ))
+        } else if NSMaxRange(range) >= storage.length, range.location > 0 {
+            range = NSRange(location: range.location - 1, length: range.length + 1)
+        }
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: range, with: replacement)
+        }
+        view.pSelectedRange = NSRange(location: min(range.location, storage.length), length: 0)
+        rebuildHiddenRanges(previous: hiddenBefore)
+        registerUndo(from: undo, actionName: "Send to Scratchpad")
+        scheduleSave()
+        controller.padded &+= 1
+        return spans
+    }
+
+    /// Cut the selection out of the note and park it on a pad, making the pad
+    /// if this is the first thing to land on it.
+    func sendSelectionToPad(pocket: Bool) {
+        guard let spans = cutSelectionToPad() else { return }
+        controller.paddedPocket = pocket
+        let store = model.pads
+        let noteUrl = self.noteUrl
+        Task { @MainActor in
+            let pad = pocket
+                ? await store.ensurePocketPad()
+                : await store.ensureNotePad(for: noteUrl)
+            guard let pad else { return }
+            store.add(store.textItem(spans: spans, origin: noteUrl, in: pad), to: pad)
+        }
+    }
+
+    /// Put a card's text back in the note: at a drop point, or at the caret.
+    func insertPadSpans(_ spans: [SpanNode], at dropIndex: Int?) {
+        guard let view = noteView, let storage = view.pStorage, !spans.isEmpty else { return }
         let slice = NSMutableAttributedString(
-            attributedString: storage.attributedSubstring(from: source)
+            attributedString: RichText.attributed(from: spans, cache: cache)
         )
-        if !slice.string.hasSuffix("\n"), slice.length > 0 {
+        guard slice.length > 0 else { return }
+        if !slice.string.hasSuffix("\n") {
             let tail = slice.attributes(at: slice.length - 1, effectiveRange: nil)
             slice.append(NSAttributedString(string: "\n", attributes: tail))
         }
-        var target: Int
-        if droppingAtEnd {
-            target = storage.length
-            slice.deleteCharacters(in: NSRange(location: slice.length - 1, length: 1))
-            slice.insert(
-                NSAttributedString(string: "\n", attributes: endSeparatorAttributes(in: storage)),
-                at: 0
-            )
-        } else {
-            target = str.paragraphRange(for: NSRange(location: min(dropIndex, storage.length), length: 0)).location
-        }
-        slice.enumerateAttribute(.amBlock, in: NSRange(location: 0, length: slice.length)) { value, _, _ in
-            (value as? BlockBox)?.value.attrs.removeValue(forKey: "stash")
-        }
-        view.pPerformStorageEdit { storage in
-            storage.beginEditing()
-            storage.replaceCharacters(in: source, with: NSAttributedString())
-            if target > source.location { target -= source.length }
-            storage.insert(slice, at: min(target, storage.length))
-            storage.endEditing()
-        }
-        view.pSelectedRange = NSRange(location: min(target, storage.length), length: 0)
-        rebuildHiddenRanges(previous: hiddenBefore)
-        registerUndo(from: undo, actionName: "Unstash")
-        scheduleSave()
-    }
-
-    private func setStash(_ value: JSONValue?, forParagraphAt location: Int) {
-        guard let view, let storage = view.pStorage, location < storage.length else { return }
-        let paragraph = (storage.string as NSString).paragraphRange(for: NSRange(location: location, length: 0))
-        guard paragraph.length > 0,
-              let box = storage.attribute(.amBlock, at: paragraph.location, effectiveRange: nil) as? BlockBox
-        else { return }
-        var block = box.value
-        if let value {
-            block.attrs["stash"] = value
-        } else {
-            block.attrs.removeValue(forKey: "stash")
-        }
+        let str = storage.string as NSString
+        let caret = dropIndex ?? view.pSelectedRange.location
+        let target = str.paragraphRange(
+            for: NSRange(location: min(caret, max(0, storage.length - 1)), length: 0)
+        ).location
         let undo = undoSnapshot()
         let hiddenBefore = folding.hiddenRanges
-        let selection = view.pSelectedRange
         view.pPerformStorageEdit { storage in
-            storage.beginEditing()
-            storage.enumerateAttributes(in: paragraph) { runAttrs, runRange, _ in
-                let marks = RichText.marks(from: runAttrs, block: box.value)
-                storage.setAttributes(RichText.attributes(block: block, marks: marks), range: runRange)
-            }
-            storage.endEditing()
+            storage.insert(slice, at: min(target, storage.length))
         }
-        view.pSelectedRange = NSRange(
-            location: min(selection.location, storage.length),
-            length: 0
-        )
+        view.pSelectedRange = NSRange(location: min(target + slice.length, storage.length), length: 0)
         rebuildHiddenRanges(previous: hiddenBefore)
-        registerUndo(from: undo, actionName: value == nil ? "Unstash" : "Stash")
+        registerUndo(from: undo, actionName: "Put Back in Note")
         scheduleSave()
     }
 
-    /// Run an editing command against whatever text has focus. A stash card
-    /// holds its own copy of the paragraphs it parks on the canvas, so the
-    /// command runs on that copy and the result goes back into the note.
+    /// Run an editing command against whatever text has focus. A pad card
+    /// holds its own copy of the text it parks, so the command runs on that
+    /// copy and the result goes back to the pad.
     func onFocusedText(_ body: (EditorCore) -> Void) {
-        guard let card = focusedStashCard, card !== view else {
+        guard let card = focusedPadCard, card !== view else {
             body(self)
             return
         }
@@ -2373,127 +2189,6 @@ final class EditorCore {
         body(self)
         view = note
         card.scheduleCommit()
-    }
-
-    /// Replace the paragraphs a card stands for with what its editor holds.
-    func updateStashCard(anchoredAt box: BlockBox, with attributed: NSAttributedString) {
-        guard let view = noteView, let storage = view.pStorage,
-              let card = stashedCards().first(where: { $0.boxes.contains { $0 === box } }),
-              let range = paragraphSpan(of: card, in: storage)
-        else { return }
-        let slice = stampedStash(
-            attributed,
-            x: card.x,
-            y: card.y,
-            trailingNewline: (storage.string as NSString).substring(with: range).hasSuffix("\n")
-        )
-        guard !slice.isEqual(to: storage.attributedSubstring(from: range)) else { return }
-        // the storage observer sees a stashed block in the edit and refreshes
-        // the hidden set from there; doing it here as well invalidated the
-        // note's layout twice per keystroke
-        view.pPerformStorageEdit { storage in
-            storage.replaceCharacters(in: range, with: slice)
-        }
-        scheduleSave()
-    }
-
-    /// The paragraphs of a card as one range: its own, plus the ones that share
-    /// its position and follow it.
-    private func paragraphSpan(of card: StashedCard, in storage: NSTextStorage) -> NSRange? {
-        guard storage.length > 0,
-              let first = card.locations.first, let last = card.locations.last,
-              first < storage.length
-        else { return nil }
-        let str = storage.string as NSString
-        let start = str.paragraphRange(for: NSRange(location: first, length: 0))
-        let end = str.paragraphRange(for: NSRange(location: min(last, storage.length - 1), length: 0))
-        guard NSMaxRange(end) > start.location else { return nil }
-        return NSRange(location: start.location, length: NSMaxRange(end) - start.location)
-    }
-
-    /// Card text on its way back into the note: every paragraph the editor now
-    /// holds — including ones typed inside the card — parks at the card's spot.
-    private func stampedStash(
-        _ attributed: NSAttributedString,
-        x: CGFloat,
-        y: CGFloat,
-        trailingNewline: Bool
-    ) -> NSAttributedString {
-        let stash = JSONValue.object(["x": .number(Double(x)), "y": .number(Double(y))])
-        let out = NSMutableAttributedString(attributedString: attributed)
-        var restamp: [(NSRange, [NSAttributedString.Key: Any])] = []
-        out.enumerateAttributes(in: NSRange(location: 0, length: out.length)) { attrs, range, _ in
-            // paragraphs already parked here keep their block object: the card
-            // is found again by that identity, and a fresh one would orphan it
-            guard let box = attrs[.amBlock] as? BlockBox, !box.value.isAtomic,
-                  box.value.attrs["stash"] != stash,
-                  attrs[.attachment] == nil, attrs[.amTableBox] == nil,
-                  attrs[.amColumnsBox] == nil, attrs[.amDisplayOnly] == nil
-            else { return }
-            var block = box.value
-            block.attrs["stash"] = stash
-            restamp.append((
-                range,
-                RichText.attributes(block: block, marks: RichText.marks(from: attrs, block: box.value))
-            ))
-        }
-        for (range, attrs) in restamp {
-            out.setAttributes(attrs, range: range)
-        }
-        // paragraph parity with the range being replaced, so emptying a card
-        // leaves an empty stashed paragraph rather than swallowing the next one
-        if trailingNewline {
-            if !out.string.hasSuffix("\n") {
-                var block = BlockValue.paragraph
-                block.attrs["stash"] = stash
-                let attrs = out.length > 0
-                    ? out.attributes(at: out.length - 1, effectiveRange: nil)
-                    : RichText.attributes(block: block, marks: [:])
-                out.append(NSAttributedString(string: "\n", attributes: attrs))
-            }
-        } else if out.string.hasSuffix("\n") {
-            out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1))
-        }
-        return out
-    }
-
-    /// Insert a new blank paragraph at the end of the doc, pre-stashed at the given canvas point.
-    func addBlankCardToCanvas(at canvasPoint: CGPoint) {
-        addCardToCanvas(at: canvasPoint, text: nil)
-    }
-
-    /// Park text on the canvas: it joins the document as hidden paragraphs at
-    /// the end, which is where every stashed paragraph lives.
-    func addCardToCanvas(at canvasPoint: CGPoint, text: NSAttributedString?) {
-        guard let view = noteView, let storage = view.pStorage else { return }
-        var block = BlockValue.paragraph
-        let stash = JSONValue.object([
-            "x": .number(Double(max(0, canvasPoint.x))),
-            "y": .number(Double(max(0, canvasPoint.y)))
-        ])
-        block.attrs["stash"] = stash
-        let attrs = RichText.attributes(block: block, marks: [:])
-        let insertAt = storage.length
-        let savedSelection = view.pSelectedRange
-        let str = storage.string as NSString
-        let body = NSMutableAttributedString()
-        if let text, text.length > 0 {
-            body.append(stampedStash(text, x: canvasPoint.x, y: canvasPoint.y, trailingNewline: true))
-        } else {
-            body.append(NSAttributedString(string: "\n", attributes: attrs))
-        }
-        view.pPerformStorageEdit { storage in
-            let insertion = NSMutableAttributedString()
-            if insertAt > 0, str.character(at: insertAt - 1) != 0x0A {
-                insertion.append(NSAttributedString(string: "\n", attributes: attrs))
-            }
-            insertion.append(body)
-            storage.insert(insertion, at: insertAt)
-        }
-        view.pSelectedRange = NSRange(location: min(savedSelection.location, storage.length), length: 0)
-        rebuildHiddenRanges()
-        scheduleSave()
-        controller.stashed &+= 1
     }
 
     // MARK: minimap
@@ -2869,7 +2564,7 @@ final class EditorCore {
         )
     }
 
-    /// The view is carried along: a snapshot taken in a stash card must not be
+    /// The view is carried along: a snapshot taken in a pad card must not be
     /// restored into the note when the caret has moved on.
     private func restoreUndoSnapshot(
         _ snapshot: UndoSnapshot,
@@ -2895,8 +2590,8 @@ final class EditorCore {
         updateGlobalMatches()
         scheduleMinimapUpdate()
         refreshEditorDisplay()
-        if let card = view as? any StashCardEditing {
-            card.commitToNote()
+        if let card = view as? any PadCardEditing {
+            card.commit()
         } else {
             scheduleSave()
         }
@@ -2948,14 +2643,11 @@ final class EditorCore {
         let available = (view?.pTextContainer?.size.width ?? ideal) - padding * 2
         let width = available > 40 ? min(ideal, available) : ideal
         let zone = CalendarEventInlineView.buttonZone * width / max(ideal, 1)
-        if point.x >= padding + width - zone, let url = box.value.calendarAppURL {
-            ExternalBrowser.open(url)
-        } else {
-            AppRouter.shared.pending = .calendar(
-                day: box.value.calendarEventDay,
-                item: box.value.attrs["event"]?.stringValue
-            )
-        }
+        if point.x >= padding + width - zone, box.value.openExternally() { return true }
+        AppRouter.shared.pending = .calendar(
+            day: box.value.calendarEventDay,
+            item: box.value.attrs["event"]?.stringValue
+        )
         return true
     }
 
@@ -4137,19 +3829,37 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
         let plain = editorPlainText(slice)
+        let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
+        let item = NSPasteboardItem()
+        item.setString(json, forType: Self.spansPasteboardType)
+        item.setString(RichTextClipboard.html(from: spans), forType: Self.htmlPasteboardType)
+        item.setString(RichTextClipboard.markdown(from: spans), forType: Self.markdownPasteboardType)
+        for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
+            item.setData(data, forType: .init(type))
+        }
+        item.setString(plain, forType: .string)
+        // an app that takes none of our rich types still gets the picture,
+        // and it rides on the same item so a one-image copy pastes as one
+        if let png = media.images.first.flatMap(Self.pngData) {
+            item.setData(png, forType: .png)
+        }
+        var objects: [NSPasteboardWriting] = [item]
+        for image in media.images.dropFirst() { objects.append(image) }
+        for file in media.files { objects.append(file as NSURL) }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(json, forType: Self.spansPasteboardType)
-        pasteboard.setString(RichTextClipboard.html(from: spans), forType: Self.htmlPasteboardType)
-        pasteboard.setString(RichTextClipboard.markdown(from: spans), forType: Self.markdownPasteboardType)
-        for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
-            pasteboard.setData(data, forType: .init(type))
-        }
-        pasteboard.setString(plain, forType: .string)
+        pasteboard.writeObjects(objects)
         if cut {
             pReplace(range, with: NSAttributedString())
         }
         return true
+    }
+
+    static func pngData(_ image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else {
+            return nil
+        }
+        return rep.representation(using: .png, properties: [:])
     }
 
     override func copy(_ sender: Any?) {
@@ -4231,11 +3941,11 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         return nil
     }
 
-    /// A card coming back from the stash is a move — the badgeless one, and the
+    /// A card coming back from a pad is a move — the badgeless one, and the
     /// operation its drag source offers.
     private func textDragOperation(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard let text = dragString(sender.draggingPasteboard) else { return .copy }
-        return text.hasPrefix(StashDrag.prefix) ? .move : .copy
+        return text.hasPrefix(PadDrag.prefix) ? .move : .copy
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -4265,10 +3975,16 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let pasteboard = sender.draggingPasteboard
         if let core,
            let text = dragString(pasteboard),
-           let drag = StashDrag(text) {
+           let drag = PadDrag(text) {
             let point = convert(sender.draggingLocation, from: nil)
             let dropIndex = characterIndexForInsertion(at: point)
-            core.unstash(fromParagraphAt: drag.location, toDropIndex: dropIndex)
+            let store = core.model.pads
+            guard let item = store.items(of: drag.padUrl).first(where: { $0.id == drag.itemId })
+            else { return false }
+            core.insertPadSpans(item.spans, at: dropIndex)
+            if !NSEvent.modifierFlags.contains(.option) {
+                store.remove(drag.itemId, from: drag.padUrl)
+            }
             return true
         }
         if let core,
@@ -4612,430 +4328,6 @@ struct RichTextEditor: NSViewRepresentable {
     }
 }
 
-// MARK: - stash card editing
-
-/// A stash card is a real editor over a copy of the paragraphs it parks: the
-/// same text view class as the note, so clicks, keys, menus and formatting all
-/// behave the same. Every event runs with the core pointed at this view, and
-/// what the card holds afterwards goes back into the note.
-final class StashCardTextView: EditorTextView, StashCardEditing {
-    /// The block the card's first paragraph carries. Identity, not an index:
-    /// paragraphs move around as the note is edited.
-    var anchor: BlockBox?
-
-    /// Called when the card stops being edited, by escape or by a click landing
-    /// somewhere else.
-    var onExit: (() -> Void)?
-
-    private let cardUndoManager = UndoManager()
-    override var undoManager: UndoManager? { cardUndoManager }
-    private var commitTask: Task<Void, Never>?
-
-    override func becomeFirstResponder() -> Bool {
-        let became = super.becomeFirstResponder()
-        if became { core?.focusedStashCard = self }
-        return became
-    }
-
-    override func resignFirstResponder() -> Bool {
-        let resigned = super.resignFirstResponder()
-        if resigned {
-            if core?.focusedStashCard === self { core?.focusedStashCard = nil }
-            commitToNote()
-            onExit?()
-        }
-        return resigned
-    }
-
-    override func cancelOperation(_ sender: Any?) {
-        window?.makeFirstResponder(nil)
-    }
-
-    func scheduleCommit() {
-        commitTask?.cancel()
-        commitTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(400))
-            guard !Task.isCancelled else { return }
-            self?.commitToNote()
-        }
-    }
-
-    func commitToNote() {
-        commitTask?.cancel()
-        commitTask = nil
-        guard let core, let anchor else { return }
-        core.updateStashCard(anchoredAt: anchor, with: attributedString())
-    }
-
-    private func focused(_ body: () -> Void) {
-        guard let core, core.focusedStashCard === self else {
-            body()
-            return
-        }
-        core.onFocusedText { _ in body() }
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        focused { super.mouseDown(with: event) }
-    }
-
-    override func keyDown(with event: NSEvent) {
-        focused { super.keyDown(with: event) }
-    }
-
-    /// Menu and key-equivalent actions — paste, undo, the edit menu — arrive
-    /// through the responder chain rather than as key events.
-    override func tryToPerform(_ action: Selector, with object: Any?) -> Bool {
-        var handled = false
-        focused { handled = super.tryToPerform(action, with: object) }
-        return handled
-    }
-
-    // the card is 184 points wide; the note's centring insets have no place here
-    override func pApplyMaxWidth() {}
-    override func pApplyTypewriterPadding(_ enabled: Bool) {}
-}
-
-struct StashCardEditor: NSViewRepresentable {
-    let card: StashedCard
-    let core: EditorCore
-    /// Editing is a mode the card is put into by a click on its text.
-    let editing: Bool
-    /// Where that click landed, in window coordinates, so the caret starts
-    /// under it rather than at the top of the card.
-    let caret: CGPoint?
-    let onExit: () -> Void
-    /// What the text actually took to lay out — the card is that tall.
-    let onHeight: (CGFloat) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(core: core) }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let textView = StashCardTextView(usingTextLayoutManager: true)
-        textView.core = core
-        textView.anchor = card.box
-        textView.delegate = context.coordinator
-        textView.textLayoutManager?.delegate = context.coordinator.markers
-        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
-        textView.textContainer?.widthTracksTextView = true
-        textView.isRichText = true
-        textView.allowsUndo = true
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 2, height: 2)
-        textView.autoresizingMask = [.width]
-        textView.isVerticallyResizable = true
-        textView.minSize = .zero
-        textView.maxSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textStorage?.setAttributedString(card.attributed)
-        textView.typingAttributes = RichText.attributes(block: card.box.value, marks: [:])
-        context.coordinator.markers.driveTypingAttributes(from: textView)
-        context.coordinator.markers.driveSelection(from: textView)
-
-        let scroll = NSScrollView()
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = false
-        scroll.documentView = textView
-        return scroll
-    }
-
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        guard let textView = nsView.documentView as? StashCardTextView else { return }
-        textView.anchor = card.box
-        textView.onExit = onExit
-        context.coordinator.onHeight = { [self] in reportHeight(of: $0) }
-        let focused = textView.window?.firstResponder === textView
-        // reseeding under the caret would eat the edit that produced this
-        // update; a card being typed in is already the source of truth
-        if !focused, !textView.attributedString().isEqual(to: card.attributed) {
-            textView.textStorage?.setAttributedString(card.attributed)
-        }
-        // moving focus resigns another view, which reports back into SwiftUI
-        // state — doing that inside a view update is a cycle
-        let caret = caret
-        let editing = editing
-        Task { @MainActor in
-            guard let window = textView.window else { return }
-            let focused = window.firstResponder === textView
-            if editing, !focused {
-                window.makeFirstResponder(textView)
-                if let caret, textView.textStorage?.length ?? 0 > 0 {
-                    let point = textView.convert(caret, from: nil)
-                    let index = min(
-                        textView.characterIndexForInsertion(at: point),
-                        textView.textStorage?.length ?? 0
-                    )
-                    textView.setSelectedRange(NSRange(location: index, length: 0))
-                }
-            } else if !editing, focused {
-                window.makeFirstResponder(nil)
-            }
-        }
-        reportHeight(of: textView)
-    }
-
-    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
-        (nsView.documentView as? StashCardTextView)?.commitToNote()
-    }
-
-    private func reportHeight(of textView: NSTextView) {
-        guard let layout = textView.textLayoutManager else { return }
-        layout.ensureLayout(for: layout.documentRange)
-        let height = ceil(layout.usageBoundsForTextContainer.height)
-        + textView.textContainerInset.height * 2
-        let onHeight = onHeight
-        Task { @MainActor in onHeight(height) }
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
-        let core: EditorCore
-        let markers = ListMarkerLayoutDelegate()
-        var onHeight: ((NSTextView) -> Void)?
-
-        init(core: EditorCore) {
-            self.core = core
-        }
-
-        func undoManager(for view: NSTextView) -> UndoManager? {
-            view.undoManager
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let view = notification.object as? StashCardTextView else { return }
-            view.scheduleCommit()
-            onHeight?(view)
-        }
-
-        func textViewDidChangeSelection(_ notification: Notification) {
-            core.onFocusedText { $0.refreshFormattingState() }
-        }
-
-        func textView(_ view: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                return core.handleReturn()
-            }
-            if commandSelector == #selector(NSResponder.insertLineBreak(_:))
-                || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
-                if core.blockAtSelection().type == "code-block" {
-                    return core.leaveCodeBlock()
-                }
-                core.insertSoftLineBreak()
-                return true
-            }
-            if commandSelector == #selector(NSResponder.insertTab(_:)) {
-                return core.nestListItem()
-            }
-            if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
-                return core.unnestListItem()
-            }
-            return false
-        }
-
-        /// No splice pipeline here: the card's text lands in the note as a
-        /// paragraph replacement, which the whole-doc save picks up.
-        func textView(
-            _ textView: NSTextView,
-            shouldChangeTextIn affectedCharRange: NSRange,
-            replacementString: String?
-        ) -> Bool {
-            if replacementString == " ",
-               affectedCharRange.length == 0,
-               core.handleMarkdownTrigger(at: affectedCharRange.location) {
-                return false
-            }
-            return true
-        }
-    }
-}
-
-/// The canvas takes dropped text as a new card. Text dragged out of the note
-/// leaves it: the drop answers `.move`, which is the note's cue as the drag
-/// source to remove what was dragged.
-struct StashDropTarget: NSViewRepresentable {
-    let core: EditorCore
-
-    func makeNSView(context: Context) -> Drop {
-        let view = Drop()
-        view.core = core
-        view.registerForDraggedTypes([
-            .string,
-            NSPasteboard.PasteboardType(RichTextClipboard.spansTypeIdentifier),
-        ])
-        return view
-    }
-
-    func updateNSView(_ nsView: Drop, context: Context) {
-        nsView.core = core
-    }
-
-    final class Drop: NSView {
-        weak var core: EditorCore?
-
-        // the canvas places cards from its top-left, and so does this
-        override var isFlipped: Bool { true }
-
-        private func operation(_ sender: NSDraggingInfo) -> NSDragOperation {
-            let pasteboard = sender.draggingPasteboard
-            if let text = pasteboard.string(forType: .string),
-               text.hasPrefix(StashDrag.prefix) {
-                return []
-            }
-            guard payload(from: pasteboard) != nil else { return [] }
-            return sender.draggingSource is EditorTextView ? .move : .copy
-        }
-
-        private func payload(from pasteboard: NSPasteboard) -> NSAttributedString? {
-            guard let core else { return nil }
-            if let json = pasteboard.string(
-                forType: NSPasteboard.PasteboardType(RichTextClipboard.spansTypeIdentifier)
-            ), let attributed = RichTextClipboard.attributed(fromSpansJSON: json, cache: core.cache) {
-                return attributed
-            }
-            guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return nil }
-            return NSAttributedString(
-                string: text,
-                attributes: RichText.attributes(block: .paragraph, marks: [:])
-            )
-        }
-
-        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-            operation(sender)
-        }
-
-        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-            operation(sender)
-        }
-
-        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-            guard let core, let text = payload(from: sender.draggingPasteboard) else { return false }
-            core.addCardToCanvas(
-                at: convert(sender.draggingLocation, from: nil),
-                text: text
-            )
-            return true
-        }
-    }
-}
-
-/// One drag for a card, tracked by hand: it slides around the canvas, and the
-/// moment the pointer reaches the note it becomes a document drag the editor
-/// can take. SwiftUI can't hand a gesture over to a drag session mid-flight,
-/// which is why the tracking loop lives here.
-struct StashCardGrab: NSViewRepresentable {
-    let location: Int
-    let attributed: NSAttributedString
-    let onMove: (CGSize) -> Void
-    let onDrop: (CGSize) -> Void
-    let onClick: (CGPoint) -> Void
-
-    func makeNSView(context: Context) -> Grab { Grab() }
-
-    func updateNSView(_ nsView: Grab, context: Context) {
-        nsView.location = location
-        nsView.attributed = attributed
-        nsView.onMove = onMove
-        nsView.onDrop = onDrop
-        nsView.onClick = onClick
-    }
-
-    final class Grab: NSView, NSDraggingSource {
-        var location = 0
-        var attributed = NSAttributedString()
-        var onMove: ((CGSize) -> Void)?
-        var onDrop: ((CGSize) -> Void)?
-        var onClick: ((CGPoint) -> Void)?
-
-        override func resetCursorRects() {
-            addCursorRect(bounds, cursor: .openHand)
-        }
-
-        override func mouseDown(with event: NSEvent) {
-            let start = event.locationInWindow
-            var translation = CGSize.zero
-            while let next = window?.nextEvent(
-                matching: [.leftMouseDragged, .leftMouseUp],
-                until: .distantFuture,
-                inMode: .eventTracking,
-                dequeue: true
-            ) {
-                guard next.type == .leftMouseDragged else {
-                    // a click, not a drag: the card opens for editing
-                    if abs(translation.width) < 3, abs(translation.height) < 3 {
-                        onClick?(next.locationInWindow)
-                        return
-                    }
-                    break
-                }
-                let point = next.locationInWindow
-                translation = CGSize(width: point.x - start.x, height: start.y - point.y)
-                if overTheNote(point) {
-                    // the card keeps its place on the canvas unless the drop
-                    // lands somewhere that takes it
-                    onMove?(.zero)
-                    dragToNote(with: next)
-                    return
-                }
-                onMove?(translation)
-            }
-            onDrop?(translation)
-        }
-
-        private func overTheNote(_ windowPoint: CGPoint) -> Bool {
-            var hit = window?.contentView?.hitTest(windowPoint)
-            while let view = hit {
-                if view is EditorTextView { return !(view is StashCardTextView) }
-                hit = view.superview
-            }
-            guard let scroll = enclosingScrollView else { return false }
-            return !scroll.bounds.contains(scroll.convert(windowPoint, from: nil))
-        }
-
-        private func dragToNote(with event: NSEvent) {
-            let item = NSPasteboardItem()
-            item.setString(StashDrag(location: location, grab: .zero).text, forType: .string)
-            let dragItem = NSDraggingItem(pasteboardWriter: item)
-            dragItem.setDraggingFrame(bounds, contents: cardImage())
-            beginDraggingSession(with: [dragItem], event: event, source: self)
-        }
-
-        /// What travels with the pointer is the card itself, drawn.
-        private func cardImage() -> NSImage {
-            let size = bounds.size
-            let image = NSImage(size: size)
-            guard size.width > 1, size.height > 1 else { return image }
-            image.lockFocusFlipped(true)
-            effectiveAppearance.performAsCurrentDrawingAppearance {
-                let card = NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5)
-                let shape = NSBezierPath(roundedRect: card, xRadius: 6, yRadius: 6)
-                NSColor.textBackgroundColor.withAlphaComponent(0.95).setFill()
-                shape.fill()
-                NSColor.separatorColor.setStroke()
-                shape.stroke()
-                attributed.draw(
-                    with: card.insetBy(dx: 8, dy: 8),
-                    options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine]
-                )
-            }
-            image.unlockFocus()
-            return image
-        }
-
-        /// Move, not copy: the paragraph goes back to the note rather than
-        /// being duplicated, and the pointer shows no badge.
-        func draggingSession(
-            _ session: NSDraggingSession,
-            sourceOperationMaskFor context: NSDraggingContext
-        ) -> NSDragOperation {
-            .move
-        }
-    }
-}
-
 #else
 
 // MARK: - iOS
@@ -5265,7 +4557,22 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item[type] = data
         }
-        UIPasteboard.general.items = [item]
+        let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
+        // an app that takes none of our rich types still gets the picture,
+        // and it rides on the same item so a one-image copy pastes as one
+        if let png = media.images.first?.pngData() {
+            item[UTType.png.identifier] = png
+        }
+        var items: [[String: Any]] = [item]
+        for image in media.images.dropFirst() {
+            guard let png = image.pngData() else { continue }
+            items.append([UTType.png.identifier: png])
+        }
+        for file in media.files {
+            guard let data = try? Data(contentsOf: file) else { continue }
+            items.append([UTType.data.identifier: data])
+        }
+        UIPasteboard.general.items = items
         if cut {
             pReplace(range, with: NSAttributedString())
         }

@@ -115,25 +115,13 @@ struct FontSpecimen: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Hamburgefonstiv")
                 .font(font("sans", size: EditorSettings.bodySize + 10, weight: .bold))
-            Text("Sans carries the body text, ")
-                .font(font("sans"))
-            + Text("bold sits inside it")
-                .font(font("sans", weight: .bold))
-            + Text(", and ")
-                .font(font("sans"))
-            + Text("italic leans")
-                .font(font("sans").italic())
-            + Text(".")
+            Text("Sans carries the body text, \(Text("bold sits inside it").font(font("sans", weight: .bold))), and \(Text("italic leans").font(font("sans").italic())).")
                 .font(font("sans"))
 
             Text("Serif runs alongside at the same nominal size — 0123456789.")
                 .font(font("serif"))
 
-            Text("Mono for ")
-                .font(font("sans"))
-            + Text("let x = 1")
-                .font(font("mono", size: EditorSettings.bodySize - 1))
-            + Text(" inline.")
+            Text("Mono for \(Text("let x = 1").font(font("mono", size: EditorSettings.bodySize - 1))) inline.")
                 .font(font("sans"))
 
             Text("Hand writes a line at the end.")
@@ -293,12 +281,7 @@ struct FontChooser: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Hamburgefonstiv 0123")
                 .font(font(size: previewSize))
-            Text("Regular ")
-                .font(font())
-            + Text("Bold ")
-                .font(font(weight: .bold))
-            + Text("Italic")
-                .font(font().italic())
+            Text("\(Text("Regular ").font(font()))\(Text("Bold ").font(font(weight: .bold)))\(Text("Italic").font(font().italic()))")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)

@@ -9,6 +9,7 @@ The running macOS app writes `agent.json` with `url`, `token`, and `protocol`. W
 | `GET` | `/v1/status` | Protocol, root folders, selected note |
 | `GET` | `/v1/notes` | 100 recent notes |
 | `GET` | `/v1/notes?query=...` | Full-text search |
+| `GET` | `/v1/notes?query=...&folder=automerge:...` | Full-text search inside one folder and everything under it |
 | `GET` | `/v1/folder?url=...` | Folder entries |
 | `GET` | `/v1/note?url=...` | Title, plain text, spans, and Automerge heads |
 | `POST` | `/v1/notes` | Create a note |

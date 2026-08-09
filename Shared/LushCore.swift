@@ -590,13 +590,14 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func addIrohPeer(code: String) throws 
     
     /**
-     * Fold pre-login local docs into the account just signed into: every
-     * local root folder that holds something is linked into the account's
-     * root folder and appended to the lush config's `.folders`, and the
-     * scratchpad note is linked into the account root unless one of those
-     * folders already holds it. Returns the merged folder list.
+     * Fold pre-login local docs into the account just signed into: one folder
+     * holding every local root folder that has something in it, plus any loose
+     * doc — the pocket pad, notes tied to calendar items — no adopted folder
+     * already holds. That folder goes to the top of the account's root folder
+     * and is appended to the lush config's `.folders`. Returns the merged
+     * folder list.
      */
-    func adoptLocalDocs(accountUrl: String, folderUrls: [String], scratchpadUrl: String?) throws  -> [String]
+    func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String]) throws  -> [String]
     
     func applyNoteMark(url: String, start: UInt64, end: UInt64, name: String, valueJson: String?, title: String, heads: [String]) throws  -> [String]
     
@@ -912,12 +913,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Full-text search across every locally indexed note. The index is local
      * to this device and is updated as prefetched docs land or change.
      */
-    func searchNotes(query: String)  -> [SearchHit]
+    func searchNotes(query: String, filter: SearchFilter?)  -> [SearchHit]
     
     /**
      * Notes whose closest passage is nearest `vector`, best first.
      */
-    func semanticSearch(vector: [Float], limit: UInt32, excluding: [String])  -> [SearchHit]
+    func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], filter: SearchFilter?)  -> [SearchHit]
     
     func setApplyIncoming(enabled: Bool) 
     
@@ -939,6 +940,14 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Store a note's embedded passages, replacing any it already had.
      */
     func setNoteEmbeddings(url: String, name: String, digest: String, chunks: [EmbeddingChunk]) throws 
+    
+    /**
+     * Hands the index the folder tree as child -> parent edges, so a scoped
+     * search can narrow inside SQL instead of throwing away rows the limit
+     * already cut. Folder membership lives on the folder docs, so only a
+     * caller that has walked the tree knows this.
+     */
+    func setSearchParents(parents: [String: String]) 
     
     func setSendChanges(enabled: Bool) 
     
@@ -1060,18 +1069,19 @@ open func addIrohPeer(code: String)throws   {try rustCallWithError(FfiConverterT
 }
     
     /**
-     * Fold pre-login local docs into the account just signed into: every
-     * local root folder that holds something is linked into the account's
-     * root folder and appended to the lush config's `.folders`, and the
-     * scratchpad note is linked into the account root unless one of those
-     * folders already holds it. Returns the merged folder list.
+     * Fold pre-login local docs into the account just signed into: one folder
+     * holding every local root folder that has something in it, plus any loose
+     * doc — the pocket pad, notes tied to calendar items — no adopted folder
+     * already holds. That folder goes to the top of the account's root folder
+     * and is appended to the lush config's `.folders`. Returns the merged
+     * folder list.
      */
-open func adoptLocalDocs(accountUrl: String, folderUrls: [String], scratchpadUrl: String?)throws  -> [String]  {
+open func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String])throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_adopt_local_docs(self.uniffiClonePointer(),
         FfiConverterString.lower(accountUrl),
         FfiConverterSequenceString.lower(folderUrls),
-        FfiConverterOptionString.lower(scratchpadUrl),$0
+        FfiConverterSequenceString.lower(docUrls),$0
     )
 })
 }
@@ -2021,10 +2031,11 @@ open func resyncDoc(url: String)throws   {try rustCallWithError(FfiConverterType
      * Full-text search across every locally indexed note. The index is local
      * to this device and is updated as prefetched docs land or change.
      */
-open func searchNotes(query: String) -> [SearchHit]  {
+open func searchNotes(query: String, filter: SearchFilter?) -> [SearchHit]  {
     return try!  FfiConverterSequenceTypeSearchHit.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_search_notes(self.uniffiClonePointer(),
-        FfiConverterString.lower(query),$0
+        FfiConverterString.lower(query),
+        FfiConverterOptionTypeSearchFilter.lower(filter),$0
     )
 })
 }
@@ -2032,12 +2043,13 @@ open func searchNotes(query: String) -> [SearchHit]  {
     /**
      * Notes whose closest passage is nearest `vector`, best first.
      */
-open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String]) -> [SearchHit]  {
+open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], filter: SearchFilter?) -> [SearchHit]  {
     return try!  FfiConverterSequenceTypeSearchHit.lift(try! rustCall() {
     uniffi_lush_core_fn_method_core_semantic_search(self.uniffiClonePointer(),
         FfiConverterSequenceFloat.lower(vector),
         FfiConverterUInt32.lower(limit),
-        FfiConverterSequenceString.lower(excluding),$0
+        FfiConverterSequenceString.lower(excluding),
+        FfiConverterOptionTypeSearchFilter.lower(filter),$0
     )
 })
 }
@@ -2114,6 +2126,19 @@ open func setNoteEmbeddings(url: String, name: String, digest: String, chunks: [
         FfiConverterString.lower(name),
         FfiConverterString.lower(digest),
         FfiConverterSequenceTypeEmbeddingChunk.lower(chunks),$0
+    )
+}
+}
+    
+    /**
+     * Hands the index the folder tree as child -> parent edges, so a scoped
+     * search can narrow inside SQL instead of throwing away rows the limit
+     * already cut. Folder membership lives on the folder docs, so only a
+     * caller that has walked the tree knows this.
+     */
+open func setSearchParents(parents: [String: String])  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_set_search_parents(self.uniffiClonePointer(),
+        FfiConverterDictionaryStringString.lower(parents),$0
     )
 }
 }
@@ -3767,6 +3792,98 @@ public func FfiConverterTypeRecentNote_lower(_ value: RecentNote) -> RustBuffer 
 }
 
 
+/**
+ * Narrows a search without touching the query text. Every field is optional;
+ * an all-empty filter matches everything. `scope` is a folder url and covers
+ * the whole subtree under it. `when_from`/`when_to` are inclusive `YYYY-MM-DD`
+ * bounds and only ever match docs that carry a day at all.
+ */
+public struct SearchFilter {
+    public var scope: String?
+    public var tags: [String]
+    public var whenFrom: String?
+    public var whenTo: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(scope: String?, tags: [String], whenFrom: String?, whenTo: String?) {
+        self.scope = scope
+        self.tags = tags
+        self.whenFrom = whenFrom
+        self.whenTo = whenTo
+    }
+}
+
+#if compiler(>=6)
+extension SearchFilter: Sendable {}
+#endif
+
+
+extension SearchFilter: Equatable, Hashable {
+    public static func ==(lhs: SearchFilter, rhs: SearchFilter) -> Bool {
+        if lhs.scope != rhs.scope {
+            return false
+        }
+        if lhs.tags != rhs.tags {
+            return false
+        }
+        if lhs.whenFrom != rhs.whenFrom {
+            return false
+        }
+        if lhs.whenTo != rhs.whenTo {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(scope)
+        hasher.combine(tags)
+        hasher.combine(whenFrom)
+        hasher.combine(whenTo)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSearchFilter: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchFilter {
+        return
+            try SearchFilter(
+                scope: FfiConverterOptionString.read(from: &buf), 
+                tags: FfiConverterSequenceString.read(from: &buf), 
+                whenFrom: FfiConverterOptionString.read(from: &buf), 
+                whenTo: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SearchFilter, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.scope, into: &buf)
+        FfiConverterSequenceString.write(value.tags, into: &buf)
+        FfiConverterOptionString.write(value.whenFrom, into: &buf)
+        FfiConverterOptionString.write(value.whenTo, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchFilter_lift(_ buf: RustBuffer) throws -> SearchFilter {
+    return try FfiConverterTypeSearchFilter.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchFilter_lower(_ value: SearchFilter) -> RustBuffer {
+    return FfiConverterTypeSearchFilter.lower(value)
+}
+
+
 public struct SearchHit {
     public var url: String
     public var name: String
@@ -4576,6 +4693,30 @@ fileprivate struct FfiConverterOptionTypeDraftState: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSearchFilter: FfiConverterRustBuffer {
+    typealias SwiftType = SearchFilter?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSearchFilter.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSearchFilter.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]?
 
@@ -5036,7 +5177,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_add_iroh_peer() != 44741) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 17495) {
+    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 40160) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_apply_note_mark() != 29508) {
@@ -5291,10 +5432,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_resync_doc() != 27414) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_search_notes() != 27844) {
+    if (uniffi_lush_core_checksum_method_core_search_notes() != 9591) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_semantic_search() != 9002) {
+    if (uniffi_lush_core_checksum_method_core_semantic_search() != 33300) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_apply_incoming() != 65158) {
@@ -5322,6 +5463,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_note_embeddings() != 49168) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_search_parents() != 11459) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_send_changes() != 21542) {

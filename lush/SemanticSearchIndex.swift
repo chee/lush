@@ -56,17 +56,19 @@ actor SemanticSearchIndex {
         core?.removeNoteEmbeddings(url: url)
     }
 
-    func search(_ query: String, excluding excluded: Set<String> = []) -> [SearchHit] {
-        guard let core else { return [] }
-        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty,
-              let embedding = embeddingModel(),
-              let raw = embedding.vector(for: query)
-        else { return [] }
+    func search(
+        _ query: String,
+        excluding excluded: Set<String> = [],
+        in scope: String? = nil
+    ) async -> [SearchHit] {
+        guard let core, let vector = await QueryEmbedding.shared.vector(for: query) else {
+            return []
+        }
         return core.semanticSearch(
-            vector: Self.unit(raw),
+            vector: vector,
             limit: 12,
-            excluding: Array(excluded)
+            excluding: Array(excluded),
+            filter: SearchFilter(scope: scope, tags: [], whenFrom: nil, whenTo: nil)
         )
     }
 

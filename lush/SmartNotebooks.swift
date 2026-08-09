@@ -1,37 +1,5 @@
 import SwiftUI
 
-extension SmartNotebook: Identifiable {
-    var displayName: String { name.isEmpty ? "Smart Notebook" : name }
-}
-
-enum SmartNotebookKind: String, CaseIterable {
-    case any = ""
-    case note = "note"
-    case file = "file"
-    case script = "script"
-    case patchwork = "patchwork"
-
-    var label: String {
-        switch self {
-        case .any: "Anything"
-        case .note: "Notes"
-        case .file: "Files"
-        case .script: "Scripts"
-        case .patchwork: "Patchwork Docs"
-        }
-    }
-
-    func matches(_ node: FolderNode) -> Bool {
-        switch self {
-        case .any: node.kind != "folder"
-        case .note: node.isNote
-        case .file: node.kind == "file"
-        case .script: node.kind == "lush:script"
-        case .patchwork: node.isPatchworkDoc && node.kind != "file"
-        }
-    }
-}
-
 enum SmartNotebookAge: Int64, CaseIterable {
     case any = 0
     case day = 1
@@ -147,42 +115,39 @@ extension NotesModel {
         }
     }
 
-    /// Runs the saved search: the query through the same text + semantic
-    /// search the sidebar field uses, then the filters over the results. An
-    /// empty query means the filters alone decide, newest first. A quoted
-    /// query is exact — text only, no semantic neighbours.
+    /// Runs the saved search through the shared runner, so an open Lush and a
+    /// background helper always agree about what a notebook holds.
     func smartNotebookHits(_ folder: SmartNotebook) async -> [SearchHit] {
         guard let core else { return [] }
-        let modified = await Task.detached {
-            Dictionary(
-                core.recentNotes(limit: 5000).map { ($0.url, Self.seconds($0.modified)) },
-                uniquingKeysWith: { first, _ in first }
-            )
+        let tree = notebookTree
+        let vector = folder.query.contains("\"")
+            ? nil
+            : await QueryEmbedding.shared.vector(for: folder.query)
+        return await Task.detached {
+            SmartNotebookRun.hits(folder, core: core, tree: tree, vector: vector)
         }.value
-        let query = folder.query.trimmingCharacters(in: .whitespaces)
-        var hits: [SearchHit]
-        if query.isEmpty {
-            let rows = await Task.detached { core.recentNotes(limit: 5000) }.value
-            hits = rows.map { SearchHit(url: $0.url, name: $0.name, snippet: "") }
-        } else {
-            hits = await search(query)
-        }
-        let kind = SmartNotebookKind(rawValue: folder.kind) ?? .any
-        let cutoff = folder.withinDays > 0
-            ? Date().timeIntervalSince1970 - Double(folder.withinDays) * 86_400
-            : nil
-        return hits.filter { hit in
-            guard let node = node(for: hit.url), kind.matches(node) else { return false }
-            if !folder.scope.isEmpty, !isDescendant(hit.url, of: folder.scope) { return false }
-            if let cutoff { return (modified[hit.url] ?? 0) >= cutoff }
-            return true
-        }
     }
 
+    var notebookTree: NotebookTree {
+        var tree = NotebookTree()
+        func walk(_ nodes: [FolderNode]) {
+            for node in nodes {
+                tree.kinds[node.url] = node.kind
+                tree.parents[node.url] = node.parentUrl
+                walk(node.children ?? [])
+            }
+        }
+        walk(folderTree)
+        return tree
+    }
+
+    /// Notes land in bursts while typing, so the count waits for the typing to
+    /// stop rather than re-running the search on every change.
     func refreshSmartHits(_ folder: SmartNotebook) {
         smartHitTasks[folder.id]?.cancel()
         smartHitTasks[folder.id] = Task { [weak self] in
-            guard let hits = await self?.smartNotebookHits(folder), !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled, let hits = await self?.smartNotebookHits(folder) else { return }
             self?.smartHits[folder.id] = hits
             await SmartNotebookAlerts.counted(folder, count: hits.count)
         }
@@ -194,19 +159,14 @@ extension NotesModel {
         }
     }
 
-    nonisolated private static func seconds(_ stamp: Int64) -> TimeInterval {
-        // older docs recorded milliseconds
-        let value = TimeInterval(stamp)
-        return value > 4_000_000_000 ? value / 1000 : value
-    }
-
-    private func isDescendant(_ url: String, of folderUrl: String) -> Bool {
-        var parent = node(for: url)?.parentUrl
-        while let current = parent {
-            if current == folderUrl { return true }
-            parent = node(for: current)?.parentUrl
+    /// Counted straight through, no debounce: background time is short and the
+    /// caller has to wait for the answer.
+    func checkSmartNotebooks() async {
+        for folder in smartNotebooks where folder.notifyOnChange {
+            let hits = await smartNotebookHits(folder)
+            smartHits[folder.id] = hits
+            await SmartNotebookAlerts.counted(folder, count: hits.count)
         }
-        return false
     }
 }
 
@@ -322,13 +282,13 @@ func isQuotedPhrase(_ query: String) -> Bool {
         && !query.dropFirst().dropLast().contains("\"")
 }
 
-func newSmartNotebook(query: String = "") -> SmartNotebook {
+func newSmartNotebook(query: String = "", scope: String = "") -> SmartNotebook {
     SmartNotebook(
         id: UUID().uuidString,
         name: query.isEmpty ? "" : query,
         query: query,
         kind: "",
-        scope: "",
+        scope: scope,
         withinDays: 0,
         showCount: true,
         notifyOnChange: false

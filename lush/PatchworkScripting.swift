@@ -83,7 +83,7 @@ final class PatchworkScripting {
                 "timeoutMs": timeout * 1000,
             ],
             in: nil,
-            in: .page
+            contentWorld: .page
         )
         return result as? String ?? "null"
     }

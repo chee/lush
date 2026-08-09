@@ -44,6 +44,7 @@ enum BackgroundSync {
         }
         Task { @MainActor in
             await NotesModel.shared.syncNow(budget: .seconds(15))
+            await NotesModel.shared.checkSmartNotebooks()
             endAssertion()
         }
     }
@@ -58,6 +59,7 @@ enum BackgroundSync {
         schedule()
         let work = Task { @MainActor in
             await NotesModel.shared.syncNow(budget: budget)
+            await NotesModel.shared.checkSmartNotebooks()
         }
         task.expirationHandler = { work.cancel() }
         await work.value

@@ -121,6 +121,7 @@ final class HelperSync {
                     }
                 }
                 await self.drainSharedIntake()
+                await self.checkSmartNotebooks()
                 if changed { await self.writeWidgetSnapshot() }
             }
         }
@@ -212,6 +213,30 @@ extension HelperSync {
 
     private static func mimeType(forExtension ext: String) -> String {
         UTType(filenameExtension: ext)?.preferredMIMEType ?? "application/octet-stream"
+    }
+}
+
+// MARK: - Smart notebooks
+
+extension HelperSync {
+    /// Lush is closed whenever the helper holds the core, so this is the only
+    /// thing counting notebooks in that window. Only the ones that asked for a
+    /// notification are counted — the rest can wait for the app.
+    func checkSmartNotebooks() async {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let folders = (core.configState(configUrl: configUrl)?.smart ?? [])
+            .filter(\.notifyOnChange)
+        guard !folders.isEmpty else { return }
+        let tree = await NotebookTree.walk(core: core, roots: rootUrls)
+        for folder in folders {
+            let vector = folder.query.contains("\"")
+                ? nil
+                : await QueryEmbedding.shared.vector(for: folder.query)
+            let hits = await Task.detached {
+                SmartNotebookRun.hits(folder, core: core, tree: tree, vector: vector)
+            }.value
+            await SmartNotebookAlerts.counted(folder, count: hits.count)
+        }
     }
 }
 

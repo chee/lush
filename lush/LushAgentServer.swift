@@ -71,8 +71,17 @@ final class LushAgentServer {
                 ])
             case ("GET", "/v1/notes"):
                 let query = request.query["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let folder = request.query["folder"]?.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !query.isEmpty {
-                    let hits = await Task.detached { core.searchNotes(query: query) }.value
+                    let filter = SearchFilter(
+                        scope: folder?.isEmpty == false ? folder : nil,
+                        tags: [],
+                        whenFrom: nil,
+                        whenTo: nil
+                    )
+                    let hits = await Task.detached {
+                        core.searchNotes(query: query, filter: filter)
+                    }.value
                     return .json(status: 200, value: ["notes": hits.map {
                         ["url": $0.url, "title": $0.name, "snippet": $0.snippet]
                     }])
