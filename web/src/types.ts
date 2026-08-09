@@ -18,9 +18,11 @@ export type FolderDoc = {
 export type PatchworkConfig = {
   publicEndpoint?: string;
   subductionEndpoints?: string[];
-  localWsPort?: number;
+  localWsPorts?: number[];
   signerSeedHex?: string;
   accountUrl?: string;
+  moduleUrls?: string[];
+  accountModuleUrl?: string;
 };
 
 declare global {
@@ -33,11 +35,25 @@ declare global {
     Automerge: unknown;
     AutomergeRepo: unknown;
     __patchworkOpenSettings?: () => void;
+    setDoc?: (
+      docUrl: string | null,
+      toolId?: string | null,
+      draftUrl?: string | null,
+      checkoutUrl?: string | null,
+    ) => Promise<void>;
+    setContextTool?: (
+      toolId: string | null,
+      docUrl?: string | null,
+      checkoutUrl?: string | null,
+    ) => void;
     webkit?: {
       messageHandlers?: {
         patchworkReady?: {
           postMessage: (message: unknown) => void;
         };
+        lush?: { postMessage: (message: unknown) => void };
+        lusherror?: { postMessage: (message: unknown) => void };
+        lushstorage?: { postMessage: (message: unknown) => Promise<unknown> };
       };
     };
     __patchworkResolve?: (path: string) => Promise<{

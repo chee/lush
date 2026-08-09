@@ -394,6 +394,7 @@ struct LushApp: App {
         // are built — a second of main-thread work the core could have spent
         // opening storage on another thread. The .task callers await the same
         // startTask, so this only moves the start earlier.
+        NotesModel.shared.prewarm()
         Task { @MainActor in await NotesModel.shared.start() }
     }
 

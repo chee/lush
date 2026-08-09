@@ -8,20 +8,12 @@ import {
 } from "@automerge/automerge-repo/slim";
 import { hasHeads } from "@automerge/automerge/slim";
 import { resolvePath } from "@inkandswitch/patchwork-filesystem";
+import { toBase64 } from "./bytes";
 
 const RESOLVE_TIMEOUT_MS = 20_000;
 
 type ResolveResult = { status: number; mimeType: string; base64: string };
 type CacheEntry = { mimeType: string; bytes: Uint8Array };
-
-function toBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
-}
 
 function text(status: number, message: string): ResolveResult {
   return {

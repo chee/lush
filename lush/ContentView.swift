@@ -89,6 +89,7 @@ struct ContentView: View {
             // Selecting the top search hit must not pull focus out of the
             // field mid-query.
             if !searchFocused { sidebarFocused = true }
+            smartEditor = nil
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
             let url = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
             if let node = model.node(for: url), node.kind == "folder" {
@@ -215,10 +216,6 @@ struct ContentView: View {
         }
         .sheet(item: $patchworkCreateRequest) { request in
             patchworkCreateSheet(request)
-        }
-        .sheet(item: $smartEditor) { edit in
-            SmartNotebookEditor(existing: edit.folder, isNew: edit.isNew)
-                .environment(model)
         }
         #endif
     }
@@ -399,10 +396,6 @@ struct ContentView: View {
         }
         .sheet(item: $moveTarget) { target in
             MoveSheet(urls: target.urls)
-                .environment(model)
-        }
-        .sheet(item: $smartEditor) { edit in
-            SmartNotebookEditor(existing: edit.folder, isNew: edit.isNew)
                 .environment(model)
         }
         .sheet(item: $folderSettingsTarget) { node in
@@ -1187,7 +1180,13 @@ struct ContentView: View {
         // drags the field over into the sidebar.
         HStack(spacing: 0) {
             Group {
-                if meetingNotesSelected {
+                if let edit = smartEditor {
+                    SmartNotebookEditor(
+                        existing: edit.folder,
+                        isNew: edit.isNew,
+                        close: { smartEditor = nil }
+                    )
+                } else if meetingNotesSelected {
                     MeetingNotesScreen { open($0) }
                 } else if calendarSelected {
                     AgendaScreen { open($0) }
@@ -2025,6 +2024,25 @@ struct SmartNotebookScreen: View {
     private var folder: SmartNotebook? { model.smartNotebook(id: smartNotebookId) }
 
     var body: some View {
+        Group {
+            if editing, let folder {
+                SmartNotebookEditor(existing: folder, close: { editing = false })
+            } else {
+                list
+            }
+        }
+        .navigationTitle(folder?.displayName ?? "Smart Notebook")
+        .toolbar {
+            if !editing {
+                Button("Edit") { editing = true }
+                    .disabled(folder == nil)
+            }
+        }
+        .task(id: folder) { await refresh() }
+        .onChange(of: model.notes) { Task { await refresh() } }
+    }
+
+    private var list: some View {
         List(hits, id: \.url) { hit in
             NavigationLink(value: NavRoute.note(hit.url)) {
                 if let node = model.node(for: hit.url) {
@@ -2039,19 +2057,6 @@ struct SmartNotebookScreen: View {
                 ContentUnavailableView("Nothing Matches", systemImage: "folder.badge.gearshape")
             }
         }
-        .navigationTitle(folder?.displayName ?? "Smart Notebook")
-        .toolbar {
-            Button("Edit") { editing = true }
-                .disabled(folder == nil)
-        }
-        .sheet(isPresented: $editing) {
-            if let folder {
-                SmartNotebookEditor(existing: folder)
-                    .environment(model)
-            }
-        }
-        .task(id: folder) { await refresh() }
-        .onChange(of: model.notes) { Task { await refresh() } }
     }
 
     private func refresh() async {
@@ -2233,7 +2238,7 @@ struct RightSidebarView: View {
             case .chat:
                 NoteChatView(url: model.resolvedNoteUrl(url), node: node)
             case .tools:
-                ContextToolsView(url: model.resolvedNoteUrl(url))
+                ContextToolsView(url: url)
             }
         }
         .background(.regularMaterial)

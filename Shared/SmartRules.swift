@@ -158,6 +158,44 @@ struct SmartRule: Identifiable, Equatable {
     }
 }
 
+/// Tree edits the editor's drag and drop needs. A leaf's `children` setter is
+/// a no-op, so these walk leaves harmlessly.
+extension SmartRule {
+    func node(_ id: UUID) -> SmartRule? {
+        if self.id == id { return self }
+        for child in children {
+            if let hit = child.node(id) { return hit }
+        }
+        return nil
+    }
+
+    /// The group holding `id`, and where in it.
+    func parent(of id: UUID) -> (group: UUID, index: Int)? {
+        if let index = children.firstIndex(where: { $0.id == id }) { return (self.id, index) }
+        for child in children {
+            if let hit = child.parent(of: id) { return hit }
+        }
+        return nil
+    }
+
+    mutating func drop(_ id: UUID) {
+        var rules = children
+        rules.removeAll { $0.id == id }
+        for index in rules.indices { rules[index].drop(id) }
+        children = rules
+    }
+
+    mutating func insert(_ rule: SmartRule, into group: UUID, at index: Int) {
+        var rules = children
+        if self.id == group {
+            rules.insert(rule, at: min(max(index, 0), rules.count))
+        } else {
+            for slot in rules.indices { rules[slot].insert(rule, into: group, at: index) }
+        }
+        children = rules
+    }
+}
+
 extension SmartRule: Codable {
     private enum Key: String, CodingKey {
         case op, rules, type, field, whole, exact, text, kind, folder, days, on, day

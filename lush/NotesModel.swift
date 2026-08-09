@@ -215,6 +215,10 @@ final class NotesModel {
     @ObservationIgnored private var metaFetched: Set<String> = []
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
+    @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
+    /// The root folder finished loading before the main actor was free to adopt
+    /// the core, so its `docChanged` had nothing to refresh.
+    @ObservationIgnored private var pendingStartupRefresh = false
 
     init() {
         Self.bootLog("model init")
@@ -495,6 +499,32 @@ final class NotesModel {
         NSLog("lush boot +%dms %@", ms, message)
     }
 
+    /// Builds the core off the main actor and starts the root folder loading
+    /// from storage. Called from `LushApp.init`, where a `Task { @MainActor }`
+    /// would sit behind a second of scene construction before it ran.
+    func prewarm() {
+        guard prewarmTask == nil else { return }
+        let dataDir = LushShared.coreDataDirectory()
+        let saved = LushShared.rootFolderUrls
+        let applyIncoming = applyingIncomingChanges
+        let sendChanges = sendingChanges
+        let bridge = DelegateBridge(model: self)
+        delegateBridge = bridge
+        prewarmTask = Task.detached {
+            Self.bootLog("prewarm begin")
+            guard let core = try? Core(dataDir: dataDir.path, serverUrl: nil) else { return nil }
+            Self.bootLog("core constructed")
+            await core.setApplyIncoming(enabled: applyIncoming)
+            await core.setSendChanges(enabled: sendChanges)
+            core.setDelegate(delegate: bridge)
+            guard let first = saved.first else { return core }
+            try? core.startFolderUrl(url: first)
+            core.prefetchNotes(urls: Array(saved.dropFirst()))
+            Self.bootLog("root folder scheduled for local load")
+            return core
+        }
+    }
+
     func start() async {
         if core != nil { return }
         if let startTask {
@@ -516,28 +546,21 @@ final class NotesModel {
         focus.watchSystemFocus()
         Task { await focus.reconcileWithSystemFocus() }
         do {
-            let dataDir = LushShared.coreDataDirectory()
             var saved = LushShared.rootFolderUrls
-            Self.bootLog("core paths read")
-            let core = try await Task.detached {
-                Self.bootLog("core init entered")
-                let core = try Core(dataDir: dataDir.path, serverUrl: nil)
-                Self.bootLog("core init returned")
-                return core
-            }.value
-            Self.bootLog("Core constructed")
+            prewarm()
+            guard let core = await prewarmTask?.value else {
+                status = "Failed to start"
+                Self.bootLog("prewarm produced no core")
+                return
+            }
+            Self.bootLog("Core adopted")
             self.core = core
             LushAgentServer.shared.start(model: self)
-            await core.setApplyIncoming(enabled: applyingIncomingChanges)
-            await core.setSendChanges(enabled: sendingChanges)
             applyingIncomingChanges = core.isApplyingIncoming()
             sendingChanges = core.isSendingChanges()
             PatchworkWeb.coreServerPort = core.localServerPort()
             NativeWebStorage.shared.core = core
             Task { [semanticSearch] in await semanticSearch.attach(core) }
-            let delegateBridge = DelegateBridge(model: self)
-            self.delegateBridge = delegateBridge
-            core.setDelegate(delegate: delegateBridge)
             presence.model = self
             presence.setEnabled(sharingPresence, url: nil)
             connected = core.isConnected()
@@ -550,16 +573,14 @@ final class NotesModel {
             }
 
             if let first = saved.first {
-                // Returning user: set folder immediately and return to the UI.
-                // startFolderUrl sets self.folder in Rust and loads the doc
-                // from redb in the background; docChanged fires when ready.
-                try core.startFolderUrl(url: first)
-                Self.bootLog("root folder scheduled for local load")
                 rootFolderUrls = saved
                 persistRoots()
                 folderUrl = first
                 status = ""
-                core.prefetchNotes(urls: Array(saved.dropFirst()))
+                if pendingStartupRefresh {
+                    pendingStartupRefresh = false
+                    refreshNotes()
+                }
                 startPolling()
                 startMaintenancePolling()
                 Self.bootLog("startup UI state queued")
@@ -1338,6 +1359,10 @@ final class NotesModel {
     private var pendingRefreshUrls: Set<String> = []
 
     func docChanged(url: String) {
+        guard core != nil else {
+            pendingStartupRefresh = true
+            return
+        }
         pads.docChanged(url: url)
         folderNodeCache.removeValue(forKey: url)
         documentHistoryCache.removeValue(forKey: url)
@@ -2053,6 +2078,9 @@ final class NotesModel {
         let newHeads = await Task.detached { () -> [String]? in
             try? core.updateNoteSpans(url: url, spansJson: json, heads: heads)
         }.value
+        if let newHeads {
+            cacheSnapshot(NoteSpansSnapshot(spansJson: json, heads: newHeads), for: url)
+        }
         async let previewTask = core.notePreview(url: url)
         async let titleTask = core.noteTitle(url: url)
         let (preview, title) = await (previewTask, titleTask)

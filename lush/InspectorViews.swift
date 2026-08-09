@@ -307,6 +307,7 @@ struct ContextToolsView: View {
             PatchworkContextToolsView(
                 docUrl: url,
                 accountUrl: model.accountUrl,
+                checkoutUrl: model.checkoutDocs[url],
                 toolId: state.selected,
                 onTools: { [state] tools in state.offer(tools) }
             )

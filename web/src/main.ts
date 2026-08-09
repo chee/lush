@@ -6,10 +6,10 @@ if ("serviceWorker" in navigator) {
 import { initializeWasm } from "@automerge/automerge/slim";
 // @ts-expect-error the wasm-bindgen default init is missing from the published typings
 import initSubduction from "@automerge/automerge-subduction/slim";
-import { MemorySigner } from "@automerge/automerge-subduction/slim";
 import { Repo, type PeerId } from "@automerge/automerge-repo/slim";
 import { IndexedDBStorageAdapter } from "@automerge/automerge-repo-storage-indexeddb";
 import { accountFrameId, ensureAccountUrl, loadAccount } from "./account";
+import { configuredSigner, subductionEndpoints } from "./config";
 import { installPatchworkApi } from "./patchwork-api";
 import { mountFrame } from "./frame";
 import { installResolver } from "./resolver";
@@ -17,32 +17,11 @@ import { installSettings } from "./settings";
 import { installHandoffListener } from "./handoff";
 import type { PatchworkConfig } from "./types";
 
-const DEFAULT_ENDPOINT = "wss://subduction.sync.inkandswitch.com";
-
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
 function show(id: string, text: string, ok?: boolean) {
   const el = document.getElementById(id);
   if (!el) return;
   el.textContent = text;
   if (ok !== undefined) el.className = ok ? "ok" : "bad";
-}
-
-function configuredSubductionEndpoints(config: PatchworkConfig): string[] {
-  const endpoints = config.subductionEndpoints?.length
-    ? config.subductionEndpoints
-    : [config.publicEndpoint ?? DEFAULT_ENDPOINT];
-  const withLocal = [...endpoints];
-  if (config.localWsPort) {
-    withLocal.push(`ws://127.0.0.1:${config.localWsPort}`);
-  }
-  return [...new Set(withLocal)];
 }
 
 function notifyNativeReady(error?: unknown) {
@@ -59,11 +38,8 @@ async function boot() {
     initSubduction({ module_or_path: fetch("/subduction.wasm") }),
   ]);
 
-  const signer = config.signerSeedHex
-    ? MemorySigner.fromBytes(hexToBytes(config.signerSeedHex))
-    : new MemorySigner();
-
-  const endpoints = configuredSubductionEndpoints(config);
+  const signer = configuredSigner(config);
+  const endpoints = subductionEndpoints(config);
 
   const repo = new Repo({
     storage: new IndexedDBStorageAdapter(),

@@ -257,6 +257,9 @@ extension NotesModel {
 struct SmartNotebookEditor: View {
     let existing: SmartNotebook
     var isNew = false
+    /// Set when the editor is the detail pane rather than a sheet: there is no
+    /// sheet to dismiss, so the caller takes it down.
+    var close: (() -> Void)?
     @Environment(NotesModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
@@ -266,56 +269,93 @@ struct SmartNotebookEditor: View {
     @State private var notificationsDenied = false
 
     var body: some View {
-        NavigationStack {
-            Form {
-                TextField("Name", text: $name)
-                Section {
-                    SmartRuleGroup(rule: $root, depth: 0)
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Color.clear)
-                } header: {
-                    Text("Rules")
-                } footer: {
-                    Text(
-                        "“Contains” is loose: it ignores case and accents, and a Note rule also "
-                            + "finds notes that mean the same thing without saying it. "
-                            + "“Exactly” matches the characters as typed."
-                    )
-                }
-                Section {
-                    Toggle("Show how many", isOn: $showCount)
-                    Toggle("Notify me when that changes", isOn: $notifyOnChange)
-                } footer: {
-                    if notificationsDenied {
-                        Text("Notifications are turned off for Lush in System Settings.")
-                    }
-                }
-            }
-            .formStyle(.grouped)
+        form
             .navigationTitle(isNew ? "New Smart Notebook" : "Smart Notebook")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button("Cancel", action: dismissEditor)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
                         .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
+            .onAppear {
+                name = existing.name
+                root = existing.rootRule
+                showCount = existing.showCount
+                notifyOnChange = existing.notifyOnChange
+            }
+            .onChange(of: notifyOnChange) {
+                guard notifyOnChange else { return }
+                Task { notificationsDenied = await !SmartNotebookAlerts.requestAuthorization() }
+            }
+    }
+
+    @ViewBuilder private var form: some View {
+        if close == nil {
+            NavigationStack { fields }
+            #if os(macOS)
+                .frame(minWidth: 620, minHeight: 460)
+            #endif
+        } else {
+            fields
         }
-        .onAppear {
-            name = existing.name
-            root = existing.rootRule
-            showCount = existing.showCount
-            notifyOnChange = existing.notifyOnChange
+    }
+
+    private var fields: some View {
+        Form {
+            Section {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.badge.gearshape")
+                    TextField("Name", text: $name, prompt: Text("Untitled"))
+                        .textFieldStyle(.plain)
+                }
+                .font(.title3.weight(.medium))
+                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .background(nameTint, in: RoundedRectangle(cornerRadius: 8))
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+            }
+            Section {
+                SmartRuleGroup(rule: $root, depth: 0, move: move)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+            } header: {
+                Text("Rules")
+            } footer: {
+                Text(
+                    "“Contains” is loose: it ignores case and accents, and a Note rule also "
+                        + "finds notes that mean the same thing without saying it. "
+                        + "“Exactly” matches the characters as typed."
+                )
+            }
+            Section {
+                Toggle("Show how many", isOn: $showCount)
+                Toggle("Notify me when that changes", isOn: $notifyOnChange)
+            } footer: {
+                if notificationsDenied {
+                    Text("Notifications are turned off for Lush in System Settings.")
+                }
+            }
         }
-        .onChange(of: notifyOnChange) {
-            guard notifyOnChange else { return }
-            Task { notificationsDenied = await !SmartNotebookAlerts.requestAuthorization() }
-        }
-        #if os(macOS)
-        .frame(minWidth: 620, minHeight: 460)
-        #endif
+        .formStyle(.grouped)
+    }
+
+    /// A dragged rule leaves where it was and lands where it was dropped. A
+    /// group dropped inside itself would take the tree with it, so it stays.
+    private func move(_ id: UUID, into group: UUID, at index: Int) {
+        guard let dragged = root.node(id), dragged.node(group) == nil else { return }
+        guard let from = root.parent(of: id) else { return }
+        var next = root
+        next.drop(id)
+        next.insert(dragged, into: group, at: from.group == group && from.index < index ? index - 1 : index)
+        withAnimation(.snappy) { root = next }
+    }
+
+    private func dismissEditor() {
+        if let close { close() } else { dismiss() }
     }
 
     private func save() {
@@ -328,21 +368,26 @@ struct SmartNotebookEditor: View {
                 notifyOnChange: notifyOnChange
             )
         )
-        dismiss()
+        dismissEditor()
     }
 }
 
-/// A block of rules. Nested groups are the same view one level in: a group is
-/// a closed box that holds its children on every side, which is what makes the
-/// nesting readable without reading the words.
+/// A block of rules. A group is its header and one line down the left of what
+/// it holds: the indent says where a rule sits, the line says where the group
+/// ends, and nothing is boxed. Values stay flush with the right edge at every
+/// depth, since the indent only ever eats into the left.
 struct SmartRuleGroup: View {
     @Binding var rule: SmartRule
     let depth: Int
+    let move: (UUID, UUID, Int) -> Void
     var remove: (() -> Void)?
+    @State private var hovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
+                RuleDragHandle(id: rule.id)
+                    .opacity(remove != nil && hovering ? 1 : 0)
                 Text("Match")
                 Picker("", selection: $rule.op) {
                     ForEach(SmartRule.Op.allCases, id: \.self) { op in
@@ -353,23 +398,39 @@ struct SmartRuleGroup: View {
                 .fixedSize()
                 Text("of these")
                 Spacer(minLength: 4)
-                if let remove {
-                    RuleDeleteButton(remove: remove)
-                }
+                RuleDeleteButton(remove: remove)
+                    .opacity(hovering ? 1 : 0)
             }
             .font(.callout.weight(.medium))
-            ForEach($rule.children) { $child in
-                if child.isGroup {
-                    SmartRuleGroup(rule: $child, depth: depth + 1, remove: { drop(child.id) })
-                } else {
-                    SmartRuleRow(rule: $child, remove: { drop(child.id) })
+            .padding(.vertical, 4)
+            .onHover { hovering = $0 }
+            HStack(alignment: .top, spacing: 0) {
+                Capsule()
+                    .fill(railTint)
+                    .frame(width: 1.5)
+                    .frame(maxHeight: .infinity)
+                    .padding(.trailing, 13)
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array($rule.children.enumerated()), id: \.element.id) { index, $child in
+                        RuleDropSlot(group: rule.id, index: index, move: move)
+                        if child.isGroup {
+                            SmartRuleGroup(
+                                rule: $child,
+                                depth: depth + 1,
+                                move: move,
+                                remove: { drop(child.id) }
+                            )
+                        } else {
+                            SmartRuleRow(rule: $child, remove: { drop(child.id) })
+                        }
+                    }
+                    RuleDropSlot(group: rule.id, index: rule.children.count, move: move)
+                    SmartRuleAddMenu(add: add)
+                        .padding(.vertical, 3)
                 }
             }
-            SmartRuleAddMenu(add: add)
         }
-        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(ruleBox(groupFill, groupStroke, radius: 12))
     }
 
     private func add(_ body: SmartRule.Body) {
@@ -381,24 +442,62 @@ struct SmartRuleGroup: View {
     }
 }
 
+/// The gap between two rules, and where a dragged one goes. The gap is there
+/// either way; it only shows itself when something is over it.
+struct RuleDropSlot: View {
+    let group: UUID
+    let index: Int
+    let move: (UUID, UUID, Int) -> Void
+    @State private var targeted = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5)
+            .fill(targeted ? Color.accentColor : .clear)
+            .frame(height: 3)
+            .padding(.vertical, 2.5)
+            .contentShape(Rectangle())
+            .dropDestination(for: String.self) { items, _ in
+                guard let id = items.first.flatMap({ UUID(uuidString: $0) }) else { return false }
+                move(id, group, index)
+                return true
+            } isTargeted: { targeted = $0 }
+    }
+}
+
+struct RuleDragHandle: View {
+    let id: UUID
+
+    var body: some View {
+        Image(systemName: "line.3.horizontal")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .draggable(id.uuidString)
+            .help("Drag to move")
+    }
+}
+
 struct SmartRuleRow: View {
     @Binding var rule: SmartRule
     let remove: () -> Void
     @Environment(NotesModel.self) private var model
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 6) {
+            RuleDragHandle(id: rule.id)
+                .opacity(hovering ? 1 : 0)
             SmartRuleTypeMenu(rule: $rule)
             comparison
+            Spacer(minLength: 12)
             value
                 .layoutPriority(1)
             RuleDeleteButton(remove: remove)
+                .opacity(hovering ? 1 : 0)
         }
         .font(.callout)
-        .padding(.vertical, 7)
-        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(ruleBox(rowFill, rowStroke, radius: 9))
+        .onHover { hovering = $0 }
     }
 
     @ViewBuilder private var comparison: some View {
@@ -437,7 +536,7 @@ struct SmartRuleRow: View {
         case let .text(field, whole, exact, text):
             TextField("text to find", text: bind(text) { .text(field, whole: whole, exact: exact, $0) })
                 .textFieldStyle(.roundedBorder)
-                .frame(minWidth: 120)
+                .frame(minWidth: 120, maxWidth: 260)
         case let .kind(kind):
             Picker("", selection: bind(kind) { .kind($0) }) {
                 ForEach(SmartNotebookKind.allCases, id: \.self) { kind in
@@ -552,32 +651,21 @@ extension SmartRule {
 }
 
 struct RuleDeleteButton: View {
-    let remove: () -> Void
+    let remove: (() -> Void)?
 
     var body: some View {
-        Button(action: remove) {
-            Image(systemName: "minus.circle.fill")
-                .foregroundStyle(.tertiary)
+        Button { remove?() } label: {
+            Image(systemName: "minus.circle")
+                .foregroundStyle(.secondary)
         }
         .buttonStyle(.plain)
+        .disabled(remove == nil)
         .help("Remove")
     }
 }
 
-/// Groups are pink and rules are yellow, so a block is recognisable as one or
-/// the other before you read it. Both are drawn as a filled box with a line
-/// round it: the line is what says where a group ends and its neighbour
-/// begins, which a wash on its own never managed.
-private func ruleBox(_ fill: Color, _ stroke: Color, radius: CGFloat) -> some View {
-    RoundedRectangle(cornerRadius: radius)
-        .fill(fill)
-        .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(stroke))
-}
-
-private let groupFill = Color.pink.opacity(0.07)
-private let groupStroke = Color.pink.opacity(0.35)
-private let rowFill = Color.yellow.opacity(0.16)
-private let rowStroke = Color.orange.opacity(0.30)
+private let railTint = Color.orange.opacity(0.35)
+private let nameTint = Color.pink.opacity(0.14)
 
 func smartNotebook(
     id: String,

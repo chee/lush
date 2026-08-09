@@ -108,17 +108,17 @@ One pattern throughout: file I/O / sync FFI / heavy codec work on the main actor
 
 Do these after the behavioral fixes above so there's one place to fix, not two.
 
-- [ ] **Embed shellJS ↔ `web/src`** — `lush/PatchworkView.swift:416` vs `resolver.ts`/`main.ts`; already drifted (IndexedDB cache, `localWsPort` vs `localWsPorts`). Fix: second Vite entry (`embed.ts`) importing the shared modules; WKWebView loads the built bundle instead of a Swift string literal.
-- [ ] **Share extension ↔ Finder action ↔ Shared handoff codec** — `LushShareExtension/ShareViewController.swift:50`, `LushFinderAction/FinderActionRequestHandler.swift:33`, `Shared/SharedIntake.swift:103`. ~150 lines duplicated; provider priority already differs; codec drift silently discards shared content. Fix: move loaders + codec into Shared/, compile into both targets, pick one priority order.
+- [x] **Embed shellJS ↔ `web/src`** — `lush/PatchworkView.swift:416` vs `resolver.ts`/`main.ts`; already drifted (IndexedDB cache, `localWsPort` vs `localWsPorts`). Fix: second Vite entry (`embed.ts`) importing the shared modules; WKWebView loads the built bundle instead of a Swift string literal.
+- [x] **Share extension ↔ Finder action ↔ Shared handoff codec** — `LushShareExtension/ShareViewController.swift:50`, `LushFinderAction/FinderActionRequestHandler.swift:33`, `Shared/SharedIntake.swift:103`. ~150 lines duplicated; provider priority already differs; codec drift silently discards shared content. Fix: move loaders + codec into Shared/, compile into both targets, pick one priority order.
 - [ ] **Intake drain + import: app vs helper, diverged behavior** — `lush/NotesModel.swift:2884` vs `LushHelper/HelperSync.swift:136`. Same share produces a rich note or a raw asset depending on which process drains. Fix: one implementation in Shared/ (incl. one UTType-based mime lookup).
 - [ ] **`writeWidgetSnapshot` app vs helper** — `lush/NotesModel.swift:1173` vs `LushHelper/HelperSync.swift:246`. Fix: one builder in Shared/.
-- [ ] **Widget snapshot schema duplicated into the widget target** — `LushWidget/LushWidget.swift:62` vs `Shared/SharedIntake.swift:3`. Silent decode fallback on drift. Fix: compile the structs' file into LushWidgetExtension; delete the copies.
-- [ ] **HTML→spans converter ×2** — `lush/AppleNotesImporter.swift:90` vs `lush/RichTextClipboard.swift:276`; list-marker trimming already diverged. Fix: keep the clipboard version, merge the bullet-regex cases into `trimListMarker`, delete the importer's copy.
-- [ ] **Dock tile codec/filename/group id ×2** — `LushDockTile/LushDockTilePlugin.swift:75` vs `lush/NotesModel.swift:3225`. Fix: small Shared file in both targets.
-- [ ] **`NotesModel` re-declares LushShared constants (+ a third inline literal)** — `lush/NotesModel.swift:234`, `:2787`. Fix: use `LushShared.*`.
-- [ ] **ms-vs-s timestamp heuristic ×2** — `Shared/SmartNotebookRun.swift:118` vs `lush/NotesModel.swift:2774`. Fix: one shared helper (better: normalize in the core at write time).
-- [ ] **`account:` URL parsing Swift vs web, different rules** — `lush/NotesModel.swift:261` vs `web/src/account.ts:39`. Fix: adopt the stricter web rule in Swift.
-- [ ] **Sentence-embedding model loaded twice; normalization ×2** — `lush/SemanticSearchIndex.swift:75` vs `Shared/SmartNotebookRun.swift:127`. Fix: QueryEmbedding owns model + normalization; SemanticSearchIndex delegates.
+- [x] **Widget snapshot schema duplicated into the widget target** — `LushWidget/LushWidget.swift:62` vs `Shared/SharedIntake.swift:3`. Silent decode fallback on drift. Fix: compile the structs' file into LushWidgetExtension; delete the copies.
+- [x] **HTML→spans converter ×2** — `lush/AppleNotesImporter.swift:90` vs `lush/RichTextClipboard.swift:276`; list-marker trimming already diverged. Fix: keep the clipboard version, merge the bullet-regex cases into `trimListMarker`, delete the importer's copy.
+- [x] **Dock tile codec/filename/group id ×2** — `LushDockTile/LushDockTilePlugin.swift:75` vs `lush/NotesModel.swift:3225`. Fix: small Shared file in both targets.
+- [x] **`NotesModel` re-declares LushShared constants (+ a third inline literal)** — `lush/NotesModel.swift:234`, `:2787`. Fix: use `LushShared.*`.
+- [x] **ms-vs-s timestamp heuristic ×2** — `Shared/SmartNotebookRun.swift:118` vs `lush/NotesModel.swift:2774`. Fix: one shared helper (better: normalize in the core at write time).
+- [x] **`account:` URL parsing Swift vs web, different rules** — `lush/NotesModel.swift:261` vs `web/src/account.ts:39`. Fix: adopt the stricter web rule in Swift.
+- [x] **Sentence-embedding model loaded twice; normalization ×2** — `lush/SemanticSearchIndex.swift:75` vs `Shared/SmartNotebookRun.swift:127`. Fix: QueryEmbedding owns model + normalization; SemanticSearchIndex delegates.
 
 ## Suggested order of attack
 

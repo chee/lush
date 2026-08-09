@@ -136,10 +136,15 @@ struct NoteAttachment: Equatable {
 }
 
 /// What Apple Intelligence is asked to fill in on a pass that only wants prose.
-/// A schema it completes beats an object it has to spell out by hand.
+/// A schema it completes beats an object it has to spell out by hand — and the
+/// fields are filled in the order they are written, so naming the question
+/// first is a few tokens spent making the answer be about it. A small model
+/// asked straight out for prose drifts to summarising whatever it just read.
 @Generable
 struct NoteChatGuidedAnswer {
-    @Guide(description: "The answer to the question the person actually asked, in your own words. Not a summary of the note unless a summary is what was asked for. Empty only when you cannot answer from what you were given.")
+    @Guide(description: "What the person is asking for, in a few words. Not an answer — the ask itself.")
+    let asking: String
+    @Guide(description: "The answer to that, in your own words, from the note. Not a summary of the note unless a summary is what was asked for. Empty only when you cannot answer from what you were given.")
     let answer: String
     @Guide(description: "What you would need in order to answer. Empty whenever you have answered.")
     let need: String

@@ -41,8 +41,8 @@ struct ChatProfile: Identifiable, Hashable {
         """,
         tools: .none,
         rounds: 1,
-        temperature: 0.4,
-        maximumResponseTokens: 400,
+        temperature: 0.3,
+        maximumResponseTokens: 520,
         promptLimit: 4_000
     )
 

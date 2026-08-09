@@ -9,7 +9,7 @@ if ! command -v pnpm >/dev/null 2>&1; then
 	exit 0
 fi
 
-sources="src public vite index.html package.json pnpm-lock.yaml tsconfig.json vite.config.ts"
+sources="src public vite index.html package.json pnpm-lock.yaml tsconfig.json vite.config.ts vite.config.embed.ts"
 stamp=../PatchworkWeb.bundle/index.html
 
 if [ -f "$stamp" ] && [ -z "$(find $sources -newer "$stamp" -print -quit)" ]; then
