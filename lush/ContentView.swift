@@ -86,6 +86,7 @@ struct ContentView: View {
             detail
         }
         .onChange(of: selectedItemUrls) {
+            NSLog("LUSHDBG select \(selectedItemUrls)")
             // Selecting the top search hit must not pull focus out of the
             // field mid-query.
             if !searchFocused { sidebarFocused = true }
@@ -134,12 +135,14 @@ struct ContentView: View {
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url else { return }
             selectedHistoryEntry = nil
-            if !selectedItemUrls.containsSidebarTag(for: url) { selectedItemUrls = [url] }
+            if !selectedItemUrls.contains(where: { Self.sidebarUrl($0) == url }) {
+                selectedItemUrls = [rowTag(for: url)]
+            }
         }
         .onAppear {
             if let url = model.selectedNoteUrl,
-               !selectedItemUrls.containsSidebarTag(for: url) {
-                selectedItemUrls = [url]
+               !selectedItemUrls.contains(where: { Self.sidebarUrl($0) == url }) {
+                selectedItemUrls = [rowTag(for: url)]
             }
         }
         .focusedSceneValue(\.noteSearchActions, NoteSearchActions(
@@ -240,7 +243,7 @@ struct ContentView: View {
             PatchworkWeb.setLastTool(tool, for: url)
             Task { await model.addDocToFolder(url: url, folderUrl: request.folderUrl) }
             #if os(macOS)
-            selectedItemUrls = [url]
+            selectedItemUrls = [rowTag(for: url)]
             #else
             path = [.patchwork(url)]
             #endif
@@ -320,7 +323,7 @@ struct ContentView: View {
     private func open(_ url: String) {
         #if os(macOS)
         model.selectedNoteUrl = url
-        selectedItemUrls = [url]
+        selectedItemUrls = [rowTag(for: url)]
         #else
         path = [.note(url)]
         #endif
@@ -328,7 +331,7 @@ struct ContentView: View {
 
     private func openFolder(_ url: String) {
         #if os(macOS)
-        selectedItemUrls = [url]
+        selectedItemUrls = [rowTag(for: url)]
         #else
         path = [.folder(url)]
         #endif
@@ -352,16 +355,18 @@ struct ContentView: View {
                     guard let first = hits.first else { return }
                     proxy.scrollTo(first.url, anchor: .top)
                 }
-                .onChange(of: revealTarget) { _, url in
-                    guard let url else { return }
+                .onChange(of: revealTarget) { _, row in
+                    guard let row else { return }
                     revealTarget = nil
                     Task { @MainActor in
                         await Task.yield()
-                        withAnimation { proxy.scrollTo(url, anchor: .center) }
+                        withAnimation { proxy.scrollTo(row, anchor: .center) }
                     }
                 }
         }
     }
+
+
 
     private var sidebarList: some View {
         List(selection: $selectedItemUrls) {
@@ -371,7 +376,6 @@ struct ContentView: View {
                 }
                 Color.clear
                     .frame(height: 28)
-                    .modifier(SectionTailDrop(order: $sectionOrder))
                     .listRowInsets(sidebarRowInsets(depth: 0))
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -383,10 +387,11 @@ struct ContentView: View {
                     .padding(.trailing, sidebarTrailingGutter)
                     .contentShape(Rectangle())
                     .tag(hit.url)
-                    .onDrag({ SidebarDrag.provider(hit.url, kind: .item) }, preview: {
+                    .draggable(SidebarDrag.payload(hit.url, kind: .item), preview: {
                         DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
                     })
                     .listRowInsets(sidebarRowInsets(depth: 0))
+                    .listRowBackground(selectionBackground(url: hit.url, tag: hit.url))
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
                             singleNoteContextMenu(for: node, showInFolder: true)
@@ -417,6 +422,10 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 230)
         .onChange(of: model.folderTree, initial: true) {
             seedRootExpansion()
+            resolveSelectionRows()
+        }
+        .onChange(of: expanded) {
+            resolveSelectionRows()
         }
         .onChange(of: searchText) {
             model.searchQuery = searchText
@@ -441,7 +450,7 @@ struct ContentView: View {
                   selectedItemUrls.count == 1,
                   let tag = selectedItemUrls.first
             else { return .ignored }
-            let selected = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
+            let selected = Self.sidebarUrl(tag)
             if let node = model.node(for: selected), node.kind == "folder" {
                 setExpanded(!expanded.contains(selected), for: selected)
             } else {
@@ -451,7 +460,7 @@ struct ContentView: View {
         }
         .onKeyPress(.space) {
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return .ignored }
-            let selected = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
+            let selected = Self.sidebarUrl(tag)
             guard let node = model.node(for: selected), node.kind == "folder" else { return .ignored }
             setExpanded(!expanded.contains(selected), for: selected)
             return .handled
@@ -459,7 +468,7 @@ struct ContentView: View {
         .onKeyPress(.delete) {
             guard renamingUrl == nil, !selectedItemUrls.isEmpty else { return .ignored }
             for tag in selectedItemUrls {
-                let url = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
+                let url = Self.sidebarUrl(tag)
                 if let node = model.node(for: url), node.parentUrl != nil {
                     model.removeEntry(parentUrl: node.parentUrl, url: url)
                 }
@@ -467,6 +476,7 @@ struct ContentView: View {
             return .handled
         }
         .focused($sidebarFocused)
+        .foregroundStyle(Color.primary)
         .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
     }
 
@@ -514,12 +524,10 @@ struct ContentView: View {
         switch section {
         case .calendar:
             calendarRow
-                .modifier(SectionDragReorder(section: .calendar, order: $sectionOrder))
                 .listRowInsets(sidebarRowInsets(depth: 0))
         case .pinned:
             if !model.pinnedNodes.isEmpty {
                 pinnedRootRow
-                    .modifier(SectionDragReorder(section: .pinned, order: $sectionOrder))
                     .listRowInsets(sidebarRowInsets(depth: 0))
                 if pinnedExpanded {
                     ForEach(model.pinnedNodes) { node in
@@ -534,6 +542,12 @@ struct ContentView: View {
                     ForEach(model.smartNotebooks) { folder in
                         smartNotebookRow(folder)
                             .listRowInsets(sidebarRowInsets(depth: 0))
+                            .listRowBackground(
+                                selectionBackground(
+                                    url: "smart:\(folder.id)",
+                                    tag: "smart:\(folder.id)"
+                                )
+                            )
                         if smartExpanded.contains(folder.id) {
                             ForEach(model.smartHits[folder.id] ?? [], id: \.url) { hit in
                                 smartHitRow(hit)
@@ -569,7 +583,6 @@ struct ContentView: View {
         .padding(.trailing, sidebarTrailingGutter)
         .contentShape(Rectangle())
         .onTapGesture { toggleSection(section) }
-        .modifier(SectionDragReorder(section: section, order: $sectionOrder))
         .listRowInsets(sidebarRowInsets(depth: 0))
     }
 
@@ -591,13 +604,13 @@ struct ContentView: View {
             .padding(.top, 12)
             .padding(.bottom, 5)
             .padding(.trailing, sidebarTrailingGutter)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                // Coming back lands where she left. Double-clicking it is the
-                // one way to ask for today instead.
+            .simultaneousGesture(TapGesture().onEnded {
+                // Coming back lands where she left. Clicking the row while the
+                // calendar is already up is the one way to ask for today.
+                guard calendarSelected else { return }
                 AgendaStore.shared.restoreDay = nil
                 AgendaStore.shared.focusDay = Calendar.current.startOfDay(for: Date())
-            }
+            })
             .contextMenu {
                 Button("Show Meeting Notes") {
                     selectedItemUrls = [Agenda.meetingNotesTag]
@@ -605,6 +618,9 @@ struct ContentView: View {
             }
             .tag(Agenda.sidebarTag)
             .listRowInsets(sidebarRowInsets(depth: 0))
+            .listRowBackground(
+                selectionBackground(url: Agenda.sidebarTag, tag: Agenda.sidebarTag)
+            )
     }
 
     private var calendarSelected: Bool {
@@ -638,38 +654,83 @@ struct ContentView: View {
         let tag = "pinned:\(node.url)"
         return NoteRowView(node: node, showFolder: true)
             .padding(.trailing, sidebarTrailingGutter)
-            .contentShape(Rectangle())
             .padding(.leading, 12)
             .tag(tag)
             .id(tag)
-            .onDrag({ SidebarDrag.provider(node.url, kind: .item) }, preview: {
+            .draggable(SidebarDrag.payload(node.url, kind: .item), preview: {
                 DragPreviewView(name: node.displayName)
             })
             .modifier(PinReorderTarget(url: node.url, model: model))
             .listRowInsets(sidebarRowInsets(depth: 1))
-            .listRowBackground(duplicateTint(url: node.url, tag: tag))
+            .listRowBackground(selectionBackground(url: node.url, tag: tag))
             .contextMenu {
                 singleNoteContextMenu(for: node, showInFolder: true)
             }
     }
 
-    private func nodeRows(_ nodes: [FolderNode], depth: Int = 0) -> AnyView {
+    private func nodeRows(_ nodes: [FolderNode], depth: Int = 0, path: String = "") -> AnyView {
         AnyView(
-            ForEach(nodes) { node in
+            ForEach(Self.sidebarRows(nodes, path: path)) { row in
+                let node = row.node
                 if node.kind == "folder" {
                     folderRow(for: node, depth: depth)
-                        .tag(node.url)
+                        .tag(row.id)
                         .listRowInsets(sidebarRowInsets(depth: depth))
+                        .listRowBackground(selectionBackground(url: node.url, tag: row.id))
                     if expanded.contains(node.url) {
-                        nodeRows(model.orderedChildren(node.children ?? [], in: node.url), depth: depth + 1)
+                        nodeRows(
+                            model.orderedChildren(node.children ?? [], in: node.url),
+                            depth: depth + 1,
+                            path: row.id
+                        )
                     }
                 } else {
-                    noteRow(for: node, depth: depth)
+                    noteRow(for: node, depth: depth, tag: row.id)
                         .listRowInsets(sidebarRowInsets(depth: depth))
-                        .listRowBackground(duplicateTint(url: node.url, tag: node.url))
+                        .listRowBackground(selectionBackground(url: node.url, tag: row.id))
                 }
             }
         )
+    }
+
+    /// The same item can sit in a folder more than once, so a row is named by
+    /// where it is, not by what it holds. Two copies are two selections.
+    private static func sidebarRows(_ nodes: [FolderNode], path: String) -> [SidebarRow] {
+        nodes.enumerated().map {
+            SidebarRow(id: "\(path)\u{1}\($0.offset)\u{1}\($0.element.url)", node: $0.element)
+        }
+    }
+
+    /// Where a url first shows up in the tree as it is currently unfolded.
+    private func firstRowId(for url: String) -> String? {
+        func walk(_ nodes: [FolderNode], path: String) -> String? {
+            for row in Self.sidebarRows(nodes, path: path) {
+                if row.node.url == url { return row.id }
+                guard row.node.kind == "folder", expanded.contains(row.node.url) else { continue }
+                let children = model.orderedChildren(row.node.children ?? [], in: row.node.url)
+                if let hit = walk(children, path: row.id) { return hit }
+            }
+            return nil
+        }
+        return walk(model.visibleFolderTree, path: "")
+    }
+
+    private func rowTag(for url: String) -> String {
+        if let row = firstRowId(for: url) { return row }
+        if pinnedExpanded, model.isPinned(url) { return "pinned:\(url)" }
+        return url
+    }
+
+    /// A url picked before its row existed — at launch, or while its folder was
+    /// folded — is held as the bare url. Once the row shows up, point at it,
+    /// otherwise every copy reads as the unfocused one.
+    private func resolveSelectionRows() {
+        guard searchText.isEmpty else { return }
+        let resolved = Set(selectedItemUrls.map { tag in
+            guard !Self.isRowTag(tag), tag.hasPrefix("automerge:") else { return tag }
+            return rowTag(for: tag)
+        })
+        if resolved != selectedItemUrls { selectedItemUrls = resolved }
     }
 
     /// Rows run the full width and keep the right-hand gutter in their own
@@ -730,16 +791,16 @@ struct ContentView: View {
         .padding(.bottom, 5)
         .padding(.trailing, sidebarTrailingGutter)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
             if isOpen {
                 smartExpanded.remove(folder.id)
             } else {
                 smartExpanded.insert(folder.id)
                 model.refreshSmartHits(folder)
             }
-        }
+        })
         .tag(tag)
-        .onDrag({ SidebarDrag.provider(folder.id, kind: .smart) }, preview: {
+        .draggable(SidebarDrag.payload(folder.id, kind: .smart), preview: {
             DragPreviewView(name: folder.displayName, isFolder: true)
         })
         .modifier(SmartReorderTarget(id: folder.id, model: model))
@@ -774,15 +835,15 @@ struct ContentView: View {
         let tag = "smarthit:\(hit.url)"
         searchHitRow(hit)
             .padding(.trailing, sidebarTrailingGutter)
-            .contentShape(Rectangle())
+          
             .padding(.leading, 12)
             .tag(tag)
             .id(tag)
-            .onDrag({ SidebarDrag.provider(hit.url, kind: .item) }, preview: {
+            .draggable(SidebarDrag.payload(hit.url, kind: .item), preview: {
                 DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
             })
             .listRowInsets(sidebarRowInsets(depth: 1))
-            .listRowBackground(duplicateTint(url: hit.url, tag: tag))
+            .listRowBackground(selectionBackground(url: hit.url, tag: tag))
             .contextMenu {
                 if let node = model.node(for: hit.url) {
                     singleNoteContextMenu(for: node, showInFolder: true)
@@ -832,7 +893,7 @@ struct ContentView: View {
     private func newNotebook() {
         Task {
             guard let url = await model.createNotebook() else { return }
-            selectedItemUrls = [url]
+            selectedItemUrls = [rowTag(for: url)]
             renameText = "New Notebook"
             renamingUrl = url
         }
@@ -860,14 +921,29 @@ struct ContentView: View {
         .listRowInsets(sidebarRowInsets(depth: 0))
     }
 
-    private func duplicateTint(url: String, tag: String) -> Color? {
-        let selectedElsewhere = selectedItemUrls.contains { $0 != tag && Self.sidebarUrl($0) == url }
-        return selectedElsewhere ? Color.secondary.opacity(0.12) : nil
+    /// The copy she clicked keeps the real selection; the others draw the
+    /// system's unfocused selection, in the same shape the list uses.
+    /// Selection is drawn here rather than left to the list: the row she
+    /// clicked gets the pink, every other copy of it gets the system's
+    /// unfocused grey.
+    private func selectionBackground(url: String, tag: String) -> SidebarSelectionRow {
+        if selectedItemUrls.contains(tag) { return SidebarSelectionRow(state: .clicked) }
+        let selectedElsewhere = selectedItemUrls.contains {
+            $0 != tag && Self.isRowTag($0) && Self.sidebarUrl($0) == url
+        }
+        return SidebarSelectionRow(state: selectedElsewhere ? .echo : .none)
+    }
+
+    /// A bare url is a selection made before its row existed. It names no row,
+    /// so it must not grey the copies either.
+    private static func isRowTag(_ tag: String) -> Bool {
+        tag.contains("\u{1}") || tag.hasPrefix("pinned:") || tag.hasPrefix("smarthit:")
     }
 
     private static func sidebarUrl(_ tag: String) -> String {
         if tag.hasPrefix("pinned:") { return String(tag.dropFirst(7)) }
         if tag.hasPrefix("smarthit:") { return String(tag.dropFirst(9)) }
+        if let sep = tag.lastIndex(of: "\u{1}") { return String(tag[tag.index(after: sep)...]) }
         return tag
     }
 
@@ -956,10 +1032,6 @@ struct ContentView: View {
                     }
                     Spacer(minLength: 8)
                 }
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    setExpanded(!expanded.contains(node.url), for: node.url)
-                }
             }
             if model.folderSettings(for: node.url).showCount {
                 Text("\(model.folderNoteCount(node))")
@@ -982,14 +1054,18 @@ struct ContentView: View {
         .padding(.bottom, depth == 0 ? 5 : 2)
         .padding(.trailing, sidebarTrailingGutter)
         .contentShape(Rectangle())
-        .onDrag({
-            SidebarDrag.provider(
+        .simultaneousGesture(TapGesture(count: 2).onEnded {
+            setExpanded(!expanded.contains(node.url), for: node.url)
+        })
+        .draggable(
+            SidebarDrag.payload(
                 node.url,
                 kind: model.rootFolderUrls.contains(node.url) ? .notebook : .item
-            )
-        }, preview: {
-            DragPreviewView(name: node.displayName, isFolder: true)
-        })
+            ),
+            preview: {
+                DragPreviewView(name: node.displayName, isFolder: true)
+            }
+        )
         .modifier(
             FolderDropTarget(
                 node: node,
@@ -1063,30 +1139,35 @@ struct ContentView: View {
         }
     }
 
+    private func draggedUrls(node: FolderNode, tag: String) -> String {
+        let urls = selectedItemUrls.contains(tag)
+            ? selectedItemUrls.map(Self.sidebarUrl)
+            : [node.url]
+        return urls.joined(separator: "\n")
+    }
+
     @ViewBuilder
-    private func noteRow(for node: FolderNode, depth: Int = 0) -> some View {
+    private func noteRow(for node: FolderNode, depth: Int = 0, tag: String) -> some View {
         NoteRowView(
             node: node,
             renameText: renamingUrl == node.url ? $renameText : nil,
             commitRename: { commitRename(node) }
         )
             .padding(.trailing, sidebarTrailingGutter)
-            .contentShape(Rectangle())
+     
             .padding(.leading, CGFloat(depth) * 8 + 4)
-            .tag(node.url)
-            .onDrag({
-                let urls = selectedItemUrls.contains(node.url)
-                    ? Array(selectedItemUrls)
-                    : [node.url]
-                return SidebarDrag.provider(urls.joined(separator: "\n"), kind: .item)
-            }, preview: {
-                let count = selectedItemUrls.contains(node.url) ? selectedItemUrls.count : 1
-                DragPreviewView(name: node.displayName, count: count)
-            })
+            .tag(tag)
+            .draggable(
+                SidebarDrag.payload(draggedUrls(node: node, tag: tag), kind: .item),
+                preview: {
+                    let count = selectedItemUrls.contains(tag) ? selectedItemUrls.count : 1
+                    DragPreviewView(name: node.displayName, count: count)
+                }
+            )
             .modifier(NoteReorderDropTarget(node: node, model: model))
             .contextMenu {
-                let targets = selectedItemUrls.contains(node.url)
-                    ? Array(selectedItemUrls)
+                let targets = selectedItemUrls.contains(tag)
+                    ? selectedItemUrls.map(Self.sidebarUrl)
                     : [node.url]
                 if targets.count > 1 {
                     Group {
@@ -1282,8 +1363,8 @@ struct ContentView: View {
             url = model.node(for: u)?.parentUrl
         }
         UserDefaults.standard.set(Array(expanded), forKey: Self.expandedKey)
-        selectedItemUrls = [node.url]
-        revealTarget = node.url
+        selectedItemUrls = [rowTag(for: node.url)]
+        revealTarget = rowTag(for: node.url)
         Task { await model.selectItem(node.url) }
     }
 
@@ -1301,10 +1382,9 @@ struct ContentView: View {
 }
 
 #if os(macOS)
-private extension Set where Element == String {
-    func containsSidebarTag(for url: String) -> Bool {
-        contains(url) || contains("pinned:\(url)") || contains("smarthit:\(url)")
-    }
+struct SidebarRow: Identifiable {
+    let id: String
+    let node: FolderNode
 }
 
 #endif
@@ -1407,11 +1487,6 @@ struct NoteRowView: View {
             }
         }
         .padding(.vertical, 2)
-        #if os(macOS)
-        .onDrag({ SidebarDrag.provider(node.url, kind: .item) }, preview: {
-            DragPreviewView(name: node.displayName)
-        })
-        #endif
         .task { await model.loadContextMeta(url: node.url) }
     }
 }
@@ -3953,8 +4028,30 @@ enum SidebarSection: String, CaseIterable, Hashable {
 /// Every sidebar drag travels as plain text so it can also be dropped into the
 /// editor or another app. What is being dragged is remembered here instead, so
 /// a row only lights up for the drags it can actually accept.
+/// The sidebar draws its own selection. Rows always hand the list a
+/// background, so the list never paints its highlight over the top.
+struct SidebarSelectionRow: View {
+    enum State { case clicked, echo, none }
+
+    let state: State
+    @Environment(\.colorScheme) private var scheme
+
+    private var fill: Color {
+        switch state {
+        case .clicked: Color.accentColor.opacity(scheme == .dark ? 0.40 : 0.28)
+        case .echo: Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+        case .none: .clear
+        }
+    }
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(fill)
+            .padding(.horizontal, 10)
+    }
+}
+
 enum SidebarDragKind {
-    case section
     case smart
     case notebook
     case item
@@ -3967,6 +4064,14 @@ enum SidebarDrag {
         Self.kind = kind
         SidebarDropHighlight.shared.clear()
         return NSItemProvider(object: payload as NSString)
+    }
+
+    /// `onDrag` on a list row swallows the click that would have selected it.
+    /// `draggable` carries the same plain text and leaves selection alone.
+    static func payload(_ payload: String, kind: SidebarDragKind) -> String {
+        Self.kind = kind
+        SidebarDropHighlight.shared.clear()
+        return payload
     }
 
     static func ended() {
@@ -3991,11 +4096,13 @@ final class SidebarDropHighlight {
     private var mark: DropMark?
 
     func show(_ row: String, _ mark: DropMark) {
+        NSLog("LUSHDBG show \(row) \(mark) main=\(Thread.isMainThread)")
         self.row = row
         self.mark = mark
     }
 
     func clear(_ row: String? = nil) {
+        NSLog("LUSHDBG clear \(row ?? "all") holding=\(self.row ?? "none") main=\(Thread.isMainThread)")
         guard row == nil || row == self.row else { return }
         self.row = nil
         self.mark = nil
@@ -4016,69 +4123,37 @@ private struct SidebarReorderTarget: ViewModifier {
 
     @State private var height: CGFloat = 0
 
+    @ViewBuilder
     func body(content: Content) -> some View {
-        let mark = SidebarDropHighlight.shared.mark(for: row)
+        // A DropDelegate anywhere in a row makes the list refuse to select it,
+        // so the row takes drops through dropDestination instead.
+        let marked = SidebarDropHighlight.shared.mark(for: row) != nil
         content
             .onGeometryChange(for: CGFloat.self, of: { $0.size.height }, action: { height = $0 })
-            .overlay(alignment: mark == .after ? .bottom : .top) {
-                if mark != nil {
-                    Rectangle().fill(Color.accentColor).frame(height: 2)
+            .background {
+                if marked {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.18))
+                        .padding(.horizontal, 10)
                 }
             }
-            .onDrop(
-                of: [UTType.plainText.identifier],
-                delegate: SidebarReorderDrop(
-                    row: row,
-                    kind: kind,
-                    pinnedMark: pinnedMark,
-                    height: height,
-                    handle: handle
-                )
-            )
+            .dropDestination(for: String.self) { items, location in
+                SidebarDropHighlight.shared.clear(row)
+                guard SidebarDrag.kind == kind, let payload = items.first else { return false }
+                let after = pinnedMark.map { $0 == .after } ?? (location.y > height / 2)
+                handle(payload, after)
+                SidebarDrag.ended()
+                return true
+            } isTargeted: { inside in
+                if inside, SidebarDrag.kind == kind {
+                    SidebarDropHighlight.shared.show(row, pinnedMark ?? .into)
+                } else {
+                    SidebarDropHighlight.shared.clear(row)
+                }
+            }
     }
 }
 
-private struct SidebarReorderDrop: DropDelegate {
-    let row: String
-    let kind: SidebarDragKind
-    let pinnedMark: DropMark?
-    let height: CGFloat
-    let handle: @MainActor (String, Bool) -> Void
-
-    private func landing(_ info: DropInfo) -> DropMark {
-        pinnedMark ?? (info.location.y > height / 2 ? .after : .before)
-    }
-
-    func validateDrop(info: DropInfo) -> Bool {
-        SidebarDrag.kind == kind && info.hasItemsConforming(to: [UTType.plainText.identifier])
-    }
-
-    func dropEntered(info: DropInfo) {
-        SidebarDropHighlight.shared.show(row, landing(info))
-    }
-
-    func dropExited(info: DropInfo) {
-        SidebarDropHighlight.shared.clear(row)
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        SidebarDropHighlight.shared.show(row, landing(info))
-        return DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        let after = landing(info) == .after
-        SidebarDrag.ended()
-        guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
-            return false
-        }
-        loadPayload(provider) { payload in handle(payload, after) }
-        return true
-    }
-}
-
-/// Catches the drag leaving the sidebar or ending on nothing, which is when
-/// rows are least likely to hear about it themselves.
 struct SidebarDropCleanup: DropDelegate {
     func validateDrop(info: DropInfo) -> Bool { SidebarDrag.kind != nil }
     func dropEntered(info: DropInfo) {}
@@ -4094,48 +4169,6 @@ struct SidebarDropCleanup: DropDelegate {
 /// Sections are dragged by their heading row and land above whichever heading
 /// they are dropped on; the tail row past the last section is what puts one
 /// at the bottom.
-private struct SectionDragReorder: ViewModifier {
-    let section: SidebarSection
-    @Binding var order: [SidebarSection]
-
-    func body(content: Content) -> some View {
-        content
-            .onDrag({ SidebarDrag.provider(section.rawValue, kind: .section) }, preview: {
-                DragPreviewView(name: section.title, isFolder: true)
-            })
-            .modifier(
-                SidebarReorderTarget(
-                    row: "section:\(section.rawValue)",
-                    kind: .section,
-                    pinnedMark: .before
-                ) { payload, _ in
-                    guard let dragged = SidebarSection(rawValue: payload), dragged != section else { return }
-                    order = reordered(order, moving: dragged, adjacentTo: section, after: false)
-                    SidebarSection.save(order)
-                }
-            )
-    }
-}
-
-private struct SectionTailDrop: ViewModifier {
-    @Binding var order: [SidebarSection]
-
-    func body(content: Content) -> some View {
-        content.modifier(
-            SidebarReorderTarget(row: "section:tail", kind: .section, pinnedMark: .before) { payload, _ in
-                guard let dragged = SidebarSection(rawValue: payload),
-                      order.last != dragged
-                else { return }
-                var next = order
-                next.removeAll { $0 == dragged }
-                next.append(dragged)
-                order = next
-                SidebarSection.save(next)
-            }
-        )
-    }
-}
-
 private struct SmartReorderTarget: ViewModifier {
     let id: String
     let model: NotesModel
@@ -4177,81 +4210,44 @@ private struct FolderDropTarget: ViewModifier {
 
     func body(content: Content) -> some View {
         if node.kind == "folder" {
-            let mark = SidebarDropHighlight.shared.mark(for: row)
+            let marked = SidebarDropHighlight.shared.mark(for: row) != nil
             content
                 .onGeometryChange(for: CGFloat.self, of: { $0.size.height }, action: { height = $0 })
                 .background {
-                    if mark == .into {
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(Color.accentColor.opacity(0.12))
+                    if marked {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.accentColor.opacity(0.18))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 5)
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
                                     .strokeBorder(Color.accentColor.opacity(0.5), lineWidth: 1.5)
+                                    .padding(.horizontal, 10)
                             )
+                            .padding(.horizontal, 10)
                     }
                 }
-                .overlay(alignment: mark == .after ? .bottom : .top) {
-                    if mark == .before || mark == .after {
-                        Rectangle().fill(Color.accentColor).frame(height: 2)
+                .dropDestination(for: String.self) { items, location in
+                    SidebarDropHighlight.shared.clear(row)
+                    guard let payload = items.first else { return false }
+                    if isRoot, SidebarDrag.kind == .notebook {
+                        model.reorderRootFolder(payload, adjacentTo: node.url, after: location.y > height / 2)
+                    } else {
+                        for url in payload.components(separatedBy: "\n")
+                        where url.hasPrefix("automerge:") {
+                            model.moveItem(url, into: node.url)
+                        }
+                    }
+                    SidebarDrag.ended()
+                    return true
+                } isTargeted: { inside in
+                    if inside, SidebarDrag.kind == .notebook || SidebarDrag.kind == .item {
+                        SidebarDropHighlight.shared.show(row, .into)
+                    } else {
+                        SidebarDropHighlight.shared.clear(row)
                     }
                 }
-                .onDrop(
-                    of: [UTType.plainText.identifier],
-                    delegate: FolderDrop(row: row, node: node, isRoot: isRoot, model: model, height: height)
-                )
         } else {
             content
         }
-    }
-}
-
-private struct FolderDrop: DropDelegate {
-    let row: String
-    let node: FolderNode
-    let isRoot: Bool
-    let model: NotesModel
-    let height: CGFloat
-
-    private func landing(_ info: DropInfo) -> DropMark {
-        guard isRoot, SidebarDrag.kind == .notebook else { return .into }
-        return info.location.y > height / 2 ? .after : .before
-    }
-
-    func validateDrop(info: DropInfo) -> Bool {
-        (SidebarDrag.kind == .notebook || SidebarDrag.kind == .item)
-            && info.hasItemsConforming(to: [UTType.plainText.identifier])
-    }
-
-    func dropEntered(info: DropInfo) {
-        SidebarDropHighlight.shared.show(row, landing(info))
-    }
-
-    func dropExited(info: DropInfo) {
-        SidebarDropHighlight.shared.clear(row)
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        SidebarDropHighlight.shared.show(row, landing(info))
-        return DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        let landed = landing(info)
-        SidebarDrag.ended()
-        let targetUrl = node.url
-        guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
-            return false
-        }
-        loadPayload(provider) { payload in
-            if landed != .into {
-                model.reorderRootFolder(payload, adjacentTo: targetUrl, after: landed == .after)
-                return
-            }
-            for url in payload.components(separatedBy: "\n") where url.hasPrefix("automerge:") {
-                model.moveItem(url, into: targetUrl)
-            }
-        }
-        return true
     }
 }
 
