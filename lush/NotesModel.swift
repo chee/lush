@@ -203,7 +203,7 @@ final class NotesModel {
     @ObservationIgnored private var lastWidgetSnapshot: LushWidgetSnapshot?
     private var lastKnownCounts: [String: Int] = [:]
     private static let patchworkDocUrlsKey = "patchworkDocUrls"
-    private static let bootStart = Date()
+    nonisolated private static let bootStart = Date()
     private(set) var patchworkDocUrls: Set<String> = Set(
         UserDefaults.standard.stringArray(forKey: patchworkDocUrlsKey) ?? []
     )
@@ -502,14 +502,20 @@ final class NotesModel {
         bootTrace.append("+\(ms)ms \(message)")
         let text = bootTrace.joined(separator: "\n") + "\n"
         bootTraceLock.unlock()
-        try? FileManager.default.createDirectory(
-            at: bootTraceURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? text.write(to: bootTraceURL, atomically: true, encoding: .utf8)
+        bootTraceQueue.async {
+            try? FileManager.default.createDirectory(
+                at: bootTraceURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? text.write(to: bootTraceURL, atomically: true, encoding: .utf8)
+        }
     }
 
-    private static let bootTraceLock = NSLock()
+    nonisolated private static let bootTraceLock = NSLock()
+    nonisolated private static let bootTraceQueue = DispatchQueue(
+        label: "party.chee.lush.boot-trace",
+        qos: .utility
+    )
     nonisolated(unsafe) private static var bootTrace: [String] = []
     nonisolated static let bootTraceURL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -913,11 +919,12 @@ final class NotesModel {
             // open instantly; folder retargeting happens behind the scenes
             selectedNoteUrl = url
             if let parent = node.parentUrl {
-                core?.refreshFolderEntry(folderUrl: parent, url: url)
-                if parent != folderUrl {
-                    await selectFolder(parent)
-                    selectedNoteUrl = url
+                if let core {
+                    Task.detached { [core, parent, url] in
+                        core.refreshFolderEntry(folderUrl: parent, url: url)
+                    }
                 }
+                folderUrl = parent
             }
         }
     }
@@ -1028,7 +1035,6 @@ final class NotesModel {
         let visible = visibleNotes(in: tree)
         let localMs = Int(Date().timeIntervalSince(start) * 1000)
         let unprefetched = notes.map(\.url).filter { !prefetched.contains($0) }
-        if !unprefetched.isEmpty { core.prefetchNotes(urls: unprefetched) }
         return TreeWalk(
             notes: notes,
             folderTitle: folderTitle,
@@ -1051,47 +1057,67 @@ final class NotesModel {
         let fetched = metaFetched
         let prefetched = prefetchedUrls
         Self.bootLog("refreshNotes begin roots=\(rootUrls.count)")
-        Task.detached { [core, rootUrls, cache, fetched, prefetched, treeGen, refreshGen, prepared, weak self] in
-            let walk: TreeWalk
-            if let prepared {
-                walk = prepared
-            } else {
-                walk = await Self.walkTree(
-                    core: core,
-                    rootUrls: rootUrls,
-                    cache: cache,
-                    prefetched: prefetched
-                )
+        if let prepared {
+            guard publishRefresh(prepared, treeGen: treeGen, refreshGen: refreshGen) else { return }
+            finishRefresh(core: core, walk: prepared, fetched: fetched, refreshGen: refreshGen)
+            return
+        }
+        Task.detached { [core, rootUrls, cache, fetched, prefetched, treeGen, refreshGen, weak self] in
+            let walk = await Self.walkTree(
+                core: core,
+                rootUrls: rootUrls,
+                cache: cache,
+                prefetched: prefetched
+            )
+            await MainActor.run { [weak self] in
+                guard let self,
+                      self.publishRefresh(walk, treeGen: treeGen, refreshGen: refreshGen)
+                else { return }
+                self.finishRefresh(core: core, walk: walk, fetched: fetched, refreshGen: refreshGen)
             }
-            let notes = walk.notes
-            let folderTitle = walk.folderTitle
-            let tree = walk.tree
-            let newCache = walk.cache
-            let visible = walk.visible
-            let localMs = walk.localMs
-            let unprefetched = walk.unprefetched
-            let richNotes = visible.filter { $0.kind == "rich" }.map {
-                NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
+        }
+    }
+
+    private func publishRefresh(_ walk: TreeWalk, treeGen: Int, refreshGen: Int) -> Bool {
+        guard refreshGeneration == refreshGen else { return false }
+        prefetchedUrls.formUnion(walk.unprefetched)
+        notes = walk.notes
+        folderTitle = walk.folderTitle
+        if treeGeneration == treeGen {
+            folderTree = walk.tree
+            folderNodeCache = walk.cache
+        }
+        if let selected = selectedNoteUrl, node(for: selected) == nil {
+            selectedNoteUrl = nil
+        }
+        Self.bootLog(
+            "sidebar published notes=\(walk.notes.count) visible=\(walk.visible.count) localMs=\(walk.localMs)"
+        )
+        return true
+    }
+
+    private func finishRefresh(core: Core, walk: TreeWalk, fetched: Set<String>, refreshGen: Int) {
+        let visible = walk.visible
+        let unprefetched = walk.unprefetched
+        let urlsNeedingMeta = visible.map(\.url).filter { !fetched.contains($0) }
+        let richNotes = visible.filter { $0.kind == "rich" }.map {
+            NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
+        }
+        let fileNotes = visible.filter { $0.kind == "file" }.map {
+            NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
+        }
+        if !unprefetched.isEmpty {
+            Task.detached { [core, unprefetched] in
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                core.prefetchNotes(urls: unprefetched)
             }
-            let urlsNeedingMeta = visible.map(\.url).filter { !fetched.contains($0) }
-            let published = await MainActor.run { [weak self] () -> Bool in
-                guard let self, self.refreshGeneration == refreshGen else { return false }
-                self.prefetchedUrls.formUnion(unprefetched)
-                self.notes = notes
-                self.folderTitle = folderTitle
-                if self.treeGeneration == treeGen {
-                    self.folderTree = tree
-                    self.folderNodeCache = newCache
-                }
-                if let selected = self.selectedNoteUrl, self.node(for: selected) == nil {
-                    self.selectedNoteUrl = nil
-                }
-                Self.bootLog(
-                    "sidebar published notes=\(notes.count) visible=\(visible.count) localMs=\(localMs)"
-                )
-                return true
-            }
-            guard published else { return }
+        }
+        Task.detached { [core, urlsNeedingMeta, visible, richNotes, fileNotes, refreshGen, weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled,
+                  await MainActor.run(body: { [weak self] in self?.refreshGeneration == refreshGen })
+            else { return }
             let metaStart = Date()
             let (newPreviews, newThumbnails) = await Self.fetchMeta(
                 core: core,
@@ -1105,9 +1131,6 @@ final class NotesModel {
                 self.pruneRows(to: liveUrls)
                 self.metaFetched.formUnion(newPreviews.keys)
                 self.metaFetched.formIntersection(liveUrls)
-                let fileNotes = visible.filter { $0.kind == "file" }.map {
-                    NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
-                }
                 self.backfillSemanticIndex(for: richNotes)
                 self.backfillFileSemanticIndex(for: fileNotes)
                 self.backfillSpotlightIndex(for: richNotes)
@@ -1857,7 +1880,8 @@ final class NotesModel {
         let spans = await Task.detached {
             SpanNode.decodeList(snapshot.spansJson)
         }.value
-        let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        let cache = await snapshotAssetCache(for: spans)
+        let attributed = RichText.attributed(from: spans, cache: cache)
         if !snapshot.heads.isEmpty {
             renderedSnapshotCache[key] = attributed
             renderedRecency.removeAll { $0 == key }
@@ -1867,6 +1891,46 @@ final class NotesModel {
             }
         }
         return attributed
+    }
+
+    private func snapshotAssetCache(for spans: [SpanNode]) async -> AssetCache {
+        let urls = Set(spans.compactMap { span -> String? in
+            guard case .block(let block) = span,
+                  block.isEmbedBlock,
+                  let url = block.embedUrl,
+                  url.hasPrefix("automerge:")
+            else { return nil }
+            return url
+        })
+        let assets = await withTaskGroup(
+            of: (String, Data?, AssetInfo?).self,
+            returning: [(String, Data?, AssetInfo?)].self
+        ) { group in
+            for url in urls {
+                group.addTask { [weak self] in
+                    guard let self else { return (url, nil, nil) }
+                    async let data = self.assetBytes(url)
+                    async let info = self.assetInfo(url)
+                    return await (url, data, info)
+                }
+            }
+            var assets: [(String, Data?, AssetInfo?)] = []
+            for await asset in group {
+                assets.append(asset)
+            }
+            return assets
+        }
+        let cache = AssetCache()
+        for (url, data, info) in assets {
+            if let data, let image = PImage(data: data) {
+                cache.images[url] = image
+            } else if let info, !info.name.isEmpty {
+                cache.names[url] = info.name
+            } else if data == nil {
+                cache.patchworkDocs.insert(url)
+            }
+        }
+        return cache
     }
 
     /// The snapshot with `.amChanged` stamped on paragraphs that differ from

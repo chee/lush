@@ -957,6 +957,17 @@ enum EditorSettings {
 }
 
 enum RichText {
+    private static let loadingEmbedImage = PImage.draw(size: CGSize(width: 460, height: 140)) { context in
+        context.setFillColor(PColor.pSecondaryLabel.withAlphaComponent(0.12).cgColor)
+        context.addPath(CGPath(
+            roundedRect: CGRect(x: 0, y: 0, width: 460, height: 140),
+            cornerWidth: 8,
+            cornerHeight: 8,
+            transform: nil
+        ))
+        context.fillPath()
+    }
+
     static var bodySize: CGFloat { EditorSettings.bodySize }
 
     /// The families a `font` mark may name.
@@ -1360,7 +1371,11 @@ enum RichText {
             // unknown block types render as the live chip, never as blank space
             attachment = liveBox(width: 320, height: 44)
         } else {
-            attachment = liveBox(width: 460, height: 140)
+            attachment = imageBox(
+                loadingEmbedImage,
+                bounds: CGRect(x: 0, y: 0, width: 460, height: 140),
+                ideal: CGSize(width: 460, height: 140)
+            )
         }
         let string = NSMutableAttributedString(attachment: attachment)
         string.addAttributes(attrs, range: NSRange(location: 0, length: string.length))

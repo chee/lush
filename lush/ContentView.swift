@@ -51,6 +51,8 @@ struct ContentView: View {
     @State private var searchPresented = false
     @State private var searchHits: [SearchHit] = []
     @State private var searchTask: Task<Void, Never>?
+    @State private var sidebarSelectionTask: Task<Void, Never>?
+    @State private var deferredSidebarTag: String?
     @State private var searchScope: String?
     @State private var renamingUrl: String?
     @State private var renameText = ""
@@ -90,14 +92,12 @@ struct ContentView: View {
             // field mid-query.
             if !searchFocused { sidebarFocused = true }
             smartEditor = nil
+            let deferred = deferredSidebarTag
+            deferredSidebarTag = nil
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
             guard !tag.hasPrefix("smart:"), tag != Agenda.sidebarTag, tag != Agenda.meetingNotesTag else { return }
-            let url = Self.sidebarUrl(tag)
-            if let node = model.node(for: url), node.kind == "folder" {
-                Task { await model.selectFolder(url) }
-            } else {
-                Task { await model.selectItem(url) }
-            }
+            let delay = deferred == tag ? 80 : 0
+            scheduleSidebarSelection(Self.sidebarUrl(tag), delay: delay)
         }
         .onChange(of: model.activeEditor?.padded) { _, padded in
             guard let padded, padded > 0 else { return }
@@ -506,6 +506,19 @@ struct ContentView: View {
         sidebarFocused = true
     }
 
+    private func scheduleSidebarSelection(_ url: String, delay: Int) {
+        sidebarSelectionTask?.cancel()
+        sidebarSelectionTask = Task {
+            if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+            guard !Task.isCancelled else { return }
+            if let node = model.node(for: url), node.kind == "folder" {
+                await model.selectFolder(url)
+            } else {
+                await model.selectItem(url)
+            }
+        }
+    }
+
     private var visibleSidebarRowTags: [String] {
         if !searchText.isEmpty { return searchHits.map(\.url) }
         var tags: [String] = []
@@ -550,8 +563,10 @@ struct ContentView: View {
         let rows = visibleSidebarRowTags
         guard !rows.isEmpty else { return .ignored }
         let current = rows.firstIndex { selectedItemUrls.contains($0) }
+        if current == nil, !selectedItemUrls.isEmpty { return .handled }
         let index = min(max((current ?? (offset > 0 ? -1 : rows.count)) + offset, 0), rows.count - 1)
         let tag = rows[index]
+        deferredSidebarTag = tag
         selectedItemUrls = [tag]
         revealTarget = tag
         return .handled
@@ -1014,7 +1029,9 @@ struct ContentView: View {
     /// clicked gets the pink, every other copy of it gets the system's
     /// unfocused grey.
     private func selectionBackground(url: String, tag: String) -> SidebarSelectionRow {
-        if selectedItemUrls.contains(tag) { return SidebarSelectionRow(state: .clicked) }
+        if selectedItemUrls.contains(tag) {
+            return SidebarSelectionRow(state: sidebarFocused ? .clicked : .echo)
+        }
         let selectedElsewhere = selectedItemUrls.contains {
             $0 != tag && Self.isRowTag($0) && Self.sidebarUrl($0) == url
         }

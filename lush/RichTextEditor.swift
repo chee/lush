@@ -651,6 +651,7 @@ final class EditorCore {
                             self.rebuildHiddenRanges(previous: hiddenBefore)
                         }
                     }
+                    self.placePendingAttachmentViews()
                 }
             }
         }
