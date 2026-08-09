@@ -648,6 +648,18 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         }
     }
 
+    /// The line box of an embed drawn by a hosted view, if this fragment is
+    /// one.
+    private var hostedEmbedRect: CGRect? {
+        guard let paragraph = textElement as? NSTextParagraph else { return nil }
+        let string = paragraph.attributedString
+        guard string.length > 0, string.length <= 2,
+              string.attribute(.attachment, at: 0, effectiveRange: nil) is EmbedAttachment,
+              let line = textLineFragments.first
+        else { return nil }
+        return line.typographicBounds
+    }
+
     override func draw(at point: CGPoint, in context: CGContext) {
         #if os(macOS)
         NSGraphicsContext.saveGraphicsState()
@@ -688,6 +700,14 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
             )
         }
         super.draw(at: point, in: context)
+        // super.draw is what builds the attachment's view provider, and an
+        // imageless attachment draws TextKit's generic document icon in that
+        // same pass — one frame before the view mounts. Wipe it; the loading
+        // view is what should be seen there.
+        if let embedRect = hostedEmbedRect {
+            PColor.pOnTint.setFill()
+            PBezierPath(rect: embedRect).fill()
+        }
         if let block = decoratedBlock(attrs), block.type == "blockquote",
            let width = textLayoutManager?.textContainer?.size.width {
             let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }

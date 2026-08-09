@@ -40,11 +40,14 @@ declare global {
       toolId?: string | null,
       draftUrl?: string | null,
       checkoutUrl?: string | null,
+      backingUrl?: string | null,
     ) => Promise<void>;
+    setOverlay?: (docUrl: string, backingUrl: string | null) => void;
     setContextTool?: (
       toolId: string | null,
       docUrl?: string | null,
       checkoutUrl?: string | null,
+      backingUrl?: string | null,
     ) => void;
     webkit?: {
       messageHandlers?: {

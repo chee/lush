@@ -99,6 +99,14 @@ extension PColor {
         .systemBackground
         #endif
     }
+
+    static var pGroupedBackground: PColor {
+        #if os(macOS)
+        .windowBackgroundColor
+        #else
+        .systemGroupedBackground
+        #endif
+    }
 }
 
 extension PImage {

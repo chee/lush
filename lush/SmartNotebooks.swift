@@ -304,43 +304,38 @@ struct SmartNotebookEditor: View {
     }
 
     private var fields: some View {
-        Form {
-            Section {
-                HStack(spacing: 8) {
-                    Image(systemName: "folder.badge.gearshape")
-                    TextField("Name", text: $name, prompt: Text("Untitled"))
-                        .textFieldStyle(.plain)
-                }
-                .font(.title3.weight(.medium))
-                .padding(.vertical, 6)
-                .padding(.horizontal, 10)
-                .background(nameTint, in: RoundedRectangle(cornerRadius: 8))
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Color.clear)
-            }
-            Section {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                TextField("Untitled", text: $name)
+                    .textFieldStyle(.plain)
+                    .labelsHidden()
+                    .font(Font(EditorSettings.font(ofSize: EditorSettings.bodySize + 10, weight: .bold)))
                 SmartRuleGroup(rule: $root, depth: 0, move: move)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Color.clear)
-            } header: {
-                Text("Rules")
-            } footer: {
                 Text(
                     "“Contains” is loose: it ignores case and accents, and a Note rule also "
                         + "finds notes that mean the same thing without saying it. "
                         + "“Exactly” matches the characters as typed."
                 )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                settings
             }
-            Section {
-                Toggle("Show how many", isOn: $showCount)
-                Toggle("Notify me when that changes", isOn: $notifyOnChange)
-            } footer: {
-                if notificationsDenied {
-                    Text("Notifications are turned off for Lush in System Settings.")
-                }
+            .padding(22)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Show count", isOn: $showCount)
+            Toggle("Notify when count changes", isOn: $notifyOnChange)
+            if notificationsDenied {
+                Text("Notifications are turned off for Lush in System Settings.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
+        .toggleStyle(.switch)
     }
 
     /// A dragged rule leaves where it was and lands where it was dropped. A
@@ -372,10 +367,10 @@ struct SmartNotebookEditor: View {
     }
 }
 
-/// A block of rules. A group is its header and one line down the left of what
-/// it holds: the indent says where a rule sits, the line says where the group
-/// ends, and nothing is boxed. Values stay flush with the right edge at every
-/// depth, since the indent only ever eats into the left.
+/// A block of rules, laid out the way Shortcuts lays out a nested if: every
+/// row is a pill, a level in steps the left edge over, and the right edge
+/// stays where it is. Nothing is drawn round a group — the indent is the
+/// grouping, and the group's own "Add rule" marks where it ends.
 struct SmartRuleGroup: View {
     @Binding var rule: SmartRule
     let depth: Int
@@ -386,8 +381,6 @@ struct SmartRuleGroup: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
-                RuleDragHandle(id: rule.id)
-                    .opacity(remove != nil && hovering ? 1 : 0)
                 Text("Match")
                 Picker("", selection: $rule.op) {
                     ForEach(SmartRule.Op.allCases, id: \.self) { op in
@@ -402,33 +395,32 @@ struct SmartRuleGroup: View {
                     .opacity(hovering ? 1 : 0)
             }
             .font(.callout.weight(.medium))
-            .padding(.vertical, 4)
+            .rulePill(groupTint)
+            .draggable(rule.id.uuidString)
+            .ruleDropTarget(group: rule.id, index: 0, move: move)
+            .padding(.leading, ruleIndent * CGFloat(depth))
             .onHover { hovering = $0 }
-            HStack(alignment: .top, spacing: 0) {
-                Capsule()
-                    .fill(railTint)
-                    .frame(width: 1.5)
-                    .frame(maxHeight: .infinity)
-                    .padding(.trailing, 13)
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array($rule.children.enumerated()), id: \.element.id) { index, $child in
-                        RuleDropSlot(group: rule.id, index: index, move: move)
-                        if child.isGroup {
-                            SmartRuleGroup(
-                                rule: $child,
-                                depth: depth + 1,
-                                move: move,
-                                remove: { drop(child.id) }
-                            )
-                        } else {
-                            SmartRuleRow(rule: $child, remove: { drop(child.id) })
-                        }
-                    }
-                    RuleDropSlot(group: rule.id, index: rule.children.count, move: move)
-                    SmartRuleAddMenu(add: add)
-                        .padding(.vertical, 3)
+            ForEach(Array($rule.children.enumerated()), id: \.element.id) { index, $child in
+                RuleDropSlot(group: rule.id, index: index, move: move)
+                    .padding(.leading, ruleIndent * CGFloat(depth + 1))
+                if child.isGroup {
+                    SmartRuleGroup(
+                        rule: $child,
+                        depth: depth + 1,
+                        move: move,
+                        remove: { drop(child.id) }
+                    )
+                } else {
+                    SmartRuleRow(rule: $child, remove: { drop(child.id) })
+                        .ruleDropTarget(group: rule.id, index: index + 1, move: move)
+                        .padding(.leading, ruleIndent * CGFloat(depth + 1))
                 }
             }
+            RuleDropSlot(group: rule.id, index: rule.children.count, move: move)
+                .padding(.leading, ruleIndent * CGFloat(depth + 1))
+            SmartRuleAddMenu(add: add)
+                .padding(.top, 4)
+                .padding(.leading, ruleIndent * CGFloat(depth + 1) + 12)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -451,10 +443,13 @@ struct RuleDropSlot: View {
     @State private var targeted = false
 
     var body: some View {
-        RoundedRectangle(cornerRadius: 1.5)
-            .fill(targeted ? Color.accentColor : .clear)
-            .frame(height: 3)
-            .padding(.vertical, 2.5)
+        Color.clear
+            .frame(height: 10)
+            .overlay {
+                Capsule()
+                    .fill(targeted ? Color.accentColor : .clear)
+                    .frame(height: 3)
+            }
             .contentShape(Rectangle())
             .dropDestination(for: String.self) { items, _ in
                 guard let id = items.first.flatMap({ UUID(uuidString: $0) }) else { return false }
@@ -464,15 +459,31 @@ struct RuleDropSlot: View {
     }
 }
 
-struct RuleDragHandle: View {
-    let id: UUID
+/// A pill takes a drop too, not only the gaps: landing on one puts the dragged
+/// rule just after it, and landing on a group's header puts it inside.
+private struct RuleDropTarget: ViewModifier {
+    let group: UUID
+    let index: Int
+    let move: (UUID, UUID, Int) -> Void
+    @State private var targeted = false
 
-    var body: some View {
-        Image(systemName: "line.3.horizontal")
-            .font(.caption)
-            .foregroundStyle(.tertiary)
-            .draggable(id.uuidString)
-            .help("Drag to move")
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.accentColor, lineWidth: targeted ? 2 : 0)
+            }
+            .dropDestination(for: String.self) { items, _ in
+                guard let id = items.first.flatMap({ UUID(uuidString: $0) }) else { return false }
+                move(id, group, index)
+                return true
+            } isTargeted: { targeted = $0 }
+    }
+}
+
+extension View {
+    func ruleDropTarget(group: UUID, index: Int, move: @escaping (UUID, UUID, Int) -> Void) -> some View {
+        modifier(RuleDropTarget(group: group, index: index, move: move))
     }
 }
 
@@ -484,8 +495,6 @@ struct SmartRuleRow: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            RuleDragHandle(id: rule.id)
-                .opacity(hovering ? 1 : 0)
             SmartRuleTypeMenu(rule: $rule)
             comparison
             Spacer(minLength: 12)
@@ -495,8 +504,8 @@ struct SmartRuleRow: View {
                 .opacity(hovering ? 1 : 0)
         }
         .font(.callout)
-        .padding(.vertical, 3)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .rulePill(rowTint)
+        .draggable(rule.id.uuidString)
         .onHover { hovering = $0 }
     }
 
@@ -534,8 +543,9 @@ struct SmartRuleRow: View {
     @ViewBuilder private var value: some View {
         switch rule.body {
         case let .text(field, whole, exact, text):
-            TextField("text to find", text: bind(text) { .text(field, whole: whole, exact: exact, $0) })
+            TextField("", text: bind(text) { .text(field, whole: whole, exact: exact, $0) }, prompt: Text("text to find"))
                 .textFieldStyle(.roundedBorder)
+                .labelsHidden()
                 .frame(minWidth: 120, maxWidth: 260)
         case let .kind(kind):
             Picker("", selection: bind(kind) { .kind($0) }) {
@@ -664,8 +674,18 @@ struct RuleDeleteButton: View {
     }
 }
 
-private let railTint = Color.orange.opacity(0.35)
-private let nameTint = Color.pink.opacity(0.14)
+private let ruleIndent: CGFloat = 18
+private let groupTint = Color.yellow.opacity(0.22)
+private let rowTint = Color.pink.opacity(0.14)
+
+extension View {
+    func rulePill(_ tint: Color) -> some View {
+        padding(.vertical, 7)
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(tint, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
 
 func smartNotebook(
     id: String,

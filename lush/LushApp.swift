@@ -16,10 +16,13 @@ private extension NSResponder {
 @MainActor
 final class LushAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
+        NotesModel.bootLog("appDelegate willFinishLaunching")
         LushShared.migrateDefaults()
+        NotesModel.bootLog("defaults migrated")
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NotesModel.bootLog("appDelegate didFinishLaunching")
         NSApp.servicesProvider = LushServicesProvider.shared
     }
 
@@ -385,8 +388,11 @@ struct LushApp: App {
     #endif
 
     init() {
+        NotesModel.bootLog("app init begin")
         LushShortcuts.updateAppShortcutParameters()
+        NotesModel.bootLog("shortcuts registered")
         InterfaceFont.applyNavigationBarAppearance(family: InterfaceFont.family)
+        NotesModel.bootLog("fonts applied")
         #if os(iOS) || os(visionOS)
         BackgroundSync.register()
         #endif
@@ -396,6 +402,7 @@ struct LushApp: App {
         // startTask, so this only moves the start earlier.
         NotesModel.shared.prewarm()
         Task { @MainActor in await NotesModel.shared.start() }
+        NotesModel.bootLog("app init done")
     }
 
     var body: some Scene {

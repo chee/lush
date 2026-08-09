@@ -8,7 +8,7 @@ import {
   type AutomergeUrl,
   type PeerId,
 } from "@automerge/automerge-repo/slim";
-import { registerRepoProviderElement } from "@inkandswitch/patchwork-providers";
+import { accept, registerRepoProviderElement } from "@inkandswitch/patchwork-providers";
 import { registerPatchworkViewElement } from "@inkandswitch/patchwork-elements";
 import { ModuleWatcher } from "@inkandswitch/patchwork-filesystem";
 import {
@@ -89,6 +89,61 @@ class NativeStorageAdapter {
   async removeRange(keyPrefix: string[]) {
     await this.#call({ op: "removeRange", key: keyPrefix });
   }
+}
+
+// The native half of the draft overlay: the app knows which document the
+// view should really be reading — a draft's clone, pinned to the version the
+// history inspector is scrubbed to — and says so directly, rather than
+// through a doc the webview's repo would have to sync first.
+//
+// Answers `repo:handle-descriptor` for the mounted doc only (nested docs fall
+// through to the draft overlay above us, which forks them lazily), and
+// re-answers every live subscription on `set`, so OverlayRepo swaps the
+// handle's backing in place: scrubbing rolls the tool back with no remount.
+function docRemapper(docUrl: string, initial: string | null) {
+  const element = document.createElement("div");
+  element.style.display = "contents";
+  const responders = new Set<() => void>();
+  let backing = initial;
+
+  const mounted = isValidAutomergeUrl(docUrl)
+    ? parseAutomergeUrl(docUrl as AutomergeUrl).documentId
+    : undefined;
+  // Only the doc itself: a sub-document path under the same id is a different
+  // document to the overlay repo, and we have no mapping for it.
+  const isMountedDoc = (raw: unknown) => {
+    if (typeof raw !== "string" || !mounted) return false;
+    if (raw.slice("automerge:".length).includes("/")) return false;
+    if (!isValidAutomergeUrl(raw)) return false;
+    return parseAutomergeUrl(raw as AutomergeUrl).documentId === mounted;
+  };
+
+  element.addEventListener("patchwork:subscribe", (event: Event) => {
+    const detail = (event as CustomEvent).detail;
+    if (detail?.selector?.type !== "repo:handle-descriptor") return;
+    if (!isMountedDoc(detail.selector.url)) return;
+    accept<{ url: string; cloneUrl?: string }>(
+      event as never,
+      (respond: (descriptor: { url: string; cloneUrl?: string }) => void) => {
+        const send = () =>
+          respond(backing ? { url: docUrl, cloneUrl: backing } : { url: docUrl });
+        responders.add(send);
+        send();
+        return () => {
+          responders.delete(send);
+        };
+      },
+    );
+  });
+
+  return {
+    element,
+    set(next: string | null) {
+      if (next === backing) return;
+      backing = next;
+      for (const send of [...responders]) send();
+    },
+  };
 }
 
 // The one bit the host's activation machine needs: does anything in
@@ -196,17 +251,26 @@ async function boot() {
       console.warn("lush: could not load embedded doc", error);
     }
     const type = String(doc?.["@patchwork"]?.type ?? "");
-    const firstToolFor = (t: string) =>
-      (getSupportedToolsForType(t) ?? []).filter((tool: any) => !tool.unlisted)[0]
-        ?.id;
+    const listedToolsFor = (t: string) =>
+      (getSupportedToolsForType(t) ?? []).filter((tool: any) => !tool.unlisted);
+    const firstToolFor = (t: string) => listedToolsFor(t)[0]?.id;
+    // A `*` tool renders anything and so says nothing about this datatype:
+    // the doc's own suggested package is the better answer, and is worth
+    // fetching until something names the type outright.
+    const namedToolFor = (t: string) =>
+      listedToolsFor(t).find(
+        (tool: any) =>
+          Array.isArray(tool.supportedDatatypes) &&
+          tool.supportedDatatypes.includes(t),
+      )?.id;
     if (!toolId) {
-      toolId = firstToolFor(type);
+      toolId = namedToolFor(type);
       const suggested = doc?.["@patchwork"]?.suggestedImportUrl;
       if (!toolId && suggested && isValidAutomergeUrl(String(suggested))) {
         try {
           const mod = await importToolPackage(String(suggested) as AutomergeUrl);
           toolId =
-            firstToolFor(type) ??
+            namedToolFor(type) ??
             (mod?.plugins ?? []).find(
               (plugin: any) => plugin?.type === "patchwork:tool",
             )?.id;
@@ -214,6 +278,7 @@ async function boot() {
           console.warn("lush: suggested tool import failed", error);
         }
       }
+      toolId ??= firstToolFor(type);
       if (toolId && view.isConnected) view.setAttribute("tool-id", toolId);
     }
     if (!view.isConnected) return;
@@ -238,8 +303,9 @@ async function boot() {
   // around the tree answers the overlay's `draft:checked-out`
   // subscription with it, standing in for patchwork's draft-list
   // provider, so per-member checkpoint pins apply while scrubbing.
-  window.setDoc = async (docUrl, toolId, draftUrl, checkoutUrl) => {
+  window.setDoc = async (docUrl, toolId, draftUrl, checkoutUrl, backingUrl) => {
     if (!docUrl) {
+      window.setOverlay = undefined;
       document.body.classList.remove("loading");
       document.body.replaceChildren();
       status("");
@@ -249,15 +315,17 @@ async function boot() {
     const view = document.createElement("patchwork-view");
     if (toolId) view.setAttribute("tool-id", toolId);
     view.setAttribute("doc-url", docUrl);
+    const remapper = docRemapper(docUrl, backingUrl ?? null);
+    remapper.element.appendChild(view);
     const provider = document.createElement("repo-provider");
     if (draftUrl || checkoutUrl) {
       const overlay = document.createElement("patchwork-view");
       overlay.setAttribute("component", "patchwork-draft-overlay-provider");
       if (draftUrl) overlay.setAttribute("url", draftUrl);
-      overlay.appendChild(view);
+      overlay.appendChild(remapper.element);
       provider.appendChild(overlay);
     } else {
-      provider.appendChild(view);
+      provider.appendChild(remapper.element);
     }
     let mountRoot: Element = provider;
     if (checkoutUrl) {
@@ -272,6 +340,10 @@ async function boot() {
       shim.appendChild(provider);
       mountRoot = shim;
     }
+    window.setOverlay = (url, next) => {
+      if (url !== docUrl || !view.isConnected) return;
+      remapper.set(next ?? null);
+    };
     document.body.replaceChildren(mountRoot);
     // Pulse until the tool actually renders something (content may live in
     // a shadow root, so poll rather than observe). A superseded view stops
@@ -432,6 +504,7 @@ function installContextMode(
   const accountUrl = params.get("account-url");
   let docUrl = params.get("doc-url");
   let checkoutUrl = params.get("checkout-url");
+  let backingUrl = params.get("backing-url");
   const registry = getRegistry("patchwork:component");
   const publish = () => {
     const tools = (registry.all?.() ?? [])
@@ -446,14 +519,15 @@ function installContextMode(
     post({ kind: "context-tools", tools });
   };
 
-  window.setContextTool = (toolId, nextDocUrl, nextCheckoutUrl) => {
+  window.setContextTool = (toolId, nextDocUrl, nextCheckoutUrl, nextBackingUrl) => {
     if (nextDocUrl !== undefined) docUrl = nextDocUrl;
     if (nextCheckoutUrl !== undefined) checkoutUrl = nextCheckoutUrl;
+    if (nextBackingUrl !== undefined) backingUrl = nextBackingUrl;
     if (!toolId) {
       document.body.replaceChildren();
       return;
     }
-    let root = document.createElement("patchwork-view");
+    let root: HTMLElement = document.createElement("patchwork-view");
     root.setAttribute("component", toolId);
     const wrap = (component: string, url?: string | null) => {
       const wrapper = document.createElement("patchwork-view");
@@ -472,10 +546,14 @@ function installContextMode(
     if (docUrl) location.hash = `doc=${docUrl}`;
     wrap("patchwork-selected-doc-provider");
     const selectedDocProvider = root;
-    // Same overlay the editor mounts: docUrl stays the origin, and the draft
-    // overlay re-points the handles beneath it — to the checked-out draft's
-    // clone, pinned to the checkpoint heads — in place, so scrubbing and
-    // switching drafts swap backings instead of remounting the tool.
+    // Same mapping the editor mounts: the tools speak about the origin url
+    // while reading the checked-out draft's clone. The app says which doc
+    // that is; the draft overlay handles everything nested under it.
+    if (docUrl) {
+      const remapper = docRemapper(docUrl, backingUrl);
+      remapper.element.appendChild(root);
+      root = remapper.element;
+    }
     if (checkoutUrl) wrap("patchwork-draft-overlay-provider");
     const provider = document.createElement("repo-provider");
     provider.appendChild(root);

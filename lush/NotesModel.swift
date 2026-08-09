@@ -216,9 +216,8 @@ final class NotesModel {
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
     @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
-    /// The root folder finished loading before the main actor was free to adopt
-    /// the core, so its `docChanged` had nothing to refresh.
-    @ObservationIgnored private var pendingStartupRefresh = false
+    @ObservationIgnored private var prewarmWalkTask: Task<TreeWalk?, Never>?
+    @ObservationIgnored private var deferredStartupRefresh = false
 
     init() {
         Self.bootLog("model init")
@@ -494,10 +493,28 @@ final class NotesModel {
         LushShared.rootFolderUrls = rootFolderUrls
     }
 
-    nonisolated private static func bootLog(_ message: String) {
+    /// Written to a file as well as the log: os_log drops messages under load,
+    /// and a boot trace with holes in it is worse than none.
+    nonisolated static func bootLog(_ message: String) {
         let ms = Int(Date().timeIntervalSince(bootStart) * 1000)
         NSLog("lush boot +%dms %@", ms, message)
+        bootTraceLock.lock()
+        bootTrace.append("+\(ms)ms \(message)")
+        let text = bootTrace.joined(separator: "\n") + "\n"
+        bootTraceLock.unlock()
+        try? FileManager.default.createDirectory(
+            at: bootTraceURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? text.write(to: bootTraceURL, atomically: true, encoding: .utf8)
     }
+
+    private static let bootTraceLock = NSLock()
+    nonisolated(unsafe) private static var bootTrace: [String] = []
+    nonisolated static let bootTraceURL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Lush", isDirectory: true)
+        .appendingPathComponent("boot-trace.log")
 
     /// Builds the core off the main actor and starts the root folder loading
     /// from storage. Called from `LushApp.init`, where a `Task { @MainActor }`
@@ -510,7 +527,12 @@ final class NotesModel {
         let sendChanges = sendingChanges
         let bridge = DelegateBridge(model: self)
         delegateBridge = bridge
-        prewarmTask = Task.detached {
+        let priority: String? = {
+            if case .note(let url) = AppRouter.shared.pending { return url }
+            guard saved.first != nil else { return nil }
+            return UserDefaults.standard.string(forKey: Self.lastOpenNoteKey)
+        }()
+        let task = Task.detached { () -> Core? in
             Self.bootLog("prewarm begin")
             guard let core = try? Core(dataDir: dataDir.path, serverUrl: nil) else { return nil }
             Self.bootLog("core constructed")
@@ -518,10 +540,23 @@ final class NotesModel {
             await core.setSendChanges(enabled: sendChanges)
             core.setDelegate(delegate: bridge)
             guard let first = saved.first else { return core }
+            // The note being opened goes in before the folder tree, so its
+            // storage load and background sync are queued ahead of the flood.
+            if let priority { core.prefetchNotes(urls: [priority]) }
             try? core.startFolderUrl(url: first)
             core.prefetchNotes(urls: Array(saved.dropFirst()))
             Self.bootLog("root folder scheduled for local load")
             return core
+        }
+        prewarmTask = task
+        guard let first = saved.first else { return }
+        prewarmWalkTask = Task.detached { () -> TreeWalk? in
+            guard let core = await task.value else { return nil }
+            try? await core.openNote(url: first)
+            Self.bootLog("root folder loaded")
+            let walk = await Self.walkTree(core: core, rootUrls: saved, cache: [:], prefetched: [])
+            Self.bootLog("prewarm walk done visible=\(walk.visible.count) localMs=\(walk.localMs)")
+            return walk
         }
     }
 
@@ -577,10 +612,7 @@ final class NotesModel {
                 persistRoots()
                 folderUrl = first
                 status = ""
-                if pendingStartupRefresh {
-                    pendingStartupRefresh = false
-                    refreshNotes()
-                }
+                refreshNotes(prepared: await prewarmWalkTask?.value)
                 startPolling()
                 startMaintenancePolling()
                 Self.bootLog("startup UI state queued")
@@ -969,7 +1001,46 @@ final class NotesModel {
         applyRootFolderOrder(reordered(rootFolderUrls, moving: url, adjacentTo: targetUrl, after: after))
     }
 
-    func refreshNotes() {
+    typealias FolderNodeCacheEntry = (heads: [String], node: FolderNode)
+
+    struct TreeWalk: Sendable {
+        let notes: [NoteInfo]
+        let folderTitle: String
+        let tree: [FolderNode]
+        let cache: [String: FolderNodeCacheEntry]
+        let visible: [FolderNode]
+        let unprefetched: [String]
+        let localMs: Int
+    }
+
+    nonisolated private static func walkTree(
+        core: Core,
+        rootUrls: [String],
+        cache: [String: FolderNodeCacheEntry],
+        prefetched: Set<String>
+    ) async -> TreeWalk {
+        let start = Date()
+        async let notesTask = core.listNotes()
+        async let titleTask = core.folderTitle()
+        let notes = await notesTask
+        let folderTitle = await titleTask
+        let (tree, newCache) = await computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
+        let visible = visibleNotes(in: tree)
+        let localMs = Int(Date().timeIntervalSince(start) * 1000)
+        let unprefetched = notes.map(\.url).filter { !prefetched.contains($0) }
+        if !unprefetched.isEmpty { core.prefetchNotes(urls: unprefetched) }
+        return TreeWalk(
+            notes: notes,
+            folderTitle: folderTitle,
+            tree: tree,
+            cache: newCache,
+            visible: visible,
+            unprefetched: unprefetched,
+            localMs: localMs
+        )
+    }
+
+    func refreshNotes(prepared: TreeWalk? = nil) {
         guard let core else { return }
         treeGeneration += 1
         refreshGeneration += 1
@@ -980,17 +1051,25 @@ final class NotesModel {
         let fetched = metaFetched
         let prefetched = prefetchedUrls
         Self.bootLog("refreshNotes begin roots=\(rootUrls.count)")
-        Task.detached { [core, rootUrls, cache, fetched, prefetched, treeGen, refreshGen, weak self] in
-            let refreshStart = Date()
-            async let notesTask = core.listNotes()
-            async let titleTask = core.folderTitle()
-            let notes = await notesTask
-            let folderTitle = await titleTask
-            let (tree, newCache) = await Self.computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
-            let visible = Self.visibleNotes(in: tree)
-            let localMs = Int(Date().timeIntervalSince(refreshStart) * 1000)
-            let unprefetched = notes.map(\.url).filter { !prefetched.contains($0) }
-            if !unprefetched.isEmpty { core.prefetchNotes(urls: unprefetched) }
+        Task.detached { [core, rootUrls, cache, fetched, prefetched, treeGen, refreshGen, prepared, weak self] in
+            let walk: TreeWalk
+            if let prepared {
+                walk = prepared
+            } else {
+                walk = await Self.walkTree(
+                    core: core,
+                    rootUrls: rootUrls,
+                    cache: cache,
+                    prefetched: prefetched
+                )
+            }
+            let notes = walk.notes
+            let folderTitle = walk.folderTitle
+            let tree = walk.tree
+            let newCache = walk.cache
+            let visible = walk.visible
+            let localMs = walk.localMs
+            let unprefetched = walk.unprefetched
             let richNotes = visible.filter { $0.kind == "rich" }.map {
                 NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
             }
@@ -1163,6 +1242,10 @@ final class NotesModel {
         guard !startupSettled else { return }
         startupSettled = true
         drainStartupWaiters()
+        if deferredStartupRefresh {
+            deferredStartupRefresh = false
+            refreshNotes()
+        }
     }
 
     private func drainStartupWaiters() {
@@ -1359,10 +1442,6 @@ final class NotesModel {
     private var pendingRefreshUrls: Set<String> = []
 
     func docChanged(url: String) {
-        guard core != nil else {
-            pendingStartupRefresh = true
-            return
-        }
         pads.docChanged(url: url)
         folderNodeCache.removeValue(forKey: url)
         documentHistoryCache.removeValue(forKey: url)
@@ -1420,7 +1499,14 @@ final class NotesModel {
                 $0 == self.folderUrl || self.rootFolderUrls.contains($0)
             })
             if needsFullRefresh {
-                self.refreshNotes()
+                // Every prefetched note announces itself, and the roots are in
+                // that flood. One walk when the flood ends beats a walk that
+                // runs during it.
+                if self.startupSettled {
+                    self.refreshNotes()
+                } else {
+                    self.deferredStartupRefresh = true
+                }
             } else {
                 let treeChanged = urls.contains(where: { self.isFolderInTree($0) })
                 if treeChanged { self.buildTree() }
@@ -1710,7 +1796,10 @@ final class NotesModel {
         try? await core.openNote(url: url)
         guard let snapshot = try? await core.noteSpansSnapshot(url: url),
               !snapshot.heads.isEmpty
-        else { return nil }
+        else {
+            Self.bootLog("note snapshot empty ms=\(Int(Date().timeIntervalSince(start) * 1000))")
+            return nil
+        }
         Self.bootLog("note snapshot loaded from core ms=\(Int(Date().timeIntervalSince(start) * 1000))")
         return snapshot
     }

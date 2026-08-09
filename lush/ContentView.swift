@@ -91,9 +91,12 @@ struct ContentView: View {
             if !searchFocused { sidebarFocused = true }
             smartEditor = nil
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
-            let url = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
+            guard !tag.hasPrefix("smart:"), tag != Agenda.sidebarTag, tag != Agenda.meetingNotesTag else { return }
+            let url = Self.sidebarUrl(tag)
             if let node = model.node(for: url), node.kind == "folder" {
                 Task { await model.selectFolder(url) }
+            } else {
+                Task { await model.selectItem(url) }
             }
         }
         .onChange(of: model.activeEditor?.padded) { _, padded in
@@ -379,13 +382,11 @@ struct ContentView: View {
                     searchHitRow(hit)
                     .padding(.trailing, sidebarTrailingGutter)
                     .contentShape(Rectangle())
-                    .onTapGesture { Task { await model.selectItem(hit.url) } }
                     .tag(hit.url)
                     .onDrag({ SidebarDrag.provider(hit.url, kind: .item) }, preview: {
                         DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
                     })
                     .listRowInsets(sidebarRowInsets(depth: 0))
-                    .listRowBackground(selectionBackground(hit.url))
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
                             singleNoteContextMenu(for: node, showInFolder: true)
@@ -533,7 +534,6 @@ struct ContentView: View {
                     ForEach(model.smartNotebooks) { folder in
                         smartNotebookRow(folder)
                             .listRowInsets(sidebarRowInsets(depth: 0))
-                            .listRowBackground(selectionBackground("smart:\(folder.id)"))
                         if smartExpanded.contains(folder.id) {
                             ForEach(model.smartHits[folder.id] ?? [], id: \.url) { hit in
                                 smartHitRow(hit)
@@ -569,7 +569,6 @@ struct ContentView: View {
         .padding(.trailing, sidebarTrailingGutter)
         .contentShape(Rectangle())
         .onTapGesture { toggleSection(section) }
-        .background(SuppressListSelectionHighlight().frame(width: 0, height: 0))
         .modifier(SectionDragReorder(section: section, order: $sectionOrder))
         .listRowInsets(sidebarRowInsets(depth: 0))
     }
@@ -593,15 +592,11 @@ struct ContentView: View {
             .padding(.bottom, 5)
             .padding(.trailing, sidebarTrailingGutter)
             .contentShape(Rectangle())
-            .background(SuppressListSelectionHighlight().frame(width: 0, height: 0))
-            .onTapGesture {
-                // Coming back lands where she left. Clicking it while it is
-                // already showing is the one way to ask for today instead.
-                if calendarSelected {
-                    AgendaStore.shared.restoreDay = nil
-                    AgendaStore.shared.focusDay = Calendar.current.startOfDay(for: Date())
-                }
-                selectedItemUrls = [Agenda.sidebarTag]
+            .onTapGesture(count: 2) {
+                // Coming back lands where she left. Double-clicking it is the
+                // one way to ask for today instead.
+                AgendaStore.shared.restoreDay = nil
+                AgendaStore.shared.focusDay = Calendar.current.startOfDay(for: Date())
             }
             .contextMenu {
                 Button("Show Meeting Notes") {
@@ -610,7 +605,6 @@ struct ContentView: View {
             }
             .tag(Agenda.sidebarTag)
             .listRowInsets(sidebarRowInsets(depth: 0))
-            .listRowBackground(selectionBackground(Agenda.sidebarTag))
     }
 
     private var calendarSelected: Bool {
@@ -646,10 +640,6 @@ struct ContentView: View {
             .padding(.trailing, sidebarTrailingGutter)
             .contentShape(Rectangle())
             .padding(.leading, 12)
-            .onTapGesture {
-                selectedItemUrls = [tag]
-                Task { await model.selectItem(node.url) }
-            }
             .tag(tag)
             .id(tag)
             .onDrag({ SidebarDrag.provider(node.url, kind: .item) }, preview: {
@@ -657,7 +647,7 @@ struct ContentView: View {
             })
             .modifier(PinReorderTarget(url: node.url, model: model))
             .listRowInsets(sidebarRowInsets(depth: 1))
-            .listRowBackground(selectionBackground(tag, greyWhen: node.url))
+            .listRowBackground(duplicateTint(url: node.url, tag: tag))
             .contextMenu {
                 singleNoteContextMenu(for: node, showInFolder: true)
             }
@@ -670,16 +660,13 @@ struct ContentView: View {
                     folderRow(for: node, depth: depth)
                         .tag(node.url)
                         .listRowInsets(sidebarRowInsets(depth: depth))
-                        .listRowBackground(selectionBackground(node.url))
                     if expanded.contains(node.url) {
                         nodeRows(model.orderedChildren(node.children ?? [], in: node.url), depth: depth + 1)
                     }
                 } else {
                     noteRow(for: node, depth: depth)
                         .listRowInsets(sidebarRowInsets(depth: depth))
-                        .listRowBackground(
-                            selectionBackground(node.url, greyWhen: model.isPinned(node.url) ? "pinned:\(node.url)" : nil)
-                        )
+                        .listRowBackground(duplicateTint(url: node.url, tag: node.url))
                 }
             }
         )
@@ -743,8 +730,7 @@ struct ContentView: View {
         .padding(.bottom, 5)
         .padding(.trailing, sidebarTrailingGutter)
         .contentShape(Rectangle())
-        .onTapGesture {
-            selectedItemUrls = [tag]
+        .onTapGesture(count: 2) {
             if isOpen {
                 smartExpanded.remove(folder.id)
             } else {
@@ -790,17 +776,13 @@ struct ContentView: View {
             .padding(.trailing, sidebarTrailingGutter)
             .contentShape(Rectangle())
             .padding(.leading, 12)
-            .onTapGesture {
-                selectedItemUrls = [tag]
-                Task { await model.selectItem(hit.url) }
-            }
             .tag(tag)
             .id(tag)
             .onDrag({ SidebarDrag.provider(hit.url, kind: .item) }, preview: {
                 DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
             })
             .listRowInsets(sidebarRowInsets(depth: 1))
-            .listRowBackground(selectionBackground(tag, greyWhen: hit.url))
+            .listRowBackground(duplicateTint(url: hit.url, tag: tag))
             .contextMenu {
                 if let node = model.node(for: hit.url) {
                     singleNoteContextMenu(for: node, showInFolder: true)
@@ -876,16 +858,17 @@ struct ContentView: View {
         .padding(.top, 14)
         .padding(.bottom, 8)
         .listRowInsets(sidebarRowInsets(depth: 0))
-        .background(SuppressListSelectionHighlight().frame(width: 0, height: 0))
     }
 
-    @ViewBuilder
-    private func selectionBackground(_ tag: String, greyWhen greyTag: String? = nil) -> some View {
-        if selectedItemUrls.contains(tag) {
-            Self.selectionTint.opacity(0.22)
-        } else if let greyTag, selectedItemUrls.contains(greyTag) {
-            Color.secondary.opacity(0.12)
-        }
+    private func duplicateTint(url: String, tag: String) -> Color? {
+        let selectedElsewhere = selectedItemUrls.contains { $0 != tag && Self.sidebarUrl($0) == url }
+        return selectedElsewhere ? Color.secondary.opacity(0.12) : nil
+    }
+
+    private static func sidebarUrl(_ tag: String) -> String {
+        if tag.hasPrefix("pinned:") { return String(tag.dropFirst(7)) }
+        if tag.hasPrefix("smarthit:") { return String(tag.dropFirst(9)) }
+        return tag
     }
 
     private static let selectionTint = Color(red: 1.0, green: 0.412, blue: 0.647)
@@ -974,7 +957,7 @@ struct ContentView: View {
                     Spacer(minLength: 8)
                 }
                 .contentShape(Rectangle())
-                .onTapGesture {
+                .onTapGesture(count: 2) {
                     setExpanded(!expanded.contains(node.url), for: node.url)
                 }
             }
@@ -1090,20 +1073,6 @@ struct ContentView: View {
             .padding(.trailing, sidebarTrailingGutter)
             .contentShape(Rectangle())
             .padding(.leading, CGFloat(depth) * 8 + 4)
-            .onTapGesture {
-                guard renamingUrl != node.url else { return }
-                let flags = NSEvent.modifierFlags
-                if flags.contains(.command) {
-                    if selectedItemUrls.contains(node.url) {
-                        selectedItemUrls.remove(node.url)
-                    } else {
-                        selectedItemUrls.insert(node.url)
-                    }
-                } else {
-                    selectedItemUrls = [node.url]
-                    Task { await model.selectItem(node.url) }
-                }
-            }
             .tag(node.url)
             .onDrag({
                 let urls = selectedItemUrls.contains(node.url)
@@ -1252,28 +1221,16 @@ struct ContentView: View {
         // Checked-out drafts redirect the editor to the draft's clone; the
         // sidebar, node and title all keep speaking about the origin url.
         let resolved = model.resolvedNoteUrl(url)
-        if node == nil, isPatchwork {
-            // Known patchwork doc: open directly, no need to wait for the tree.
-            PatchworkDetail(
-                docUrl: url,
-                historyVersion: selectedHistoryEntry,
-                rightSidebarVisible: $rightSidebarVisible
-            )
-                .id(url)
-        } else if node == nil, url.hasPrefix("automerge:") {
-            // A doc url is enough to load the editor; the tree catches up.
-            NoteDetail(
-                noteUrl: resolved,
-                historyVersion: selectedHistoryEntry,
-                rightSidebarVisible: $rightSidebarVisible
-            )
-        } else if node == nil {
-            ResolvingDocumentView(url: url)
-        } else if node?.kind == "lush:script" {
-            ScriptEditorView(url: url)
-                .environment(model)
-                .id(url)
-        } else if !isPatchwork && (node?.isNote == true || (!url.hasPrefix("automerge:") && node?.isNote != false)) {
+        // One NoteDetail call site: a second one in another branch of this
+        // chain is a different view identity, so a new note's editor was torn
+        // down and rebuilt the moment the tree caught up and `node` resolved,
+        // leaving two EditorCores on one shared text storage.
+        let isNoteDetail: Bool = {
+            guard !isPatchwork else { return false }
+            guard let node else { return url.hasPrefix("automerge:") }
+            return node.isNote
+        }()
+        if isNoteDetail {
             // No .id here: the editor swaps documents through EditorCore.switchTo,
             // which keeps the text view, its layout manager and the asset cache.
             NoteDetail(
@@ -1281,6 +1238,20 @@ struct ContentView: View {
                 historyVersion: selectedHistoryEntry,
                 rightSidebarVisible: $rightSidebarVisible
             )
+        } else if node == nil, isPatchwork {
+            // Known patchwork doc: open directly, no need to wait for the tree.
+            PatchworkDetail(
+                docUrl: url,
+                historyVersion: selectedHistoryEntry,
+                rightSidebarVisible: $rightSidebarVisible
+            )
+                .id(url)
+        } else if node == nil {
+            ResolvingDocumentView(url: url)
+        } else if node?.kind == "lush:script" {
+            ScriptEditorView(url: url)
+                .environment(model)
+                .id(url)
         } else {
             PatchworkDetail(
                 docUrl: url,
@@ -1332,26 +1303,10 @@ struct ContentView: View {
 #if os(macOS)
 private extension Set where Element == String {
     func containsSidebarTag(for url: String) -> Bool {
-        contains(url) || contains("pinned:\(url)")
+        contains(url) || contains("pinned:\(url)") || contains("smarthit:\(url)")
     }
 }
 
-private struct SuppressListSelectionHighlight: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView { NSView() }
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            var v: NSView? = nsView
-            while let current = v {
-                if let scroll = current as? NSScrollView,
-                   let table = scroll.documentView as? NSTableView {
-                    table.selectionHighlightStyle = .none
-                    return
-                }
-                v = current.superview
-            }
-        }
-    }
-}
 #endif
 
 extension FolderNode {
@@ -4524,13 +4479,18 @@ struct PatchworkDetail: View {
     }
 
     var body: some View {
-        // The draft overlay provider streams freshly-pinned repo:handle-descriptor
-        // answers whenever the checkout doc's checkpoint changes, so OverlayRepo
-        // swaps handle backings in place — no remount on scrub. The docUrl is
-        // always the plain origin URL; heads ride inside the checkout doc's `at`
-        // map, not on the URL itself.
+        // docUrl is always the plain origin URL. What the view actually reads
+        // is the backing url: the checked-out draft's clone, pinned to the
+        // scrubbed version. The embed answers repo:handle-descriptor with it,
+        // so OverlayRepo swaps the live handle's backing in place — no
+        // remount on scrub, and no waiting on the checkout doc to sync into
+        // the webview's repo. Nested docs still come from the draft overlay.
         let draftUrl = model.checkedOutDrafts[docUrl]
         let scrubbed = historyVersion != nil
+        let resolved = model.resolvedNoteUrl(docUrl)
+        let backingUrl = historyVersion
+            .flatMap { model.pinnedUrl(resolved, heads: $0.heads) }
+            ?? (resolved == docUrl ? nil : resolved)
         Group {
             if PatchworkWeb.available {
                 PatchworkBoxWebViewWrapper(
@@ -4538,6 +4498,7 @@ struct PatchworkDetail: View {
                     toolId: appliedToolId,
                     draftUrl: draftUrl,
                     checkoutUrl: model.checkoutDocs[docUrl],
+                    backingUrl: backingUrl,
                     onTools: { newTools, current in
                         tools = newTools
                         toolsLoaded = true

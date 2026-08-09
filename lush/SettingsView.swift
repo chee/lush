@@ -58,14 +58,14 @@ struct SettingsView: View {
                 Label("Editor", systemImage: "textformat")
             }
             NavigationLink {
-                SystemSettingsPane()
-            } label: {
-                Label("System", systemImage: "apple.logo")
-            }
-            NavigationLink {
                 MachineLearningSettingsPane()
             } label: {
                 Label("Machine Learning", systemImage: "sparkles.tv")
+            }
+            NavigationLink {
+                SystemSettingsPane()
+            } label: {
+                Label("System", systemImage: "apple.logo")
             }
         }
         .navigationTitle("Settings")
@@ -99,6 +99,7 @@ struct SettingsSubtabs<Content: View>: View {
             .padding(.top, 12)
             content(selection)
         }
+        .background(Color(PColor.pGroupedBackground))
     }
 }
 
@@ -332,7 +333,7 @@ struct SyncSettingsPane: View {
             } header: {
                 Text("Diagnostics")
             } footer: {
-                Text("Reclaim Loose Commits drops commits that a fragment already covers — nothing else ever removes them, so they build up for the life of the account. Force Resync re-fetches all root folders from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend code still works.")
+                Text("Reclaim Loose Commits drops commits that a fragment already covers, this should happen automatically but i am not good at computer programming. Force Resync re-fetches all notebooks from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend codes still works. You'll still be logged out tho")
             }
             if !model.syncLog.isEmpty {
                 Section("Sync Log") {

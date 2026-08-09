@@ -523,20 +523,21 @@ final class PatchworkContextBridge: NSObject, WKScriptMessageHandler {
     }
 
     @MainActor
-    func mount(toolId: String?, docUrl: String, checkoutUrl: String?) {
-        let key = "\(toolId ?? "")|\(docUrl)|\(checkoutUrl ?? "")"
+    func mount(toolId: String?, docUrl: String, checkoutUrl: String?, backingUrl: String?) {
+        let key = "\(toolId ?? "")|\(docUrl)|\(checkoutUrl ?? "")|\(backingUrl ?? "")"
         guard key != applied, let webView else { return }
         applied = key
         Task {
             _ = try? await webView.callAsyncJavaScript(
                 """
                 await window.patchworkReady
-                window.setContextTool(toolId, docUrl, checkoutUrl)
+                window.setContextTool(toolId, docUrl, checkoutUrl, backingUrl)
                 """,
                 arguments: [
                     "toolId": toolId ?? NSNull(),
                     "docUrl": docUrl,
                     "checkoutUrl": checkoutUrl ?? NSNull(),
+                    "backingUrl": backingUrl ?? NSNull(),
                 ],
                 in: nil,
                 contentWorld: .page
@@ -549,6 +550,7 @@ struct PatchworkContextToolsView {
     let docUrl: String
     let accountUrl: String?
     let checkoutUrl: String?
+    let backingUrl: String?
     let toolId: String?
     let onTools: @MainActor @Sendable ([ToolChoice]) -> Void
 
@@ -565,16 +567,19 @@ struct PatchworkContextToolsView {
         if let checkoutUrl, !checkoutUrl.isEmpty {
             query.append(URLQueryItem(name: "checkout-url", value: checkoutUrl))
         }
+        if let backingUrl, !backingUrl.isEmpty {
+            query.append(URLQueryItem(name: "backing-url", value: backingUrl))
+        }
         let webView = makePatchworkWebView(query: query, messageHandler: coordinator)
         coordinator.webView = webView
-        coordinator.mount(toolId: toolId, docUrl: docUrl, checkoutUrl: checkoutUrl)
+        coordinator.mount(toolId: toolId, docUrl: docUrl, checkoutUrl: checkoutUrl, backingUrl: backingUrl)
         return webView
     }
 
     @MainActor
     fileprivate func update(coordinator: PatchworkContextBridge) {
         coordinator.onTools = onTools
-        coordinator.mount(toolId: toolId, docUrl: docUrl, checkoutUrl: checkoutUrl)
+        coordinator.mount(toolId: toolId, docUrl: docUrl, checkoutUrl: checkoutUrl, backingUrl: backingUrl)
     }
 }
 
@@ -1096,6 +1101,7 @@ final class PatchworkBoxCoordinator {
     var lastToolId: String? = "__unset__"
     var lastDraftUrl: String?
     var lastCheckoutUrl: String?
+    var lastBackingUrl: String? = "__unset__"
 }
 
 #if os(macOS)
@@ -1104,6 +1110,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
     let toolId: String?
     var draftUrl: String? = nil
     var checkoutUrl: String? = nil
+    var backingUrl: String? = nil
     var activatable = false
     var toolCapturesPointer = false
     var active: Binding<Bool>? = nil
@@ -1124,6 +1131,8 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         coord.lastToolId = toolId
         coord.lastDraftUrl = draftUrl
         coord.lastCheckoutUrl = checkoutUrl
+        coord.lastBackingUrl = backingUrl
+        host.setPatchworkBacking(backingUrl)
         host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
         PatchworkScripting.shared.register(host.webView, for: .doc(docUrl))
         configureActivation(host.webView)
@@ -1136,6 +1145,10 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         coord.bridge.onTools = onTools
         coord.bridge.onTraits = onTraits
         configureActivation(nsView)
+        if coord.lastBackingUrl != backingUrl {
+            coord.lastBackingUrl = backingUrl
+            coord.host?.setPatchworkBacking(backingUrl)
+        }
         if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
             || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
             coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
@@ -1167,6 +1180,7 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
     let toolId: String?
     var draftUrl: String? = nil
     var checkoutUrl: String? = nil
+    var backingUrl: String? = nil
     var activatable = false
     var toolCapturesPointer = false
     var active: Binding<Bool>? = nil
@@ -1187,6 +1201,8 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         coord.lastToolId = toolId
         coord.lastDraftUrl = draftUrl
         coord.lastCheckoutUrl = checkoutUrl
+        coord.lastBackingUrl = backingUrl
+        host.setPatchworkBacking(backingUrl)
         host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
         PatchworkScripting.shared.register(host.webView, for: .doc(docUrl))
         configureActivation(host.webView)
@@ -1199,6 +1215,10 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         coord.bridge.onTools = onTools
         coord.bridge.onTraits = onTraits
         configureActivation(uiView)
+        if coord.lastBackingUrl != backingUrl {
+            coord.lastBackingUrl = backingUrl
+            coord.host?.setPatchworkBacking(backingUrl)
+        }
         if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
             || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
             coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
@@ -1383,7 +1403,13 @@ private extension WKWebView {
     // leave the previous doc on screen. Concurrent calls race on their poll
     // timers, so each takes a generation and only the newest may mount —
     // otherwise a stale call can win and show the previous doc.
-    func callSetDoc(url: String?, toolId: String?, draftUrl: String? = nil, checkoutUrl: String? = nil) {
+    func callSetDoc(
+        url: String?,
+        toolId: String?,
+        draftUrl: String? = nil,
+        checkoutUrl: String? = nil,
+        backingUrl: String? = nil
+    ) {
         callAsyncJavaScript(
             """
             window.__lushSetDocGen = (window.__lushSetDocGen ?? 0) + 1
@@ -1399,14 +1425,33 @@ private extension WKWebView {
                 waited += 50
             }
             if (gen !== window.__lushSetDocGen) return
-            await window.setDoc(docUrl, toolId, draftUrl, checkoutUrl)
+            await window.setDoc(docUrl, toolId, draftUrl, checkoutUrl, backingUrl)
             """,
             arguments: [
                 "docUrl": url as Any,
                 "toolId": toolId as Any,
                 "draftUrl": draftUrl as Any,
                 "checkoutUrl": checkoutUrl as Any,
+                "backingUrl": backingUrl as Any,
             ],
+            in: nil,
+            in: .page,
+            completionHandler: nil
+        )
+    }
+
+    func callSetOverlay(docUrl: String, backingUrl: String?) {
+        callAsyncJavaScript(
+            """
+            let waited = 0
+            while (!window.setOverlay) {
+                if (waited >= 5000) return
+                await new Promise(r => setTimeout(r, 50))
+                waited += 50
+            }
+            window.setOverlay(docUrl, backingUrl)
+            """,
+            arguments: ["docUrl": docUrl, "backingUrl": backingUrl as Any],
             in: nil,
             in: .page,
             completionHandler: nil
@@ -1419,6 +1464,7 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     let webView: WKWebView
     private var pending: (url: String?, toolId: String?, draftUrl: String?, checkoutUrl: String?)?
     private var current: (url: String?, toolId: String?, draftUrl: String?, checkoutUrl: String?)?
+    private var backingUrl: String?
     private var loaded = false
 
     init(query: [URLQueryItem] = [], messageHandler: (any WKScriptMessageHandler)? = nil) {
@@ -1430,17 +1476,38 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     func setPatchworkDoc(url: String?, toolId: String?, draftUrl: String? = nil, checkoutUrl: String? = nil) {
         current = (url, toolId, draftUrl, checkoutUrl)
         if loaded {
-            webView.callSetDoc(url: url, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
+            webView.callSetDoc(
+                url: url,
+                toolId: toolId,
+                draftUrl: draftUrl,
+                checkoutUrl: checkoutUrl,
+                backingUrl: backingUrl
+            )
         } else {
             pending = (url, toolId, draftUrl, checkoutUrl)
         }
+    }
+
+    /// The document the view should really read: the checked-out draft's
+    /// clone, pinned to the scrubbed version. Pushed on its own so history
+    /// scrubbing re-points the live handle instead of remounting the tool.
+    func setPatchworkBacking(_ url: String?) {
+        backingUrl = url
+        guard loaded, let docUrl = current?.url else { return }
+        webView.callSetOverlay(docUrl: docUrl, backingUrl: url)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         loaded = true
         if let p = pending {
             pending = nil
-            webView.callSetDoc(url: p.url, toolId: p.toolId, draftUrl: p.draftUrl, checkoutUrl: p.checkoutUrl)
+            webView.callSetDoc(
+                url: p.url,
+                toolId: p.toolId,
+                draftUrl: p.draftUrl,
+                checkoutUrl: p.checkoutUrl,
+                backingUrl: backingUrl
+            )
         }
     }
 

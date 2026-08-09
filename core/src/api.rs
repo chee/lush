@@ -1791,7 +1791,10 @@ impl Core {
                 repo.change_doc(id, |doc| shapes::normalize_strings(doc))
                     .await?;
             }
-            index_doc(repo, index, id).await;
+            // Not awaited: the search index is one mutex, and at startup the
+            // prefetch walk holds it for every note on disk. The caller wants
+            // the document, not the search row.
+            tokio::spawn(index_doc(repo, index, id));
             Ok::<_, anyhow::Error>(())
         })
         .await??;

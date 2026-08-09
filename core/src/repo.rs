@@ -26,7 +26,6 @@ use sedimentree_core::{
     fragment::Fragment as SedimentreeFragment,
     id::SedimentreeId,
     loose_commit::{id::CommitId, LooseCommit},
-    sedimentree::{Sedimentree, SedimentreeItem},
 };
 use sedimentree_fs_storage::FsStorage;
 use subduction_core::{
@@ -1018,6 +1017,9 @@ fn catching<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> (bool, bool) {
+    // automerge logs its own parse warnings with no idea which doc they are;
+    // the span puts the url on them.
+    let _span = tracing::info_span!("doc", doc = %id.to_url()).entered();
     state.stored_commits.extend(
         batch
             .commits
@@ -1056,22 +1058,24 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
             (state.doc.get_heads() != before, false)
         }
         Err(e) => {
-            tracing::warn!(doc = %id.to_url(), error = %e, "stored blob batch failed to apply; isolating");
+            tracing::warn!(doc = %id.to_url(), error = %e, "stored blob batch could not be ordered; loading in storage order");
             let mut any_failed = false;
-            for record in &commits {
-                match load_blob_batch(&mut state.doc, std::slice::from_ref(record), &[]) {
-                    Ok(applied) => state.applied.extend(applied),
-                    Err(_) => {
-                        state.failed.insert(BlobMeta::new(&record.blob).digest());
-                        any_failed = true;
-                    }
+            let blobs = commits
+                .iter()
+                .map(|record| &record.blob)
+                .chain(fragments.iter().map(|record| &record.blob));
+            for blob in blobs {
+                let digest = BlobMeta::new(blob).digest();
+                if state.applied.contains(&digest) {
+                    continue;
                 }
-            }
-            for record in &fragments {
-                match load_blob_batch(&mut state.doc, &[], std::slice::from_ref(record)) {
-                    Ok(applied) => state.applied.extend(applied),
-                    Err(_) => {
-                        state.failed.insert(BlobMeta::new(&record.blob).digest());
+                match catching(|| Ok(state.doc.load_incremental(blob.as_slice())?)) {
+                    Ok(_) => {
+                        state.applied.insert(digest);
+                    }
+                    Err(e) => {
+                        tracing::warn!(doc = %id.to_url(), %digest, error = %e, "stored blob failed to load");
+                        state.failed.insert(digest);
                         any_failed = true;
                     }
                 }
@@ -1081,8 +1085,9 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
     }
 }
 
-/// Apply stored blobs to `doc` in the dependency order guaranteed by their
-/// sedimentree fragment metadata.
+/// Apply stored blobs to `doc` as one concatenated load. `load_incremental`
+/// takes any concatenation of `save_incremental` output — loose commits and
+/// fragment bundles, in any order — and resolves the dependencies itself.
 fn load_blob_batch(
     doc: &mut Automerge,
     commits: &[StoredRecord<LooseCommit>],
@@ -1091,36 +1096,18 @@ fn load_blob_batch(
     if commits.is_empty() && fragments.is_empty() {
         return Ok(Vec::new());
     }
-    let sedimentree = Sedimentree::new(
-        fragments.iter().map(|record| record.meta.clone()).collect(),
-        commits.iter().map(|record| record.meta.clone()).collect(),
-    );
-    let fragment_metas: Vec<_> = sedimentree.fragments().collect();
-    let commit_metas: Vec<_> = sedimentree.loose_commits().collect();
-    let blobs: HashMap<_, _> = commits
-        .iter()
-        .map(|record| (BlobMeta::new(&record.blob).digest(), &record.blob))
-        .chain(
-            fragments
-                .iter()
-                .map(|record| (BlobMeta::new(&record.blob).digest(), &record.blob)),
-        )
-        .collect();
     let mut digests = Vec::new();
+    let mut seen = HashSet::new();
     let mut bytes = Vec::new();
-    for item in sedimentree.topsorted_blob_order()? {
-        let digest = match item {
-            SedimentreeItem::Fragment(index) => {
-                fragment_metas[index].summary().blob_meta().digest()
-            }
-            SedimentreeItem::LooseCommit(index) => commit_metas[index].blob_meta().digest(),
-        };
-        if digests.contains(&digest) {
+    for blob in commits
+        .iter()
+        .map(|record| &record.blob)
+        .chain(fragments.iter().map(|record| &record.blob))
+    {
+        let digest = BlobMeta::new(blob).digest();
+        if !seen.insert(digest) {
             continue;
         }
-        let blob = blobs
-            .get(&digest)
-            .ok_or_else(|| anyhow!("stored metadata has no matching blob {digest}"))?;
         bytes.extend_from_slice(blob.as_slice());
         digests.push(digest);
     }

@@ -308,6 +308,7 @@ struct ContextToolsView: View {
                 docUrl: url,
                 accountUrl: model.accountUrl,
                 checkoutUrl: model.checkoutDocs[url],
+                backingUrl: model.resolvedNoteUrl(url) == url ? nil : model.resolvedNoteUrl(url),
                 toolId: state.selected,
                 onTools: { [state] tools in state.offer(tools) }
             )

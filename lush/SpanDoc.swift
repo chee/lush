@@ -422,18 +422,6 @@ final class EmbedAttachment: NSTextAttachment {
         fatalError("init(coder:) is not supported")
     }
 
-    /// Without an image TextKit draws its generic blank-document icon wherever
-    /// the live view is not available yet (or at all — dock tile, exports).
-    override func image(
-        forBounds imageBounds: CGRect,
-        textContainer: NSTextContainer?,
-        characterIndex charIndex: Int
-    ) -> PImage? {
-        Self.blank
-    }
-
-    private static let blank = PImage.draw(size: CGSize(width: 1, height: 1)) { _ in }
-
     override func viewProvider(
         for parentView: PView?,
         location: NSTextLocation,

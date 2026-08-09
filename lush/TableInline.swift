@@ -305,7 +305,11 @@ final class InlineViewManager {
         )
     }
 
-    private func makeHosting(_ root: some View) -> (PView, () -> CGSize, AnyObject?) {
+    /// An imageless attachment falls back to TextKit's generic document icon,
+    /// which would otherwise show through every hosted embed; the host paints
+    /// over it in the editor's own background colour.
+    private func makeHosting(_ view: some View) -> (PView, () -> CGSize, AnyObject?) {
+        let root = view.background(Color(PColor.pOnTint))
         #if os(macOS)
         let hosting = NSHostingView(rootView: root)
         return (hosting, { hosting.fittingSize }, nil)
@@ -605,7 +609,7 @@ struct EmbedLoadingView: View {
 
     var body: some View {
         RoundedRectangle(cornerRadius: 8)
-            .fill(Color.secondary.opacity(phase ? 0.07 : 0.16))
+            .fill(Color.secondary.opacity(phase ? 0 : 0.16))
             .animation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true), value: phase)
             .onAppear { phase = true }
     }

@@ -410,6 +410,7 @@ final class EditorCore {
     private var isApplyingDocumentState = false
     private var remoteReloadTask: Task<Void, Never>?
     private var remoteReloadGeneration = 0
+    private var placingAttachmentViews = false
     private var pendingTextSplice: PendingTextSplice?
     private var queuedTextSplice: QueuedTextSplice?
     private var textSpliceFlushTask: Task<Void, Never>?
@@ -919,6 +920,20 @@ final class EditorCore {
         return file
     }
 
+    /// TextKit builds an attachment's view provider while drawing, but only
+    /// mounts it on the next viewport pass. Without one, an embed whose asset
+    /// is still loading keeps its provider unmounted and shows TextKit's
+    /// generic document icon until the next edit.
+    private func placePendingAttachmentViews() {
+        guard !placingAttachmentViews else { return }
+        placingAttachmentViews = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.placingAttachmentViews = false
+            self.view?.pTextLayoutManager?.textViewportLayoutController.layoutViewport()
+        }
+    }
+
     private func apply(spans: [SpanNode], focus: Bool = false) {
         guard let view = noteView, view.pStorage != nil else { return }
         // write out queued typing before it's discarded — the flush's write
@@ -972,6 +987,7 @@ final class EditorCore {
             updateFindMatches(resetIndex: false)
         }
         scheduleMinimapUpdate()
+        placePendingAttachmentViews()
         // the edit observer skips its bump while applying document state, so
         // canvas/outline inspectors would otherwise render the old doc
         controller.docVersion &+= 1
