@@ -1,4 +1,4 @@
-const CACHE = "patchwork-v1";
+const CACHE = "patchwork-v2";
 const CACHEABLE_STATUSES = [0, 200, 203, 204];
 const HANDOFF_CHANNEL = "@patchwork/handoff";
 const HANDOFF_TIMEOUT_MS = 35_000;
@@ -84,7 +84,6 @@ async function serveHandoff(fetchEvent, cache, handoffURL, cached) {
   if (!reply) {
     // Timeout: fall back to the native scheme handler
     const response = await fetch(fetchEvent.request).catch(() => undefined);
-    if (response?.ok) cache.put(fetchEvent.request, response.clone());
     return response ?? Response.error();
   }
 

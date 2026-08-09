@@ -57,8 +57,6 @@ struct ContentView: View {
     @FocusState private var sidebarFocused: Bool
     @FocusState private var searchFocused: Bool
     @State private var expanded: Set<String> = []
-    @State private var browsePath: [String] = []
-    @State private var browseNoteUrl: String?
     @State private var revealTarget: String?
     @State private var moveTarget: MoveTarget?
     @State private var pinnedExpanded = true
@@ -76,7 +74,6 @@ struct ContentView: View {
     private static let seededRootsKey = "seededRoots"
     private static let pinnedExpandedKey = "pinnedExpanded"
     private static let collapsedSectionsKey = "collapsedSidebarSections"
-    private static let browsePathKey = "browsePath"
     #else
     @State private var path: [NavRoute] = []
     #endif
@@ -92,10 +89,6 @@ struct ContentView: View {
             // Selecting the top search hit must not pull focus out of the
             // field mid-query.
             if !searchFocused { sidebarFocused = true }
-            if !browsePath.isEmpty, selectedItemUrls != [browsePath[0]] {
-                browsePath = []
-                browseNoteUrl = nil
-            }
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
             let url = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
             if let node = model.node(for: url), node.kind == "folder" {
@@ -137,7 +130,6 @@ struct ContentView: View {
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url else { return }
             selectedHistoryEntry = nil
-            guard browsePath.isEmpty else { return }
             if !selectedItemUrls.containsSidebarTag(for: url) { selectedItemUrls = [url] }
         }
         .onAppear {
@@ -335,10 +327,7 @@ struct ContentView: View {
 
     private func openFolder(_ url: String) {
         #if os(macOS)
-        browsePath = [url]
-        browseNoteUrl = nil
         selectedItemUrls = [url]
-        Task { await model.loadFolder(url: url) }
         #else
         path = [.folder(url)]
         #endif
@@ -419,7 +408,6 @@ struct ContentView: View {
             FolderSettingsEditor(node: node)
                 .environment(model)
         }
-        .navigationSplitViewColumnWidth(min: 180, ideal: 230)
         .task {
             expanded = Set(
                 UserDefaults.standard.stringArray(forKey: Self.expandedKey) ?? []
@@ -430,12 +418,8 @@ struct ContentView: View {
             collapsedSections = Set(
                 UserDefaults.standard.stringArray(forKey: Self.collapsedSectionsKey) ?? []
             )
-            browsePath = UserDefaults.standard.stringArray(forKey: Self.browsePathKey) ?? []
-            if let root = browsePath.first { selectedItemUrls = [root] }
         }
-        .onChange(of: browsePath) {
-            UserDefaults.standard.set(browsePath, forKey: Self.browsePathKey)
-        }
+        .navigationSplitViewColumnWidth(min: 180, ideal: 230)
         .onChange(of: model.folderTree, initial: true) {
             seedRootExpansion()
         }
@@ -464,7 +448,7 @@ struct ContentView: View {
             else { return .ignored }
             let selected = tag.hasPrefix("pinned:") ? String(tag.dropFirst(7)) : tag
             if let node = model.node(for: selected), node.kind == "folder" {
-                openFolder(selected)
+                setExpanded(!expanded.contains(selected), for: selected)
             } else {
                 Task { await model.selectItem(selected) }
             }
@@ -488,7 +472,7 @@ struct ContentView: View {
             return .handled
         }
         .focused($sidebarFocused)
-        .tint(Color.lushSelection)
+        .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
     }
 
     private func focusCurrentNoteSearch() {
@@ -846,7 +830,7 @@ struct ContentView: View {
             .help("Search everywhere")
         }
         .font(.caption.weight(.medium))
-        .foregroundStyle(Color.lushSelection)
+        .foregroundStyle(Self.selectionTint)
         .padding(.vertical, 4)
         .listRowInsets(sidebarRowInsets(depth: 0))
     }
@@ -860,7 +844,7 @@ struct ContentView: View {
         } label: {
             Label("Save as Smart Notebook", systemImage: "folder.badge.gearshape")
                 .font(.body.weight(.medium))
-                .foregroundStyle(Color.lushSelection)
+                .foregroundStyle(Self.selectionTint)
         }
         .buttonStyle(.plain)
         .padding(.vertical, 4)
@@ -902,11 +886,13 @@ struct ContentView: View {
     @ViewBuilder
     private func selectionBackground(_ tag: String, greyWhen greyTag: String? = nil) -> some View {
         if selectedItemUrls.contains(tag) {
-            Color.lushSelection.opacity(0.22)
+            Self.selectionTint.opacity(0.22)
         } else if let greyTag, selectedItemUrls.contains(greyTag) {
             Color.secondary.opacity(0.12)
         }
     }
+
+    private static let selectionTint = Color(red: 1.0, green: 0.412, blue: 0.647)
 
     private func expansionBinding(_ url: String) -> Binding<Bool> {
         Binding(
@@ -993,7 +979,7 @@ struct ContentView: View {
                 }
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    openFolder(node.url)
+                    setExpanded(!expanded.contains(node.url), for: node.url)
                 }
             }
             if model.folderSettings(for: node.url).showCount {
@@ -1038,14 +1024,64 @@ struct ContentView: View {
     }
 
     private func folderContextMenu(for node: FolderNode) -> some View {
-        FolderContextMenu(
-            node: node,
-            open: { open($0) },
-            search: { searchInFolder(node.url) },
-            settings: { folderSettingsTarget = node },
-            rename: { beginRename(node) },
-            move: { moveTarget = MoveTarget(urls: [node.url]) }
-        )
+        Group {
+            folderContextMenuContent(for: node)
+        }
+        .tint(.primary)
+    }
+
+    @ViewBuilder
+    private func folderContextMenuContent(for node: FolderNode) -> some View {
+        Menu("New") {
+            NewItemMenuItems(model: model, folderUrl: node.url) { open($0) }
+        }
+        Divider()
+        Button {
+            searchInFolder(node.url)
+        } label: {
+            Label("Search in \(node.displayName)…", systemImage: "magnifyingglass")
+        }
+        Divider()
+        Button {
+            folderSettingsTarget = node
+        } label: {
+            Label("Folder Settings…", systemImage: "gearshape")
+        }
+        Button {
+            beginRename(node)
+        } label: {
+            Label("Rename", systemImage: "pencil")
+        }
+        if node.parentUrl != nil {
+            Button {
+                moveTarget = MoveTarget(urls: [node.url])
+            } label: {
+                Label("Move…", systemImage: "arrowshape.turn.up.right")
+            }
+        }
+        if !model.rootFolderUrls.contains(node.url) {
+            Button {
+                Task { await model.addRootFolder(node.url) }
+            } label: {
+                Label("Add to Notebooks", systemImage: "book.closed")
+            }
+        }
+        Divider()
+        CopyUrlMenu(url: node.url)
+        Divider()
+        if node.parentUrl != nil {
+            Button(role: .destructive) {
+                model.removeEntry(parentUrl: node.parentUrl, url: node.url)
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        } else if model.rootFolderUrls.count > 1 {
+            Button(role: .destructive) {
+                model.removeRootFolder(node.url)
+            } label: {
+                Label("Remove from Notebooks", systemImage: "trash")
+            }
+        }
     }
 
     @ViewBuilder
@@ -1152,8 +1188,6 @@ struct ContentView: View {
                     MeetingNotesScreen { open($0) }
                 } else if calendarSelected {
                     AgendaScreen { open($0) }
-                } else if !browsePath.isEmpty {
-                    browseArea
                 } else if let url = model.selectedNoteUrl {
                     if model.core == nil {
                         BootNoteSnapshotView(url: url)
@@ -1170,8 +1204,7 @@ struct ContentView: View {
             }
             .frame(minWidth: 360, maxWidth: .infinity)
 
-            if rightSidebarVisible, browsePath.isEmpty || browseNoteUrl != nil,
-               let url = model.selectedNoteUrl {
+            if rightSidebarVisible, let url = model.selectedNoteUrl {
                 rightSidebarDivider
                 RightSidebarView(
                     url: url,
@@ -1209,62 +1242,6 @@ struct ContentView: View {
                 .map { "Search \($0)" } ?? "Search notes"
         )
         .searchFocused($searchFocused)
-    }
-
-    /// The editor rides over the columns rather than replacing them, so the
-    /// folder you came from stays in view and one click away.
-    private var browseArea: some View {
-        ZStack(alignment: .trailing) {
-            ColumnBrowser(
-                path: $browsePath,
-                noteUrl: $browseNoteUrl,
-                open: { browseOpen($0) },
-                search: { searchInFolder($0) },
-                settings: { folderSettingsTarget = $0 },
-                move: { moveTarget = MoveTarget(urls: $0) }
-            )
-            if browseNoteUrl != nil, let url = model.selectedNoteUrl, model.core != nil {
-                browseEditorPanel(url)
-            }
-        }
-        .animation(.easeOut(duration: 0.18), value: browseNoteUrl == nil)
-    }
-
-    /// Opening from inside the browser must leave `selectedItemUrls` parked on
-    /// the browsed folder, or the sidebar selection change closes the browser.
-    private func browseOpen(_ url: String) {
-        model.selectedNoteUrl = url
-        browseNoteUrl = url
-    }
-
-    private func browseEditorPanel(_ url: String) -> some View {
-        detailContent(for: url)
-            .background(Color(nsColor: .textBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(Color(nsColor: .separatorColor))
-            )
-            .shadow(color: .black.opacity(0.3), radius: 26, x: -2, y: 6)
-            .overlay(alignment: .topTrailing) { browseEditorCloseButton }
-            .padding(.leading, 180)
-            .padding([.top, .bottom, .trailing], 10)
-            .transition(.move(edge: .trailing).combined(with: .opacity))
-    }
-
-    private var browseEditorCloseButton: some View {
-        Button {
-            browseNoteUrl = nil
-        } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 22, height: 22)
-                .background(.regularMaterial, in: Circle())
-        }
-        .buttonStyle(.plain)
-        .keyboardShortcut(.escape, modifiers: [])
-        .padding(10)
     }
 
     @ViewBuilder
@@ -3964,7 +3941,7 @@ extension View {
     }
 }
 
-struct DragPreviewView: View {
+private struct DragPreviewView: View {
     let name: String
     var count: Int = 1
     var isFolder: Bool = false
@@ -4236,14 +4213,13 @@ private struct PinReorderTarget: ViewModifier {
 
 /// A notebook takes notes and folders *into* it, but another root notebook
 /// lands beside it instead — the highlight says which is about to happen.
-struct FolderDropTarget: ViewModifier {
+private struct FolderDropTarget: ViewModifier {
     let node: FolderNode
     let isRoot: Bool
     let model: NotesModel
-    var scope: String = ""
     @State private var height: CGFloat = 0
 
-    private var row: String { "folder:\(scope):\(node.url)" }
+    private var row: String { "folder:\(node.url)" }
 
     func body(content: Content) -> some View {
         if node.kind == "folder" {
@@ -4325,14 +4301,13 @@ private struct FolderDrop: DropDelegate {
     }
 }
 
-struct NoteReorderDropTarget: ViewModifier {
+private struct NoteReorderDropTarget: ViewModifier {
     let node: FolderNode
     let model: NotesModel
-    var scope: String = ""
 
     func body(content: Content) -> some View {
         content.modifier(
-            SidebarReorderTarget(row: "note:\(scope):\(node.url)", kind: .item) { payload, after in
+            SidebarReorderTarget(row: "note:\(node.url)", kind: .item) { payload, after in
                 for url in payload.components(separatedBy: "\n") where url.hasPrefix("automerge:") {
                     if model.node(for: url)?.parentUrl == node.parentUrl {
                         model.reorderChild(url, adjacentTo: node.url, after: after)
@@ -4357,6 +4332,91 @@ private func droppedString(from item: NSSecureCoding?) -> String? {
     if let s = item as? NSString { return s as String }
     if let d = item as? Data { return String(data: d, encoding: .utf8) }
     return nil
+}
+
+struct FolderColumnBrowser: View {
+    let rootUrl: String
+    let onSelectNote: (String) -> Void
+    @Environment(NotesModel.self) private var model
+    @State private var columnUrls: [String] = []
+    @State private var selectedPerColumn: [String: String] = [:]
+
+    init(rootUrl: String, onSelectNote: @escaping (String) -> Void) {
+        self.rootUrl = rootUrl
+        self.onSelectNote = onSelectNote
+        _columnUrls = State(initialValue: [rootUrl])
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 0) {
+                    ForEach(columnUrls, id: \.self) { folderUrl in
+                        browserColumn(folderUrl: folderUrl)
+                            .frame(minWidth: 240, maxWidth: 300, maxHeight: .infinity)
+                            .id(folderUrl)
+                        Divider()
+                    }
+                    Color.clear.frame(width: 1)
+                }
+                .frame(maxHeight: .infinity, alignment: .topLeading)
+            }
+            .frame(maxHeight: .infinity, alignment: .topLeading)
+            .onChange(of: columnUrls) {
+                if let last = columnUrls.last {
+                    withAnimation { proxy.scrollTo(last, anchor: .trailing) }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .navigationTitle(model.node(for: rootUrl)?.displayName ?? "Folder")
+    }
+
+    @ViewBuilder
+    private func browserColumn(folderUrl: String) -> some View {
+        let children = model.node(for: folderUrl)?.children ?? []
+        List {
+            ForEach(children) { node in
+                if node.kind == "folder" {
+                    Button {
+                        if let idx = columnUrls.firstIndex(of: folderUrl) {
+                            columnUrls = Array(columnUrls.prefix(idx + 1))
+                            columnUrls.append(node.url)
+                            selectedPerColumn[folderUrl] = node.url
+                        }
+                    } label: {
+                        HStack {
+                            Label(node.displayName, systemImage: "folder")
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .listRowBackground(
+                        selectedPerColumn[folderUrl] == node.url
+                            ? Color.accentColor.opacity(0.12) : Color.clear
+                    )
+                    .buttonStyle(.plain)
+                } else {
+                    Button {
+                        selectedPerColumn[folderUrl] = node.url
+                        onSelectNote(node.url)
+                    } label: {
+                        NoteRowView(node: node)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(
+                        selectedPerColumn[folderUrl] == node.url
+                            ? Color(red: 1.0, green: 0.412, blue: 0.647).opacity(0.2) : Color.clear
+                    )
+                }
+            }
+        }
+        .listStyle(.inset)
+        .frame(maxHeight: .infinity)
+    }
 }
 
 /// Floating "you are not looking at live Main" markers over an editor.

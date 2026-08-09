@@ -1,3 +1,5 @@
+import { isPinned } from "./resolver";
+
 const HANDOFF_CHANNEL = "@patchwork/handoff";
 const CACHEABLE_STATUSES = [200, 203, 204];
 
@@ -44,7 +46,7 @@ export function installHandoffListener() {
     const result = await resolve(raw);
     const bytes = Uint8Array.from(atob(result.base64), (c) => c.charCodeAt(0));
 
-    if (CACHEABLE_STATUSES.includes(result.status)) {
+    if (isPinned(raw) && CACHEABLE_STATUSES.includes(result.status)) {
       const response = new Response(bytes, {
         status: result.status,
         headers: { "content-type": result.mimeType },
@@ -65,7 +67,7 @@ export function installHandoffListener() {
         type: "response",
         response: {
           status: result.status,
-          body: new TextDecoder().decode(bytes),
+          body: bytes,
           headers: { "content-type": result.mimeType },
         },
       });

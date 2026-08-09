@@ -106,6 +106,14 @@ function cachePut(key: string, entry: CacheEntry): void {
     .catch(() => {});
 }
 
+// Head-pinned URLs are content-addressed — safe to cache indefinitely.
+export function isPinned(raw: string): boolean {
+  const url = decodeURIComponent(raw.split("/")[0]) as AutomergeUrl;
+  if (!isValidAutomergeUrl(url)) return false;
+  const { heads } = parseAutomergeUrl(url);
+  return !!heads && heads.length > 0;
+}
+
 // The JS half of PatchworkSchemeHandler: patchwork's resolveAutomergeUrl with the
 // service-worker/SharedWorker handoff collapsed into one native round trip.
 // `raw` is the URL path after patchwork://app/ — an encoded automerge: URL first,
@@ -124,9 +132,8 @@ export function installResolver(repo: Repo) {
       let { heads, hexHeads, documentId } =
         parseAutomergeUrl(maybeAutomergeUrl);
 
-      // Head-pinned URLs are content-addressed — safe to cache indefinitely.
-      const isPinned = !!heads && heads.length > 0;
-      if (isPinned) {
+      const pinned = isPinned(raw);
+      if (pinned) {
         const cached = await cacheGet(raw);
         if (cached) {
           return {
@@ -168,7 +175,7 @@ export function installResolver(repo: Repo) {
           ? resolved.content
           : new TextEncoder().encode(String(resolved.content));
 
-      if (isPinned) {
+      if (pinned) {
         cachePut(raw, { mimeType: resolved.type, bytes });
       }
 

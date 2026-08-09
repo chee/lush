@@ -1646,41 +1646,53 @@ impl Repo {
         let trees = ids.len() as u64;
         let mut dropped = 0u64;
         for id in ids {
-            let commits =
-                <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("loading loose commits: {e}"))?;
-            if commits.is_empty() {
-                continue;
-            }
-            let fragments =
-                <ObservedStorage as Storage<Sendable>>::load_fragment_metas(&self.storage, id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("loading fragments: {e}"))?;
-            if fragments.is_empty() {
-                continue;
-            }
-            let tree = Sedimentree::new(fragments, commits.clone());
-            let keep = tree.minimize(&CountLeadingZeroBytes);
-            for commit in commits {
-                let head = commit.head();
-                if keep.has_loose_commit(head) {
-                    continue;
-                }
-                match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(
-                    &self.storage,
-                    id,
-                    head,
-                )
-                .await
-                {
-                    Ok(()) => dropped += 1,
-                    Err(e) => tracing::warn!(error = %e, "deleting loose commit failed"),
-                }
-            }
+            dropped += self.reclaim_tree(id).await;
         }
         tracing::info!(trees, dropped, "reclaimed loose commits");
         Ok((trees, dropped))
+    }
+
+    /// One tree's worth of the same pass. Runs whenever fragments land, so the
+    /// commits they cover go at that moment rather than waiting for a sweep.
+    pub(crate) async fn reclaim_tree(&self, id: SedimentreeId) -> u64 {
+        let commits =
+            match <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, id)
+                .await
+            {
+                Ok(commits) if !commits.is_empty() => commits,
+                Ok(_) => return 0,
+                Err(e) => {
+                    tracing::warn!(error = %e, "loading loose commits failed");
+                    return 0;
+                }
+            };
+        let fragments =
+            match <ObservedStorage as Storage<Sendable>>::load_fragment_metas(&self.storage, id)
+                .await
+            {
+                Ok(fragments) if !fragments.is_empty() => fragments,
+                Ok(_) => return 0,
+                Err(e) => {
+                    tracing::warn!(error = %e, "loading fragments failed");
+                    return 0;
+                }
+            };
+        let tree = Sedimentree::new(fragments, commits.clone());
+        let keep = tree.minimize(&CountLeadingZeroBytes);
+        let mut dropped = 0;
+        for commit in commits {
+            let head = commit.head();
+            if keep.has_loose_commit(head) {
+                continue;
+            }
+            match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(&self.storage, id, head)
+                .await
+            {
+                Ok(()) => dropped += 1,
+                Err(e) => tracing::warn!(error = %e, "deleting loose commit failed"),
+            }
+        }
+        dropped
     }
 
     pub fn announce_notes_prefetched(&self) {
@@ -1863,7 +1875,7 @@ impl Repo {
         };
         self.last_server_heads.lock().await.insert(id, heads_set);
         if still_missing {
-            self.request_sync(id).await;
+            self.request_sync_forced(id).await;
         }
     }
 
@@ -2049,6 +2061,10 @@ impl Repo {
         }
         let id = DocId::from_sedimentree_id(batch.sedimentree_id);
         let count = batch.commits.len() + batch.fragments.len();
+        // Fragments arriving from a peer cover commits this device may still be
+        // holding loose, so the same reclaim runs on receive as on save.
+        let received_fragments = !batch.fragments.is_empty();
+        let sid = batch.sedimentree_id;
         let (advanced, failed) = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 return Ok(false);
@@ -2057,6 +2073,9 @@ impl Repo {
             cpu_heavy(|| apply_batch_to_state(&mut state, batch, id))
         };
         self.emit_batch_events(id, count, advanced, failed);
+        if received_fragments {
+            self.reclaim_tree(sid).await;
+        }
         Ok(advanced)
     }
 
@@ -2113,11 +2132,17 @@ impl Repo {
             .await
             .map_err(|e| anyhow!("store_built_batch failed: {e}"))?;
 
-        let mut state = shared.lock().await;
-        state.stored_commits.extend(commit_heads);
-        state.stored_fragments.extend(fragment_heads);
+        let wrote_fragments = !fragment_heads.is_empty();
+        {
+            let mut state = shared.lock().await;
+            state.stored_commits.extend(commit_heads);
+            state.stored_fragments.extend(fragment_heads);
+        }
         if !skipped {
             let _ = std::fs::remove_file(self.outbox_path(id));
+        }
+        if wrote_fragments {
+            self.reclaim_tree(sid).await;
         }
 
         Ok(true)

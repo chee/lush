@@ -50,6 +50,7 @@ final class PadStore {
     let cache = AssetCache()
     @ObservationIgnored weak var model: NotesModel?
     @ObservationIgnored private var loading: Set<String> = []
+    @ObservationIgnored private var padWriteTasks: [String: Task<Void, Never>] = [:]
 
     private static let localPocketKey = "pocketPadUrl"
 
@@ -139,11 +140,30 @@ final class PadStore {
         load(url)
     }
 
+    /// Item writes run in a per-pad chain, so a `setData` can't reach the core
+    /// before the `add` that made the item it edits. A write that fails takes
+    /// the optimistic state back to whatever the core actually holds.
+    private func chainedPadWrite(
+        _ padUrl: String,
+        _ body: @escaping @Sendable () throws -> Void
+    ) {
+        let previous = padWriteTasks[padUrl]
+        padWriteTasks[padUrl] = Task { @MainActor [weak self] in
+            await previous?.value
+            do {
+                try await Task.detached { try body() }.value
+            } catch {
+                NSLog("lush pad write failed: %@ %@", padUrl, error.localizedDescription)
+                self?.load(padUrl)
+            }
+        }
+    }
+
     func add(_ item: PadItem, to padUrl: String) {
         items[padUrl, default: []].append(item)
         version &+= 1
         guard let core = model?.core else { return }
-        Task.detached { try? core.padPutItem(url: padUrl, item: item) }
+        chainedPadWrite(padUrl) { try core.padPutItem(url: padUrl, item: item) }
     }
 
     func move(_ id: String, in padUrl: String, to rect: CGRect) {
@@ -154,8 +174,8 @@ final class PadStore {
         items[padUrl]?[index].h = rect.height
         version &+= 1
         guard let core = model?.core else { return }
-        Task.detached {
-            try? core.padMoveItem(
+        chainedPadWrite(padUrl) {
+            try core.padMoveItem(
                 url: padUrl,
                 itemId: id,
                 x: rect.origin.x,
@@ -173,14 +193,14 @@ final class PadStore {
         items[padUrl]?[index].data = data
         version &+= 1
         guard let core = model?.core else { return }
-        Task.detached { try? core.padSetData(url: padUrl, itemId: id, data: data) }
+        chainedPadWrite(padUrl) { try core.padSetData(url: padUrl, itemId: id, data: data) }
     }
 
     func remove(_ id: String, from padUrl: String) {
         items[padUrl]?.removeAll { $0.id == id }
         version &+= 1
         guard let core = model?.core else { return }
-        Task.detached { try? core.padRemoveItem(url: padUrl, itemId: id) }
+        chainedPadWrite(padUrl) { try core.padRemoveItem(url: padUrl, itemId: id) }
     }
 
     /// Move an item between pads, keeping its id so a return trip is a no-op.

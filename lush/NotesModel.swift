@@ -109,7 +109,7 @@ final class NotesModel {
     /// Anything that would read an empty result as "nothing there" waits for
     /// it rather than guessing how long loading takes.
     private(set) var startupSettled = false
-    private var startupWaiters: [CheckedContinuation<Void, Never>] = []
+    private var startupWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     var irohPeers: [IrohPeer] = []
 
     func refreshPeers() {
@@ -204,6 +204,9 @@ final class NotesModel {
         UserDefaults.standard.stringArray(forKey: patchworkDocUrlsKey) ?? []
     )
     @ObservationIgnored private var folderNodeCache: [String: (heads: [String], node: FolderNode)] = [:]
+    /// Every tree walk is detached and they overlap freely at launch. A walk
+    /// only publishes if nothing newer has started since it did.
+    @ObservationIgnored private var treeGeneration = 0
     /// Notes whose preview + thumbnail have been read from the core. A refresh
     /// must not re-read the whole tree; docChanged drops the entries it stales.
     @ObservationIgnored private var metaFetched: Set<String> = []
@@ -716,13 +719,21 @@ final class NotesModel {
 
     func addDocToCurrentFolder(url: String) {
         guard let core else { return }
-        patchworkDocUrls.insert(url)
-        UserDefaults.standard.set(Array(patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
         Task.detached { [core, weak self, url] in
-            try? core.linkNoteToFolder(noteUrl: url, title: "")
+            do {
+                try core.linkNoteToFolder(noteUrl: url, title: "")
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't add document: \(error.localizedDescription)"
+                }
+                return
+            }
             await MainActor.run { [weak self] in
-                self?.selectedNoteUrl = url
-                self?.refreshNotes()
+                guard let self else { return }
+                self.patchworkDocUrls.insert(url)
+                UserDefaults.standard.set(Array(self.patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
+                self.selectedNoteUrl = url
+                self.refreshNotes()
             }
         }
     }
@@ -845,12 +856,15 @@ final class NotesModel {
 
     private func buildTree() {
         guard let core else { folderTree = []; return }
+        treeGeneration += 1
+        let generation = treeGeneration
         let rootUrls = rootFolderUrls
         let cache = folderNodeCache
-        Task.detached { [core, rootUrls, cache, weak self] in
+        Task.detached { [core, rootUrls, cache, generation, weak self] in
             let (tree, newCache) = await Self.computeTree(core: core, rootFolderUrls: rootUrls, cache: cache)
             guard let self else { return }
             await MainActor.run {
+                guard self.treeGeneration == generation else { return }
                 self.folderTree = tree
                 self.folderNodeCache = newCache
                 self.writeWidgetSnapshot()
@@ -986,11 +1000,13 @@ final class NotesModel {
 
     func refreshNotes() {
         guard let core else { return }
+        treeGeneration += 1
+        let generation = treeGeneration
         let rootUrls = rootFolderUrls
         let cache = folderNodeCache
         let fetched = metaFetched
         Self.bootLog("refreshNotes begin roots=\(rootUrls.count)")
-        Task.detached { [core, rootUrls, cache, fetched, weak self] in
+        Task.detached { [core, rootUrls, cache, fetched, generation, weak self] in
             let refreshStart = Date()
             async let notesTask = core.listNotes()
             async let titleTask = core.folderTitle()
@@ -1004,8 +1020,8 @@ final class NotesModel {
                 NoteInfo(url: $0.url, name: $0.name, kind: $0.kind)
             }
             let urlsNeedingMeta = visible.map(\.url).filter { !fetched.contains($0) }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
+            let published = await MainActor.run { [weak self] () -> Bool in
+                guard let self, self.treeGeneration == generation else { return false }
                 self.notes = notes
                 self.folderTitle = folderTitle
                 self.folderTree = tree
@@ -1018,7 +1034,9 @@ final class NotesModel {
                     "sidebar published notes=\(notes.count) visible=\(visible.count) localMs=\(localMs)"
                 )
                 self.writeWidgetSnapshot()
+                return true
             }
+            guard published else { return }
             let metaStart = Date()
             let (newPreviews, newThumbnails) = await Self.fetchMeta(
                 core: core,
@@ -1026,7 +1044,7 @@ final class NotesModel {
             )
             let metaMs = Int(Date().timeIntervalSince(metaStart) * 1000)
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                guard let self, self.treeGeneration == generation else { return }
                 self.previews.merge(newPreviews) { _, new in new }
                 self.thumbnails.merge(newThumbnails) { _, new in new }
                 let liveUrls = Set(visible.map(\.url))
@@ -1135,6 +1153,7 @@ final class NotesModel {
     }
 
     func releaseCore() {
+        drainStartupWaiters()
         pollTask?.cancel()
         pollTask = nil
         maintenanceTask?.cancel()
@@ -1185,14 +1204,33 @@ final class NotesModel {
     func notesPrefetched() {
         guard !startupSettled else { return }
         startupSettled = true
+        drainStartupWaiters()
+    }
+
+    /// A waiter is only ever resumed by whoever takes it out of the dictionary,
+    /// and the dictionary is main-actor state, so a waiter resumes exactly once.
+    private func drainStartupWaiters() {
         let waiters = startupWaiters
-        startupWaiters = []
-        for waiter in waiters { waiter.resume() }
+        startupWaiters = [:]
+        for waiter in waiters.values { waiter.resume() }
     }
 
     func awaitStartup() async {
         guard !startupSettled else { return }
-        await withCheckedContinuation { startupWaiters.append($0) }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if startupSettled || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    startupWaiters[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.startupWaiters.removeValue(forKey: id)?.resume()
+            }
+        }
     }
 
     private func startMaintenancePolling() {
@@ -1457,7 +1495,7 @@ final class NotesModel {
                 let url = try core.createNoteDoc(title: "")
                 let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
-                try? core.linkNoteToFolder(noteUrl: url, title: "")
+                try core.linkNoteToFolder(noteUrl: url, title: "")
                 return url
             }.value
             pendingFocusUrl = url
@@ -2711,7 +2749,7 @@ final class NotesModel {
                     return try core.createNoteIn(folderUrl: target, title: "Quick Note")
                 }
                 let noteUrl = try core.createNoteDoc(title: "Quick Note")
-                try? core.linkNoteToFolder(noteUrl: noteUrl, title: "Quick Note")
+                try core.linkNoteToFolder(noteUrl: noteUrl, title: "Quick Note")
                 return noteUrl
             }.value
             setQuickNote(url)

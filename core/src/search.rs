@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, ErrorCode};
 
 use crate::api::{EmbeddingChunk, RecentNote, SearchFilter, SearchHit};
 use crate::shapes;
@@ -59,8 +60,9 @@ fn encode_tags(tags: &[String]) -> String {
 /// Open the db and touch its schema so a corrupt file surfaces here rather
 /// than lazily on the first real query. Setting WAL and reading `sqlite_master`
 /// both force SQLite to validate the file header.
-fn open_verified(db_path: &Path) -> Result<Connection> {
+fn open_verified(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
     Ok(conn)
@@ -81,10 +83,16 @@ impl SearchIndex {
         let db_path = data_dir.join("search.sqlite3");
         let conn = match open_verified(&db_path) {
             Ok(conn) => conn,
-            Err(_) => {
+            Err(err)
+                if matches!(
+                    err.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+                ) =>
+            {
                 remove_db_files(&db_path);
                 open_verified(&db_path)?
             }
+            Err(err) => return Err(err.into()),
         };
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
@@ -797,5 +805,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(urls(index.search("cake", &filter).unwrap()), ["note"]);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_rebuilt() {
+        let dir = std::env::temp_dir().join("lush-search-notadb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("search.sqlite3"), "garbage".repeat(64)).unwrap();
+        let index = SearchIndex::open(&dir).unwrap();
+        index.upsert(indexed("note", "cake", &[], "")).unwrap();
+        assert_eq!(
+            urls(index.search("cake", &SearchFilter::default()).unwrap()),
+            ["note"]
+        );
     }
 }

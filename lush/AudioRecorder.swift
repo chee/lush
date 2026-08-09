@@ -9,15 +9,19 @@ final class AudioRecorder {
     var permissionDenied = false
 
     @ObservationIgnored private var recorder: AVAudioRecorder?
-    @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored private var fileURL: URL?
+    @ObservationIgnored private var generation = 0
 
     func start() async {
+        guard !isRecording else { return }
+        let gen = generation
         let granted = await AVAudioApplication.requestRecordPermission()
         guard granted else {
             permissionDenied = true
             return
         }
+        guard !isRecording, gen == generation, !Task.isCancelled else { return }
         #if os(iOS)
         try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
         try? AVAudioSession.sharedInstance().setActive(true)
@@ -39,8 +43,9 @@ final class AudioRecorder {
         fileURL = url
         elapsed = 0
         isRecording = true
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
+        ticker = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
                 guard let self, let recorder = self.recorder else { return }
                 recorder.updateMeters()
                 self.elapsed = recorder.currentTime
@@ -48,6 +53,10 @@ final class AudioRecorder {
                 self.level = max(0, min(1, (recorder.averagePower(forChannel: 0) + 60) / 60))
             }
         }
+    }
+
+    deinit {
+        ticker?.cancel()
     }
 
     func cancel() {
@@ -66,8 +75,9 @@ final class AudioRecorder {
     }
 
     private func finishRecorder() {
-        timer?.invalidate()
-        timer = nil
+        generation += 1
+        ticker?.cancel()
+        ticker = nil
         recorder?.stop()
         recorder = nil
         isRecording = false
@@ -120,6 +130,9 @@ struct RecorderBar: View {
         .background(.bar)
         .task {
             await recorder.start()
+        }
+        .onDisappear {
+            recorder.cancel()
         }
     }
 

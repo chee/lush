@@ -351,7 +351,9 @@ enum NoteChatAssistant {
             "Note title: \(limited(title, to: 300))",
             "The note, one line per block, numbered for editing:\n\(blocks)",
             attachments.isEmpty ? nil : "Attachments:\n\(notes)",
-            previousTurns.isEmpty ? nil : "Recent chat:\n\(history)",
+            previousTurns.isEmpty
+                ? nil
+                : "Recent chat — the person has read all of this, so do not repeat an answer word for word:\n\(history)",
             calls.isEmpty ? nil : "What you have found so far this turn:\n\(calls)",
             catalog.isEmpty ? nil : "Tools:\n\(catalog)",
             "Person request:\n\(question)",
@@ -511,8 +513,11 @@ enum NoteChatAssistant {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// A placeholder that reached the transcript before this was caught teaches
+    /// the model to write another one, so history leaves them out.
     private static func historySummary(from turns: [NoteChatTurn]) -> String {
-        let lines = turns.suffix(8).map { turn in
+        let lines = turns.suffix(8).compactMap { turn -> String? in
+            guard !isPlaceholder(turn.text) else { return nil }
             let role = turn.role == .user ? "Person" : "Assistant"
             return "\(role): \(limited(turn.text, to: 1_000))"
         }

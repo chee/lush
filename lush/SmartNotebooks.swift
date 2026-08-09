@@ -184,13 +184,12 @@ extension NotesModel {
     /// holding a background task open waiting to hear it.
     private func waitForStartup(timeout: Duration = .seconds(20)) async -> Bool {
         guard !startupSettled else { return true }
-        let waited = Task { await awaitStartup() }
-        let bound = Task {
-            try? await Task.sleep(for: timeout)
-            waited.cancel()
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.awaitStartup() }
+            group.addTask { try? await Task.sleep(for: timeout) }
+            _ = await group.next()
+            group.cancelAll()
         }
-        await waited.value
-        bound.cancel()
         return startupSettled
     }
 

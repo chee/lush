@@ -42,7 +42,18 @@ struct ModelChoiceMenu: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
-        .onAppear { choices = LocalModelSettings.availableChoices() }
+        .task {
+            choices = LocalModelSettings.availableChoices()
+            // ollama names no default model, so it has nothing to offer until
+            // its own list of pulled models is read
+            guard LocalModelSettings.isConnected(.ollama),
+                  let pulled = try? await OllamaModelCatalog.fetch()
+            else { return }
+            var seen = Set(choices.map(\.id))
+            choices += pulled
+                .map { ModelChoice(backend: .ollama, model: $0.name) }
+                .filter { seen.insert($0.id).inserted }
+        }
     }
 
     private var groupedChoices: [(backend: LocalModelBackend, choices: [ModelChoice])] {

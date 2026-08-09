@@ -895,10 +895,11 @@ final class RichWebSchemeHandler: NSObject, WKURLSchemeHandler {
 
     private func respond(to request: URLRequest) async throws -> (Data, URLResponse) {
         guard let url = request.url else { throw URLError(.badURL) }
-        let path = url.path.isEmpty ? "" : String(url.path.dropFirst())
+        let encodedPath = String(url.path(percentEncoded: true).dropFirst())
+        let path = encodedPath.removingPercentEncoding ?? encodedPath
         let firstSegment = path.components(separatedBy: "/").first ?? ""
-        if firstSegment.removingPercentEncoding?.hasPrefix("automerge:") == true {
-            return try await resolveDocURL(path: path, url: url)
+        if firstSegment.hasPrefix("automerge:") {
+            return try await resolveDocURL(path: encodedPath, url: url)
         }
         switch path {
         case "", "embed.html":

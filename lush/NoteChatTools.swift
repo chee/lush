@@ -87,7 +87,7 @@ enum NoteChatAction: Codable, Equatable {
                         try core.createNoteDoc(title: title)
                     }
                     if folderUrl == nil || folderUrl?.isEmpty == true {
-                        try? core.linkNoteToFolder(noteUrl: url, title: title)
+                        try core.linkNoteToFolder(noteUrl: url, title: title)
                     }
                     _ = try? core.updateNoteSpans(url: url, spansJson: spans, heads: nil)
                     return url
