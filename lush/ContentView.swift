@@ -2392,6 +2392,7 @@ struct FolderScreen: View {
     @State private var renameText = ""
     @State private var moveTarget: MoveTarget?
     @State private var pinnedExpanded = true
+    @State private var expandedFolders: Set<String> = []
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
     @Environment(\.editMode) private var editMode
@@ -2408,11 +2409,41 @@ struct FolderScreen: View {
     }
 
     private var title: String {
-        guard let folderUrl else { return "Folders" }
+        guard let folderUrl else { return "" }
         return model.node(for: folderUrl)?.displayName ?? "Folder"
     }
 
     private var editing: Bool { editMode?.wrappedValue.isEditing == true }
+
+    private struct DisplayedNode: Identifiable {
+        let node: FolderNode
+        let depth: Int
+        var id: String { node.url }
+    }
+
+    private var displayedNodes: [DisplayedNode] {
+        flattened(nodes, depth: 0)
+    }
+
+    private func flattened(_ nodes: [FolderNode], depth: Int) -> [DisplayedNode] {
+        nodes.flatMap { node in
+            var result = [DisplayedNode(node: node, depth: depth)]
+            if node.kind == "folder", expandedFolders.contains(node.url) {
+                result += flattened(node.children ?? [], depth: depth + 1)
+            }
+            return result
+        }
+    }
+
+    private func route(for node: FolderNode) -> NavRoute {
+        node.kind == "folder"
+            ? .folder(node.url)
+            : node.kind == "lush:script"
+                ? .script(node.url)
+                : node.isNote
+                    ? .note(node.url)
+                    : .patchwork(node.url)
+    }
 
     /// Reordering flattens the tree to the level being shown; nesting is what
     /// drilling in is for.
@@ -2485,7 +2516,57 @@ struct FolderScreen: View {
                 } header: {
                     Text("Pinned")
                 }
-                if !model.smartNotebooks.isEmpty {
+            }
+            if searchText.isEmpty {
+                if editing {
+                    Section {
+                        ForEach(nodes) { node in
+                            nodeLabel(node)
+                                .moveDisabled(node.kind == "folder" && folderUrl != nil)
+                        }
+                        .onMove(perform: moveNodes)
+                    } header: {
+                        if folderUrl == nil { Text("Notebooks") }
+                    }
+                } else {
+                    Section {
+                        ForEach(displayedNodes) { displayed in
+                            HStack(spacing: 4) {
+                                Button {
+                                    push(route(for: displayed.node))
+                                } label: {
+                                    nodeLabel(displayed.node)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                if displayed.node.kind == "folder" {
+                                    Button {
+                                        if expandedFolders.contains(displayed.node.url) {
+                                            expandedFolders.remove(displayed.node.url)
+                                        } else {
+                                            expandedFolders.insert(displayed.node.url)
+                                        }
+                                    } label: {
+                                        Image(systemName: expandedFolders.contains(displayed.node.url)
+                                            ? "chevron.down"
+                                            : "chevron.right")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 24, height: 32)
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.leading, CGFloat(displayed.depth) * 20)
+                            .contextMenu { nodeMenu(displayed.node) }
+                        }
+                    } header: {
+                        if folderUrl == nil { Text("Notebooks") }
+                    }
+                }
+                if folderUrl == nil, !model.smartNotebooks.isEmpty {
                     Section {
                         ForEach(model.smartNotebooks) { folder in
                             Button {
@@ -2525,31 +2606,6 @@ struct FolderScreen: View {
                         }
                     } header: {
                         Text("Smart Notebooks")
-                    }
-                }
-            }
-            if searchText.isEmpty {
-                if editing {
-                    ForEach(nodes) { node in
-                        nodeLabel(node)
-                            .moveDisabled(node.kind == "folder" && folderUrl != nil)
-                    }
-                    .onMove(perform: moveNodes)
-                } else {
-                    OutlineGroup(nodes, children: \.children) { node in
-                        Button {
-                            push(node.kind == "folder"
-                                ? .folder(node.url)
-                                : node.kind == "lush:script"
-                                    ? .script(node.url)
-                                    : node.isNote
-                                        ? .note(node.url)
-                                        : .patchwork(node.url))
-                        } label: {
-                            nodeLabel(node)
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu { nodeMenu(node) }
                     }
                 }
             } else {
@@ -2639,6 +2695,11 @@ struct FolderScreen: View {
                         showingSettings = true
                     } label: {
                         Label("Settings", systemImage: "gearshape")
+                    }
+                }
+                if !model.focusModeEnabled {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        FocusModeControl(model: model)
                     }
                 }
             }
