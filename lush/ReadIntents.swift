@@ -204,7 +204,7 @@ struct SearchNotesIntent: AppIntent {
 
 struct GetRecentNotesIntent: AppIntent {
     static let title: LocalizedStringResource = "Get Recent Notes"
-    static let description = IntentDescription("The most recently modified Lush notes.")
+    static let description = IntentDescription("The most recently changed Lush notes.")
     static let openAppWhenRun = false
 
     @Parameter(title: "Limit", default: 20)

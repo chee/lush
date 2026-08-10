@@ -226,6 +226,9 @@ pub struct IndexedNote {
     /// Unix seconds of the doc's first change; 0 when its history carries none.
     pub created: i64,
     pub tags: Vec<String>,
+    pub weather: Vec<String>,
+    pub locations: Vec<String>,
+    pub has: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
 }

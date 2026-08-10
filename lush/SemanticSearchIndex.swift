@@ -5,6 +5,7 @@ import CryptoKit
 /// to the core, which stores them in search.sqlite3 beside the full-text index
 /// and does the similarity scan.
 actor SemanticSearchIndex {
+    private static let digestVersion = "2"
     private var core: Core?
 
     func attach(_ core: Core) {
@@ -15,6 +16,13 @@ actor SemanticSearchIndex {
     func indexedUrls() -> Set<String> {
         guard let core else { return [] }
         return Set(core.noteEmbeddingDigests().keys)
+    }
+
+    func contextIndexedUrls() -> Set<String> {
+        guard let core else { return [] }
+        return Set(core.noteEmbeddingDigests().compactMap { url, digest in
+            digest.hasPrefix("\(Self.digestVersion):") ? url : nil
+        })
     }
 
     func indexFile(url: String, name: String, text: String) async {
@@ -118,25 +126,73 @@ actor SemanticSearchIndex {
     // MARK: text
 
     private static func digest(of text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        let hash = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        return "\(digestVersion):\(hash)"
     }
 
     private static func plainText(from spans: [SpanNode]) -> String {
-        var parts: [String] = []
+        var context: [String] = []
+        var body: [String] = []
         for span in spans {
             switch span {
             case .block(let block):
+                if block.type == "context" {
+                    context.append(contextText(block))
+                }
                 if block.isEmbedBlock, let html = block.htmlSource {
-                    parts.append(html)
+                    body.append(html)
                 }
                 if let event = block.calendarEventSearchText {
-                    parts.append(event)
+                    body.append(event)
                 }
             case .text(let text, _):
-                parts.append(text)
+                body.append(text)
             }
         }
-        return parts.joined(separator: "\n")
+        return (context + body).filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    private static func contextText(_ block: BlockValue) -> String {
+        var parts = ["Logline"]
+        if let raw = (block.attrs["created"] ?? block.attrs["ts"])?.stringValue,
+           let date = ISO8601DateFormatter().date(from: raw) {
+            let hour = Calendar.current.component(.hour, from: date)
+            switch hour {
+            case 5..<12: parts.append("morning daytime")
+            case 12..<17: parts.append("afternoon daytime")
+            case 17..<21: parts.append("evening")
+            default: parts.append("night nighttime")
+            }
+            parts.append(date.formatted(.dateTime.weekday(.wide)))
+        }
+        if let location = block.attrs["location"]?.stringValue {
+            parts.append(location)
+        }
+        if let weather = block.attrs["weather"]?.stringValue {
+            parts.append(weather)
+            let value = weather.lowercased()
+            if value.contains("rain") || value.contains("drizzle")
+                || value.contains("shower") || value.contains("thunder") {
+                parts.append("wet rainy")
+            }
+            if value.contains("clear") || value.contains("sun") {
+                parts.append("sunny sunshine")
+            }
+            if value.contains("cloud") || value.contains("overcast") {
+                parts.append("cloudy")
+            }
+            if value.contains("snow") {
+                parts.append("snowy cold")
+            }
+            if value.contains("fog") || value.contains("mist") {
+                parts.append("foggy misty")
+            }
+        }
+        let reserved = Set(["created", "ts", "location", "lat", "lon", "weather"])
+        for (key, value) in block.attrs where !reserved.contains(key) {
+            if let text = value.stringValue { parts.append(text) }
+        }
+        return parts.joined(separator: " ")
     }
 
     private static func chunks(for text: String) -> [String] {

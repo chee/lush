@@ -5,6 +5,7 @@ struct NewItemMenuItems: View {
     var folderUrl: String? = nil
     var snap: ContextSnapshot? = nil
     var shortcuts = false
+    var onNewSmartNotebook: () -> Void = { AppRouter.shared.pending = .newSmartNotebook }
     var onCreate: (String) -> Void = { _ in }
 
     private var target: String? { folderUrl ?? model.folderUrl }
@@ -69,7 +70,7 @@ struct NewItemMenuItems: View {
             Label("Notebook", systemImage: "book.closed")
         }
         Button {
-            AppRouter.shared.pending = .newSmartNotebook
+            onNewSmartNotebook()
         } label: {
             Label("Smart Notebook…", systemImage: "folder.badge.gearshape")
         }

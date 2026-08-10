@@ -45,6 +45,9 @@ pub struct IndexedDoc {
     /// File docs only: whether `@computervision` has been written yet.
     pub has_vision: bool,
     pub tags: Vec<String>,
+    pub weather: Vec<String>,
+    pub locations: Vec<String>,
+    pub facets: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
     /// The doc state this row was built from. An upsert whose heads match what
@@ -176,6 +179,18 @@ impl SearchIndex {
             "ALTER TABLE search_docs ADD COLUMN created INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN weather TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN locations TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN facets TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS search_docs_modified
                 ON search_docs(modified DESC);
@@ -192,23 +207,28 @@ impl SearchIndex {
         if !doc.heads.is_empty() {
             // A row written before `created` existed has to be rewritten even
             // though its heads still match, or it never gets one.
-            let stored: Option<(String, i64)> = conn
+            let stored: Option<(String, i64, String, String, String)> = conn
                 .query_row(
-                    "SELECT heads, created FROM search_docs WHERE url = ?1",
+                    "SELECT heads, created, weather, locations, facets FROM search_docs WHERE url = ?1",
                     params![doc.url],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .optional()?;
-            if let Some((heads, created)) = stored {
-                if heads == doc.heads && (created != 0 || doc.created == 0) {
+            if let Some((heads, created, weather, locations, facets)) = stored {
+                if heads == doc.heads
+                    && (created != 0 || doc.created == 0)
+                    && weather == doc.weather.join("\n")
+                    && locations == doc.locations.join("\n")
+                    && facets == encode_tags(&doc.facets)
+                {
                     return Ok(());
                 }
             }
         }
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -218,7 +238,10 @@ impl SearchIndex {
                 tags = excluded.tags,
                 when_day = excluded.when_day,
                 heads = excluded.heads,
-                created = excluded.created",
+                created = excluded.created,
+                weather = excluded.weather,
+                locations = excluded.locations,
+                facets = excluded.facets",
             params![
                 doc.url,
                 doc.kind,
@@ -229,7 +252,10 @@ impl SearchIndex {
                 encode_tags(&doc.tags),
                 doc.when,
                 doc.heads,
-                doc.created
+                doc.created,
+                doc.weather.join("\n"),
+                doc.locations.join("\n"),
+                encode_tags(&doc.facets)
             ],
         )?;
         tx.execute(
@@ -461,9 +487,16 @@ impl SearchIndex {
     pub fn indexed_notes(&self, limit: u32) -> Result<Vec<IndexedNote>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT url, title, kind, modified, created, tags, when_day
-             FROM search_docs
-             ORDER BY modified DESC
+            "SELECT d.url, d.title, d.kind, d.modified, d.created, d.tags, d.when_day,
+                    d.weather, d.locations,
+                    d.facets || ' ' || COALESCE((
+                        SELECT group_concat(a.facets, ' ')
+                        FROM search_links l
+                        JOIN search_docs a ON a.url = l.asset_url
+                        WHERE l.note_url = d.url
+                    ), '')
+             FROM search_docs d
+             ORDER BY d.modified DESC
              LIMIT ?1",
         )?;
         let mut rows = stmt.query(params![limit])?;
@@ -478,6 +511,21 @@ impl SearchIndex {
                 created: row.get(4)?,
                 tags: tags.split_whitespace().map(str::to_string).collect(),
                 when: row.get(6)?,
+                weather: row
+                    .get::<_, String>(7)?
+                    .lines()
+                    .map(str::to_string)
+                    .collect(),
+                locations: row
+                    .get::<_, String>(8)?
+                    .lines()
+                    .map(str::to_string)
+                    .collect(),
+                has: row
+                    .get::<_, String>(9)?
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
             });
         }
         Ok(out)
@@ -609,6 +657,9 @@ pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
         created: shapes::doc_created(doc),
         has_vision,
         tags: shapes::doc_tags(doc),
+        weather: shapes::context_values(doc, "weather"),
+        locations: shapes::context_values(doc, "location"),
+        facets: shapes::doc_facets(doc),
         when: shapes::doc_when(doc),
         heads: heads.join(","),
     }
@@ -802,6 +853,9 @@ mod tests {
             created: 0,
             has_vision: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            weather: Vec::new(),
+            locations: Vec::new(),
+            facets: Vec::new(),
             when: when.into(),
             heads: String::new(),
         }

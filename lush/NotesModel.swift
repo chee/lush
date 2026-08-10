@@ -655,7 +655,9 @@ final class NotesModel {
     }
 
     func selectFolder(_ url: String?) async {
-        guard let core, let url else { return }
+        guard let url else { return }
+        selectedNoteUrl = nil
+        guard let core else { return }
         do {
             _ = try await Task.detached { try core.ensureFolder(existingUrl: url) }.value
             folderUrl = url
@@ -916,9 +918,7 @@ final class NotesModel {
             return
         }
         if node.kind == "folder" {
-            let openNote = selectedNoteUrl
             await selectFolder(url)
-            selectedNoteUrl = openNote
         } else {
             // open instantly; folder retargeting happens behind the scenes
             selectedNoteUrl = url
@@ -2364,26 +2364,42 @@ final class NotesModel {
     /// the semantic pass sits out.
     func search(_ query: String, in scope: String? = nil) async -> [SearchHit] {
         guard let core, !query.trimmingCharacters(in: .whitespaces).isEmpty else { return [] }
+        let syntax = SearchSyntax(query)
         // Anything still in the tree, which is what a smart notebook counts
         // too. `notes` is only the open folder's own entries, so using it here
         // quietly threw away every hit that lived anywhere else.
         if Task.isCancelled { return [] }
         let liveUrls = notebookTree.kinds
+        var allowed: Set<String>?
+        var metadata: [IndexedNote] = []
+        if !syntax.clauses.isEmpty || syntax.text.isEmpty {
+            let tree = notebookTree
+            metadata = await indexedCorpus().filter { note in
+                guard liveUrls[note.url] != nil, note.kind != "folder", syntax.matches(note) else { return false }
+                return scope.map { tree.contains(note.url, under: $0) } ?? true
+            }
+            allowed = Set(metadata.map(\.url))
+        }
+        if syntax.text.isEmpty {
+            return metadata.map {
+                SearchHit(url: $0.url, name: $0.title, snippet: "")
+            }
+        }
         let filter = SearchFilter(scope: scope, tags: [], whenFrom: nil, whenTo: nil)
-        let exact = await Task.detached { core.searchNotes(query: query, filter: filter) }.value
-            .filter { liveUrls[$0.url] != nil }
+        let exact = await Task.detached { core.searchNotes(query: syntax.text, filter: filter) }.value
+            .filter { liveUrls[$0.url] != nil && (allowed?.contains($0.url) ?? true) }
         if Task.isCancelled { return [] }
-        if query.contains("\"") { return exact }
+        if syntax.text.contains("\"") { return exact }
         let seen = Set(exact.map(\.url))
-        return await exact + semanticSearch.search(query, excluding: seen, in: scope)
-            .filter { liveUrls[$0.url] != nil }
+        return await exact + semanticSearch.search(syntax.text, excluding: seen, in: scope)
+            .filter { liveUrls[$0.url] != nil && (allowed?.contains($0.url) ?? true) }
     }
 
     /// Notes the index has never seen — everything else is kept current by
     /// docChanged and the edit paths, so a refresh must not re-embed the world.
     private func backfillSemanticIndex(for notes: [NoteInfo]) {
         Task { [weak self, semanticSearch] in
-            let known = await semanticSearch.indexedUrls()
+            let known = await semanticSearch.contextIndexedUrls()
             guard let self else { return }
             for note in notes where !known.contains(note.url) {
                 self.scheduleSemanticIndex(url: note.url, name: note.name)

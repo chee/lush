@@ -76,7 +76,7 @@ enum SmartNotebookRun {
         var queries: [String] = []
         walk(folder.rootRule) { rule in
             guard case let .text(.anything, false, exact, text) = rule.body else { return }
-            let query = searchQuery(text, exact: exact)
+            let query = searchQuery(SearchSyntax(text).text, exact: exact)
             if !query.isEmpty, !queries.contains(query) { queries.append(query) }
         }
         return queries
@@ -160,13 +160,18 @@ enum SmartNotebookRun {
         case let .text(field, whole, exact, text):
             let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.isEmpty { return true }
-            guard let note else { return field != .anything }
             switch field {
             case .anything:
-                return matched[searchQuery(text, exact: exact)]?.contains(note.url) == true
+                let syntax = SearchSyntax(text)
+                let query = searchQuery(syntax.text, exact: exact)
+                guard let note else { return query.isEmpty }
+                return syntax.matches(note)
+                    && (query.isEmpty || matched[query]?.contains(note.url) == true)
             case .title:
+                guard let note else { return true }
                 return compare(note.title, text, whole: whole, exact: exact)
             case .tag:
+                guard let note else { return true }
                 return note.tags.contains { compare($0, text, whole: whole, exact: exact) }
             }
         case let .kind(kind):

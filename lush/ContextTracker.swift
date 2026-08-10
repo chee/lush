@@ -185,7 +185,9 @@ final class ContextTracker {
     private var locationManager: CLLocationManager?
     private var monitorTask: Task<Void, Never>?
     private var lastWeatherFetch: Date = .distantPast
+    private var lastWeatherAttempt: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
+    private var weatherFetchInProgress = false
     private var lastLocation: CLLocation?
 
     init() {
@@ -294,21 +296,57 @@ final class ContextTracker {
 
     private func fetchWeather(lat: Double, lon: Double) async {
         let now = Date()
+        guard !weatherFetchInProgress else { return }
         if let last = lastWeatherLocation {
             let moved = sqrt(pow(lat - last.0, 2) + pow(lon - last.1, 2)) > 0.01
             let stale = now.timeIntervalSince(lastWeatherFetch) > 1800
             guard moved || stale else { return }
         }
+        guard now.timeIntervalSince(lastWeatherAttempt) > 60 else { return }
+        lastWeatherAttempt = now
+        weatherFetchInProgress = true
+        defer { weatherFetchInProgress = false }
+        let location = CLLocation(latitude: lat, longitude: lon)
+        if let current = try? await WeatherService.shared.weather(for: location, including: .current) {
+            let formatter = MeasurementFormatter()
+            formatter.unitOptions = [.naturalScale, .temperatureWithoutUnit]
+            formatter.numberFormatter.maximumFractionDigits = 0
+            let temp = formatter.string(from: current.temperature)
+            snapshot.weatherDescription = "\(temp) \(current.condition.description)"
+            lastWeatherFetch = now
+            lastWeatherLocation = (lat, lon)
+            return
+        }
+        guard let url = URL(
+            string: "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(lon)&current_weather=true"
+        ),
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let current = json["current_weather"] as? [String: Any],
+              let temperature = current["temperature"] as? Double
+        else { return }
+        let condition = weatherLabel(current["weathercode"] as? Int ?? 0)
+        let temp = "\(Int(temperature.rounded()))°C"
+        snapshot.weatherDescription = condition.isEmpty ? temp : "\(temp) \(condition)"
         lastWeatherFetch = now
         lastWeatherLocation = (lat, lon)
-        let location = CLLocation(latitude: lat, longitude: lon)
-        guard let current = try? await WeatherService.shared.weather(for: location, including: .current)
-        else { return }
-        let formatter = MeasurementFormatter()
-        formatter.unitOptions = [.naturalScale, .temperatureWithoutUnit]
-        formatter.numberFormatter.maximumFractionDigits = 0
-        let temp = formatter.string(from: current.temperature)
-        snapshot.weatherDescription = "\(temp) \(current.condition.description)"
+    }
+
+    private func weatherLabel(_ code: Int) -> String {
+        switch code {
+        case 0: "Clear"
+        case 1, 2: "Partly Cloudy"
+        case 3: "Overcast"
+        case 45, 48: "Fog"
+        case 51, 53, 55, 61, 63, 65: "Rain"
+        case 66, 67: "Freezing Rain"
+        case 71, 73, 75, 77: "Snow"
+        case 80, 81, 82: "Showers"
+        case 85, 86: "Snow Showers"
+        case 95: "Thunderstorm"
+        default: ""
+        }
     }
 }
 

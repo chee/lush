@@ -2058,6 +2058,61 @@ pub fn full_text(doc: &Automerge) -> String {
     out
 }
 
+pub fn context_values(doc: &Automerge, key: &str) -> Vec<String> {
+    let Ok(spans) = spans_to_json(doc) else {
+        return Vec::new();
+    };
+    spans
+        .into_iter()
+        .filter_map(|span| match span {
+            SpanJson::Block { value }
+                if value.get("type").and_then(Json::as_str) == Some("context") =>
+            {
+                value
+                    .get("attrs")
+                    .and_then(Json::as_object)
+                    .and_then(|attrs| attrs.get(key))
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn doc_facets(doc: &Automerge) -> Vec<String> {
+    let kind = doc_kind(doc);
+    let mut facets = Vec::new();
+    if kind == "file" {
+        let mime = doc_field(doc, "mimeType").to_lowercase();
+        if let Some(media) = mime.split('/').next().filter(|value| !value.is_empty()) {
+            facets.push(media.to_string());
+            if media == "audio" {
+                facets.push("recording".into());
+            }
+        }
+    } else if !["", "rich", "folder", "lush:script"].contains(&kind.as_str()) {
+        facets.push("datatype".into());
+        facets.push(kind);
+    }
+    if let Ok(spans) = spans_to_json(doc) {
+        for span in spans {
+            let SpanJson::Block { value } = span else {
+                continue;
+            };
+            let Some(kind) = value.get("type").and_then(Json::as_str) else {
+                continue;
+            };
+            if !["paragraph", "heading", "embed"].contains(&kind) {
+                facets.push(kind.to_string());
+            }
+        }
+    }
+    facets.sort();
+    facets.dedup();
+    facets
+}
+
 /// Case-insensitive substring search returning a snippet around the first
 /// match, or None. Works in char space to stay boundary-safe.
 pub fn search_snippet(text: &str, query: &str) -> Option<String> {

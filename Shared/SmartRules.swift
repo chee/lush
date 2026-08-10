@@ -23,7 +23,230 @@ enum SmartDateField: String, CaseIterable {
     case modified
     case created
 
-    var label: String { self == .modified ? "Modified" : "Created" }
+    var label: String { self == .modified ? "Changed" : "Created" }
+}
+
+struct SearchSyntax {
+    struct Suggestion: Identifiable {
+        let label: String
+        let replacement: String
+        let range: NSRange
+
+        var id: String { replacement }
+    }
+
+    struct Clause: Identifiable, Equatable {
+        enum Field: String {
+            case created
+            case changed
+            case weather
+            case location
+            case tag
+            case kind
+            case when
+            case title
+            case has
+        }
+
+        enum Comparison: Equatable {
+            case equal
+            case before
+            case after
+        }
+
+        let id: Int
+        let range: NSRange
+        let raw: String
+        let field: Field
+        let comparison: Comparison
+        let value: String
+
+        var label: String {
+            let suffix = raw.split(separator: ":", maxSplits: 1).last.map(String.init) ?? value
+            return "\(field.rawValue):\(suffix)"
+        }
+    }
+
+    let text: String
+    let clauses: [Clause]
+
+    init(_ source: String) {
+        let pattern = #"(?:[^\s\"]+:\"[^\"]*\"|\"[^\"]*\"|[^\s]+)"#
+        let sourceRange = NSRange(location: 0, length: (source as NSString).length)
+        let matches = (try? NSRegularExpression(pattern: pattern))?.matches(in: source, range: sourceRange) ?? []
+        var text: [String] = []
+        var clauses: [Clause] = []
+        let ns = source as NSString
+        for match in matches {
+            let raw = ns.substring(with: match.range)
+            guard let colon = raw.firstIndex(of: ":") else {
+                text.append(raw)
+                continue
+            }
+            let key = String(raw[..<colon]).lowercased()
+            let canonical = key == "modified" || key == "updated" ? "changed" : key
+            guard let field = Clause.Field(rawValue: canonical) else {
+                text.append(raw)
+                continue
+            }
+            var value = String(raw[raw.index(after: colon)...])
+            if value.hasPrefix("\"") && !value.hasSuffix("\"") {
+                text.append(raw)
+                continue
+            }
+            var comparison = Clause.Comparison.equal
+            if value.first == "<" {
+                comparison = .before
+                value.removeFirst()
+            } else if value.first == ">" {
+                comparison = .after
+                value.removeFirst()
+            }
+            if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
+                value.removeFirst()
+                value.removeLast()
+            }
+            guard !value.isEmpty, Self.valid(value, for: field) else {
+                text.append(raw)
+                continue
+            }
+            clauses.append(Clause(
+                id: match.range.location,
+                range: match.range,
+                raw: raw,
+                field: field,
+                comparison: comparison,
+                value: Self.day(value) ?? value
+            ))
+        }
+        self.text = text.joined(separator: " ")
+        self.clauses = clauses
+    }
+
+    func removing(_ clause: Clause, from source: String) -> String {
+        let value = NSMutableString(string: source)
+        value.replaceCharacters(in: clause.range, with: "")
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+    }
+
+    static func suggestions(for source: String) -> [Suggestion] {
+        let ns = source as NSString
+        let boundary = ns.range(of: " ", options: .backwards)
+        let start = boundary.location == NSNotFound ? 0 : boundary.location + boundary.length
+        let range = NSRange(location: start, length: ns.length - start)
+        let current = ns.substring(with: range).lowercased()
+        let fields = ["created", "changed", "weather", "location", "has", "tag", "title", "kind", "when"]
+        guard let colon = current.firstIndex(of: ":") else {
+            guard !current.isEmpty else { return [] }
+            return fields
+                .filter { $0.hasPrefix(current) }
+                .map { Suggestion(label: "\($0):", replacement: "\($0):", range: range) }
+        }
+        let field = String(current[..<colon])
+        let prefix = String(current[current.index(after: colon)...])
+        let values: [String]
+        switch field {
+        case "created", "changed", "when": values = ["today", "yesterday"]
+        case "weather": values = ["sunny", "wet", "rainy", "cloudy", "snowy", "foggy"]
+        case "has": values = ["image", "video", "audio", "recording", "datatype"]
+        case "kind": values = ["note", "file", "script", "patchwork"]
+        default: values = []
+        }
+        return values
+            .filter { prefix.isEmpty || $0.hasPrefix(prefix) }
+            .map {
+                let replacement = "\(field):\($0) "
+                return Suggestion(label: replacement.trimmingCharacters(in: .whitespaces), replacement: replacement, range: range)
+            }
+    }
+
+    static func completing(_ suggestion: Suggestion, in source: String) -> String {
+        let value = NSMutableString(string: source)
+        value.replaceCharacters(in: suggestion.range, with: suggestion.replacement)
+        return value as String
+    }
+
+    func matches(_ note: IndexedNote) -> Bool {
+        clauses.allSatisfy { clause in
+            switch clause.field {
+            case .created:
+                return Self.matches(Date(docTimestamp: note.created), clause)
+            case .changed:
+                return Self.matches(Date(docTimestamp: note.modified), clause)
+            case .weather:
+                return note.weather.contains { Self.weather($0, matches: clause.value) }
+            case .location:
+                return note.locations.contains { Self.contains($0, clause.value) }
+            case .tag:
+                return note.tags.contains { Self.contains($0, clause.value) }
+            case .kind:
+                return SmartNotebookKind(rawValue: clause.value.lowercased())?.matches(note.kind) == true
+            case .when:
+                guard let day = Self.day(clause.value), !note.when.isEmpty else { return false }
+                switch clause.comparison {
+                case .equal: return note.when == day
+                case .before: return note.when < day
+                case .after: return note.when > day
+                }
+            case .title:
+                return Self.contains(note.title, clause.value)
+            case .has:
+                return note.has.contains { Self.contains($0, clause.value) }
+            }
+        }
+    }
+
+    private static func valid(_ value: String, for field: Clause.Field) -> Bool {
+        switch field {
+        case .created, .changed, .when:
+            return day(value) != nil
+        case .kind:
+            return SmartNotebookKind(rawValue: value.lowercased()) != nil
+        default:
+            return true
+        }
+    }
+
+    private static func day(_ value: String) -> String? {
+        let lowered = value.lowercased()
+        if lowered == "today" { return smartRuleDay(Date()) }
+        if lowered == "yesterday", let date = Calendar.current.date(byAdding: .day, value: -1, to: Date()) {
+            return smartRuleDay(date)
+        }
+        return smartRuleDayStart(value) == nil ? nil : value
+    }
+
+    private static func matches(_ date: Date, _ clause: Clause) -> Bool {
+        guard date.timeIntervalSince1970 > 0,
+              let day = smartRuleDayStart(clause.value),
+              let next = Calendar.current.date(byAdding: .day, value: 1, to: day)
+        else { return false }
+        switch clause.comparison {
+        case .equal: return date >= day && date < next
+        case .before: return date < day
+        case .after: return date >= next
+        }
+    }
+
+    private static func contains(_ value: String, _ query: String) -> Bool {
+        value.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    private static func weather(_ value: String, matches query: String) -> Bool {
+        let value = value.lowercased()
+        let query = query.lowercased()
+        if value.contains(query) { return true }
+        let aliases: [String: [String]] = [
+            "sunny": ["sun", "clear"],
+            "wet": ["rain", "drizzle", "shower", "thunder"],
+            "rainy": ["rain", "drizzle", "shower", "thunder"],
+            "cloudy": ["cloud", "overcast"],
+            "snowy": ["snow"],
+            "foggy": ["fog", "mist"],
+        ]
+        return aliases[query]?.contains(where: value.contains) == true
+    }
 }
 
 enum SmartDateOp: String, CaseIterable {

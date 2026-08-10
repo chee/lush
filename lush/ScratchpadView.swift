@@ -298,9 +298,9 @@ private struct PadCanvasView: View {
 
     private var padPaper: Color {
         #if os(macOS)
-        Color(nsColor: .underPageBackgroundColor)
+        Color(nsColor: .windowBackgroundColor)
         #else
-        Color(uiColor: .systemGroupedBackground)
+        Color(uiColor: .secondarySystemGroupedBackground)
         #endif
     }
 

@@ -269,16 +269,15 @@ struct SmartNotebookEditor: View {
     @State private var showCount = true
     @State private var notifyOnChange = false
     @State private var notificationsDenied = false
+    @State private var loaded = false
+    @State private var saveTask: Task<Void, Never>?
 
     var body: some View {
         form
             .navigationTitle(isNew ? "New Smart Notebook" : "Smart Notebook")
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: dismissEditor)
-                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { save() }
+                    Button("Done") { saveAndClose() }
                         .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
@@ -287,10 +286,20 @@ struct SmartNotebookEditor: View {
                 root = existing.rootRule
                 showCount = existing.showCount
                 notifyOnChange = existing.notifyOnChange
+                loaded = true
             }
+            .onChange(of: name) { scheduleSave() }
+            .onChange(of: root) { scheduleSave() }
+            .onChange(of: showCount) { scheduleSave() }
             .onChange(of: notifyOnChange) {
-                guard notifyOnChange else { return }
-                Task { notificationsDenied = await !SmartNotebookAlerts.requestAuthorization() }
+                scheduleSave()
+                if notifyOnChange {
+                    Task { notificationsDenied = await !SmartNotebookAlerts.requestAuthorization() }
+                }
+            }
+            .onDisappear {
+                saveTask?.cancel()
+                saveNow()
             }
     }
 
@@ -316,7 +325,9 @@ struct SmartNotebookEditor: View {
                 Text(
                     "“Contains” is loose: it ignores case and accents, and a Note rule also "
                         + "finds notes that mean the same thing without saying it. "
-                        + "“Exactly” matches the characters as typed."
+                        + "“Exactly” matches the characters as typed. Use created:, changed:, "
+                        + "weather:, location:, has:, tag:, title:, kind:, or when: inside a Note rule. "
+                        + "Dates accept today, yesterday, YYYY-MM-DD, <, and >."
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -355,16 +366,33 @@ struct SmartNotebookEditor: View {
         if let close { close() } else { dismiss() }
     }
 
-    private func save() {
+    private func scheduleSave() {
+        guard loaded else { return }
+        saveTask?.cancel()
+        saveTask = Task {
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            saveNow()
+        }
+    }
+
+    private func saveNow() {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard loaded, !name.isEmpty else { return }
         model.saveSmartNotebook(
             smartNotebook(
                 id: existing.id,
-                name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                name: name,
                 root: root,
                 showCount: showCount,
                 notifyOnChange: notifyOnChange
             )
         )
+    }
+
+    private func saveAndClose() {
+        saveTask?.cancel()
+        saveNow()
         dismissEditor()
     }
 }
@@ -545,10 +573,17 @@ struct SmartRuleRow: View {
     @ViewBuilder private var value: some View {
         switch rule.body {
         case let .text(field, whole, exact, text):
-            TextField("", text: bind(text) { .text(field, whole: whole, exact: exact, $0) }, prompt: Text("text to find"))
-                .textFieldStyle(.roundedBorder)
-                .labelsHidden()
-                .frame(minWidth: 120, maxWidth: 260)
+            let text = bind(text) { .text(field, whole: whole, exact: exact, $0) }
+            VStack(alignment: .leading, spacing: 6) {
+                TextField("", text: text, prompt: Text("text to find"))
+                    .textFieldStyle(.roundedBorder)
+                    .labelsHidden()
+                    .frame(minWidth: 120, maxWidth: 260)
+                if field == .anything, !SearchSyntax(text.wrappedValue).clauses.isEmpty {
+                    SearchSyntaxPills(text: text)
+                        .frame(maxWidth: 260)
+                }
+            }
         case let .kind(kind):
             Picker("", selection: bind(kind) { .kind($0) }) {
                 ForEach(SmartNotebookKind.allCases, id: \.self) { kind in

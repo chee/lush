@@ -36,6 +36,54 @@ struct PatchworkCreateRequest: Identifiable {
     let folderUrl: String?
 }
 
+struct SearchFieldToken: Identifiable, Equatable {
+    let id = UUID()
+    let raw: String
+
+    var label: String { SearchSyntax(raw).clauses.first?.label ?? raw }
+}
+
+#if os(macOS)
+struct DoubleClickCatcher: NSViewRepresentable {
+    let action: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        let recognizer = NSClickGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.doubleClicked)
+        )
+        recognizer.numberOfClicksRequired = 2
+        recognizer.delegate = context.coordinator
+        view.addGestureRecognizer(recognizer)
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.action = action
+    }
+
+    final class Coordinator: NSObject, NSGestureRecognizerDelegate {
+        var action: () -> Void
+
+        init(action: @escaping () -> Void) {
+            self.action = action
+        }
+
+        @objc func doubleClicked() { action() }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: NSGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: NSGestureRecognizer
+        ) -> Bool {
+            true
+        }
+    }
+}
+#endif
+
 struct ContentView: View {
     @Environment(NotesModel.self) private var model
     @Environment(ContextTracker.self) private var contextTracker
@@ -48,6 +96,8 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var selectedItemUrls: Set<String> = []
     @State private var searchText = ""
+    @State private var searchTokens: [SearchFieldToken] = []
+    @State private var preserveSearchInputOnce = false
     @State private var searchPresented = false
     @State private var searchHits: [SearchHit] = []
     @State private var searchTask: Task<Void, Never>?
@@ -297,7 +347,7 @@ struct ContentView: View {
             openCalendar()
         case .search(let query):
             #if os(macOS)
-            searchText = query
+            setSearchQuery(query)
             searchPresented = true
             searchFocused = true
             sidebarFocused = true
@@ -350,10 +400,6 @@ struct ContentView: View {
         ScrollViewReader { proxy in
             sidebarList
                 .onDrop(of: [UTType.plainText.identifier], delegate: SidebarDropCleanup())
-                .onChange(of: searchHits) { _, hits in
-                    guard let first = hits.first else { return }
-                    proxy.scrollTo(first.url, anchor: .top)
-                }
                 .onChange(of: revealTarget) { _, row in
                     guard let row else { return }
                     revealTarget = nil
@@ -369,7 +415,7 @@ struct ContentView: View {
 
     private var sidebarList: some View {
         List {
-            if searchText.isEmpty {
+            if searchQueryText.isEmpty {
                 ForEach(sectionOrder, id: \.self) { section in
                     sectionRows(section)
                 }
@@ -428,19 +474,26 @@ struct ContentView: View {
         .onChange(of: expanded) {
             resolveSelectionRows()
         }
-        .onChange(of: searchText) {
-            model.searchQuery = searchText
-            runSearch()
+        .onChange(of: searchText) { oldValue, newValue in
+            let preserve = preserveSearchInputOnce
+            preserveSearchInputOnce = false
+            let inserted = newValue.difference(from: oldValue).reduce(into: 0) { count, change in
+                if case .insert = change { count += 1 }
+            }
+            absorbSearchTokens(commitAll: !preserve && inserted > 1)
+        }
+        .onChange(of: searchTokens) {
+            searchDidChange()
         }
         .onChange(of: searchPresented) {
             if !searchPresented { searchScope = nil }
         }
         .onChange(of: model.notes) {
-            if !searchText.isEmpty { runSearch(selectTop: false) }
+            if !searchQueryText.isEmpty { runSearch(selectTop: false) }
             model.refreshSmartHits()
         }
         .onChange(of: model.folderTree) {
-            if !searchText.isEmpty { runSearch(selectTop: false) }
+            if !searchQueryText.isEmpty { runSearch(selectTop: false) }
             model.refreshSmartHits()
         }
         .onChange(of: model.smartNotebooks, initial: true) {
@@ -468,7 +521,15 @@ struct ContentView: View {
             return .ignored
         }
         .onKeyPress(.space) {
-            guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return .ignored }
+            guard renamingUrl == nil,
+                  selectedItemUrls.count == 1,
+                  let tag = selectedItemUrls.first
+            else { return .ignored }
+            if tag.hasPrefix("smart:") {
+                let id = String(tag.dropFirst(6))
+                setSmartExpanded(!smartExpanded.contains(id), id: id)
+                return .handled
+            }
             let selected = Self.sidebarUrl(tag)
             guard let node = model.node(for: selected), node.kind == "folder" else { return .ignored }
             setExpanded(!expanded.contains(selected), for: selected)
@@ -503,6 +564,11 @@ struct ContentView: View {
         } else {
             selectedItemUrls = [tag]
         }
+        if selectedItemUrls.count == 1,
+           let selected = selectedItemUrls.first,
+           model.node(for: Self.sidebarUrl(selected))?.kind == "folder" {
+            model.selectedNoteUrl = nil
+        }
         sidebarFocused = true
     }
 
@@ -520,7 +586,7 @@ struct ContentView: View {
     }
 
     private var visibleSidebarRowTags: [String] {
-        if !searchText.isEmpty { return searchHits.map(\.url) }
+        if !searchQueryText.isEmpty { return searchHits.map(\.url) }
         var tags: [String] = []
         for section in sectionOrder {
             switch section {
@@ -560,6 +626,7 @@ struct ContentView: View {
     }
 
     private func moveSidebarSelection(by offset: Int) -> KeyPress.Result {
+        guard renamingUrl == nil else { return .ignored }
         let rows = visibleSidebarRowTags
         guard !rows.isEmpty else { return .ignored }
         let current = rows.firstIndex { selectedItemUrls.contains($0) }
@@ -576,7 +643,7 @@ struct ContentView: View {
     /// typing walks straight into the best match without leaving the field.
     private func runSearch(selectTop: Bool = true) {
         searchTask?.cancel()
-        let query = searchText
+        let query = searchQueryText
         guard !query.isEmpty else {
             searchHits = []
             return
@@ -604,7 +671,7 @@ struct ContentView: View {
     private func searchInFolder(_ url: String) {
         searchScope = url
         focusNotesSearch()
-        if !searchText.isEmpty { runSearch(selectTop: false) }
+        if !searchQueryText.isEmpty { runSearch(selectTop: false) }
     }
 
     @ViewBuilder
@@ -614,6 +681,9 @@ struct ContentView: View {
             calendarRow
                 .modifier(SectionDragReorder(section: .calendar, order: $sectionOrder))
                 .listRowInsets(sidebarRowInsets(depth: 0))
+                .listRowBackground(
+                    selectionBackground(url: Agenda.sidebarTag, tag: Agenda.sidebarTag)
+                )
         case .pinned:
             if !model.pinnedNodes.isEmpty {
                 pinnedRootRow
@@ -713,9 +783,6 @@ struct ContentView: View {
             }
             .tag(Agenda.sidebarTag)
             .listRowInsets(sidebarRowInsets(depth: 0))
-            .listRowBackground(
-                selectionBackground(url: Agenda.sidebarTag, tag: Agenda.sidebarTag)
-            )
     }
 
     private var calendarSelected: Bool {
@@ -728,7 +795,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private func searchHitRow(_ hit: SearchHit) -> some View {
-        let snippet = highlighted(hit.snippet, query: searchText)
+        let snippet = highlighted(hit.snippet, query: SearchSyntax(searchQueryText).text)
         if let node = model.node(for: hit.url) {
             NoteRowView(node: node, showFolder: true, snippet: snippet)
         } else {
@@ -823,7 +890,7 @@ struct ContentView: View {
     /// folded — is held as the bare url. Once the row shows up, point at it,
     /// otherwise every copy reads as the unfocused one.
     private func resolveSelectionRows() {
-        guard searchText.isEmpty else { return }
+        guard searchQueryText.isEmpty else { return }
         let resolved = Set(selectedItemUrls.map { tag in
             guard !Self.isRowTag(tag), tag.hasPrefix("automerge:") else { return tag }
             return rowTag(for: tag)
@@ -880,10 +947,16 @@ struct ContentView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Image(systemName: isOpen ? "chevron.down" : "chevron.right")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 20, height: 20)
+            Button {
+                setSmartExpanded(!isOpen, id: folder.id)
+            } label: {
+                Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
         .padding(.top, 12)
         .padding(.bottom, 5)
@@ -892,12 +965,7 @@ struct ContentView: View {
         .contentShape(Rectangle())
         .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(tag) })
         .simultaneousGesture(TapGesture(count: 2).onEnded {
-            if isOpen {
-                smartExpanded.remove(folder.id)
-            } else {
-                smartExpanded.insert(folder.id)
-                model.refreshSmartHits(folder)
-            }
+            setSmartExpanded(!isOpen, id: folder.id)
         })
         .tag(tag)
         .onDrag({ SidebarDrag.provider(folder.id, kind: .smart) }, preview: {
@@ -927,6 +995,15 @@ struct ContentView: View {
                 }
             }
             .tint(.primary)
+        }
+    }
+
+    private func setSmartExpanded(_ isOpen: Bool, id: String) {
+        if isOpen {
+            smartExpanded.insert(id)
+            if let folder = model.smartNotebook(id: id) { model.refreshSmartHits(folder) }
+        } else {
+            smartExpanded.remove(id)
         }
     }
 
@@ -979,7 +1056,7 @@ struct ContentView: View {
     private var saveSearchRow: some View {
         Button {
             smartEditor = SmartNotebookEdit(
-                folder: newSmartNotebook(query: searchText, scope: searchScope ?? ""),
+                folder: newSmartNotebook(query: searchQueryText, scope: searchScope ?? ""),
                 isNew: true
             )
         } label: {
@@ -1193,7 +1270,11 @@ struct ContentView: View {
     @ViewBuilder
     private func folderContextMenuContent(for node: FolderNode) -> some View {
         Menu("New") {
-            NewItemMenuItems(model: model, folderUrl: node.url) { open($0) }
+            NewItemMenuItems(
+                model: model,
+                folderUrl: node.url,
+                onNewSmartNotebook: { smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true) }
+            ) { open($0) }
         }
         Divider()
         Button {
@@ -1349,11 +1430,7 @@ struct ContentView: View {
                 } else if let url = model.selectedNoteUrl {
                     detailContent(for: url)
                 } else {
-                    ContentUnavailableView(
-                        "No Note Selected",
-                        systemImage: "doc.richtext",
-                        description: Text("Select a note or create a new one.")
-                    )
+                    Color.clear
                 }
             }
             .frame(minWidth: 360, maxWidth: .infinity)
@@ -1374,7 +1451,11 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Menu {
-                    NewItemMenuItems(model: model, snap: contextTracker.snapshot) { open($0) }
+                    NewItemMenuItems(
+                        model: model,
+                        snap: contextTracker.snapshot,
+                        onNewSmartNotebook: { smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true) }
+                    ) { open($0) }
                 } label: {
                     Image(systemName: "square.and.pencil")
                 } primaryAction: {
@@ -1393,12 +1474,81 @@ struct ContentView: View {
         // inspector button lands before it and that's that.
         .searchable(
             text: $searchText,
+            tokens: $searchTokens,
             isPresented: $searchPresented,
             placement: .toolbar,
             prompt: searchScope.flatMap { model.node(for: $0)?.displayName }
                 .map { "Search \($0)" } ?? "Search notes"
-        )
+        ) { token in
+            Text(token.label)
+                .overlay {
+                    DoubleClickCatcher { editSearchToken(token) }
+                }
+        }
+        .searchSuggestions {
+            ForEach(SearchSyntax.suggestions(for: searchText)) { suggestion in
+                Text(suggestion.label)
+                    .searchCompletion(SearchSyntax.completing(suggestion, in: searchText))
+            }
+        }
         .searchFocused($searchFocused)
+        .onSubmit(of: .search) {
+            absorbSearchTokens(commitAll: true)
+            searchDidChange()
+        }
+        .onChange(of: searchFocused) { _, focused in
+            if !focused { absorbSearchTokens(commitAll: true) }
+        }
+    }
+
+    private var searchQueryText: String {
+        (searchTokens.map(\.raw) + [searchText])
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private func setSearchQuery(_ query: String) {
+        let syntax = SearchSyntax(query)
+        searchTokens = syntax.clauses.map { SearchFieldToken(raw: $0.raw) }
+        searchText = syntax.text
+    }
+
+    private func absorbSearchTokens(commitAll: Bool = false) {
+        let syntax = SearchSyntax(searchText)
+        let source = searchText as NSString
+        let length = (searchText as NSString).length
+        let clauses = syntax.clauses.filter {
+            if commitAll { return true }
+            let end = NSMaxRange($0.range)
+            guard end < length else { return false }
+            return source.substring(with: NSRange(location: end, length: 1)) == " "
+        }
+        guard !clauses.isEmpty else {
+            searchDidChange()
+            return
+        }
+        let remaining = NSMutableString(string: searchText)
+        for clause in clauses.reversed() {
+            remaining.replaceCharacters(in: clause.range, with: "")
+        }
+        searchTokens += clauses.map { SearchFieldToken(raw: $0.raw) }
+        searchText = (remaining as String)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+    }
+
+    private func editSearchToken(_ token: SearchFieldToken) {
+        searchTokens.removeAll { $0.id == token.id }
+        preserveSearchInputOnce = true
+        searchText = [searchText, token.raw]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        searchFocused = true
+    }
+
+    private func searchDidChange() {
+        model.searchQuery = searchQueryText
+        runSearch()
     }
 
     @ViewBuilder
@@ -1463,6 +1613,7 @@ struct ContentView: View {
 
     private func showNoteInFolder(_ node: FolderNode) {
         searchText = ""
+        searchTokens = []
         var url: String? = node.parentUrl
         while let u = url {
             expanded.insert(u)
@@ -1701,11 +1852,66 @@ struct FolderSettingsEditor: View {
 
 func highlighted(_ snippet: String, query: String) -> AttributedString {
     var text = AttributedString(snippet)
-    if let range = text.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) {
+    if !query.isEmpty,
+       let range = text.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) {
         text[range].font = .caption.bold()
         text[range].foregroundColor = .primary
     }
     return text
+}
+
+struct SearchSyntaxPills: View {
+    @Binding var text: String
+
+    var body: some View {
+        let syntax = SearchSyntax(text)
+        ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+                ForEach(syntax.clauses) { clause in
+                    Button {
+                        text = syntax.removing(clause, from: text)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(clause.label)
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .bold))
+                        }
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(.tint.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .scrollIndicators(.hidden)
+    }
+}
+
+struct SearchSyntaxSuggestions: View {
+    @Binding var text: String
+
+    var body: some View {
+        let suggestions = SearchSyntax.suggestions(for: text)
+        if !suggestions.isEmpty {
+            ScrollView(.horizontal) {
+                HStack(spacing: 6) {
+                    ForEach(suggestions) { suggestion in
+                        Button(suggestion.label) {
+                            text = SearchSyntax.completing(suggestion, in: text)
+                        }
+                        .buttonStyle(.bordered)
+                        .buttonBorderShape(.capsule)
+                        .font(.caption)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+            }
+            .scrollIndicators(.hidden)
+        }
+    }
 }
 
 #if os(iOS)
@@ -1872,6 +2078,19 @@ struct FolderScreen: View {
                     }
                 }
             } else {
+                Section {
+                    if !SearchSyntax(searchText).clauses.isEmpty {
+                        SearchSyntaxPills(text: $searchText)
+                    }
+                    Button {
+                        smartEditor = SmartNotebookEdit(
+                            folder: newSmartNotebook(query: searchText, scope: folderUrl ?? ""),
+                            isNew: true
+                        )
+                    } label: {
+                        Label("Save as Smart Notebook", systemImage: "folder.badge.gearshape")
+                    }
+                }
                 ForEach(searchHits, id: \.url) { hit in
                     NavigationLink(value: NavRoute.note(hit.url)) {
                         if let node = model.node(for: hit.url) {
@@ -1881,7 +2100,7 @@ struct FolderScreen: View {
                                 Text(hit.name.isEmpty ? "Untitled" : hit.name)
                                     .font(.headline)
                                     .lineLimit(1)
-                                Text(highlighted(hit.snippet, query: searchText))
+                                Text(highlighted(hit.snippet, query: SearchSyntax(searchText).text))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(2)
@@ -1950,7 +2169,11 @@ struct FolderScreen: View {
             }
             ToolbarItem {
                 Menu {
-                    NewItemMenuItems(model: model, folderUrl: folderUrl) { push(.note($0)) }
+                    NewItemMenuItems(
+                        model: model,
+                        folderUrl: folderUrl,
+                        onNewSmartNotebook: { smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true) }
+                    ) { push(.note($0)) }
                 } label: {
                     Label("New", systemImage: "square.and.pencil")
                 }
@@ -1966,8 +2189,10 @@ struct FolderScreen: View {
                 .environment(model)
         }
         .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 12) {
-                HStack(spacing: 8) {
+            VStack(spacing: 0) {
+                SearchSyntaxSuggestions(text: $searchText)
+                HStack(spacing: 12) {
+                    HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
                         .font(.system(size: 15))
@@ -1982,11 +2207,11 @@ struct FolderScreen: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
 
-                Menu {
+                    Menu {
                     Button {
                         Task {
                             contextTracker.start()
@@ -2015,10 +2240,11 @@ struct FolderScreen: View {
                         }
                     }
                 }
-                .disabled(model.folderUrl == nil)
+                    .disabled(model.folderUrl == nil)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 10)
             }
-            .padding(.horizontal)
-            .padding(.vertical, 10)
             .background(.bar)
         }
         .sheet(isPresented: $showingNewPatchwork) {
@@ -2076,7 +2302,11 @@ struct FolderScreen: View {
     private func nodeMenuContent(_ node: FolderNode) -> some View {
         if node.kind == "folder" {
             Menu("New") {
-                NewItemMenuItems(model: model, folderUrl: node.url) { push(.note($0)) }
+                NewItemMenuItems(
+                    model: model,
+                    folderUrl: node.url,
+                    onNewSmartNotebook: { smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true) }
+                ) { push(.note($0)) }
             }
             Divider()
             Button {
@@ -2817,7 +3047,7 @@ private struct HistoryCurrentRow: View {
                     HStack(spacing: 8) {
                         Text("\(changeCount) changes")
                         if let modified {
-                            Text("Updated \(modified, style: .relative)")
+                            Text("Changed \(modified, style: .relative)")
                         }
                     }
                     .uiFont(.caption)
@@ -4165,20 +4395,23 @@ enum SidebarDragKind {
 @MainActor
 enum SidebarDrag {
     static var kind: SidebarDragKind?
+    static var payload: String?
 
     static func provider(_ payload: String, kind: SidebarDragKind) -> NSItemProvider {
         Self.kind = kind
+        Self.payload = payload
         SidebarDropHighlight.shared.clear()
         return NSItemProvider(object: payload as NSString)
     }
 
     static func ended() {
         kind = nil
+        payload = nil
         SidebarDropHighlight.shared.clear()
     }
 }
 
-enum DropMark {
+enum DropMark: Equatable {
     case into
     case before
     case after
@@ -4216,6 +4449,8 @@ private struct SidebarReorderTarget: ViewModifier {
     let row: String
     let kind: SidebarDragKind
     var pinnedMark: DropMark?
+    var movesLive = true
+    var liveHandle: (@MainActor @Sendable (String, Bool) -> Void)?
     let handle: @MainActor @Sendable (String, Bool) -> Void
 
     @State private var height: CGFloat = 0
@@ -4237,9 +4472,15 @@ private struct SidebarReorderTarget: ViewModifier {
                     kind: kind,
                     pinnedMark: pinnedMark,
                     height: height,
+                    movesLive: movesLive,
+                    hasLiveHandle: liveHandle != nil,
+                    liveHandle: { payload, after in
+                        liveHandle?(payload, after)
+                    },
                     handle: { payload, after in handle(payload, after) }
                 )
             )
+            .onDisappear { SidebarDropHighlight.shared.clear(row) }
     }
 }
 
@@ -4248,10 +4489,24 @@ private struct SidebarReorderDrop: DropDelegate {
     let kind: SidebarDragKind
     let pinnedMark: DropMark?
     let height: CGFloat
+    let movesLive: Bool
+    let hasLiveHandle: Bool
+    let liveHandle: @MainActor @Sendable (String, Bool) -> Void
     let handle: @MainActor @Sendable (String, Bool) -> Void
 
     private func landing(_ info: DropInfo) -> DropMark {
         pinnedMark ?? (info.location.y > height / 2 ? .after : .before)
+    }
+
+    private func moveLive(_ info: DropInfo) {
+        guard movesLive, let payload = SidebarDrag.payload else { return }
+        withAnimation(.snappy(duration: 0.16)) {
+            if hasLiveHandle {
+                liveHandle(payload, landing(info) == .after)
+            } else {
+                handle(payload, landing(info) == .after)
+            }
+        }
     }
 
     func validateDrop(info: DropInfo) -> Bool {
@@ -4260,6 +4515,7 @@ private struct SidebarReorderDrop: DropDelegate {
 
     func dropEntered(info: DropInfo) {
         SidebarDropHighlight.shared.show(row, landing(info))
+        moveLive(info)
     }
 
     func dropExited(info: DropInfo) {
@@ -4267,7 +4523,14 @@ private struct SidebarReorderDrop: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        SidebarDropHighlight.shared.show(row, landing(info))
+        guard validateDrop(info: info) else {
+            SidebarDropHighlight.shared.clear(row)
+            return DropProposal(operation: .forbidden)
+        }
+        let landed = landing(info)
+        let previous = SidebarDropHighlight.shared.mark(for: row)
+        SidebarDropHighlight.shared.show(row, landed)
+        if previous != landed { moveLive(info) }
         return DropProposal(operation: .move)
     }
 
@@ -4277,7 +4540,10 @@ private struct SidebarReorderDrop: DropDelegate {
         guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
             return false
         }
-        loadPayload(provider) { payload in handle(payload, after) }
+        loadPayload(provider) { payload in
+            handle(payload, after)
+            SidebarDropHighlight.shared.clear()
+        }
         return true
     }
 }
@@ -4286,7 +4552,13 @@ struct SidebarDropCleanup: DropDelegate {
     func validateDrop(info: DropInfo) -> Bool { SidebarDrag.kind != nil }
     func dropEntered(info: DropInfo) {}
     func dropExited(info: DropInfo) { SidebarDropHighlight.shared.clear() }
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard SidebarDrag.kind != nil else {
+            SidebarDropHighlight.shared.clear()
+            return DropProposal(operation: .forbidden)
+        }
+        return DropProposal(operation: .move)
+    }
 
     func performDrop(info: DropInfo) -> Bool {
         SidebarDrag.ended()
@@ -4402,6 +4674,7 @@ private struct FolderDropTarget: ViewModifier {
                         height: height
                     )
                 )
+                .onDisappear { SidebarDropHighlight.shared.clear(row) }
         } else {
             content
         }
@@ -4426,7 +4699,13 @@ private struct FolderDrop: DropDelegate {
     }
 
     func dropEntered(info: DropInfo) {
-        SidebarDropHighlight.shared.show(row, landing(info))
+        let landed = landing(info)
+        SidebarDropHighlight.shared.show(row, landed)
+        if landed != .into, let payload = SidebarDrag.payload {
+            withAnimation(.snappy(duration: 0.16)) {
+                model.reorderRootFolder(payload, adjacentTo: node.url, after: landed == .after)
+            }
+        }
     }
 
     func dropExited(info: DropInfo) {
@@ -4434,7 +4713,18 @@ private struct FolderDrop: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        SidebarDropHighlight.shared.show(row, landing(info))
+        guard validateDrop(info: info) else {
+            SidebarDropHighlight.shared.clear(row)
+            return DropProposal(operation: .forbidden)
+        }
+        let landed = landing(info)
+        let previous = SidebarDropHighlight.shared.mark(for: row)
+        SidebarDropHighlight.shared.show(row, landed)
+        if landed != .into, previous != landed, let payload = SidebarDrag.payload {
+            withAnimation(.snappy(duration: 0.16)) {
+                model.reorderRootFolder(payload, adjacentTo: node.url, after: landed == .after)
+            }
+        }
         return DropProposal(operation: .move)
     }
 
@@ -4447,11 +4737,13 @@ private struct FolderDrop: DropDelegate {
         loadPayload(provider) { payload in
             if landed != .into {
                 model.reorderRootFolder(payload, adjacentTo: node.url, after: landed == .after)
+                SidebarDropHighlight.shared.clear()
                 return
             }
             for url in payload.components(separatedBy: "\n") where url.hasPrefix("automerge:") {
                 model.moveItem(url, into: node.url)
             }
+            SidebarDropHighlight.shared.clear()
         }
         return true
     }
@@ -4463,7 +4755,16 @@ private struct NoteReorderDropTarget: ViewModifier {
 
     func body(content: Content) -> some View {
         content.modifier(
-            SidebarReorderTarget(row: "note:\(node.url)", kind: .item) { payload, after in
+            SidebarReorderTarget(
+                row: "note:\(node.url)",
+                kind: .item,
+                liveHandle: { payload, after in
+                    for url in payload.components(separatedBy: "\n")
+                    where model.node(for: url)?.parentUrl == node.parentUrl {
+                        model.reorderChild(url, adjacentTo: node.url, after: after)
+                    }
+                }
+            ) { payload, after in
                 for url in payload.components(separatedBy: "\n") where url.hasPrefix("automerge:") {
                     if model.node(for: url)?.parentUrl == node.parentUrl {
                         model.reorderChild(url, adjacentTo: node.url, after: after)

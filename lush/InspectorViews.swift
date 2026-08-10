@@ -87,7 +87,7 @@ struct DocumentInfoView: View {
                     LabeledContent("Created", value: created.formatted(date: .abbreviated, time: .shortened))
                 }
                 if let modified = history.modified {
-                    LabeledContent("Modified", value: modified.formatted(date: .abbreviated, time: .shortened))
+                    LabeledContent("Changed", value: modified.formatted(date: .abbreviated, time: .shortened))
                 }
             }
 

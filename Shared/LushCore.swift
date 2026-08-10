@@ -3699,6 +3699,9 @@ public struct IndexedNote {
      */
     public var created: Int64
     public var tags: [String]
+    public var weather: [String]
+    public var locations: [String]
+    public var has: [String]
     /**
      * The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
      */
@@ -3712,7 +3715,7 @@ public struct IndexedNote {
          */modified: Int64, 
         /**
          * Unix seconds of the doc's first change; 0 when its history carries none.
-         */created: Int64, tags: [String], 
+         */created: Int64, tags: [String], weather: [String], locations: [String], has: [String],
         /**
          * The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
          */when: String) {
@@ -3722,6 +3725,9 @@ public struct IndexedNote {
         self.modified = modified
         self.created = created
         self.tags = tags
+        self.weather = weather
+        self.locations = locations
+        self.has = has
         self.when = when
     }
 }
@@ -3751,6 +3757,15 @@ extension IndexedNote: Equatable, Hashable {
         if lhs.tags != rhs.tags {
             return false
         }
+        if lhs.weather != rhs.weather {
+            return false
+        }
+        if lhs.locations != rhs.locations {
+            return false
+        }
+        if lhs.has != rhs.has {
+            return false
+        }
         if lhs.when != rhs.when {
             return false
         }
@@ -3764,6 +3779,9 @@ extension IndexedNote: Equatable, Hashable {
         hasher.combine(modified)
         hasher.combine(created)
         hasher.combine(tags)
+        hasher.combine(weather)
+        hasher.combine(locations)
+        hasher.combine(has)
         hasher.combine(when)
     }
 }
@@ -3783,6 +3801,9 @@ public struct FfiConverterTypeIndexedNote: FfiConverterRustBuffer {
                 modified: FfiConverterInt64.read(from: &buf), 
                 created: FfiConverterInt64.read(from: &buf), 
                 tags: FfiConverterSequenceString.read(from: &buf), 
+                weather: FfiConverterSequenceString.read(from: &buf),
+                locations: FfiConverterSequenceString.read(from: &buf),
+                has: FfiConverterSequenceString.read(from: &buf),
                 when: FfiConverterString.read(from: &buf)
         )
     }
@@ -3794,6 +3815,9 @@ public struct FfiConverterTypeIndexedNote: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.modified, into: &buf)
         FfiConverterInt64.write(value.created, into: &buf)
         FfiConverterSequenceString.write(value.tags, into: &buf)
+        FfiConverterSequenceString.write(value.weather, into: &buf)
+        FfiConverterSequenceString.write(value.locations, into: &buf)
+        FfiConverterSequenceString.write(value.has, into: &buf)
         FfiConverterString.write(value.when, into: &buf)
     }
 }
