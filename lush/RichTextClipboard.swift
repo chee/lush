@@ -84,6 +84,11 @@ enum RichTextClipboard {
             }
             let content = runs.map { markdownInline($0.0, marks: $0.1) }.joined()
             let indent = String(repeating: "  ", count: block.parents.count)
+            if block.blockquotePath != nil {
+                lines.append("> " + content)
+                i = j
+                continue
+            }
             switch block.type {
             case "heading":
                 let level = min(max(block.headingLevel ?? 1, 1), 6)
@@ -94,8 +99,6 @@ enum RichTextClipboard {
                 lines.append(indent + "1. " + content)
             case "todo-list-item":
                 lines.append(indent + "- [" + markdownTodoMark(block.todoState) + "] " + content)
-            case "blockquote":
-                lines.append("> " + content)
             case "code-block":
                 var codeLines = [plainText(runs)]
                 while j < spans.count,

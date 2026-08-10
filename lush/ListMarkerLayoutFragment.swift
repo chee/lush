@@ -420,6 +420,13 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         return box.value
     }
 
+    private func quoteBlock(_ attrs: [NSAttributedString.Key: Any]?) -> BlockValue? {
+        guard let block = (attrs?[.amBlock] as? BlockBox)?.value,
+              block.blockquotePath != nil
+        else { return nil }
+        return block
+    }
+
     private var isLastFragment: Bool {
         guard let element = textElement,
               let contentManager = element.textContentManager,
@@ -459,10 +466,12 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
             ))
         }
         var indent: CGFloat = 0
-        if let attrs = paragraphAttributes, decoratedBlock(attrs) != nil {
+        if let attrs = paragraphAttributes,
+           decoratedBlock(attrs) != nil || quoteBlock(attrs) != nil {
             indent = (attrs[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
         }
-        if trailingEmptyLine != nil, let typing = typingAttributesProvider?(), decoratedBlock(typing) != nil {
+        if trailingEmptyLine != nil, let typing = typingAttributesProvider?(),
+           decoratedBlock(typing) != nil || quoteBlock(typing) != nil {
             let typingIndent = (typing[.paragraphStyle] as? NSParagraphStyle)?.firstLineHeadIndent ?? 20
             indent = max(indent, typingIndent)
         }
@@ -491,14 +500,14 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
     }
 
     private var isQuoteBlock: Bool {
-        (paragraphAttributes?[.amBlock] as? BlockBox)?.value.type == "blockquote"
+        quoteBlock(paragraphAttributes) != nil
     }
 
     private var isTypingQuoteBlockOnTrailingLine: Bool {
         guard trailingEmptyLine != nil,
               let box = typingAttributesProvider?()?[.amBlock] as? BlockBox
         else { return false }
-        return box.value.type == "blockquote"
+        return box.value.blockquotePath != nil
     }
 
     private var drawsCodeCard: Bool {
@@ -545,7 +554,7 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
                   range.location < storage.length,
                   let other = storage.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox
             else { return false }
-            return other.value.type == "blockquote" && other.value.parents == box.value.parents
+            return other.value.blockquotePath == box.value.blockquotePath
         }
 
         var first = true
@@ -734,7 +743,7 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
         if drawsCodeCard {
             drawCodeCard(origin: origin)
         }
-        if let block = decoratedBlock(attrs), block.type == "blockquote",
+        if quoteBlock(attrs) != nil,
            let width = textLayoutManager?.textContainer?.size.width {
             let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
             if !lineRect.isNull {
@@ -766,7 +775,7 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
             PColor.pOnTint.setFill()
             PBezierPath(rect: embedRect).fill()
         }
-        if let block = decoratedBlock(attrs), block.type == "blockquote",
+        if quoteBlock(attrs) != nil,
            let width = textLayoutManager?.textContainer?.size.width {
             let lineRect = contentLines.reduce(CGRect.null) { $0.union($1.typographicBounds) }
             if !lineRect.isNull {

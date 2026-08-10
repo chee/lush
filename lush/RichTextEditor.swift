@@ -963,10 +963,18 @@ final class EditorCore {
     private func placePendingAttachmentViews() {
         guard !placingAttachmentViews else { return }
         placingAttachmentViews = true
+        let url = noteUrl
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.placingAttachmentViews = false
-            self.view?.pTextLayoutManager?.textViewportLayoutController.layoutViewport()
+            guard self.noteUrl == url, let view = self.view else { return }
+            #if os(macOS)
+            view.pSelf.needsLayout = true
+            view.pSelf.needsDisplay = true
+            #else
+            view.pSelf.setNeedsLayout()
+            view.pSelf.setNeedsDisplay()
+            #endif
         }
     }
 
@@ -3079,15 +3087,15 @@ final class EditorCore {
             insertParagraphBreak(currentBlock: block, nextBlock: block)
             return true
         }
-        if block.type == "blockquote" {
+        if let blockquotePath = block.blockquotePath {
             if paragraphText.isEmpty {
-                applyBlockStyle(.paragraph)
+                applyBlockStyle(BlockValue(type: "paragraph", parents: Array(blockquotePath.dropLast())))
                 return true
             }
-            if leaveBlockquoteFromEmptySoftLine(block: block) {
-                return true
-            }
-            insertParagraphBreak(currentBlock: block, nextBlock: block)
+            let nextBlock = block.type == "blockquote"
+                ? BlockValue(type: "paragraph", parents: blockquotePath)
+                : block
+            insertParagraphBreak(currentBlock: block, nextBlock: nextBlock)
             return true
         }
         if block.type == "paragraph" || block.type == "serif" || block.type == "hand" {
@@ -3163,7 +3171,7 @@ final class EditorCore {
 
     @discardableResult
     func moveToBlockquoteSoftLineBoundary(end: Bool) -> Bool {
-        guard blockAtSelection().type == "blockquote",
+        guard blockAtSelection().blockquotePath != nil,
               let view,
               let storage = view.pStorage,
               storage.length > 0
@@ -3200,32 +3208,6 @@ final class EditorCore {
 
         view.pSelectedRange = NSRange(location: target, length: 0)
         view.pScrollRangeToVisible(view.pSelectedRange)
-        return true
-    }
-
-    private func leaveBlockquoteFromEmptySoftLine(block: BlockValue) -> Bool {
-        guard let view, let storage = view.pStorage, view.pSelectedRange.length == 0 else { return false }
-        let caret = view.pSelectedRange.location
-        guard caret > 0, caret <= storage.length else { return false }
-        let str = storage.string as NSString
-        guard str.character(at: caret - 1) == 0x2028 else { return false }
-        let paragraph = str.paragraphRange(for: NSRange(location: caret, length: 0))
-        guard caret == NSMaxRange(paragraph) || (
-            caret < storage.length && str.character(at: caret) == 0x0A
-        ) else { return false }
-
-        let quoteAttributes = RichText.attributes(block: block, marks: [:])
-        let bodyAttributes = RichText.attributes(block: .paragraph, marks: [:])
-        view.pPerformStorageEdit { storage in
-            storage.replaceCharacters(
-                in: NSRange(location: caret - 1, length: 1),
-                with: NSAttributedString(string: "\n", attributes: quoteAttributes)
-            )
-        }
-        view.pSelectedRange = NSRange(location: caret, length: 0)
-        view.pTypingAttributes = bodyAttributes
-        refreshFormattingState()
-        scheduleSave()
         return true
     }
 

@@ -195,6 +195,7 @@ enum NoteExporter {
         let segments = segmentize(spans)
         var out = ""
         var openLists: [(tag: String, depth: Int)] = []
+        var openBlockquotePath: [String]?
 
         func closeLists(to depth: Int = -1) {
             while let last = openLists.last, last.depth > depth {
@@ -203,11 +204,20 @@ enum NoteExporter {
             }
         }
 
+        func enterBlockquote(_ path: [String]?) {
+            guard path != openBlockquotePath else { return }
+            closeLists()
+            if openBlockquotePath != nil { out += "</blockquote>\n" }
+            if path != nil { out += "<blockquote>\n" }
+            openBlockquotePath = path
+        }
+
         for segment in segments {
             switch segment {
             case .simple(let b, let runs):
                 if b.type == "context" { continue }
                 if b.type == "calendar-event" { continue }
+                enterBlockquote(b.blockquotePath)
                 if b.isEmbedBlock {
                     closeLists()
                     if b.type == "html", let source = b.htmlSource {
@@ -248,12 +258,14 @@ enum NoteExporter {
                     }
                 } else {
                     closeLists()
+                    if b.blockquotePath != nil {
+                        out += "<p>\(content)</p>\n"
+                        continue
+                    }
                     switch b.type {
                     case "heading":
                         let level = min(max(b.headingLevel ?? 1, 1), 6)
                         out += "<h\(level)>\(content)</h\(level)>\n"
-                    case "blockquote":
-                        out += "<blockquote><p>\(content)</p></blockquote>\n"
                     case "code-block":
                         out += "<pre><code>\(content)</code></pre>\n"
                     default:
@@ -261,9 +273,11 @@ enum NoteExporter {
                     }
                 }
             case .table(let subSpans):
+                enterBlockquote(nil)
                 closeLists()
                 out += tableHTML(RichText.parseTable(subSpans), assetResolver: assetResolver) + "\n"
             case .columns(let subSpans):
+                enterBlockquote(nil)
                 closeLists()
                 let columns = RichText.parseColumns(subSpans)
                 out += "<div class=\"columns\">\n"
@@ -276,6 +290,7 @@ enum NoteExporter {
             }
         }
         closeLists()
+        enterBlockquote(nil)
         return out
     }
 

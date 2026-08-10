@@ -141,6 +141,14 @@ struct BlockValue: Codable, Equatable {
         isEmbedBlock || type == "table" || type == "columns"
     }
 
+    var blockquotePath: [String]? {
+        if type == "blockquote" {
+            return parents + ["blockquote"]
+        }
+        guard let index = parents.lastIndex(of: "blockquote") else { return nil }
+        return Array(parents.prefix(through: index))
+    }
+
     var embedUrl: String? {
         attrs["url"]?.stringValue ?? attrs["src"]?.stringValue
     }
@@ -206,6 +214,7 @@ struct BlockValue: Codable, Equatable {
     var styleKey: String {
         switch type {
         case "heading": return "heading\(headingLevel ?? 1)"
+        case "paragraph" where blockquotePath != nil: return "blockquote"
         default: return type
         }
     }
@@ -1086,14 +1095,14 @@ enum RichText {
 
     private struct ParagraphKey: Hashable {
         let type: String
-        let depth: Int
+        let parents: [String]
         let indentLevel: Int
     }
 
     private static var paragraphStyleCache: [ParagraphKey: NSParagraphStyle] = [:]
 
     static func paragraphStyle(for block: BlockValue) -> NSParagraphStyle {
-        let key = ParagraphKey(type: block.type, depth: block.parents.count, indentLevel: block.indentLevel)
+        let key = ParagraphKey(type: block.type, parents: block.parents, indentLevel: block.indentLevel)
         if let hit = paragraphStyleCache[key] { return hit }
         let style = buildParagraphStyle(for: block)
         paragraphStyleCache[key] = style
@@ -1108,8 +1117,10 @@ enum RichText {
         let listDepth = block.parents.filter {
             $0 == "unordered-list-item" || $0 == "ordered-list-item" || $0 == "todo-list-item"
         }.count
-        indent += CGFloat(block.parents.count - listDepth) * 20
+        let quoteDepth = block.parents.filter { $0 == "blockquote" }.count
+        indent += CGFloat(block.parents.count - listDepth - quoteDepth) * 20
         indent += CGFloat(listDepth) * 28
+        indent += CGFloat(quoteDepth) * 16
         indent += CGFloat(block.indentLevel) * 20
         switch block.type {
         case "heading":
@@ -1682,6 +1693,7 @@ enum RichText {
         }
 
         var previousBlock = BlockValue.paragraph
+        var activeBlockquotePath: [String]?
         for range in paragraphRanges {
             var contentLength = range.length
             if contentLength > 0, str.character(at: NSMaxRange(range) - 1) == 0x0A {
@@ -1706,6 +1718,7 @@ enum RichText {
                     }
                     spans.append(contentsOf: strayParagraph(in: range))
                     previousBlock = .paragraph
+                    activeBlockquotePath = nil
                     continue
                 }
             }
@@ -1717,6 +1730,15 @@ enum RichText {
                 block = trailingBlock
             } else {
                 block = previousBlock
+            }
+            if block.type == "blockquote", let path = block.blockquotePath {
+                if activeBlockquotePath == path {
+                    block = BlockValue(type: "paragraph", parents: path)
+                } else {
+                    activeBlockquotePath = path
+                }
+            } else {
+                activeBlockquotePath = block.blockquotePath
             }
             if block.type == "context" || block.type == "calendar-event" {
                 spans.append(.block(block))

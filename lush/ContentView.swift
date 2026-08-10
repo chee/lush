@@ -53,12 +53,20 @@ struct MainWindowRoute: Codable, Hashable {
 enum MainWindowTabs {
     private static var parents: [UUID: NSWindow] = [:]
 
+    private(set) static var routedSelection: String?
+
     static func open(selection: String?, using openWindow: OpenWindowAction) {
         let route = MainWindowRoute(id: UUID(), selection: selection)
+        routedSelection = selection
         if let window = NSApp.keyWindow {
             parents[route.id] = window
         }
         openWindow(id: "main", value: route)
+    }
+
+    static func claimRoute(_ selection: String?) {
+        guard let selection, routedSelection == selection else { return }
+        routedSelection = nil
     }
 
     static func attach(_ window: NSWindow, route: MainWindowRoute?) {
@@ -171,6 +179,36 @@ struct DoubleClickCatcher: NSViewRepresentable {
         }
     }
 }
+
+private struct PrimaryClickGesture: NSGestureRecognizerRepresentable {
+    let action: () -> Void
+
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
+        Coordinator(action: action)
+    }
+
+    func makeNSGestureRecognizer(context: Context) -> NSClickGestureRecognizer {
+        let recognizer = NSClickGestureRecognizer()
+        recognizer.buttonMask = 0x1
+        return recognizer
+    }
+
+    func updateNSGestureRecognizer(_ recognizer: NSClickGestureRecognizer, context: Context) {
+        context.coordinator.action = action
+    }
+
+    func handleNSGestureRecognizerAction(_ recognizer: NSClickGestureRecognizer, context: Context) {
+        context.coordinator.action()
+    }
+
+    final class Coordinator {
+        var action: () -> Void
+
+        init(action: @escaping () -> Void) {
+            self.action = action
+        }
+    }
+}
 #endif
 
 struct ContentView: View {
@@ -216,6 +254,7 @@ struct ContentView: View {
     @State private var movingThroughSidebarHistory = false
     @State private var selectedDocumentUrl: String?
     @State private var appliedInitialRoute = false
+    @State private var initialRouteSelection: String?
     @State private var hostWindow: NSWindow?
     private let initialRoute: MainWindowRoute?
 
@@ -265,6 +304,9 @@ struct ContentView: View {
             }
         }
         .onChange(of: selectedItemUrls) {
+            let initialSelection = selectedItemUrls.count == 1
+                && selectedItemUrls.first == initialRouteSelection
+            initialRouteSelection = nil
             recordSidebarHistory(selectedItemUrls)
             selectedDocumentUrl = documentUrl(in: selectedItemUrls)
             // Selecting the top search hit must not pull focus out of the
@@ -275,6 +317,7 @@ struct ContentView: View {
             deferredSidebarTag = nil
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
             guard !tag.hasPrefix("smart:"), tag != Agenda.sidebarTag, tag != Agenda.meetingNotesTag else { return }
+            guard !initialSelection else { return }
             let delay = deferred == tag ? 80 : 0
             scheduleSidebarSelection(Self.sidebarUrl(tag), delay: delay)
         }
@@ -312,6 +355,7 @@ struct ContentView: View {
         .task { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
             guard let url, hostWindow?.isKeyWindow != false else { return }
+            guard !isOtherWindowsRoute(url) else { return }
             selectedHistoryEntry = nil
             selectedDocumentUrl = url
             if !selectedItemUrls.contains(where: { Self.sidebarUrl($0) == url }) {
@@ -322,6 +366,7 @@ struct ContentView: View {
             guard let route, !appliedInitialRoute else { return }
             appliedInitialRoute = true
             if let selection = route.selection {
+                initialRouteSelection = selection
                 selectedItemUrls = [selection]
                 selectedDocumentUrl = documentUrl(in: [selection])
             } else {
@@ -338,6 +383,7 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
             guard let window = notification.object as? NSWindow, window === hostWindow else { return }
+            MainWindowTabs.claimRoute(initialRoute?.selection)
             model.selectedNoteUrl = selectedDocumentUrl
         }
         .focusedSceneValue(\.noteSearchActions, NoteSearchActions(
@@ -670,7 +716,7 @@ struct ContentView: View {
                     .padding(.trailing, sidebarTrailingGutter)
                     .contentShape(Rectangle())
                     .tag(hit.url)
-                    .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(hit.url) })
+                    .gesture(PrimaryClickGesture { selectSidebarRow(hit.url) })
                     .onDrag({ SidebarDrag.provider(hit.url, kind: .item) }, preview: {
                         DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
                     })
@@ -793,13 +839,12 @@ struct ContentView: View {
 
     private func selectSidebarRow(_ tag: String) {
         if let event = NSApp.currentEvent {
-            switch event.type {
-            case .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            if [.rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp].contains(event.type) {
                 return
-            case .leftMouseDown, .leftMouseUp where event.modifierFlags.contains(.control):
+            }
+            if [.leftMouseDown, .leftMouseUp].contains(event.type),
+               event.modifierFlags.contains(.control) {
                 return
-            default:
-                break
             }
         }
         let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -1088,7 +1133,7 @@ struct ContentView: View {
             .contentShape(Rectangle())
             .tag(tag)
             .id(tag)
-            .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(tag) })
+            .gesture(PrimaryClickGesture { selectSidebarRow(tag) })
             .onDrag({ SidebarDrag.provider(node.url, kind: .item) }, preview: {
                 DragPreviewView(name: node.displayName)
             })
@@ -1230,7 +1275,7 @@ struct ContentView: View {
         .padding(.trailing, sidebarTrailingGutter)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(tag) })
+        .gesture(PrimaryClickGesture { selectSidebarRow(tag) })
         .simultaneousGesture(TapGesture(count: 2).onEnded {
             setSmartExpanded(!isOpen, id: folder.id)
         })
@@ -1290,7 +1335,7 @@ struct ContentView: View {
             .contentShape(Rectangle())
             .tag(tag)
             .id(tag)
-            .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(tag) })
+            .gesture(PrimaryClickGesture { selectSidebarRow(tag) })
             .onDrag({ SidebarDrag.provider(hit.url, kind: .item) }, preview: {
                 DragPreviewView(name: hit.name.isEmpty ? "Untitled" : hit.name)
             })
@@ -1401,6 +1446,11 @@ struct ContentView: View {
         return tag
     }
 
+    private func isOtherWindowsRoute(_ url: String) -> Bool {
+        guard let routed = MainWindowTabs.routedSelection else { return false }
+        return routed != initialRoute?.selection && Self.sidebarUrl(routed) == url
+    }
+
     private static let selectionTint = Color(red: 1.0, green: 0.412, blue: 0.647)
 
     private func expansionBinding(_ url: String) -> Binding<Bool> {
@@ -1509,7 +1559,7 @@ struct ContentView: View {
         .padding(.trailing, sidebarTrailingGutter)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(tag) })
+        .gesture(PrimaryClickGesture { selectSidebarRow(tag) })
         .simultaneousGesture(TapGesture(count: 2).onEnded {
             setExpanded(!expanded.contains(node.url), for: node.url)
         })
@@ -1623,7 +1673,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .tag(tag)
-            .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(tag) })
+            .gesture(PrimaryClickGesture { selectSidebarRow(tag) })
             .onDrag({
                 SidebarDrag.provider(draggedUrls(node: node, tag: tag), kind: .item)
             }, preview: {
