@@ -960,6 +960,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func setConfigPackages(configUrl: String, urls: [String]) throws 
     
+    func setConfigPins(configUrl: String, urls: [String]) throws 
+    
+    func setConfigQuickNote(configUrl: String, url: String?) throws 
+    
     func setConfigSmartNotebooks(configUrl: String, folders: [SmartNotebook]) throws 
     
     func setDelegate(delegate: CoreDelegate) 
@@ -2272,6 +2276,22 @@ open func setConfigPackages(configUrl: String, urls: [String])throws   {try rust
 }
 }
     
+open func setConfigPins(configUrl: String, urls: [String])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_pins(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterSequenceString.lower(urls),$0
+    )
+}
+}
+    
+open func setConfigQuickNote(configUrl: String, url: String?)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_quick_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterOptionString.lower(url),$0
+    )
+}
+}
+    
 open func setConfigSmartNotebooks(configUrl: String, folders: [SmartNotebook])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_set_config_smart_notebooks(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),
@@ -3154,17 +3174,25 @@ public struct ConfigState {
     public var smart: [SmartNotebook]
     public var folderSettings: [FolderSettings]
     public var packages: [String]
+    public var pins: [String]
+    public var pinsConfigured: Bool
+    public var quickNote: String?
+    public var quickNoteConfigured: Bool
     public var pad: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], folderSettings: [FolderSettings], packages: [String], pad: String?) {
+    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], folderSettings: [FolderSettings], packages: [String], pins: [String], pinsConfigured: Bool, quickNote: String?, quickNoteConfigured: Bool, pad: String?) {
         self.folders = folders
         self.inbox = inbox
         self.calendar = calendar
         self.smart = smart
         self.folderSettings = folderSettings
         self.packages = packages
+        self.pins = pins
+        self.pinsConfigured = pinsConfigured
+        self.quickNote = quickNote
+        self.quickNoteConfigured = quickNoteConfigured
         self.pad = pad
     }
 }
@@ -3194,6 +3222,18 @@ extension ConfigState: Equatable, Hashable {
         if lhs.packages != rhs.packages {
             return false
         }
+        if lhs.pins != rhs.pins {
+            return false
+        }
+        if lhs.pinsConfigured != rhs.pinsConfigured {
+            return false
+        }
+        if lhs.quickNote != rhs.quickNote {
+            return false
+        }
+        if lhs.quickNoteConfigured != rhs.quickNoteConfigured {
+            return false
+        }
         if lhs.pad != rhs.pad {
             return false
         }
@@ -3207,6 +3247,10 @@ extension ConfigState: Equatable, Hashable {
         hasher.combine(smart)
         hasher.combine(folderSettings)
         hasher.combine(packages)
+        hasher.combine(pins)
+        hasher.combine(pinsConfigured)
+        hasher.combine(quickNote)
+        hasher.combine(quickNoteConfigured)
         hasher.combine(pad)
     }
 }
@@ -3226,6 +3270,10 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
                 smart: FfiConverterSequenceTypeSmartNotebook.read(from: &buf), 
                 folderSettings: FfiConverterSequenceTypeFolderSettings.read(from: &buf), 
                 packages: FfiConverterSequenceString.read(from: &buf), 
+                pins: FfiConverterSequenceString.read(from: &buf), 
+                pinsConfigured: FfiConverterBool.read(from: &buf), 
+                quickNote: FfiConverterOptionString.read(from: &buf), 
+                quickNoteConfigured: FfiConverterBool.read(from: &buf), 
                 pad: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3237,6 +3285,10 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
         FfiConverterSequenceTypeSmartNotebook.write(value.smart, into: &buf)
         FfiConverterSequenceTypeFolderSettings.write(value.folderSettings, into: &buf)
         FfiConverterSequenceString.write(value.packages, into: &buf)
+        FfiConverterSequenceString.write(value.pins, into: &buf)
+        FfiConverterBool.write(value.pinsConfigured, into: &buf)
+        FfiConverterOptionString.write(value.quickNote, into: &buf)
+        FfiConverterBool.write(value.quickNoteConfigured, into: &buf)
         FfiConverterOptionString.write(value.pad, into: &buf)
     }
 }
@@ -6121,6 +6173,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_config_packages() != 53257) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_pins() != 1646) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_quick_note() != 356) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_config_smart_notebooks() != 30305) {

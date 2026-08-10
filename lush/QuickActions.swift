@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppIntents
+import UniformTypeIdentifiers
 
 /// Pending navigation from a widget tap, url open, or app intent — the app
 /// picks it up once the model is ready.
@@ -20,6 +21,7 @@ final class AppRouter {
         case newSmartNotebook
         case share(String)
         case calendar(day: Date?, item: String?)
+        case shortcutsHelp
     }
 
     var pending: Action?
@@ -70,6 +72,8 @@ final class AppRouter {
                 day: day,
                 item: components?.queryItems?.first(where: { $0.name == "event" })?.value
             )
+        case "help" where url.path == "/shortcuts":
+            pending = .shortcutsHelp
         case "share":
             if let id = components?.queryItems?.first(where: { $0.name == "id" })?.value {
                 pending = .share(id)
@@ -151,8 +155,18 @@ struct LushFolderEntity: AppEntity {
     static let defaultQuery = LushFolderQuery()
 
     let id: String
-    let name: String
-    let url: String?
+
+    @Property(title: "Name")
+    var name: String
+
+    @Property(title: "Automerge URL")
+    var url: String?
+
+    init(id: String, name: String, url: String?) {
+        self.id = id
+        self.name = name
+        self.url = url
+    }
 
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(
@@ -244,88 +258,191 @@ private func resolvedFolderUrl(_ entity: LushFolderEntity?) -> String? {
 struct NewNoteIntent: AppIntent {
     static let title: LocalizedStringResource = "Add Note"
     static let description = IntentDescription("Create a new Lush note in Inbox or a selected folder.")
-    static let openAppWhenRun = true
+    static let openAppWhenRun = false
+
+    @Parameter(title: "Title")
+    var noteTitle: String?
+
+    @Parameter(
+        title: "Text",
+        inputOptions: String.IntentInputOptions(multiline: true),
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
+    var text: String?
 
     @Parameter(title: "Folder")
     var folder: LushFolderEntity?
 
-    @MainActor
-    func perform() async throws -> some IntentResult {
-        let url = await NotesModel.shared.createNoteForShortcut(inFolder: resolvedFolderUrl(folder))
-        if url == nil {
-            AppRouter.shared.pending = .newNote
+    static var parameterSummary: some ParameterSummary {
+        Summary("Add \(\.$text) to \(\.$folder)") {
+            \.$noteTitle
         }
-        return .result()
+    }
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ReturnsValue<LushDocumentEntity> & ProvidesDialog {
+        guard let url = await NotesModel.shared.createNoteForShortcut(
+            title: noteTitle,
+            text: text,
+            inFolder: resolvedFolderUrl(folder)
+        ) else {
+            throw LushIntentError.operationFailed("The note could not be created.")
+        }
+        let entity = LushDocuments.entity(for: url)
+            ?? LushDocumentEntity(id: url, title: noteTitle ?? "Untitled", kind: "rich")
+        return .result(value: entity, dialog: "Created \(entity.title).")
     }
 }
 
 struct AddFileIntent: AppIntent {
     static let title: LocalizedStringResource = "Add File"
     static let description = IntentDescription("Create a new Lush file document in Inbox or a selected folder.")
-    static let openAppWhenRun = true
+    static let openAppWhenRun = false
+
+    @Parameter(
+        title: "File",
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
+    var file: IntentFile
+
+    @Parameter(title: "Name")
+    var name: String?
 
     @Parameter(title: "Folder")
     var folder: LushFolderEntity?
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Add \(\.$file) to \(\.$folder)") {
+            \.$name
+        }
+    }
+
     @MainActor
-    func perform() async throws -> some IntentResult {
-        _ = await NotesModel.shared.createFileForShortcut(inFolder: resolvedFolderUrl(folder))
-        return .result()
+    func perform() async throws -> some IntentResult & ReturnsValue<LushDocumentEntity> & ProvidesDialog {
+        let suppliedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filename = suppliedName.flatMap { $0.isEmpty ? nil : $0 } ?? file.filename
+        let pathExtension = URL(fileURLWithPath: filename).pathExtension
+        let type = file.type ?? UTType(filenameExtension: pathExtension)
+        guard let url = await NotesModel.shared.importFileForShortcut(
+            data: file.data,
+            name: filename,
+            fileExtension: pathExtension.isEmpty ? "bin" : pathExtension,
+            mimeType: type?.preferredMIMEType ?? "application/octet-stream",
+            inFolder: resolvedFolderUrl(folder)
+        ) else {
+            throw LushIntentError.operationFailed("The file could not be created.")
+        }
+        let entity = LushDocuments.entity(for: url)
+            ?? LushDocumentEntity(id: url, title: filename, kind: "file")
+        return .result(value: entity, dialog: "Created \(entity.title).")
     }
 }
 
 struct AddDictionaryIntent: AppIntent {
     static let title: LocalizedStringResource = "Add Dictionary"
-    static let description = IntentDescription("Open Lush to create a Patchwork dictionary in Inbox or a selected folder.")
-    static let openAppWhenRun = true
+    static let description = IntentDescription("Create a Patchwork document from a Shortcuts dictionary.")
+    static let openAppWhenRun = false
+
+    @Parameter(
+        title: "Dictionary",
+        inputOptions: String.IntentInputOptions(multiline: true),
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
+    var dictionary: String
+
+    @Parameter(title: "Name")
+    var name: String?
+
+    @Parameter(title: "Type")
+    var type: String?
 
     @Parameter(title: "Folder")
     var folder: LushFolderEntity?
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Add \(\.$dictionary) to \(\.$folder)") {
+            \.$name
+            \.$type
+        }
+    }
+
     @MainActor
-    func perform() async throws -> some IntentResult {
-        AppRouter.shared.pending = .createPatchwork(
-            preferredType: "dictionary",
-            toolId: nil,
-            folderUrl: resolvedFolderUrl(folder)
-        )
-        return .result()
+    func perform() async throws -> some IntentResult & ReturnsValue<LushDocumentEntity> & ProvidesDialog {
+        guard let url = await NotesModel.shared.createDictionaryForShortcut(
+            json: dictionary,
+            name: name,
+            type: type,
+            inFolder: resolvedFolderUrl(folder)
+        ) else {
+            throw LushIntentError.operationFailed(NotesModel.shared.status)
+        }
+        let documentName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let documentType = type?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let entity = LushDocuments.entity(for: url)
+            ?? LushDocumentEntity(
+                id: url,
+                title: documentName.flatMap { $0.isEmpty ? nil : $0 } ?? "Dictionary",
+                kind: documentType.flatMap { $0.isEmpty ? nil : $0 } ?? "dictionary"
+            )
+        return .result(value: entity, dialog: "Created \(entity.title).")
     }
 }
 
 struct AddAutomergeURLIntent: AppIntent {
     static let title: LocalizedStringResource = "Add Automerge URL"
     static let description = IntentDescription("Add an existing Automerge document URL to Inbox or a selected folder.")
-    static let openAppWhenRun = true
+    static let openAppWhenRun = false
 
-    @Parameter(title: "Automerge URL")
+    @Parameter(
+        title: "Automerge URL",
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
     var url: String
 
     @Parameter(title: "Folder")
     var folder: LushFolderEntity?
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Add \(\.$url) to \(\.$folder)")
+    }
+
     @MainActor
-    func perform() async throws -> some IntentResult {
+    func perform() async throws -> some IntentResult & ReturnsValue<LushDocumentEntity> & ProvidesDialog {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("automerge:") else { return .result() }
-        await NotesModel.shared.addDocToFolder(url: trimmed, folderUrl: resolvedFolderUrl(folder))
-        return .result()
+        guard trimmed.hasPrefix("automerge:") else { throw LushIntentError.notAnAutomergeURL }
+        guard await NotesModel.shared.addDocToFolder(
+            url: trimmed,
+            folderUrl: resolvedFolderUrl(folder)
+        ) else {
+            throw LushIntentError.operationFailed("The document could not be added.")
+        }
+        let entity = LushDocuments.entity(for: trimmed)
+            ?? LushDocumentEntity(id: trimmed, title: "Document", kind: "")
+        return .result(value: entity, dialog: "Added \(entity.title).")
     }
 }
 
 struct LogInAccountIntent: AppIntent {
     static let title: LocalizedStringResource = "Log In to Lush Account"
     static let description = IntentDescription("Log in with an account: or automerge: account URL.")
-    static let openAppWhenRun = true
+    static let openAppWhenRun = false
 
     @Parameter(title: "Account URL")
     var accountURL: String
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Log in with \(\.$accountURL)")
+    }
+
     @MainActor
-    func perform() async throws -> some IntentResult {
+    func perform() async throws -> some IntentResult & ProvidesDialog {
         await NotesModel.shared.start()
-        _ = await NotesModel.shared.logIn(accountUrl: accountURL)
-        return .result()
+        guard await NotesModel.shared.logIn(accountUrl: accountURL) else {
+            throw LushIntentError.operationFailed(
+                NotesModel.shared.loginError ?? "The account could not be opened."
+            )
+        }
+        return .result(dialog: "Logged in.")
     }
 }
 
@@ -346,14 +463,59 @@ struct AppendToQuickNoteIntent: AppIntent {
     static let description = IntentDescription("Append text to your Quick Note.")
     static let openAppWhenRun = false
 
-    @Parameter(title: "Text")
+    @Parameter(
+        title: "Text",
+        inputOptions: String.IntentInputOptions(multiline: true),
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
     var text: String
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Append \(\.$text) to Quick Note")
+    }
+
     @MainActor
-    func perform() async throws -> some IntentResult {
+    func perform() async throws -> some IntentResult & ReturnsValue<LushDocumentEntity> & ProvidesDialog {
         await NotesModel.shared.start()
-        _ = await NotesModel.shared.appendToQuickNote(text)
-        return .result()
+        guard let url = await NotesModel.shared.appendToQuickNote(text) else {
+            throw LushIntentError.operationFailed("Quick Note could not be updated.")
+        }
+        let entity = LushDocuments.entity(for: url)
+            ?? LushDocumentEntity(id: url, title: "Quick Note", kind: "rich")
+        return .result(value: entity, dialog: "Updated Quick Note.")
+    }
+}
+
+struct AppendToNoteIntent: AppIntent {
+    static let title: LocalizedStringResource = "Append to Note"
+    static let description = IntentDescription("Append text to a selected note.")
+    static let openAppWhenRun = false
+
+    @Parameter(
+        title: "Text",
+        inputOptions: String.IntentInputOptions(multiline: true),
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
+    var text: String
+
+    @Parameter(title: "Note", inputConnectionBehavior: .connectToPreviousIntentResult)
+    var note: LushDocumentEntity
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("Append \(\.$text) to \(\.$note)")
+    }
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ReturnsValue<LushDocumentEntity> & ProvidesDialog {
+        await NotesModel.shared.start()
+        if let node = NotesModel.shared.node(for: note.id), !node.isNote {
+            throw LushIntentError.operationFailed("Choose a note.")
+        }
+        guard await NotesModel.shared.appendToNote(text, noteUrl: note.id) else {
+            throw LushIntentError.operationFailed("The note could not be updated.")
+        }
+        let entity = LushDocuments.entity(for: note.id) ?? note
+        return .result(value: entity, dialog: "Updated \(entity.title).")
     }
 }
 
@@ -397,6 +559,18 @@ struct OpenLushControlIntent: OpenIntent {
     }
 }
 
+struct OpenShortcutsHelpIntent: AppIntent {
+    static let title: LocalizedStringResource = "Open Shortcuts Help"
+    static let description = IntentDescription("Open the Lush Shortcuts and JavaScript documentation.")
+    static let openAppWhenRun = true
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        AppRouter.shared.pending = .shortcutsHelp
+        return .result()
+    }
+}
+
 struct LushShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
@@ -428,6 +602,12 @@ struct LushShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Search Notes",
             systemImageName: "magnifyingglass"
+        )
+        AppShortcut(
+            intent: OpenShortcutsHelpIntent(),
+            phrases: ["Open shortcuts help in \(.applicationName)"],
+            shortTitle: "Shortcuts Help",
+            systemImageName: "curlybraces"
         )
     }
 }

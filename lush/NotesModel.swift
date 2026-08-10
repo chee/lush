@@ -191,6 +191,7 @@ final class NotesModel {
     @ObservationIgnored private var previewUpdateTokens: [String: UUID] = [:]
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var noteWriteTasks: [String: Task<[String]?, Never>] = [:]
+    @ObservationIgnored private var configWriteTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var noteObservers: [UUID: @MainActor (String) -> Void] = [:]
     @ObservationIgnored private var delegateBridge: DelegateBridge?
     @ObservationIgnored private var pollTask: Task<Void, Never>?
@@ -300,7 +301,11 @@ final class NotesModel {
         // to this install: they're folded into the account she signs into.
         let localFolders = loggedIn ? [] : rootFolderUrls
         let localScratchpad = loggedIn ? nil : quickNoteUrl
-        let localDocs = loggedIn ? [] : ([localScratchpad].compactMap { $0 } + CalendarLinks.noteUrls)
+        let localPins = pinnedUrls
+        let localQuickNote = quickNoteUrl
+        let localDocs = loggedIn ? [] : (
+            [localScratchpad].compactMap { $0 } + localPins + CalendarLinks.noteUrls
+        )
         do {
             var state = try await Task.detached {
                 try await core.loginAccount(accountUrl: normalized)
@@ -323,8 +328,7 @@ final class NotesModel {
                 accountUrls.append(state.accountUrl)
                 LushShared.accountUrls = accountUrls
             }
-            await applyAccount(state)
-            if let localScratchpad { setQuickNote(localScratchpad) }
+            await applyAccount(state, localPins: localPins, localQuickNote: localQuickNote)
             status = ""
             appendSyncEvent("Logged in: \(state.accountUrl)")
             return true
@@ -374,18 +378,40 @@ final class NotesModel {
         folderSettings = [:]
         FolderSettingsStore.save([:])
         applyPackageLists([])
-        setQuickNote(nil)
+        applyQuickNote(nil)
+        applyPinnedUrls([])
         rootFolderUrls = []
         persistRoots()
         folderUrl = nil
         refreshNotes()
     }
 
-    private func applyAccount(_ state: AccountState) async {
+    private func applyAccount(
+        _ state: AccountState,
+        localPins: [String],
+        localQuickNote: String?
+    ) async {
         accountConfigUrl = state.configUrl
         inboxUrl = state.inbox
         accountModuleSettingsUrl = state.moduleSettingsUrl
         PatchworkWeb.accountModuleUrl = state.moduleSettingsUrl
+        if let core, let configUrl = state.configUrl {
+            let config = await Task.detached { core.configState(configUrl: configUrl) }.value
+            if let config {
+                if config.pinsConfigured {
+                    applyPinnedUrls(config.pins)
+                } else {
+                    applyPinnedUrls(localPins)
+                    syncConfigPins()
+                }
+                if config.quickNoteConfigured {
+                    applyQuickNote(config.quickNote)
+                } else {
+                    applyQuickNote(localQuickNote)
+                    syncConfigQuickNote()
+                }
+            }
+        }
         loadSmartNotebooks()
         loadPackageLists()
         if !state.folders.isEmpty, state.folders != rootFolderUrls {
@@ -1534,6 +1560,12 @@ final class NotesModel {
                 if state.packages != self.packageListUrls {
                     self.applyPackageLists(state.packages)
                 }
+                if state.pinsConfigured, state.pins != self.pinnedUrls {
+                    self.applyPinnedUrls(state.pins)
+                }
+                if state.quickNoteConfigured, state.quickNote != self.quickNoteUrl {
+                    self.applyQuickNote(state.quickNote)
+                }
                 if !state.folders.isEmpty, state.folders != self.rootFolderUrls {
                     self.rootFolderUrls = state.folders
                     self.persistRoots()
@@ -1642,17 +1674,32 @@ final class NotesModel {
         }
     }
 
-    func createNoteForShortcut(inFolder folderUrl: String?) async -> String? {
+    func createNoteForShortcut(
+        title: String? = nil,
+        text: String? = nil,
+        inFolder folderUrl: String?
+    ) async -> String? {
         if core == nil {
             await start()
         }
         guard let core else { return nil }
         let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
         guard let target else { return nil }
+        let noteTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let noteText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         do {
             let url = try await Task.detached {
-                let url = try core.createNoteIn(folderUrl: target, title: "")
-                let initial: [SpanNode] = [.block(.creationBlock(snap: nil)), .block(.heading(level: 1))]
+                let url = try core.createNoteIn(folderUrl: target, title: noteTitle)
+                var initial: [SpanNode] = [.block(.creationBlock(snap: nil)), .block(.heading(level: 1))]
+                if !noteTitle.isEmpty {
+                    initial.append(.text(noteTitle, [:]))
+                }
+                if !noteText.isEmpty {
+                    for line in noteText.components(separatedBy: .newlines) {
+                        initial.append(.block(.paragraph))
+                        if !line.isEmpty { initial.append(.text(line, [:])) }
+                    }
+                }
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
                 return url
             }.value
@@ -1688,16 +1735,17 @@ final class NotesModel {
         }
     }
 
-    func createFileForShortcut(inFolder folderUrl: String?) async -> String? {
+    func createFileForShortcut(name: String? = nil, inFolder folderUrl: String?) async -> String? {
         if core == nil {
             await start()
         }
         guard let core else { return nil }
         let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
         guard let target else { return nil }
+        let name = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         do {
             let url = try await Task.detached {
-                try core.createScriptIn(folderUrl: target, name: "")
+                try core.createScriptIn(folderUrl: target, name: name)
             }.value
             refreshNotes()
             selectedNoteUrl = url
@@ -1708,14 +1756,117 @@ final class NotesModel {
         }
     }
 
-    func addDocToFolder(url: String, folderUrl: String?) async {
+    func importFileForShortcut(
+        data: Data,
+        name: String,
+        fileExtension: String,
+        mimeType: String,
+        inFolder folderUrl: String?
+    ) async -> String? {
         if core == nil {
             await start()
         }
-        if let folderUrl {
-            await selectFolder(folderUrl)
+        guard let core else { return nil }
+        let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
+        guard let target else { return nil }
+        do {
+            let url = try await Task.detached {
+                try core.createAssetIn(
+                    folderUrl: target,
+                    name: name,
+                    extension: fileExtension,
+                    mimeType: mimeType,
+                    data: data
+                )
+            }.value
+            refreshNotes()
+            selectedNoteUrl = url
+            return url
+        } catch {
+            status = "Couldn't add file: \(error.localizedDescription)"
+            return nil
         }
-        addDocToCurrentFolder(url: url)
+    }
+
+    func addDocToFolder(url: String, folderUrl: String?) async -> Bool {
+        if core == nil {
+            await start()
+        }
+        guard let core else { return false }
+        let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
+        do {
+            if let target {
+                try await Task.detached {
+                    try core.linkNoteToFolderIn(folderUrl: target, noteUrl: url, title: "")
+                }.value
+            } else {
+                try await core.linkNoteToFolder(noteUrl: url, title: "")
+            }
+            patchworkDocUrls.insert(url)
+            UserDefaults.standard.set(Array(patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
+            selectedNoteUrl = url
+            refreshNotes()
+            return true
+        } catch {
+            status = "Couldn't add document: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func createDictionaryForShortcut(
+        json: String,
+        name: String?,
+        type: String?,
+        inFolder folderUrl: String?
+    ) async -> String? {
+        guard let data = json.data(using: .utf8) else {
+            status = "Couldn't create dictionary: the input is not a JSON dictionary"
+            return nil
+        }
+        let jsonValue = try? JSONSerialization.jsonObject(with: data)
+        let propertyListValue = try? PropertyListSerialization.propertyList(from: data, format: nil)
+        guard let dictionary = (jsonValue ?? propertyListValue) as? [String: Any],
+              JSONSerialization.isValidJSONObject(dictionary)
+        else {
+            status = "Couldn't create dictionary: the input is not a JSON dictionary"
+            return nil
+        }
+        if core == nil { await start() }
+        guard let core else {
+            status = "Couldn't create dictionary: Lush is not ready"
+            return nil
+        }
+        let type = type?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let documentType = type?.isEmpty == false ? type : nil
+        let metadata = dictionary["@patchwork"] as? [String: Any]
+        let requestedName = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let documentName = requestedName.flatMap { $0.isEmpty ? nil : $0 }
+            ?? dictionary["name"] as? String
+            ?? dictionary["title"] as? String
+            ?? metadata?["title"] as? String
+            ?? documentType
+            ?? "Dictionary"
+        do {
+            let url = try await PatchworkScripting.shared.createDictionary(
+                dictionary,
+                type: documentType
+            )
+            if let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl {
+                try await Task.detached {
+                    try core.linkNoteToFolderIn(folderUrl: target, noteUrl: url, title: documentName)
+                }.value
+            } else {
+                try await core.linkNoteToFolder(noteUrl: url, title: documentName)
+            }
+            patchworkDocUrls.insert(url)
+            UserDefaults.standard.set(Array(patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
+            selectedNoteUrl = url
+            refreshNotes()
+            return url
+        } catch {
+            status = "Couldn't create dictionary: \(error.localizedDescription)"
+            return nil
+        }
     }
 
     func deleteNote(_ url: String) {
@@ -1760,14 +1911,14 @@ final class NotesModel {
         if pinnedUrls.contains(url) {
             pinnedUrls.removeAll { $0 == url }
             UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+            syncConfigPins()
         }
         childOrder.removeValue(forKey: url)
         for (folder, order) in childOrder where order.contains(url) {
             childOrder[folder] = order.filter { $0 != url }
         }
         if quickNoteUrl == url {
-            quickNoteUrl = nil
-            UserDefaults.standard.removeObject(forKey: Self.quickNoteKey)
+            setQuickNote(nil)
         }
         focus.forgetDocument(url)
         CalendarLinks.set([], for: url)
@@ -2844,8 +2995,24 @@ final class NotesModel {
     var effectiveQuickNoteUrl: String? { focus.state?.quickNoteUrl ?? quickNoteUrl }
 
     func setQuickNote(_ url: String?) {
+        applyQuickNote(url)
+        syncConfigQuickNote()
+    }
+
+    private func applyQuickNote(_ url: String?) {
         quickNoteUrl = url
         UserDefaults.standard.set(url, forKey: Self.quickNoteKey)
+    }
+
+    private func syncConfigQuickNote() {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let url = quickNoteUrl
+        let previous = configWriteTasks["quickNote"]
+        let task = Task.detached {
+            _ = await previous?.value
+            try? core.setConfigQuickNote(configUrl: configUrl, url: url)
+        }
+        configWriteTasks["quickNote"] = task
     }
 
     /// Appends run inside the per-note write chain so the read-modify-write
@@ -2867,8 +3034,18 @@ final class NotesModel {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return effectiveQuickNoteUrl }
         guard let target = await quickNoteTarget() else { return nil }
-        let core = target.core
-        let url = target.url
+        return await append(trimmed, to: target.url, using: target.core) ? target.url : nil
+    }
+
+    func appendToNote(_ snippet: String, noteUrl: String) async -> Bool {
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        if core == nil { await start() }
+        guard let core, noteUrl.hasPrefix("automerge:") else { return false }
+        return await append(trimmed, to: noteUrl, using: core)
+    }
+
+    private func append(_ text: String, to url: String, using core: Core) async -> Bool {
         let written = await chainedNoteWrite(url) {
             try? await core.openNote(url: url)
             let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
@@ -2876,18 +3053,18 @@ final class NotesModel {
             if !spans.isEmpty {
                 spans.append(.text("\n", [:]))
             }
-            spans.append(.text(trimmed, [:]))
+            spans.append(.text(text, [:]))
             return await Task.detached { () -> [String]? in
                 try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(spans), heads: nil)
             }.value
         }
         guard written != nil else {
-            status = "Couldn't update Quick Note"
-            return nil
+            status = "Couldn't update note"
+            return false
         }
         notifyNoteObservers(url)
         refreshQuickNote(url, core: core)
-        return url
+        return true
     }
 
     func appendRecordingToQuickNote(data: Data, transcript: String?) async -> String? {
@@ -3032,6 +3209,7 @@ final class NotesModel {
             pinnedUrls.insert(url, at: 0)
         }
         UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+        syncConfigPins()
     }
 
     func movePins(displayed: [String], from: IndexSet, to: Int) {
@@ -3039,6 +3217,7 @@ final class NotesModel {
         urls.move(fromOffsets: from, toOffset: to)
         pinnedUrls = urls + pinnedUrls.filter { !urls.contains($0) }
         UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+        syncConfigPins()
     }
 
     func reorderPin(_ url: String, adjacentTo targetUrl: String, after: Bool) {
@@ -3046,6 +3225,23 @@ final class NotesModel {
         guard next != pinnedUrls else { return }
         pinnedUrls = next
         UserDefaults.standard.set(pinnedUrls, forKey: Self.pinnedKey)
+        syncConfigPins()
+    }
+
+    private func applyPinnedUrls(_ urls: [String]) {
+        pinnedUrls = urls
+        UserDefaults.standard.set(urls, forKey: Self.pinnedKey)
+    }
+
+    private func syncConfigPins() {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let urls = pinnedUrls
+        let previous = configWriteTasks["pins"]
+        let task = Task.detached {
+            _ = await previous?.value
+            try? core.setConfigPins(configUrl: configUrl, urls: urls)
+        }
+        configWriteTasks["pins"] = task
     }
 
     var pinnedNodes: [FolderNode] {
@@ -3125,6 +3321,7 @@ final class NotesModel {
 
     var pendingIncoming: IncomingContent?
     var showingFileImporter = false
+    var fileImportRequest: FileImportRequest?
 
     func importAsNewNote(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) async {
         guard let core else { return }
@@ -3257,6 +3454,15 @@ final class NotesModel {
 
     static func canImportAsNote(_ url: URL) -> Bool {
         noteImportExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    func prepareFileImport(_ urls: [URL], into folderUrl: String?) {
+        guard !urls.isEmpty else { return }
+        if urls.contains(where: Self.canImportAsNote) {
+            fileImportRequest = FileImportRequest(urls: urls, folderUrl: folderUrl)
+        } else {
+            Task { await importFiles(urls, into: folderUrl, asNotes: false) }
+        }
     }
 
     @discardableResult

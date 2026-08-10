@@ -35,6 +35,15 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         }
     }
 
+    var settingsDescription: String {
+        switch self {
+        case .attachmentSummary: "Creates searchable descriptions for attached files."
+        case .imageCaption: "Describes images for search and accessibility."
+        case .voiceNoteSummary: "Summarizes voice-note transcripts."
+        case .noteChat: "Answers questions and proposes edits using note content."
+        }
+    }
+
     var defaultSystemPrompt: String {
         switch self {
         case .attachmentSummary, .imageCaption, .voiceNoteSummary:
@@ -84,6 +93,13 @@ enum LocalModelBackend: String, CaseIterable, Identifiable {
         switch self {
         case .openRouter, .openAI, .anthropic, .compatible: true
         case .appleIntelligence, .mlx, .ollama: false
+        }
+    }
+
+    var isOnDevice: Bool {
+        switch self {
+        case .appleIntelligence, .mlx: true
+        case .openRouter, .openAI, .anthropic, .compatible, .ollama: false
         }
     }
 

@@ -20,7 +20,7 @@ struct MachineLearningSettingsPane: View {
             } header: {
                 Text("Providers")
             } footer: {
-                Text("Connect a provider once. Its key lives in Keychain and every task that uses the provider shares it.")
+                Text("Credentials are stored in Keychain on this device. Each task can use a different provider.")
             }
 
             Section {
@@ -30,15 +30,14 @@ struct MachineLearningSettingsPane: View {
                             .tag(operation)
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                .pickerStyle(.menu)
 
                 LocalModelTaskSettingsView(operation: selectedOperation)
                     .id(selectedOperation)
             } header: {
                 Text("Tasks")
             } footer: {
-                Text("What each task reaches for by default. Chat and the summary sheets can pick a different provider at the moment you run them.")
+                Text("These defaults apply immediately. Chat and summary sheets can use another provider for an individual request.")
             }
 
             #if os(macOS)
@@ -46,9 +45,9 @@ struct MachineLearningSettingsPane: View {
             #endif
 
             Section {
-                Button("Regenerate Search Index") { model.reindexAll() }
+                Button("Rebuild Semantic Search Index") { model.reindexAll() }
             } footer: {
-                Text("Clears all semantic embeddings and rebuilds the search index from scratch.")
+                Text("Recreates local search data from your notes. Your notes are unchanged.")
             }
         }
         .formStyle(.grouped)
@@ -61,21 +60,50 @@ private struct ProviderRowLabel: View {
 
     var body: some View {
         HStack {
-            Text(backend.label)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(backend.label)
+                Text(location)
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
             if backend.needsAPIKey {
-                Image(systemName: connected ? "checkmark.circle.fill" : "circle.dashed")
+                Label(
+                    connected ? "Connected" : "Not connected",
+                    systemImage: connected ? "checkmark.circle.fill" : "circle.dashed"
+                )
+                    .labelStyle(.iconOnly)
                     .foregroundStyle(connected ? Color.green : Color.secondary)
             }
-            Text(LocalModelSettings.providerModel(for: backend))
+            Text(detail)
                 .uiFont(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+        .accessibilityElement(children: .combine)
     }
 
     private var connected: Bool { LocalModelSettings.isConnected(backend) }
+
+    private var location: String {
+        switch backend {
+        case .appleIntelligence, .mlx: "On device"
+        case .openRouter, .openAI, .anthropic: "Hosted service"
+        case .compatible, .ollama: "Configured endpoint"
+        }
+    }
+
+    private var detail: String {
+        if backend.needsAPIKey { return connected ? "Connected" : "Not connected" }
+        let model = LocalModelSettings.providerModel(for: backend)
+        switch backend {
+        case .appleIntelligence: return "Built in"
+        case .mlx where !connected: return "Unavailable"
+        case .mlx, .ollama: return model.isEmpty ? "Model required" : model
+        case .openRouter, .openAI, .anthropic, .compatible: return model
+        }
+    }
 }
 
 struct ProviderSettingsView: View {
@@ -88,6 +116,7 @@ struct ProviderSettingsView: View {
     @State private var isSigningIn = false
     @State private var status: String?
     @State private var statusIsError = false
+    @State private var endpointEdited = false
 
     init(backend: LocalModelBackend) {
         self.backend = backend
@@ -101,34 +130,53 @@ struct ProviderSettingsView: View {
             .uiFont(.caption)
             .foregroundStyle(.secondary)
 
+        Label(privacySummary, systemImage: backend.isOnDevice ? "lock.fill" : "network")
+            .uiFont(.caption)
+            .foregroundStyle(.secondary)
+
         if backend.usesEndpoint {
-            HStack {
-                TextField("Default model", text: $defaultModel, prompt: Text(backend.defaultModel))
-                    .autocorrectionDisabled()
-                    .onChange(of: defaultModel) {
-                        LocalModelSettings.setProviderModel(defaultModel, for: backend)
+            LabeledContent("Default model") {
+                HStack {
+                    TextField("Default model", text: $defaultModel, prompt: Text(backend.defaultModel))
+                        .labelsHidden()
+                        .accessibilityLabel("Default model")
+                        .autocorrectionDisabled()
+                        .onChange(of: defaultModel) {
+                            LocalModelSettings.setProviderModel(defaultModel, for: backend)
+                        }
+                    if backend == .openRouter {
+                        OpenRouterModelButton(model: $defaultModel, imagesOnly: false)
                     }
-                if backend == .openRouter {
-                    OpenRouterModelButton(model: $defaultModel, imagesOnly: false)
-                }
-                if backend == .ollama {
-                    OllamaModelButton(model: $defaultModel)
+                    if backend == .ollama {
+                        OllamaModelButton(model: $defaultModel)
+                    }
                 }
             }
 
             if backend == .compatible || backend == .ollama {
-                TextField(
-                    "Endpoint",
-                    text: $endpoint,
-                    prompt: Text(
-                        backend == .ollama
-                            ? backend.defaultEndpoint
-                            : "https://provider.example/v1/chat/completions"
+                LabeledContent("Endpoint") {
+                    TextField(
+                        "Endpoint",
+                        text: $endpoint,
+                        prompt: Text(
+                            backend == .ollama
+                                ? backend.defaultEndpoint
+                                : "https://provider.example/v1/chat/completions"
+                        )
                     )
-                )
-                .autocorrectionDisabled()
-                .onChange(of: endpoint) {
-                    LocalModelSettings.setEndpoint(endpoint, for: backend)
+                    .labelsHidden()
+                    .accessibilityLabel("Endpoint")
+                    .textContentType(.URL)
+                    .autocorrectionDisabled()
+                    .onChange(of: endpoint) {
+                        endpointEdited = true
+                        LocalModelSettings.setEndpoint(endpoint, for: backend)
+                    }
+                }
+                if endpointEdited, let endpointValidationMessage {
+                    Label(endpointValidationMessage, systemImage: "exclamationmark.triangle.fill")
+                        .uiFont(.caption)
+                        .foregroundStyle(.red)
                 }
             }
 
@@ -143,34 +191,44 @@ struct ProviderSettingsView: View {
                         } else {
                             Image(systemName: "person.crop.circle.badge.checkmark")
                         }
-                        Text(isSigningIn ? "Waiting for OpenRouter…" : "Connect OpenRouter")
+                        Text(
+                            isSigningIn
+                                ? "Waiting for OpenRouter…"
+                                : credentialStored ? "Reconnect OpenRouter" : "Connect OpenRouter"
+                        )
                     }
                 }
                 .disabled(isSigningIn)
             }
 
             if backend.needsAPIKey {
-                HStack {
+                LabeledContent("API key") {
                     SecureField(
                         credentialStored ? "Enter a replacement key" : backend.credentialLabel,
                         text: $apiKey
                     )
+                    .labelsHidden()
+                    .accessibilityLabel("API key")
                     .textContentType(.password)
                     .autocorrectionDisabled()
-                    Button(credentialStored ? "Replace" : "Save") { saveAPIKey() }
-                        .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
+                Button(credentialStored ? "Replace API Key" : "Save API Key") { saveAPIKey() }
+                    .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 if credentialStored {
                     Button("Disconnect", role: .destructive) { removeAPIKey() }
                 }
             }
         } else if backend == .mlx {
-            TextField("Default repository", text: $defaultModel, prompt: Text("owner/model"))
-                .autocorrectionDisabled()
-                .onChange(of: defaultModel) {
-                    LocalModelSettings.setProviderModel(defaultModel, for: backend)
-                }
+            LabeledContent("Default repository") {
+                TextField("Default repository", text: $defaultModel, prompt: Text("owner/model"))
+                    .labelsHidden()
+                    .accessibilityLabel("Default repository")
+                    .autocorrectionDisabled()
+                    .onChange(of: defaultModel) {
+                        LocalModelSettings.setProviderModel(defaultModel, for: backend)
+                    }
+            }
         }
 
         if let status {
@@ -178,6 +236,30 @@ struct ProviderSettingsView: View {
                 .uiFont(.caption)
                 .foregroundStyle(statusIsError ? Color.red : Color.secondary)
         }
+    }
+
+    private var privacySummary: String {
+        switch backend {
+        case .appleIntelligence:
+            "Requests stay on this device."
+        case .mlx:
+            "Requests stay on this device. Model files download from Hugging Face when needed."
+        case .ollama:
+            "Task content is sent only to the configured Ollama endpoint."
+        case .openRouter, .openAI, .anthropic, .compatible:
+            "Task content is sent to this provider when you use it."
+        }
+    }
+
+    private var endpointValidationMessage: String? {
+        let value = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return "Enter an endpoint." }
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil
+        else { return "Enter a valid HTTP or HTTPS URL." }
+        return nil
     }
 
     private func saveAPIKey() {
@@ -235,6 +317,7 @@ struct LocalModelTaskSettingsView: View {
     @State private var generationSettings: LocalGenerationSettings
     @State private var systemPrompt: String
     @State private var presetFilter = ""
+    @State private var advancedExpanded = false
     @State private var promptExpanded = false
 
     init(operation: LocalModelOperation) {
@@ -248,27 +331,44 @@ struct LocalModelTaskSettingsView: View {
     }
 
     var body: some View {
+        Text(operation.settingsDescription)
+            .uiFont(.caption)
+            .foregroundStyle(.secondary)
+
         Picker("Provider", selection: $backend) {
             ForEach(LocalModelBackend.allCases) { backend in
                 Text(backend.label).tag(backend)
             }
         }
+        .pickerStyle(.menu)
         .onChange(of: backend) {
             LocalModelSettings.setBackend(backend, for: operation)
             model = LocalModelSettings.model(for: operation, backend: backend)
         }
 
+        Label(providerDisclosure, systemImage: backend.isOnDevice ? "lock.fill" : "network")
+            .uiFont(.caption)
+            .foregroundStyle(.secondary)
+
         if backend == .mlx {
-            TextField("Repository", text: $mlxConfig.repo, prompt: Text(placeholderRepo))
-                .autocorrectionDisabled()
-                .onChange(of: mlxConfig.repo) {
-                    LocalModelSettings.setRemoteModelConfig(mlxConfig, for: operation)
-                }
-            TextField("Revision", text: $mlxConfig.revision, prompt: Text("main"))
-                .autocorrectionDisabled()
-                .onChange(of: mlxConfig.revision) {
-                    LocalModelSettings.setRemoteModelConfig(mlxConfig, for: operation)
-                }
+            LabeledContent("Repository") {
+                TextField("Repository", text: $mlxConfig.repo, prompt: Text(placeholderRepo))
+                    .labelsHidden()
+                    .accessibilityLabel("Repository")
+                    .autocorrectionDisabled()
+                    .onChange(of: mlxConfig.repo) {
+                        LocalModelSettings.setRemoteModelConfig(mlxConfig, for: operation)
+                    }
+            }
+            LabeledContent("Revision") {
+                TextField("Revision", text: $mlxConfig.revision, prompt: Text("main"))
+                    .labelsHidden()
+                    .accessibilityLabel("Revision")
+                    .autocorrectionDisabled()
+                    .onChange(of: mlxConfig.revision) {
+                        LocalModelSettings.setRemoteModelConfig(mlxConfig, for: operation)
+                    }
+            }
             DisclosureGroup("Suggested models") {
                 TextField("Filter suggested models", text: $presetFilter)
                     .autocorrectionDisabled()
@@ -293,61 +393,108 @@ struct LocalModelTaskSettingsView: View {
                 }
             }
         } else if backend.usesEndpoint {
-            HStack {
-                TextField(
-                    "Model",
-                    text: $model,
-                    prompt: Text(LocalModelSettings.providerModel(for: backend))
-                )
-                .autocorrectionDisabled()
-                .onChange(of: model) {
-                    LocalModelSettings.setModel(model, for: operation, backend: backend)
-                }
-                if backend == .openRouter {
-                    OpenRouterModelButton(model: $model, imagesOnly: operation == .imageCaption)
-                }
-                if backend == .ollama {
-                    OllamaModelButton(model: $model)
+            LabeledContent("Model") {
+                HStack {
+                    TextField(
+                        "Model",
+                        text: $model,
+                        prompt: Text(LocalModelSettings.providerModel(for: backend))
+                    )
+                    .labelsHidden()
+                    .accessibilityLabel("Model")
+                    .autocorrectionDisabled()
+                    .onChange(of: model) {
+                        LocalModelSettings.setModel(model, for: operation, backend: backend)
+                    }
+                    if backend == .openRouter {
+                        OpenRouterModelButton(model: $model, imagesOnly: operation == .imageCaption)
+                    }
+                    if backend == .ollama {
+                        OllamaModelButton(model: $model)
+                    }
                 }
             }
         }
 
-        LabeledContent("Temperature") {
-            HStack(spacing: 12) {
+        DisclosureGroup("Advanced", isExpanded: $advancedExpanded) {
+            VStack(alignment: .leading, spacing: 6) {
+                LabeledContent("Variation") {
+                    Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
+                        .font(.body.monospacedDigit())
+                }
                 Slider(value: $generationSettings.temperature, in: 0...1, step: 0.05)
-                    .frame(minWidth: 180)
+                    .accessibilityLabel("Variation")
+                    .accessibilityValue(variationAccessibilityValue)
                     .onChange(of: generationSettings.temperature) {
                         LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
                     }
-                Text(generationSettings.temperature.formatted(.number.precision(.fractionLength(2))))
-                    .font(.caption.monospacedDigit())
+                HStack {
+                    Text("Consistent")
+                    Spacer()
+                    Text("Varied")
+                }
+                .uiFont(.caption)
+                .foregroundStyle(.secondary)
+                Text("Lower values make responses more repeatable.")
+                    .uiFont(.caption)
                     .foregroundStyle(.secondary)
             }
-        }
-        Stepper(
-            "Response limit: \(generationSettings.maximumResponseTokens) tokens",
-            value: $generationSettings.maximumResponseTokens,
-            in: 64...4096,
-            step: 64
-        )
-        .onChange(of: generationSettings.maximumResponseTokens) {
-            LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
-        }
-
-        DisclosureGroup("System prompt", isExpanded: $promptExpanded) {
-            TextEditor(text: $systemPrompt)
-                .font(.caption.monospaced())
-                .frame(minHeight: 140)
-                .onChange(of: systemPrompt) {
-                    LocalModelSettings.setSystemPrompt(systemPrompt, for: operation)
-                }
-            HStack {
-                Spacer()
-                Button("Restore Default") {
-                    systemPrompt = operation.defaultSystemPrompt
-                    LocalModelSettings.resetSystemPrompt(for: operation)
+            LabeledContent("Response limit") {
+                HStack(spacing: 8) {
+                    Text("\(generationSettings.maximumResponseTokens) tokens")
+                        .font(.body.monospacedDigit())
+                    Stepper(
+                        "Response limit",
+                        value: $generationSettings.maximumResponseTokens,
+                        in: 64...4096,
+                        step: 64
+                    )
+                    .labelsHidden()
                 }
             }
+            .onChange(of: generationSettings.maximumResponseTokens) {
+                LocalModelSettings.setGenerationSettings(generationSettings, for: operation)
+            }
+
+            DisclosureGroup("Instructions", isExpanded: $promptExpanded) {
+                Text("Lush sends these instructions with every request for this task.")
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $systemPrompt)
+                    .font(.caption.monospaced())
+                    .frame(minHeight: 140)
+                    .accessibilityLabel("Instructions for \(operation.label)")
+                    .onChange(of: systemPrompt) {
+                        LocalModelSettings.setSystemPrompt(systemPrompt, for: operation)
+                    }
+                HStack {
+                    Spacer()
+                    Button("Restore Default") {
+                        systemPrompt = operation.defaultSystemPrompt
+                        LocalModelSettings.resetSystemPrompt(for: operation)
+                    }
+                    .disabled(systemPrompt == operation.defaultSystemPrompt)
+                }
+            }
+        }
+    }
+
+    private var providerDisclosure: String {
+        switch backend {
+        case .appleIntelligence, .mlx:
+            "This task stays on this device."
+        case .ollama:
+            "This task sends content to the configured Ollama endpoint."
+        case .openRouter, .openAI, .anthropic, .compatible:
+            "This task sends content to \(backend.label)."
+        }
+    }
+
+    private var variationAccessibilityValue: String {
+        switch generationSettings.temperature {
+        case ..<0.34: "Low"
+        case ..<0.67: "Medium"
+        default: "High"
         }
     }
 
@@ -381,7 +528,7 @@ struct OllamaModelButton: View {
             presented.toggle()
             if models.isEmpty { refresh() }
         } label: {
-            Image(systemName: "chevron.up.chevron.down")
+            Text("Choose…")
         }
         .help("Choose a pulled Ollama model")
         .popover(isPresented: $presented, arrowEdge: .trailing) {
@@ -501,7 +648,7 @@ struct OpenRouterModelButton: View {
             presented.toggle()
             if models.isEmpty { refresh() }
         } label: {
-            Image(systemName: "chevron.up.chevron.down")
+            Text("Choose…")
         }
         .help("Choose an OpenRouter model")
         .popover(isPresented: $presented, arrowEdge: .trailing) {

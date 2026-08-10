@@ -98,15 +98,35 @@ enum LushDocuments {
         }
     }
 
-    static func content(of url: String, format: LushContentFormat) async -> String {
+    static func content(of url: String, title: String, format: LushContentFormat) async throws -> IntentFile {
         let json = await NotesModel.shared.spansJSON(for: url)
+        let spans = SpanNode.decodeList(json)
+        let filename = title
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let basename = filename.isEmpty ? "Untitled" : filename
         switch format {
         case .spansJSON:
-            return json
+            return IntentFile(data: Data(json.utf8), filename: "\(basename).json", type: .json)
         case .html:
-            return NoteExporter.htmlFragment(from: SpanNode.decodeList(json))
+            return IntentFile(
+                data: Data(NoteExporter.htmlFragment(from: spans).utf8),
+                filename: "\(basename).html",
+                type: .html
+            )
+        case .rtf:
+            return IntentFile(
+                data: try NoteExporter.rtfData(from: spans),
+                filename: "\(basename).rtf",
+                type: .rtf
+            )
         case .text:
-            return plainText(SpanNode.decodeList(json))
+            return IntentFile(
+                data: Data(plainText(spans).utf8),
+                filename: "\(basename).txt",
+                type: .plainText
+            )
         }
     }
 
@@ -127,22 +147,24 @@ enum LushDocuments {
 enum LushContentFormat: String, AppEnum {
     case text
     case html
+    case rtf
     case spansJSON
 
     static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Note Format")
     static let caseDisplayRepresentations: [LushContentFormat: DisplayRepresentation] = [
         .text: "Plain Text",
         .html: "HTML",
+        .rtf: "Rich Text",
         .spansJSON: "Spans JSON"
     ]
 }
 
 struct GetNoteContentIntent: AppIntent {
     static let title: LocalizedStringResource = "Get Note Content"
-    static let description = IntentDescription("Read the text of a Lush note.")
+    static let description = IntentDescription("Export the contents of a Lush note.")
     static let openAppWhenRun = false
 
-    @Parameter(title: "Note")
+    @Parameter(title: "Note", inputConnectionBehavior: .connectToPreviousIntentResult)
     var note: LushDocumentEntity
 
     @Parameter(title: "Format", default: .text)
@@ -153,27 +175,31 @@ struct GetNoteContentIntent: AppIntent {
     }
 
     @MainActor
-    func perform() async throws -> some IntentResult & ReturnsValue<String> {
+    func perform() async throws -> some IntentResult & ReturnsValue<IntentFile> {
         await NotesModel.shared.start()
-        return .result(value: await LushDocuments.content(of: note.id, format: format))
+        return .result(value: try await LushDocuments.content(of: note.id, title: note.title, format: format))
     }
 }
 
 struct GetQuickNoteTextIntent: AppIntent {
-    static let title: LocalizedStringResource = "Get Quick Note Text"
-    static let description = IntentDescription("The text of your Quick Note, as a value.")
+    static let title: LocalizedStringResource = "Get Quick Note Content"
+    static let description = IntentDescription("Export the contents of your Quick Note.")
     static let openAppWhenRun = false
 
     @Parameter(title: "Format", default: .text)
     var format: LushContentFormat
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Get Quick Note as \(\.$format)")
+    }
+
     @MainActor
-    func perform() async throws -> some IntentResult & ReturnsValue<String> {
+    func perform() async throws -> some IntentResult & ReturnsValue<IntentFile> {
         await NotesModel.shared.start()
         guard let url = await NotesModel.shared.ensureQuickNote() else {
-            return .result(value: "")
+            throw LushIntentError.operationFailed("Quick Note could not be opened.")
         }
-        return .result(value: await LushDocuments.content(of: url, format: format))
+        return .result(value: try await LushDocuments.content(of: url, title: "Quick Note", format: format))
     }
 }
 
@@ -182,14 +208,14 @@ struct SearchNotesIntent: AppIntent {
     static let description = IntentDescription("Find Lush notes matching a query, by text and by meaning.")
     static let openAppWhenRun = false
 
-    @Parameter(title: "Query")
+    @Parameter(title: "Query", inputConnectionBehavior: .connectToPreviousIntentResult)
     var query: String
 
-    @Parameter(title: "Limit", default: 20)
+    @Parameter(title: "Limit", default: 20, inclusiveRange: (1, 100))
     var limit: Int
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Search Lush for \(\.$query)") {
+        Summary("Search notes for \(\.$query)") {
             \.$limit
         }
     }
@@ -198,7 +224,7 @@ struct SearchNotesIntent: AppIntent {
     func perform() async throws -> some IntentResult & ReturnsValue<[LushDocumentEntity]> {
         await NotesModel.shared.start()
         let hits = await LushDocuments.search(query)
-        return .result(value: Array(hits.prefix(max(1, limit))))
+        return .result(value: Array(hits.prefix(min(100, max(1, limit)))))
     }
 }
 
@@ -207,13 +233,17 @@ struct GetRecentNotesIntent: AppIntent {
     static let description = IntentDescription("The most recently changed Lush notes.")
     static let openAppWhenRun = false
 
-    @Parameter(title: "Limit", default: 20)
+    @Parameter(title: "Limit", default: 20, inclusiveRange: (1, 100))
     var limit: Int
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("Get \(\.$limit) recent notes")
+    }
 
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<[LushDocumentEntity]> {
         await NotesModel.shared.start()
-        return .result(value: LushDocuments.recents(limit: UInt32(max(1, limit))))
+        return .result(value: LushDocuments.recents(limit: UInt32(min(100, max(1, limit)))))
     }
 }
 
@@ -225,6 +255,10 @@ struct GetFolderContentsIntent: AppIntent {
     @Parameter(title: "Folder")
     var folder: LushFolderEntity
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Get contents of \(\.$folder)")
+    }
+
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<[LushDocumentEntity]> {
         await NotesModel.shared.start()
@@ -232,7 +266,7 @@ struct GetFolderContentsIntent: AppIntent {
               let url = folder.isInbox
                 ? (NotesModel.shared.effectiveInboxUrl ?? NotesModel.shared.folderUrl)
                 : (folder.url ?? folder.id)
-        else { return .result(value: []) }
+        else { throw LushIntentError.operationFailed("The folder could not be opened.") }
         let entries = await core.folderEntriesOf(url: url)
         return .result(value: entries.map {
             LushDocumentEntity(id: $0.url, title: $0.name, kind: $0.kind)
@@ -247,8 +281,15 @@ struct GetDocumentIntent: AppIntent {
     )
     static let openAppWhenRun = false
 
-    @Parameter(title: "Automerge URL")
+    @Parameter(
+        title: "Automerge URL",
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
     var url: String
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("Get Automerge document \(\.$url)")
+    }
 
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<IntentFile> {
@@ -270,20 +311,35 @@ struct RunPatchworkJavaScriptIntent: AppIntent {
     static let title: LocalizedStringResource = "Run JavaScript in Patchwork"
     static let description = IntentDescription(
         """
-        Run a script in the Patchwork runtime. `repo`, `handle`, `doc`, and \
-        `docUrl` are in scope; return a value to hand it back as JSON.
+        Run a script in the Patchwork runtime. repo, handle, doc, url, and \
+        Patchwork are in scope. Documentation: lush://help/shortcuts
         """
     )
     static let openAppWhenRun = false
 
-    @Parameter(title: "Script")
+    @Parameter(
+        title: "Script",
+        inputOptions: String.IntentInputOptions(
+            keyboardType: .asciiCapable,
+            capitalizationType: .none,
+            multiline: true,
+            autocorrect: false,
+            smartQuotes: false,
+            smartDashes: false
+        ),
+        inputConnectionBehavior: .connectToPreviousIntentResult
+    )
     var script: String
 
-    @Parameter(title: "Automerge URL")
+    @Parameter(
+        title: "Document URL",
+        description: "Optional Automerge URL to expose as handle, doc, and url."
+    )
     var url: String?
 
     static var parameterSummary: some ParameterSummary {
-        Summary("Run \(\.$script) in Patchwork") {
+        Summary("Run JavaScript in Patchwork") {
+            \.$script
             \.$url
         }
     }
@@ -306,6 +362,12 @@ struct RunPatchworkJavaScriptIntent: AppIntent {
 
 enum LushIntentError: LocalizedError {
     case notAnAutomergeURL
+    case operationFailed(String)
 
-    var errorDescription: String? { "That is not an automerge: URL." }
+    var errorDescription: String? {
+        switch self {
+        case .notAnAutomergeURL: "That is not an automerge: URL."
+        case .operationFailed(let message): message
+        }
+    }
 }

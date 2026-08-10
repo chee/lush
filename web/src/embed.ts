@@ -18,9 +18,12 @@ import {
   getRegistry,
   createDocOfDatatype2,
 } from "@inkandswitch/patchwork-plugins";
+import * as plugins from "@inkandswitch/patchwork-plugins";
 import { fromBase64, toBase64 } from "./bytes";
 import { configuredSigner, subductionEndpoints } from "./config";
+import { loadAccount } from "./account";
 import { makeImportPackage } from "./packages";
+import { installPatchworkApi } from "./patchwork-api";
 import { installResolver } from "./resolver";
 import type { PatchworkConfig } from "./types";
 
@@ -178,15 +181,23 @@ async function boot() {
     initSubduction({ module_or_path: fetch("/subduction.wasm") }),
   ]);
 
+  const signer = configuredSigner(config);
   const repo = new Repo({
     storage: new NativeStorageAdapter(),
-    signer: configuredSigner(config),
+    signer,
     peerId: `lush-${Math.random().toString(36).slice(2, 10)}` as PeerId,
     enableRemoteHeadsGossiping: true,
     subductionWebsocketEndpoints: subductionEndpoints(config),
   } as never);
   window.repo = repo;
   installResolver(repo);
+  const Patchwork = installPatchworkApi(repo);
+  Patchwork.accountReady = isValidAutomergeUrl(config.accountUrl ?? "")
+    ? loadAccount(repo, config.accountUrl as AutomergeUrl).then((account) => {
+        Patchwork.account = account;
+        return account;
+      })
+    : Promise.resolve(undefined);
 
   registerRepoProviderElement(repo);
   registerPatchworkViewElement({ repo });
@@ -374,6 +385,43 @@ async function boot() {
       console.warn("lush: tool setup failed", error);
     });
   };
+
+  const runtime: any = {
+    repo,
+    hive: undefined,
+    get account() {
+      return Patchwork.account;
+    },
+    signer: {
+      peerId: String(signer.peerId ?? ""),
+      verifyingKey: String(signer.verifyingKey ?? ""),
+    },
+    packages: watcher,
+    plugins,
+    sw: {
+      async connectClassicSync() {},
+      async subscribeToRepoChannel() {
+        return () => {};
+      },
+      async subscribeSyncState() {
+        return () => {};
+      },
+    },
+    async create(type: string, init?: (doc: unknown) => void) {
+      const datatype = await getRegistry("patchwork:datatype").load(type);
+      if (!datatype) {
+        throw new Error(`patchwork.create: no datatype registered for "${type}"`);
+      }
+      return createDocOfDatatype2(datatype as never, repo, init as never, undefined);
+    },
+    open(url: AutomergeUrl, options: { tool?: string } = {}) {
+      void window.setDoc?.(url, options.tool ?? null);
+    },
+    find<D>(url: AutomergeUrl) {
+      return repo.find<D>(url);
+    },
+  };
+  window.patchwork = runtime;
 
   const params = new URLSearchParams(location.search);
   if (params.get("mode") === "context") {

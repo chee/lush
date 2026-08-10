@@ -216,6 +216,18 @@ struct MainWindowCommands: Commands {
         }
     }
 }
+
+struct HelpCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .help) {
+            Button("Shortcuts & JavaScript") {
+                openWindow(id: "shortcuts-help")
+            }
+        }
+    }
+}
 #endif
 
 struct ViewCommands: Commands {
@@ -481,6 +493,7 @@ struct LushApp: App {
             FormatCommands()
             FolderCommands(model: model)
             MainWindowCommands()
+            HelpCommands()
         }
 
         WindowGroup(id: "note-detail", for: String.self) { $noteUrl in
@@ -512,6 +525,13 @@ struct LushApp: App {
         }
         .defaultSize(width: 340, height: 190)
         .windowResizability(.contentSize)
+
+        WindowGroup("Shortcuts & JavaScript", id: "shortcuts-help") {
+            ShortcutsHelpView()
+                .environment(model)
+                .interfaceFont()
+        }
+        .defaultSize(width: 820, height: 820)
 
         MenuBarExtra {
             MenuBarCaptureView()

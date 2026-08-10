@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// A JavaScript console for a patchwork embed. The script body runs in the
-/// embed's page with `repo`, `handle`, `doc`, and `docUrl` in scope; whatever
+/// embed's page with `repo`, `handle`, `doc`, and `url` in scope; whatever
 /// it returns is shown as JSON.
 struct PatchworkConsole: View {
     let target: PatchworkScripting.Target
@@ -20,7 +20,7 @@ struct PatchworkConsole: View {
             HStack {
                 Text("JavaScript")
                     .uiFont(.headline)
-                Text("repo, handle, doc, docUrl")
+                Text("repo, handle, doc, url, Patchwork")
                     .uiFont(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -77,7 +77,7 @@ struct PatchworkConsole: View {
         }
     }
 
-    private static func pretty(_ json: String) -> String {
+    static func pretty(_ json: String) -> String {
         guard let data = json.data(using: .utf8),
               let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]),
               let formatted = try? JSONSerialization.data(

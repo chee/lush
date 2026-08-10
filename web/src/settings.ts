@@ -56,6 +56,10 @@ const STYLE = `
 #patchwork-settings .pw-settings__control select {
   max-width: 260px; font-size: 13px;
 }
+#patchwork-settings .pw-settings__control input {
+  width: 260px; border: none; background: transparent; color: var(--muted);
+  font: 11px ui-monospace, monospace; text-align: right;
+}
 #patchwork-settings .pw-settings__foot {
   padding: 10px 18px 14px; display: flex; justify-content: space-between;
   align-items: center; gap: 12px;
@@ -148,6 +152,15 @@ function row(property: Property, folders: DocLink[]): HTMLElement {
   const control = document.createElement("div");
   control.className = "pw-settings__control";
   el.append(label, control);
+
+  if (property.type === "file-url") {
+    const input = document.createElement("input");
+    input.readOnly = true;
+    input.value = property.value ?? "";
+    input.title = property.value ?? "";
+    control.appendChild(input);
+    return el;
+  }
 
   const select = document.createElement("select");
   const none = new Option("None", "");

@@ -20,7 +20,7 @@ export type AccountDoc = {
 export type AppleConfigProperty = {
   key: string;
   label: string;
-  type: "folder-url";
+  type: "folder-url" | "file-url";
   value: string | null;
 };
 

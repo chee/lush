@@ -175,6 +175,10 @@ pub struct ConfigState {
     pub smart: Vec<shapes::SmartNotebook>,
     pub folder_settings: Vec<shapes::FolderSettings>,
     pub packages: Vec<String>,
+    pub pins: Vec<String>,
+    pub pins_configured: bool,
+    pub quick_note: Option<String>,
+    pub quick_note_configured: bool,
     pub pad: Option<String>,
 }
 
@@ -1295,6 +1299,10 @@ impl Core {
                     smart: shapes::config_smart_notebooks(doc),
                     folder_settings: shapes::config_folder_settings(doc),
                     packages: shapes::config_packages(doc),
+                    pins: shapes::config_pins(doc),
+                    pins_configured: shapes::config_pins_configured(doc),
+                    quick_note: shapes::config_quick_note(doc),
+                    quick_note_configured: shapes::config_quick_note_configured(doc),
                     pad: shapes::config_pad(doc),
                 })
             })
@@ -1331,6 +1339,38 @@ impl Core {
                 let id = DocId::from_url(&config_url)?;
                 repo.change_doc(id, move |doc| shapes::config_set_packages(doc, &urls))
                     .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_config_pins(&self, config_url: String, urls: Vec<String>) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| shapes::config_set_pins(doc, &urls))
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_config_quick_note(
+        &self,
+        config_url: String,
+        url: Option<String>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| {
+                    shapes::config_set_quick_note(doc, url.as_deref())
+                })
+                .await?;
                 Ok::<_, anyhow::Error>(())
             })?;
             Ok(())

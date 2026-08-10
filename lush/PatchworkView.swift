@@ -195,10 +195,14 @@ enum PatchworkWeb {
             .flatMap { try? JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed) }
             .flatMap { String(data: $0, encoding: .utf8) } ?? "null")
             .replacingOccurrences(of: "</", with: "<\\/")
+        let account = (LushShared.accountUrl
+            .flatMap { try? JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed) }
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "null")
+            .replacingOccurrences(of: "</", with: "<\\/")
         return """
         <script>window.__patchwork_CONFIG = {"publicEndpoint": "\(endpoint)", \
         "signerSeedHex": "\(seed)", "moduleUrls": \(modules), \
-        "accountModuleUrl": \(accountModule)\(localPort)};</script>
+        "accountModuleUrl": \(accountModule), "accountUrl": \(account)\(localPort)};</script>
         """
     }
 
@@ -1134,7 +1138,7 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         coord.lastBackingUrl = backingUrl
         host.setPatchworkBacking(backingUrl)
         host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
-        PatchworkScripting.shared.register(host.webView, for: .doc(docUrl))
+        PatchworkScripting.shared.register(host, for: .doc(docUrl))
         configureActivation(host.webView)
         return host.webView
     }
@@ -1152,7 +1156,9 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
             || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
             coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
-            PatchworkScripting.shared.register(nsView, for: .doc(docUrl))
+            if let host = coord.host {
+                PatchworkScripting.shared.register(host, for: .doc(docUrl))
+            }
             coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
             coord.lastDraftUrl = draftUrl
@@ -1204,7 +1210,7 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         coord.lastBackingUrl = backingUrl
         host.setPatchworkBacking(backingUrl)
         host.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
-        PatchworkScripting.shared.register(host.webView, for: .doc(docUrl))
+        PatchworkScripting.shared.register(host, for: .doc(docUrl))
         configureActivation(host.webView)
         return host.webView
     }
@@ -1222,7 +1228,9 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
         if coord.lastDocUrl != docUrl || coord.lastToolId != toolId
             || coord.lastDraftUrl != draftUrl || coord.lastCheckoutUrl != checkoutUrl {
             coord.host?.setPatchworkDoc(url: docUrl, toolId: toolId, draftUrl: draftUrl, checkoutUrl: checkoutUrl)
-            PatchworkScripting.shared.register(uiView, for: .doc(docUrl))
+            if let host = coord.host {
+                PatchworkScripting.shared.register(host, for: .doc(docUrl))
+            }
             coord.lastDocUrl = docUrl
             coord.lastToolId = toolId
             coord.lastDraftUrl = draftUrl
@@ -1466,6 +1474,7 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     private var current: (url: String?, toolId: String?, draftUrl: String?, checkoutUrl: String?)?
     private var backingUrl: String?
     private var loaded = false
+    private var loadWaiters: [CheckedContinuation<Void, any Error>] = []
 
     init(query: [URLQueryItem] = [], messageHandler: (any WKScriptMessageHandler)? = nil) {
         webView = makePatchworkWebView(query: query, messageHandler: messageHandler)
@@ -1488,6 +1497,13 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
         }
     }
 
+    func waitUntilLoaded() async throws {
+        if loaded { return }
+        try await withCheckedThrowingContinuation { continuation in
+            loadWaiters.append(continuation)
+        }
+    }
+
     /// The document the view should really read: the checked-out draft's
     /// clone, pinned to the scrubbed version. Pushed on its own so history
     /// scrubbing re-points the live handle instead of remounting the tool.
@@ -1499,6 +1515,9 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         loaded = true
+        let waiters = loadWaiters
+        loadWaiters.removeAll()
+        waiters.forEach { $0.resume() }
         if let p = pending {
             pending = nil
             webView.callSetDoc(
@@ -1509,6 +1528,26 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
                 backingUrl: backingUrl
             )
         }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: any Error
+    ) {
+        let waiters = loadWaiters
+        loadWaiters.removeAll()
+        waiters.forEach { $0.resume(throwing: error) }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: any Error
+    ) {
+        let waiters = loadWaiters
+        loadWaiters.removeAll()
+        waiters.forEach { $0.resume(throwing: error) }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {

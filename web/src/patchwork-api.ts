@@ -42,6 +42,11 @@ const APPLE_CONFIG_PROPERTIES = [
     label: "New document folder",
     type: "folder-url" as const,
   },
+  {
+    key: "shortcutsReplUrl",
+    label: "Shortcuts REPL",
+    type: "file-url" as const,
+  },
 ];
 
 export function installPatchworkApi(repo: Repo) {
@@ -110,6 +115,29 @@ export function installPatchworkApi(repo: Repo) {
       );
     }
     return root;
+  }
+
+  async function shortcutsReplUrl(): Promise<string> {
+    const config = await appleConfigHandle();
+    const property = config
+      .doc()
+      ?.properties.find((p) => p.key === "shortcutsReplUrl");
+    if (!property) throw new Error("Shortcuts REPL setting is unavailable");
+    if (property.value) return property.value;
+    const handle = repo.create({
+      "@patchwork": { type: "file" },
+      content: `const notes = await Patchwork.listFolder()
+return notes.map(({ name, type, url }) => ({ name, type, url }))`,
+      extension: "repl",
+      mimeType: "text/javascript",
+      name: "Shortcuts.repl",
+    });
+    config.change((d) => {
+      const current = d.properties.find((p) => p.key === "shortcutsReplUrl");
+      if (!current) throw new Error("Shortcuts REPL setting is unavailable");
+      current.value = handle.url;
+    });
+    return handle.url;
   }
 
   const api = {
@@ -206,9 +234,12 @@ export function installPatchworkApi(repo: Repo) {
     },
 
     async appleConfigProperties(): Promise<unknown[]> {
+      await shortcutsReplUrl();
       const doc = (await appleConfigHandle()).doc();
       return structuredClone(doc?.properties ?? []);
     },
+
+    shortcutsReplUrl,
 
     async setAppleConfigValue(
       key: string,

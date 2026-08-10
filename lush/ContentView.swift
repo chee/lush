@@ -16,6 +16,7 @@ enum NavRoute: Hashable {
     case smart(String)
     case calendar
     case meetingNotes
+    case shortcutsHelp
 }
 
 struct MoveTarget: Identifiable {
@@ -396,6 +397,26 @@ struct ContentView: View {
         .sheet(item: $patchworkCreateRequest) { request in
             patchworkCreateSheet(request)
         }
+        .fileImporter(
+            isPresented: Binding(
+                get: { model.showingFileImporter },
+                set: { model.showingFileImporter = $0 }
+            ),
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            switch result {
+            case .success(let urls): model.prepareFileImport(urls, into: model.folderUrl)
+            case .failure(let error): model.status = "Couldn't import: \(error.localizedDescription)"
+            }
+        }
+        .sheet(item: Binding(
+            get: { model.fileImportRequest },
+            set: { model.fileImportRequest = $0 }
+        )) { request in
+            FileImportChoiceSheet(request: request)
+                .environment(model)
+        }
         #else
         Group {
             if usesWideLayout {
@@ -512,7 +533,17 @@ struct ContentView: View {
         #if os(macOS)
         guard hostWindow?.isKeyWindow != false else { return }
         #endif
-        guard let action = router.pending, model.folderUrl != nil else { return }
+        guard let action = router.pending else { return }
+        if action == .shortcutsHelp {
+            router.pending = nil
+            #if os(macOS)
+            openWindow(id: "shortcuts-help")
+            #else
+            openMobile(.shortcutsHelp)
+            #endif
+            return
+        }
+        guard model.folderUrl != nil else { return }
         router.pending = nil
         switch action {
         case .newNote:
@@ -577,6 +608,8 @@ struct ContentView: View {
             smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true)
         case .share:
             Task { await model.drainSharedIntake() }
+        case .shortcutsHelp:
+            break
         }
     }
 
@@ -673,6 +706,8 @@ struct ContentView: View {
             AgendaScreen { openMobile(.note($0)) }
         case .meetingNotes:
             MeetingNotesScreen { openMobile(.note($0)) }
+        case .shortcutsHelp:
+            ShortcutsHelpView()
         }
     }
     #endif
@@ -682,7 +717,10 @@ struct ContentView: View {
     private var sidebar: some View {
         ScrollViewReader { proxy in
             sidebarList
-                .onDrop(of: [UTType.plainText.identifier], delegate: SidebarDropCleanup())
+                .onDrop(
+                    of: [UTType.plainText.identifier, UTType.fileURL.identifier],
+                    delegate: SidebarDropCleanup(folderUrl: model.folderUrl, model: model)
+                )
                 .onChange(of: revealTarget) { _, row in
                     guard let row else { return }
                     revealTarget = nil
@@ -5035,10 +5073,18 @@ private struct SidebarReorderDrop: DropDelegate {
 }
 
 struct SidebarDropCleanup: DropDelegate {
-    func validateDrop(info: DropInfo) -> Bool { SidebarDrag.kind != nil }
+    let folderUrl: String?
+    let model: NotesModel
+
+    func validateDrop(info: DropInfo) -> Bool {
+        SidebarDrag.kind != nil || info.hasItemsConforming(to: [UTType.fileURL.identifier])
+    }
     func dropEntered(info: DropInfo) {}
     func dropExited(info: DropInfo) { SidebarDropHighlight.shared.clear() }
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        if info.hasItemsConforming(to: [UTType.fileURL.identifier]) {
+            return DropProposal(operation: .copy)
+        }
         guard SidebarDrag.kind != nil else {
             SidebarDropHighlight.shared.clear()
             return DropProposal(operation: .forbidden)
@@ -5047,6 +5093,11 @@ struct SidebarDropCleanup: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        let providers = info.itemProviders(for: [UTType.fileURL.identifier])
+        if !providers.isEmpty {
+            loadFileURLs(providers) { model.prepareFileImport($0, into: folderUrl) }
+            return true
+        }
         SidebarDrag.ended()
         return false
     }
@@ -5151,7 +5202,7 @@ private struct FolderDropTarget: ViewModifier {
                     }
                 }
                 .onDrop(
-                    of: [UTType.plainText.identifier],
+                    of: [UTType.plainText.identifier, UTType.fileURL.identifier],
                     delegate: FolderDrop(
                         row: row,
                         node: node,
@@ -5180,7 +5231,8 @@ private struct FolderDrop: DropDelegate {
     }
 
     func validateDrop(info: DropInfo) -> Bool {
-        (SidebarDrag.kind == .notebook || SidebarDrag.kind == .item)
+        if info.hasItemsConforming(to: [UTType.fileURL.identifier]) { return true }
+        return (SidebarDrag.kind == .notebook || SidebarDrag.kind == .item)
             && info.hasItemsConforming(to: [UTType.plainText.identifier])
     }
 
@@ -5211,10 +5263,16 @@ private struct FolderDrop: DropDelegate {
                 model.reorderRootFolder(payload, adjacentTo: node.url, after: landed == .after)
             }
         }
-        return DropProposal(operation: .move)
+        return DropProposal(operation: info.hasItemsConforming(to: [UTType.fileURL.identifier]) ? .copy : .move)
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        let providers = info.itemProviders(for: [UTType.fileURL.identifier])
+        if !providers.isEmpty {
+            SidebarDropHighlight.shared.clear()
+            loadFileURLs(providers) { model.prepareFileImport($0, into: node.url) }
+            return true
+        }
         let landed = landing(info)
         SidebarDrag.ended()
         guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
@@ -5267,6 +5325,27 @@ private func loadPayload(_ provider: NSItemProvider, handle: @escaping @MainActo
     provider.loadItem(forTypeIdentifier: UTType.plainText.identifier, options: nil) { item, _ in
         guard let payload = droppedString(from: item) else { return }
         Task { @MainActor in handle(payload) }
+    }
+}
+
+private func loadFileURLs(
+    _ providers: [NSItemProvider],
+    urls: [URL] = [],
+    handle: @escaping @MainActor ([URL]) -> Void
+) {
+    guard let provider = providers.first else {
+        Task { @MainActor in handle(urls) }
+        return
+    }
+    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+        var loaded = urls
+        if let url = item as? URL {
+            loaded.append(url)
+        } else if let data = item as? Data,
+                  let url = URL(dataRepresentation: data, relativeTo: nil) {
+            loaded.append(url)
+        }
+        loadFileURLs(Array(providers.dropFirst()), urls: loaded, handle: handle)
     }
 }
 

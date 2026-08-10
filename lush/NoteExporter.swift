@@ -120,6 +120,14 @@ enum NoteExporter {
         )
     }
 
+    static func rtfData(from spans: [SpanNode]) throws -> Data {
+        let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        return try attributed.data(
+            from: NSRange(location: 0, length: attributed.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        )
+    }
+
     private enum AssetResolver {
         case none
         case relativePaths([String: String])

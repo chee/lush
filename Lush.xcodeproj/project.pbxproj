@@ -579,6 +579,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=iphoneos*]" = AppIconIOS;
 				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=iphonesimulator*]" = AppIconIOS;
+				"ASSETCATALOG_COMPILER_APPICON_NAME[sdk=macosx*]" = AppIconDebug;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = YES;
 				CODE_SIGN_ENTITLEMENTS = lush/lush.entitlements;
@@ -604,6 +605,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = lush/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Lush;
+				"INFOPLIST_KEY_CFBundleDisplayName[sdk=macosx*]" = "Lush Debug";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Lush reads your Apple Notes to import them.";
 				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "Lush notes what you were doing when you wrote a note.";
@@ -640,6 +642,7 @@
 				NEW_SETTING2 = "";
 				OTHER_LDFLAGS = "-llush_core";
 				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = party.chee.patchwork.lush.debug;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
@@ -904,6 +907,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushWidget;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]" = party.chee.patchwork.lush.debug.LushWidget;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
 				SKIP_INSTALL = YES;
@@ -982,7 +986,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushShareExtension;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.debug.LushShareExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
@@ -1048,7 +1052,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushFinderAction;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.debug.LushFinderAction;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
@@ -1114,7 +1118,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.5;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.LushDockTile;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lush.debug.LushDockTile;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;

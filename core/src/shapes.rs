@@ -766,6 +766,18 @@ pub fn config_set_packages(doc: &mut Automerge, urls: &[String]) -> anyhow::Resu
     config_set_url_list(doc, "packages", urls)
 }
 
+pub fn config_pins(doc: &Automerge) -> Vec<String> {
+    config_url_list(doc, "pins")
+}
+
+pub fn config_pins_configured(doc: &Automerge) -> bool {
+    doc.get(ROOT, "pins").ok().flatten().is_some()
+}
+
+pub fn config_set_pins(doc: &mut Automerge, urls: &[String]) -> anyhow::Result<()> {
+    config_set_url_list(doc, "pins", urls)
+}
+
 fn config_url_list(doc: &Automerge, key: &str) -> Vec<String> {
     let Ok(Some((_, list))) = doc.get(ROOT, key) else {
         return Vec::new();
@@ -973,6 +985,25 @@ pub fn config_set_inbox(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
             set_text(t, &ROOT, "inbox", url)?;
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+pub fn config_quick_note(doc: &Automerge) -> Option<String> {
+    read_str(doc, &ROOT, "quickNote").filter(|url| !url.is_empty())
+}
+
+pub fn config_quick_note_configured(doc: &Automerge) -> bool {
+    doc.get(ROOT, "quickNote").ok().flatten().is_some()
+}
+
+pub fn config_set_quick_note(doc: &mut Automerge, url: Option<&str>) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            set_text(t, &ROOT, "quickNote", url.unwrap_or_default())?;
             Ok(())
         },
     ))?;
@@ -1891,6 +1922,31 @@ mod tests {
         let mut doc = Automerge::new();
         init_file_doc(&mut doc, "cat.png", "png", "image/png", vec![1, 2, 3]).unwrap();
         assert_eq!(file_bytes(&doc), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn config_pins_and_quick_note_roundtrip() {
+        let mut doc = Automerge::new();
+        init_lush_config(&mut doc).unwrap();
+        assert!(!config_pins_configured(&doc));
+        assert!(!config_quick_note_configured(&doc));
+
+        config_set_pins(&mut doc, &["automerge:one".into(), "automerge:two".into()]).unwrap();
+        config_set_quick_note(&mut doc, Some("automerge:quick")).unwrap();
+        assert_eq!(
+            config_pins(&doc),
+            vec!["automerge:one".to_string(), "automerge:two".to_string()]
+        );
+        assert_eq!(config_quick_note(&doc).as_deref(), Some("automerge:quick"));
+        assert!(config_pins_configured(&doc));
+        assert!(config_quick_note_configured(&doc));
+
+        config_set_pins(&mut doc, &[]).unwrap();
+        config_set_quick_note(&mut doc, None).unwrap();
+        assert!(config_pins(&doc).is_empty());
+        assert_eq!(config_quick_note(&doc), None);
+        assert!(config_pins_configured(&doc));
+        assert!(config_quick_note_configured(&doc));
     }
 
     #[test]
