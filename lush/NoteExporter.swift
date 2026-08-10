@@ -2,6 +2,8 @@ import Foundation
 #if os(macOS)
 import AppKit
 import UniformTypeIdentifiers
+#else
+import UIKit
 #endif
 
 @MainActor
