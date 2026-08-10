@@ -908,6 +908,7 @@ pub fn config_set_smart_notebooks(
 pub struct FolderSettings {
     pub url: String,
     pub show_count: bool,
+    pub recursive_count: bool,
     pub notify_on_change: bool,
 }
 
@@ -922,6 +923,7 @@ pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
             Some(FolderSettings {
                 url,
                 show_count: bool_at(doc, &item, "showCount").unwrap_or(false),
+                recursive_count: bool_at(doc, &item, "recursiveCount").unwrap_or(false),
                 notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
             })
         })
@@ -954,6 +956,7 @@ pub fn config_set_folder_settings(
                     _ => t.put_object(&obj, s.url.as_str(), ObjType::Map)?,
                 };
                 t.put(&item, "showCount", s.show_count)?;
+                t.put(&item, "recursiveCount", s.recursive_count)?;
                 t.put(&item, "notifyOnChange", s.notify_on_change)?;
             }
             Ok(())

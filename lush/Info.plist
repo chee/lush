@@ -23,6 +23,7 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>lush</string>
+				<string>automerge</string>
 			</array>
 		</dict>
 	</array>

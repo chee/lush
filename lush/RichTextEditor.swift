@@ -91,6 +91,8 @@ final class EditorController {
     var sheet: EditorSheet?
     var findVisible = false
     var findQuery = ""
+    var replaceVisible = false
+    var replaceQuery = ""
     var findMatchCount = 0
     var findIndex = 0
     /// Bumped on every storage edit so inspector views recompute.
@@ -116,15 +118,25 @@ final class EditorController {
         core?.updateFindMatches()
     }
 
+    func openReplace() {
+        findVisible = true
+        replaceVisible = true
+        core?.updateFindMatches()
+    }
+
     func closeFind() {
         findVisible = false
+        replaceVisible = false
         findQuery = ""
+        replaceQuery = ""
         core?.updateFindMatches()
     }
 
     func findQueryChanged() { core?.updateFindMatches() }
     func findNext() { core?.stepFind(1) }
     func findPrevious() { core?.stepFind(-1) }
+    func replaceCurrent() { core?.replaceCurrentFind(with: replaceQuery) }
+    func replaceAll() { core?.replaceAllFind(with: replaceQuery) }
     func scrollTo(location: Int) { core?.scrollTo(location: location) }
 
     /// Formatting reaches whichever text has focus — the note, or a card on the
@@ -2372,6 +2384,45 @@ final class EditorCore {
         }
     }
 
+    func replaceCurrentFind(with replacement: String) {
+        guard let view, let storage = view.pStorage, let range = currentFindRange else { return }
+        let undo = undoSnapshot()
+        let attributes = range.location < storage.length
+            ? storage.attributes(at: range.location, effectiveRange: nil)
+            : view.pTypingAttributes
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(
+                in: range,
+                with: NSAttributedString(string: replacement, attributes: attributes)
+            )
+        }
+        view.pSelectedRange = NSRange(location: range.location, length: (replacement as NSString).length)
+        registerUndo(from: undo, actionName: "Replace")
+        scheduleSave()
+        updateFindMatches(resetIndex: false)
+    }
+
+    func replaceAllFind(with replacement: String) {
+        guard let view, view.pStorage != nil else { return }
+        let ranges = rendering.findMatches
+        guard !ranges.isEmpty else { return }
+        let undo = undoSnapshot()
+        view.pPerformStorageEdit { storage in
+            for range in ranges.reversed() {
+                let attributes = range.location < storage.length
+                    ? storage.attributes(at: range.location, effectiveRange: nil)
+                    : view.pTypingAttributes
+                storage.replaceCharacters(
+                    in: range,
+                    with: NSAttributedString(string: replacement, attributes: attributes)
+                )
+            }
+        }
+        registerUndo(from: undo, actionName: "Replace All")
+        scheduleSave()
+        updateFindMatches()
+    }
+
     private var currentFindRange: NSRange? {
         let index = controller.findIndex
         guard index >= 1, index <= rendering.findMatches.count else { return nil }
@@ -4248,6 +4299,10 @@ struct RichTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.textContainerInset = NSSize(width: 20, height: 16)
         textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        textView.linkTextAttributes = [
+            .foregroundColor: PColor.pTint,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+        ]
         textView.delegate = context.coordinator
         textView.autoresizingMask = [.width]
         textView.isVerticallyResizable = true
@@ -4326,6 +4381,14 @@ struct RichTextEditor: NSViewRepresentable {
 
         func textViewDidChangeSelection(_ notification: Notification) {
             core.refreshFormattingState()
+        }
+
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            let url = (link as? URL)?.absoluteString ?? link as? String
+            guard let url, url.hasPrefix("automerge:") else { return false }
+            core.model.pendingFocusUrl = url
+            AppRouter.shared.pending = .note(url)
+            return true
         }
 
         func textView(_ view: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -4736,6 +4799,10 @@ struct RichTextEditor: UIViewRepresentable {
         }
         textView.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        textView.linkTextAttributes = [
+            .foregroundColor: PColor.pTint,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+        ]
         textView.delegate = context.coordinator
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
@@ -4860,6 +4927,18 @@ struct RichTextEditor: UIViewRepresentable {
 
         func textViewDidChangeSelection(_ textView: UITextView) {
             core.refreshFormattingState()
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldInteractWith url: URL,
+            in characterRange: NSRange,
+            interaction: UITextItemInteraction
+        ) -> Bool {
+            guard url.scheme == "automerge" else { return true }
+            core.model.pendingFocusUrl = url.absoluteString
+            AppRouter.shared.pending = .note(url.absoluteString)
+            return false
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {

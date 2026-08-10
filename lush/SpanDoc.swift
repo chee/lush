@@ -1109,6 +1109,7 @@ enum RichText {
         }
         if let link = marks["link"]?.stringValue, let url = URL(string: link) {
             out[.link] = url
+            out[.foregroundColor] = PColor.pTint
             out[.underlineStyle] = NSUnderlineStyle.single.rawValue
         }
         return out

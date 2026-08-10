@@ -44,6 +44,11 @@ struct SearchFieldToken: Identifiable, Equatable {
 }
 
 #if os(macOS)
+private struct SidebarHistoryEntry: Equatable {
+    let tag: String
+    let identity: String
+}
+
 struct DoubleClickCatcher: NSViewRepresentable {
     let action: () -> Void
 
@@ -121,6 +126,9 @@ struct ContentView: View {
     @State private var rightSidebarDragStart: Double?
     @State private var rightSidebarLiveWidth: Double?
     @State private var selectedHistoryEntry: DocHistoryEntry?
+    @State private var sidebarHistory: [SidebarHistoryEntry] = []
+    @State private var sidebarHistoryIndex = -1
+    @State private var movingThroughSidebarHistory = false
 
     private static let expandedKey = "expandedFolders"
     private static let seededRootsKey = "seededRoots"
@@ -137,7 +145,16 @@ struct ContentView: View {
         } detail: {
             detail
         }
+        .overlay {
+            if model.focusModeEnabled {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.purple, lineWidth: 3)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+        }
         .onChange(of: selectedItemUrls) {
+            recordSidebarHistory(selectedItemUrls)
             // Selecting the top search hit must not pull focus out of the
             // field mid-query.
             if !searchFocused { sidebarFocused = true }
@@ -155,7 +172,7 @@ struct ContentView: View {
             rightSidebarTab = .pad
         }
         .onOpenURL { url in
-            if url.scheme == "lush" {
+            if url.scheme == "lush" || url.scheme == "automerge" {
                 router.handle(url)
             } else if url.isFileURL {
                 model.pendingIncoming = IncomingContent(payload: .file(url))
@@ -230,8 +247,18 @@ struct ContentView: View {
                     }
                 }
         }
+        .overlay(alignment: .bottomTrailing) {
+            if model.focusModeEnabled {
+                FocusModeControl(model: model)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.circle)
+                    .tint(.purple)
+                    .padding()
+            }
+        }
         .onOpenURL { url in
-            if url.scheme == "lush" {
+            if url.scheme == "lush" || url.scheme == "automerge" {
                 router.handle(url)
             } else if url.isFileURL {
                 model.pendingIncoming = IncomingContent(payload: .file(url))
@@ -1449,7 +1476,22 @@ struct ContentView: View {
         }
         .navigationTitle("")
         .toolbar {
-            ToolbarItem(placement: .navigation) {
+            ToolbarItemGroup(placement: .navigation) {
+                Button {
+                    moveThroughSidebarHistory(by: -1)
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .disabled(sidebarHistoryIndex <= 0)
+                .keyboardShortcut("[", modifiers: .command)
+                Button {
+                    moveThroughSidebarHistory(by: 1)
+                } label: {
+                    Label("Forward", systemImage: "chevron.right")
+                }
+                .disabled(sidebarHistoryIndex < 0 || sidebarHistoryIndex >= sidebarHistory.count - 1)
+                .keyboardShortcut("]", modifiers: .command)
+                FocusModeControl(model: model)
                 Menu {
                     NewItemMenuItems(
                         model: model,
@@ -1625,6 +1667,52 @@ struct ContentView: View {
         Task { await model.selectItem(node.url) }
     }
 
+    private func recordSidebarHistory(_ selection: Set<String>) {
+        guard selection.count == 1, let tag = selection.first else { return }
+        if movingThroughSidebarHistory {
+            movingThroughSidebarHistory = false
+            return
+        }
+        let identity: String
+        if tag.hasPrefix("smart:") || tag == Agenda.sidebarTag || tag == Agenda.meetingNotesTag {
+            identity = tag
+        } else {
+            identity = Self.sidebarUrl(tag)
+        }
+        let entry = SidebarHistoryEntry(tag: tag, identity: identity)
+        if sidebarHistory.indices.contains(sidebarHistoryIndex),
+           sidebarHistory[sidebarHistoryIndex].identity == identity {
+            sidebarHistory[sidebarHistoryIndex] = entry
+            return
+        }
+        if sidebarHistoryIndex + 1 < sidebarHistory.count {
+            sidebarHistory.removeSubrange((sidebarHistoryIndex + 1)...)
+        }
+        sidebarHistory.append(entry)
+        sidebarHistoryIndex = sidebarHistory.count - 1
+    }
+
+    private func moveThroughSidebarHistory(by offset: Int) {
+        let index = sidebarHistoryIndex + offset
+        guard sidebarHistory.indices.contains(index) else { return }
+        sidebarHistoryIndex = index
+        let entry = sidebarHistory[index]
+        let tag: String
+        if visibleSidebarRowTags.contains(entry.tag)
+            || entry.tag.hasPrefix("smart:")
+            || entry.tag == Agenda.sidebarTag
+            || entry.tag == Agenda.meetingNotesTag {
+            tag = entry.tag
+        } else if entry.identity.hasPrefix("automerge:") {
+            tag = rowTag(for: entry.identity)
+        } else {
+            tag = entry.tag
+        }
+        movingThroughSidebarHistory = true
+        selectedItemUrls = [tag]
+        revealTarget = tag
+    }
+
     @ViewBuilder
     private func singleNoteContextMenu(for node: FolderNode, showInFolder: Bool = false) -> some View {
         NoteContextMenu(
@@ -1793,6 +1881,7 @@ struct FolderSettingsEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var showCount = false
+    @State private var recursiveCount = false
     @State private var notifyOnChange = false
     @State private var notificationsDenied = false
 
@@ -1802,6 +1891,8 @@ struct FolderSettingsEditor: View {
                 TextField("Name", text: $name)
                 Section {
                     Toggle("Show count", isOn: $showCount)
+                    Toggle("Include docs in subfolders in count", isOn: $recursiveCount)
+                        .disabled(!showCount && !notifyOnChange)
                     Toggle("Notify when count changes", isOn: $notifyOnChange)
                 } footer: {
                     if notificationsDenied {
@@ -1825,6 +1916,7 @@ struct FolderSettingsEditor: View {
             name = node.name
             let settings = model.folderSettings(for: node.url)
             showCount = settings.showCount
+            recursiveCount = settings.recursiveCount
             notifyOnChange = settings.notifyOnChange
         }
         .onChange(of: notifyOnChange) {
@@ -1844,6 +1936,7 @@ struct FolderSettingsEditor: View {
         model.setFolderSettings(FolderSettings(
             url: node.url,
             showCount: showCount,
+            recursiveCount: recursiveCount,
             notifyOnChange: notifyOnChange
         ))
         dismiss()
@@ -3677,8 +3770,10 @@ struct NoteDetail: View {
             #endif
         }
         #if !os(macOS)
-        ToolbarItem(placement: .primaryAction) {
-            FocusModeControl(model: model)
+        if !model.focusModeEnabled {
+            ToolbarItem(placement: .primaryAction) {
+                FocusModeControl(model: model)
+            }
         }
         ToolbarItem(placement: .primaryAction) {
             Button {
@@ -3959,7 +4054,6 @@ struct NoteDetail: View {
 
 private struct FocusModeControl: View {
     @Bindable var model: NotesModel
-    @State private var showingOptions = false
 
     private var partial: Bool {
         !model.focusModeEnabled && (!model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence)
@@ -3985,50 +4079,23 @@ private struct FocusModeControl: View {
     }
 
     var body: some View {
-        #if os(macOS)
-        Button {
-            model.setFocusMode(!model.focusModeEnabled)
+        Menu {
+            focusOptions
         } label: {
-            Label("Focus", systemImage: model.focusModeEnabled ? "moon.fill" : "moon")
+            Label("Moon Mode", systemImage: model.focusModeEnabled ? "moon.fill" : "moon")
                 .overlay(alignment: .topTrailing) {
                     if partial {
                         Circle()
-                            .fill(Color.accentColor)
+                            .fill(Color.purple)
                             .frame(width: 5, height: 5)
                             .offset(x: 2, y: -2)
                     }
                 }
+        } primaryAction: {
+            model.setFocusMode(!model.focusModeEnabled)
         }
         .disabled(model.changingIncomingChanges || model.changingSendingChanges)
-        .help(model.focusModeEnabled ? "Leave Focus Mode" : "Enter Focus Mode")
-        .contextMenu { focusOptions }
-        #else
-        HStack(spacing: 2) {
-            Button {
-                model.setFocusMode(!model.focusModeEnabled)
-            } label: {
-                Label("Focus", systemImage: model.focusModeEnabled ? "moon.fill" : "moon")
-            }
-            .disabled(model.changingIncomingChanges || model.changingSendingChanges)
-            .help(model.focusModeEnabled ? "Leave Focus Mode" : "Enter Focus Mode")
-
-            Button {
-                showingOptions.toggle()
-            } label: {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-            }
-            .help("Focus Options")
-            .popover(isPresented: $showingOptions, arrowEdge: .bottom) {
-                VStack(alignment: .leading, spacing: 12) {
-                    focusOptions
-                }
-                .toggleStyle(.switch)
-                .padding(14)
-                .frame(width: 250)
-            }
-        }
-        #endif
+        .help(model.focusModeEnabled ? "Leave Moon Mode" : "Enter Moon Mode")
     }
 }
 
@@ -4194,16 +4261,42 @@ private struct FindBar: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            field
-            HStack(spacing: 0) {
-                step("chevron.left") { controller.findPrevious() }
-                Divider().frame(height: 14)
-                step("chevron.right") { controller.findNext() }
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    controller.replaceVisible.toggle()
+                } label: {
+                    Image(systemName: controller.replaceVisible ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+                field
+                HStack(spacing: 0) {
+                    step("chevron.left") { controller.findPrevious() }
+                    Divider().frame(height: 14)
+                    step("chevron.right") { controller.findNext() }
+                }
+                .background(Color.primary.opacity(0.06), in: Capsule())
+                .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2)))
+                Button("Done") { controller.closeFind() }
             }
-            .background(Color.primary.opacity(0.06), in: Capsule())
-            .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2)))
-            Button("Done") { controller.closeFind() }
+            if controller.replaceVisible {
+                HStack(spacing: 8) {
+                    TextField("Replace with", text: $controller.replaceQuery)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.primary.opacity(0.06), in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.2)))
+                        .onSubmit { controller.replaceCurrent() }
+                    Button("Replace") { controller.replaceCurrent() }
+                        .disabled(controller.findMatchCount == 0)
+                    Button("All") { controller.replaceAll() }
+                        .disabled(controller.findMatchCount == 0)
+                }
+                .padding(.leading, 28)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)

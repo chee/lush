@@ -48,6 +48,7 @@ enum FolderSettingsStore {
             result[entry.key] = FolderSettings(
                 url: entry.key,
                 showCount: entry.value["showCount"] ?? false,
+                recursiveCount: entry.value["recursiveCount"] ?? false,
                 notifyOnChange: entry.value["notifyOnChange"] ?? false
             )
         }
@@ -55,7 +56,11 @@ enum FolderSettingsStore {
 
     static func save(_ settings: [String: FolderSettings]) {
         let raw = settings.mapValues {
-            ["showCount": $0.showCount, "notifyOnChange": $0.notifyOnChange]
+            [
+                "showCount": $0.showCount,
+                "recursiveCount": $0.recursiveCount,
+                "notifyOnChange": $0.notifyOnChange,
+            ]
         }
         UserDefaults.standard.set(raw, forKey: key)
     }
@@ -63,11 +68,16 @@ enum FolderSettingsStore {
 
 extension NotesModel {
     func folderSettings(for url: String) -> FolderSettings {
-        folderSettings[url] ?? FolderSettings(url: url, showCount: false, notifyOnChange: false)
+        folderSettings[url] ?? FolderSettings(
+            url: url,
+            showCount: false,
+            recursiveCount: false,
+            notifyOnChange: false
+        )
     }
 
     func setFolderSettings(_ settings: FolderSettings) {
-        if settings.showCount || settings.notifyOnChange {
+        if settings.showCount || settings.recursiveCount || settings.notifyOnChange {
             folderSettings[settings.url] = settings
         } else {
             folderSettings.removeValue(forKey: settings.url)
@@ -95,7 +105,21 @@ extension NotesModel {
     }
 
     func folderNoteCount(_ node: FolderNode) -> Int {
-        (node.children ?? []).filter { $0.kind != "folder" }.count
+        guard folderSettings(for: node.url).recursiveCount else {
+            return (node.children ?? []).filter { $0.kind != "folder" }.count
+        }
+        var urls: Set<String> = []
+        func collect(_ nodes: [FolderNode]) {
+            for node in nodes {
+                if node.kind == "folder" {
+                    collect(node.children ?? [])
+                } else {
+                    urls.insert(node.url)
+                }
+            }
+        }
+        collect(node.children ?? [])
+        return urls.count
     }
 }
 

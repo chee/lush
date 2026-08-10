@@ -25,6 +25,10 @@ final class AppRouter {
     var pending: Action?
 
     func handle(_ url: URL) {
+        if url.scheme == "automerge" {
+            pending = .note(url.absoluteString)
+            return
+        }
         guard url.scheme == "lush" else { return }
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         switch url.host() {

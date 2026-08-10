@@ -90,7 +90,7 @@ struct SearchSyntax {
                 continue
             }
             var value = String(raw[raw.index(after: colon)...])
-            if value.hasPrefix("\"") && !value.hasSuffix("\"") {
+            if value.hasPrefix("\"") && (value.count < 2 || !value.hasSuffix("\"")) {
                 text.append(raw)
                 continue
             }

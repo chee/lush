@@ -344,6 +344,11 @@ struct SearchCommands: Commands {
             }
             .keyboardShortcut("f")
 
+            Button("Find and Replace…") {
+                editor?.openReplace()
+            }
+            .keyboardShortcut("f", modifiers: [.command, .option])
+
             Button("Select Next Occurrence") {
                 editor?.core?.selectNextOccurrence()
             }

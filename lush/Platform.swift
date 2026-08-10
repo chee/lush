@@ -86,9 +86,9 @@ extension PColor {
     /// The accent colour, and something that reads on top of it.
     static var pTint: PColor {
         #if os(macOS)
-        .controlAccentColor
+        PColor(named: NSColor.Name("AccentColor")) ?? .controlAccentColor
         #else
-        .tintColor
+        PColor(named: "AccentColor") ?? .tintColor
         #endif
     }
 

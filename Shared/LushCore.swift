@@ -3606,13 +3606,15 @@ public func FfiConverterTypeEmbeddingChunk_lower(_ value: EmbeddingChunk) -> Rus
 public struct FolderSettings {
     public var url: String
     public var showCount: Bool
+    public var recursiveCount: Bool
     public var notifyOnChange: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(url: String, showCount: Bool, notifyOnChange: Bool) {
+    public init(url: String, showCount: Bool, recursiveCount: Bool, notifyOnChange: Bool) {
         self.url = url
         self.showCount = showCount
+        self.recursiveCount = recursiveCount
         self.notifyOnChange = notifyOnChange
     }
 }
@@ -3630,6 +3632,9 @@ extension FolderSettings: Equatable, Hashable {
         if lhs.showCount != rhs.showCount {
             return false
         }
+        if lhs.recursiveCount != rhs.recursiveCount {
+            return false
+        }
         if lhs.notifyOnChange != rhs.notifyOnChange {
             return false
         }
@@ -3639,6 +3644,7 @@ extension FolderSettings: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(url)
         hasher.combine(showCount)
+        hasher.combine(recursiveCount)
         hasher.combine(notifyOnChange)
     }
 }
@@ -3654,6 +3660,7 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
             try FolderSettings(
                 url: FfiConverterString.read(from: &buf), 
                 showCount: FfiConverterBool.read(from: &buf), 
+                recursiveCount: FfiConverterBool.read(from: &buf),
                 notifyOnChange: FfiConverterBool.read(from: &buf)
         )
     }
@@ -3661,6 +3668,7 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
     public static func write(_ value: FolderSettings, into buf: inout [UInt8]) {
         FfiConverterString.write(value.url, into: &buf)
         FfiConverterBool.write(value.showCount, into: &buf)
+        FfiConverterBool.write(value.recursiveCount, into: &buf)
         FfiConverterBool.write(value.notifyOnChange, into: &buf)
     }
 }
