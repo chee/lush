@@ -361,14 +361,16 @@ struct EditorSheetView: View {
             VideoPlayerSheet(fileURL: fileURL, name: name)
         case .html(let handle):
             HtmlEditorSheet(html: handle.html) { controller.saveHtml(handle, html: $0) }
-        case .info(let assetUrl, let name, let image):
+        case .info(let assetUrl, let name, let image, let block):
             AssetInfoSheet(
                 name: name,
                 image: image,
+                altText: block.value.altText,
                 fetchML: { await controller.assetML(assetUrl) },
                 generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name, choice: $0) },
                 fetch: { await controller.assetVision(assetUrl) },
-                analyze: { await controller.analyzeAssetVision(assetUrl) }
+                analyze: { await controller.analyzeAssetVision(assetUrl) },
+                saveAltText: { controller.saveImageAltText(block, altText: $0) }
             )
         case .patchworkCreate:
             PatchworkCreateSheet(controller: controller)
@@ -387,10 +389,12 @@ struct EditorSheetView: View {
 struct AssetInfoSheet: View {
     let name: String
     let image: PImage?
+    @State var altText: String
     let fetchML: () async -> AssetMl?
     let generateML: (ModelChoice?) async -> AssetMl?
     let fetch: () async -> AssetVision?
     let analyze: () async -> AssetVision?
+    let saveAltText: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var ml: AssetMl?
     @State private var vision: AssetVision?
@@ -417,8 +421,23 @@ struct AssetInfoSheet: View {
                     .frame(maxHeight: 240)
                 #endif
             }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Alt Text")
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Describe this image", text: $altText, axis: .vertical)
+                    .lineLimit(2...4)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    if let vision {
+                        if !vision.ocr.isEmpty {
+                            CopyableText(title: "Recognized Text", text: vision.ocr)
+                        }
+                        if !vision.description.isEmpty {
+                            CopyableText(title: "Description", text: vision.description)
+                        }
+                    }
                     if let ml {
                         if !ml.summary.isEmpty {
                             CopyableText(title: "Summary", text: ml.summary)
@@ -428,14 +447,6 @@ struct AssetInfoSheet: View {
                         }
                         if !ml.keywords.isEmpty {
                             CopyableText(title: "Keywords", text: ml.keywords)
-                        }
-                    }
-                    if let vision {
-                        if !vision.description.isEmpty {
-                            CopyableText(title: "Description", text: vision.description)
-                        }
-                        if !vision.ocr.isEmpty {
-                            CopyableText(title: "Text", text: vision.ocr)
                         }
                     } else if ml == nil, analyzing {
                         HStack(spacing: 6) {
@@ -489,6 +500,7 @@ struct AssetInfoSheet: View {
             }
             loaded = true
         }
+        .onDisappear { saveAltText(altText) }
     }
 
     private func regenerateML() async {
@@ -500,6 +512,7 @@ struct AssetInfoSheet: View {
             analyzing = false
         }
         ml = await generateML(modelChoice)
+        vision = await fetch()
     }
 }
 

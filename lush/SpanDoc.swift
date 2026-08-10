@@ -145,6 +145,10 @@ struct BlockValue: Codable, Equatable {
         attrs["url"]?.stringValue ?? attrs["src"]?.stringValue
     }
 
+    var altText: String {
+        attrs["alt"]?.stringValue ?? ""
+    }
+
     static func embed(url: String) -> BlockValue {
         BlockValue(type: "embed", attrs: ["url": .string(url)], isEmbed: true)
     }
@@ -269,6 +273,7 @@ extension NSAttributedString.Key {
     /// Marks display-only text (like attachment filenames) that must never
     /// round-trip into the document.
     static let amDisplayOnly = NSAttributedString.Key("io.lush.displayOnly")
+    static let amLiveTranscription = NSAttributedString.Key("io.lush.liveTranscription")
     static let amHighlight = NSAttributedString.Key("io.lush.highlight")
     /// "superscript" or "subscript" — the mark behind a shifted baseline.
     static let amBaseline = NSAttributedString.Key("io.lush.baseline")
@@ -283,6 +288,14 @@ extension NSAttributedString.Key {
     /// "serif" or "hand" — the mark behind a swapped font family. Read back
     /// from the key, not the font: family names vary by user setting.
     static let amFontRole = NSAttributedString.Key("io.lush.fontRole")
+}
+
+final class LiveTranscriptionBox: NSObject {
+    let id: String
+
+    init(id: String) {
+        self.id = id
+    }
 }
 
 /// A columns layout behind one attachment character: per-column span lists
@@ -533,6 +546,46 @@ struct FontAdjustment: Codable, Hashable {
 
 /// User-adjustable editor typography, persisted in UserDefaults. Views that
 /// render text re-load when `changed` is posted.
+enum EditorTextSize: String, CaseIterable, Identifiable {
+    case extraSmall
+    case small
+    case medium
+    case large
+    case extraLarge
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .extraSmall: "XS"
+        case .small: "S"
+        case .medium: "M"
+        case .large: "L"
+        case .extraLarge: "XL"
+        }
+    }
+
+    var points: Double {
+        #if os(iOS)
+        switch self {
+        case .extraSmall: 15.5
+        case .small: 17
+        case .medium: 19
+        case .large: 21
+        case .extraLarge: 23
+        }
+        #else
+        switch self {
+        case .extraSmall: 12.5
+        case .small: 14
+        case .medium: 16
+        case .large: 18
+        case .extraLarge: 20
+        }
+        #endif
+    }
+}
+
 enum EditorSettings {
     static let changed = Notification.Name("io.lush.editorSettingsChanged")
     static let systemFontFamily = "__system__"
@@ -547,6 +600,7 @@ enum EditorSettings {
         "Merriweather-Italic-VariableFont_opsz,wdth,wght.ttf",
     ]
     private static let sizeKey = "editorBodySize"
+    private static let textSizeKey = "editorTextSize"
     private static let designKey = "editorFontDesign"
     private static let sansFamilyKey = "editorSansFamily"
     private static let serifFamilyKey = "editorSerifFamily"
@@ -613,15 +667,38 @@ enum EditorSettings {
     }
 
     static var bodySize: Double {
-        if let cachedBodySize { return cachedBodySize }
-        let saved = UserDefaults.standard.double(forKey: sizeKey)
-        let size = saved > 0 ? saved : defaultBodySize
-        cachedBodySize = size
-        return size
+        let base: Double
+        if let cachedBodySize {
+            base = cachedBodySize
+        } else {
+            base = textSize.points
+            cachedBodySize = base
+        }
+        #if os(iOS)
+        return Double(UIFontMetrics(forTextStyle: .body).scaledValue(for: CGFloat(base)))
+        #else
+        return base
+        #endif
     }
 
-    static func setBodySize(_ size: Double) {
-        UserDefaults.standard.set(size, forKey: sizeKey)
+    static var textSize: EditorTextSize {
+        if let raw = UserDefaults.standard.string(forKey: textSizeKey),
+           let size = EditorTextSize(rawValue: raw) {
+            return size
+        }
+        let saved = UserDefaults.standard.double(forKey: sizeKey)
+        guard saved > 0 else { return .medium }
+        return EditorTextSize.allCases.min {
+            abs($0.points - saved) < abs($1.points - saved)
+        } ?? .medium
+    }
+
+    static func setTextSize(_ size: EditorTextSize) {
+        UserDefaults.standard.set(size.rawValue, forKey: textSizeKey)
+        invalidateTypography()
+    }
+
+    static func refreshDynamicType() {
         invalidateTypography()
     }
 
@@ -980,12 +1057,12 @@ enum RichText {
         switch block.type {
         case "heading":
             switch block.headingLevel ?? 1 {
-            case 1: return (bodySize + 10, .bold)
-            case 2: return (bodySize + 5, .bold)
-            default: return (bodySize + 2, .semibold)
+            case 1: return (bodySize * 1.6, .bold)
+            case 2: return (bodySize * 1.3, .bold)
+            default: return (bodySize * 1.15, .semibold)
             }
         case "code-block":
-            return (bodySize - 1, .regular)
+            return (bodySize * 0.92, .regular)
         default:
             return (bodySize, .regular)
         }
@@ -1028,14 +1105,18 @@ enum RichText {
         ps.paragraphSpacing = 0
         var indent: CGFloat = 0
         // nested structures (list nesting, columns, table cells) indent by depth
-        indent += CGFloat(block.parents.count) * 20
+        let listDepth = block.parents.filter {
+            $0 == "unordered-list-item" || $0 == "ordered-list-item" || $0 == "todo-list-item"
+        }.count
+        indent += CGFloat(block.parents.count - listDepth) * 20
+        indent += CGFloat(listDepth) * 28
         indent += CGFloat(block.indentLevel) * 20
         switch block.type {
         case "heading":
             ps.paragraphSpacingBefore = 10
             ps.paragraphSpacing = 6
         case "unordered-list-item", "ordered-list-item", "todo-list-item":
-            indent += 32
+            indent += 28
         case "blockquote":
             indent += 16
         case "code-block":
@@ -1307,7 +1388,7 @@ enum RichText {
         paragraphStyle.paragraphSpacing = 0
         paragraphStyle.firstLineHeadIndent = 0
         paragraphStyle.headIndent = 0
-        attrs[.font] = EditorSettings.font(ofSize: max(10, bodySize - 4))
+        attrs[.font] = EditorSettings.font(ofSize: bodySize * 0.76)
         attrs[.paragraphStyle] = paragraphStyle
         attrs[.foregroundColor] = PColor.pSecondaryLabel
         attrs[.amDisplayOnly] = true

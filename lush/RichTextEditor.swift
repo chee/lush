@@ -18,7 +18,7 @@ enum EditorSheet: Identifiable {
     case audio(assetUrl: String, fileURL: URL, name: String)
     case video(fileURL: URL, name: String)
     case html(HtmlBlockHandle)
-    case info(assetUrl: String, name: String, image: PImage?)
+    case info(assetUrl: String, name: String, image: PImage?, block: BlockBox)
     case patchworkCreate
     case format
     case link(initial: String)
@@ -28,7 +28,7 @@ enum EditorSheet: Identifiable {
         case .audio(let url, _, _): "audio-\(url)"
         case .video(let url, _): "video-\(url.path)"
         case .html(let handle): "html-\(handle.id)"
-        case .info(let url, _, _): "info-\(url)"
+        case .info(let url, _, _, _): "info-\(url)"
         case .patchworkCreate: "patchwork-create"
         case .format: "format"
         case .link: "link"
@@ -88,6 +88,7 @@ final class EditorController {
     var linkActive: String?
     var checkedItemsHidden = false
     var recorderVisible = false
+    var liveTranscriptionActive = false
     var sheet: EditorSheet?
     var findVisible = false
     var findQuery = ""
@@ -131,6 +132,11 @@ final class EditorController {
         replaceQuery = ""
         core?.updateFindMatches()
     }
+
+    var undoManager: UndoManager? { core?.view?.pUndoManager }
+
+    func undo() { undoManager?.undo() }
+    func redo() { undoManager?.redo() }
 
     func findQueryChanged() { core?.updateFindMatches() }
     func findNext() { core?.stepFind(1) }
@@ -179,6 +185,8 @@ final class EditorController {
     func insertHtmlBlock() { core?.insertHtmlBlock() }
     func insertLogline() { core?.insertLogline() }
     func insertPatchworkDoc() { sheet = .patchworkCreate }
+    func startLiveTranscription() { core?.startLiveTranscription() }
+    func stopLiveTranscription() { core?.stopLiveTranscription() }
 
     #if os(iOS)
     func dismissKeyboard() { core?.endEditing() }
@@ -220,6 +228,10 @@ final class EditorController {
 
     func saveHtml(_ handle: HtmlBlockHandle, html: String) {
         core?.updateHtmlBlock(handle.box, html: html)
+    }
+
+    func saveImageAltText(_ box: BlockBox, altText: String) {
+        core?.updateEmbedAltText(box, altText: altText)
     }
 
     func replaceTrimmedAudio(assetUrl: String, data: Data, name: String) {
@@ -426,6 +438,10 @@ final class EditorCore {
     private var pendingTextSplice: PendingTextSplice?
     private var queuedTextSplice: QueuedTextSplice?
     private var textSpliceFlushTask: Task<Void, Never>?
+    private var liveTranscriber: LiveTranscriber?
+    private var liveTranscriptionID: String?
+    private var liveTranscriptionAttributes: [NSAttributedString.Key: Any] = [:]
+    private var liveTranscriptionUndo: UndoSnapshot?
     let cache = AssetCache()
 
     let inline = InlineViewManager()
@@ -454,7 +470,12 @@ final class EditorCore {
                 self?.view?.pApplyMaxWidth()
                 self?.updateFocusDim()
                 self?.centerCaretIfTypewriter()
-                self?.load()
+                guard let self else { return }
+                if self.session.loaded {
+                    self.apply(spans: SpanNode.decodeList(self.session.lastKnownJSON))
+                } else {
+                    self.load()
+                }
             }
         }
     }
@@ -491,6 +512,7 @@ final class EditorCore {
     // MARK: loading
 
     func switchTo(_ url: String) {
+        cancelLiveTranscription()
         pushNow()
         remoteReloadTask?.cancel()
         textSpliceFlushTask?.cancel()
@@ -588,6 +610,7 @@ final class EditorCore {
     }
 
     func detachViewFromSharedStorage() {
+        cancelLiveTranscription()
         if let storageEditObserver {
             NotificationCenter.default.removeObserver(storageEditObserver)
             self.storageEditObserver = nil
@@ -3432,7 +3455,12 @@ final class EditorCore {
         guard let url = block.embedUrl else { return false }
         if let image = cache.images[url] {
             guard includeImages else { return false }
-            controller.sheet = .info(assetUrl: url, name: cache.names[url] ?? "Image", image: image)
+            controller.sheet = .info(
+                assetUrl: url,
+                name: cache.names[url] ?? "Image",
+                image: image,
+                block: box
+            )
             return true
         }
         let name = cache.names[url] ?? "attachment"
@@ -3488,6 +3516,24 @@ final class EditorCore {
             newBlock.attrs["tool"] = nil
         }
         replaceEmbedBlock(box, with: newBlock)
+    }
+
+    func updateEmbedAltText(_ box: BlockBox, altText: String) {
+        guard let view, let storage = view.pStorage,
+              let range = range(whereBlockBox: box, in: storage)
+        else { return }
+        var newBlock = box.value
+        newBlock.attrs["alt"] = altText.isEmpty ? nil : .string(altText)
+        guard newBlock != box.value else { return }
+        let undo = undoSnapshot()
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(
+                in: range,
+                with: RichText.embedAttachment(for: newBlock, cache: cache)
+            )
+        }
+        registerUndo(from: undo, actionName: "Edit Alt Text")
+        scheduleSave()
     }
 
     /// Mutates the box in place and re-measures so the hosted webview resizes
@@ -3693,6 +3739,144 @@ final class EditorCore {
         controller.sheet = .html(HtmlBlockHandle(box: box, html: html))
     }
 
+    func startLiveTranscription() {
+        guard liveTranscriber == nil, let view = noteView, let storage = view.pStorage else { return }
+        let id = UUID().uuidString
+        let location = min(view.pSelectedRange.location, storage.length)
+        var attributes = view.pTypingAttributes
+        attributes.removeValue(forKey: .attachment)
+        attributes.removeValue(forKey: .amDisplayOnly)
+        attributes.removeValue(forKey: .amLiveTranscription)
+        let marker = NSMutableAttributedString(
+            attachment: EmbedAttachment(box: LiveTranscriptionBox(id: id))
+        )
+        marker.addAttributes(attributes, range: NSRange(location: 0, length: marker.length))
+        marker.addAttributes([
+            .amDisplayOnly: true,
+            .amLiveTranscription: "\(id):marker",
+        ], range: NSRange(location: 0, length: marker.length))
+        liveTranscriptionUndo = undoSnapshot(of: view)
+        view.pPerformStorageEdit { storage in
+            storage.insert(marker, at: location)
+        }
+        view.pSelectedRange = NSRange(location: location + marker.length, length: 0)
+        liveTranscriptionID = id
+        liveTranscriptionAttributes = attributes
+        controller.liveTranscriptionActive = true
+        let transcriber = LiveTranscriber()
+        liveTranscriber = transcriber
+        Task { [weak self, weak transcriber] in
+            guard let self, let transcriber else { return }
+            let started = await transcriber.start { [weak self] text in
+                self?.updateLiveTranscription(text, id: id)
+            }
+            if !started {
+                self.finishLiveTranscription(id: id, registerUndo: false)
+            }
+        }
+    }
+
+    func stopLiveTranscription() {
+        guard let id = liveTranscriptionID, let transcriber = liveTranscriber else { return }
+        Task { [weak self, weak transcriber] in
+            await transcriber?.stop()
+            self?.finishLiveTranscription(id: id, registerUndo: true)
+        }
+    }
+
+    private func updateLiveTranscription(_ text: String, id: String) {
+        guard id == liveTranscriptionID, let view = noteView, let storage = view.pStorage,
+              let marker = liveTranscriptionMarker(id, in: storage)
+        else { return }
+        let start = NSMaxRange(marker)
+        var old = NSRange(location: start, length: 0)
+        if start < storage.length,
+           storage.attribute(.amLiveTranscription, at: start, effectiveRange: &old) as? String != id {
+            old = NSRange(location: start, length: 0)
+        }
+        let replacement = NSMutableAttributedString(string: text, attributes: liveTranscriptionAttributes)
+        replacement.addAttribute(
+            .amLiveTranscription,
+            value: id,
+            range: NSRange(location: 0, length: replacement.length)
+        )
+        let selection = view.pSelectedRange
+        flushQueuedTextSplice()
+        guard let index = automergeTextPosition(in: storage, at: old.location) else { return }
+        pendingTextSplice = PendingTextSplice(
+            index: UInt64(index),
+            deleteCount: Int64(editableScalarCount(in: storage, range: old)),
+            insert: text,
+            utf16Location: old.location,
+            utf16Length: old.length
+        )
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: old, with: replacement)
+        }
+        textDidChange()
+        flushQueuedTextSplice()
+        let delta = replacement.length - old.length
+        if selection.location >= NSMaxRange(old) {
+            view.pSelectedRange = NSRange(
+                location: max(start + replacement.length, selection.location + delta),
+                length: selection.length
+            )
+        } else if NSIntersectionRange(selection, old).length > 0 {
+            view.pSelectedRange = NSRange(location: start + replacement.length, length: 0)
+        }
+    }
+
+    private func finishLiveTranscription(id: String, registerUndo shouldRegisterUndo: Bool) {
+        guard id == liveTranscriptionID else { return }
+        if let view = noteView, let storage = view.pStorage,
+           let marker = liveTranscriptionMarker(id, in: storage) {
+            let selection = view.pSelectedRange
+            view.pPerformStorageEdit { storage in
+                storage.deleteCharacters(in: marker)
+                let range = NSRange(location: 0, length: storage.length)
+                storage.removeAttribute(.amLiveTranscription, range: range)
+            }
+            if selection.location > marker.location {
+                view.pSelectedRange = NSRange(
+                    location: max(marker.location, selection.location - marker.length),
+                    length: selection.length
+                )
+            }
+            if shouldRegisterUndo {
+                registerUndo(from: liveTranscriptionUndo, actionName: "Live Transcription")
+            }
+        }
+        liveTranscriber = nil
+        liveTranscriptionID = nil
+        liveTranscriptionAttributes = [:]
+        liveTranscriptionUndo = nil
+        controller.liveTranscriptionActive = false
+    }
+
+    private func cancelLiveTranscription() {
+        guard let id = liveTranscriptionID else { return }
+        let transcriber = liveTranscriber
+        finishLiveTranscription(id: id, registerUndo: true)
+        Task {
+            await transcriber?.stop()
+        }
+    }
+
+    private func liveTranscriptionMarker(_ id: String, in storage: NSTextStorage) -> NSRange? {
+        var marker: NSRange?
+        storage.enumerateAttribute(
+            .amLiveTranscription,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, range, stop in
+            guard value as? String == "\(id):marker",
+                  storage.attribute(.amDisplayOnly, at: range.location, effectiveRange: nil) != nil
+            else { return }
+            marker = NSRange(location: range.location, length: 1)
+            stop.pointee = true
+        }
+        return marker
+    }
+
     private func insertEmbedBlock(url: String) {
         let block = BlockValue.embed(url: url)
         insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
@@ -3756,6 +3940,27 @@ func editorPlainText(_ slice: NSAttributedString) -> String {
         out += str.substring(with: range).replacingOccurrences(of: "\u{FFFC}", with: "")
     }
     return out
+}
+
+@MainActor
+func editorCopyRange(
+    _ selection: NSRange,
+    in storage: NSTextStorage,
+    core: EditorCore?
+) -> NSRange? {
+    if selection.length > 0 { return selection }
+    guard let core else { return nil }
+    let locations = [selection.location, selection.location - 1]
+    for location in locations where location >= 0 && location < storage.length {
+        let attributes = storage.attributes(at: location, effectiveRange: nil)
+        guard attributes[.attachment] != nil,
+              let box = attributes[.amBlock] as? BlockBox,
+              let url = box.value.embedUrl,
+              core.cache.images[url] != nil
+        else { continue }
+        return NSRange(location: location, length: 1)
+    }
+    return nil
 }
 
 // MARK: - macOS
@@ -3931,17 +4136,34 @@ class EditorTextView: NSTextView, EditorTextViewLike {
     /// moving content through other editors.
     private func copySelectionAsSpans(cut: Bool) -> Bool {
         guard let storage = textStorage else { return false }
-        let range = selectedRange()
-        guard range.length > 0 else { return false }
+        guard let range = editorCopyRange(selectedRange(), in: storage, core: core) else { return false }
         let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
-        let plain = editorPlainText(slice)
         let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
+        var inlineImages: [String: Data] = [:]
+        for span in spans {
+            guard case .block(let block) = span,
+                  let url = block.embedUrl,
+                  let image = core?.cache.images[url],
+                  let data = Self.pngData(image)
+            else { continue }
+            inlineImages[url] = data
+        }
+        let attachmentLabel: (BlockValue, Int) -> String = { block, _ in
+            guard let url = block.embedUrl, inlineImages[url] != nil else { return "[attachment]" }
+            return block.altText
+        }
+        let markdown = RichTextClipboard.markdown(from: spans, attachmentLabel: attachmentLabel)
+        let visibleText = editorPlainText(slice)
+        let plain = visibleText.isEmpty ? markdown : visibleText
         let item = NSPasteboardItem()
         item.setString(json, forType: Self.spansPasteboardType)
-        item.setString(RichTextClipboard.html(from: spans), forType: Self.htmlPasteboardType)
-        item.setString(RichTextClipboard.markdown(from: spans), forType: Self.markdownPasteboardType)
+        item.setString(
+            RichTextClipboard.html(from: spans, inlineImages: inlineImages),
+            forType: Self.htmlPasteboardType
+        )
+        item.setString(markdown, forType: Self.markdownPasteboardType)
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item.setData(data, forType: .init(type))
         }
@@ -4270,6 +4492,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
 
 struct RichTextEditor: NSViewRepresentable {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openInTab) private var openInTab
 
     let noteUrl: String
     let model: NotesModel
@@ -4277,7 +4500,10 @@ struct RichTextEditor: NSViewRepresentable {
     let contextTracker: ContextTracker
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(core: EditorCore(noteUrl: noteUrl, model: model, controller: controller))
+        Coordinator(
+            core: EditorCore(noteUrl: noteUrl, model: model, controller: controller),
+            openInTab: openInTab
+        )
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -4346,6 +4572,7 @@ struct RichTextEditor: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.openInTab = openInTab
         if context.coordinator.core.noteUrl != noteUrl {
             context.coordinator.core.switchTo(noteUrl)
         }
@@ -4357,10 +4584,12 @@ struct RichTextEditor: NSViewRepresentable {
         let core: EditorCore
         let markers = ListMarkerLayoutDelegate()
         var scrollObserver: (any NSObjectProtocol)?
+        var openInTab: ((String) -> Void)?
         private var lastScenePhase: ScenePhase?
 
-        init(core: EditorCore) {
+        init(core: EditorCore, openInTab: ((String) -> Void)?) {
             self.core = core
+            self.openInTab = openInTab
         }
 
         deinit {
@@ -4386,6 +4615,10 @@ struct RichTextEditor: NSViewRepresentable {
         func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
             let url = (link as? URL)?.absoluteString ?? link as? String
             guard let url, url.hasPrefix("automerge:") else { return false }
+            if NSEvent.modifierFlags.contains(.command), let openInTab {
+                openInTab(url)
+                return true
+            }
             core.model.pendingFocusUrl = url
             AppRouter.shared.pending = .note(url)
             return true
@@ -4670,21 +4903,40 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     static let spansPasteboardType = RichTextClipboard.spansTypeIdentifier
 
     private func copySelectionAsSpans(cut: Bool) -> Bool {
-        let range = selectedRange
-        guard range.length > 0, let storage = pStorage else { return false }
+        guard let storage = pStorage,
+              let range = editorCopyRange(selectedRange, in: storage, core: core)
+        else { return false }
         let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
+        let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
+        var inlineImages: [String: Data] = [:]
+        for span in spans {
+            guard case .block(let block) = span,
+                  let url = block.embedUrl,
+                  let image = core?.cache.images[url],
+                  let data = image.pngData()
+            else { continue }
+            inlineImages[url] = data
+        }
+        let attachmentLabel: (BlockValue, Int) -> String = { block, _ in
+            guard let url = block.embedUrl, inlineImages[url] != nil else { return "[attachment]" }
+            return block.altText
+        }
+        let markdown = RichTextClipboard.markdown(from: spans, attachmentLabel: attachmentLabel)
+        let visibleText = editorPlainText(slice)
         var item: [String: Any] = [
             Self.spansPasteboardType: json,
-            RichTextClipboard.htmlTypeIdentifier: RichTextClipboard.html(from: spans),
-            RichTextClipboard.markdownTypeIdentifier: RichTextClipboard.markdown(from: spans),
-            UTType.utf8PlainText.identifier: editorPlainText(slice),
+            RichTextClipboard.htmlTypeIdentifier: RichTextClipboard.html(
+                from: spans,
+                inlineImages: inlineImages
+            ),
+            RichTextClipboard.markdownTypeIdentifier: markdown,
+            UTType.utf8PlainText.identifier: visibleText.isEmpty ? markdown : visibleText,
         ]
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item[type] = data
         }
-        let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
         // an app that takes none of our rich types still gets the picture,
         // and it rides on the same item so a one-image copy pastes as one
         if let png = media.images.first?.pngData() {
@@ -4985,6 +5237,7 @@ struct FormatAccessoryBar: View {
                             .font(.system(size: 17, weight: .semibold))
                             .foregroundStyle(Color.primary)
                     }
+                    .accessibilityLabel("Format")
                     Menu {
                         Button {
                             controller.attachImageFromPanel()
@@ -5003,6 +5256,12 @@ struct FormatAccessoryBar: View {
                         } label: {
                             Label("Record Audio", systemImage: "waveform")
                         }
+                        Button {
+                            controller.startLiveTranscription()
+                        } label: {
+                            Label("Live Transcription", systemImage: "mic.fill")
+                        }
+                        .disabled(controller.liveTranscriptionActive)
                         Button {
                             controller.attachFileFromPanel()
                         } label: {
@@ -5032,6 +5291,7 @@ struct FormatAccessoryBar: View {
                     } label: {
                         Image(systemName: "paperclip").foregroundStyle(Color.primary)
                     }
+                    .accessibilityLabel("Attach")
                     Menu {
                         ForEach(Highlight.names, id: \.self) { name in
                             Button {
@@ -5050,9 +5310,11 @@ struct FormatAccessoryBar: View {
                         Image(systemName: "highlighter")
                             .foregroundStyle(controller.highlightActive != nil ? Color.accentColor : Color.primary)
                     }
-                    barButton("list.bullet") { controller.applyStyle("unordered-list-item") }
-                    barButton("decrease.indent") { controller.outdentBlock() }
-                    barButton("increase.indent") { controller.indentBlock() }
+                    .accessibilityLabel("Highlight")
+                    .accessibilityValue(controller.highlightActive?.capitalized ?? "None")
+                    barButton("list.bullet", label: "Bulleted List") { controller.applyStyle("unordered-list-item") }
+                    barButton("decrease.indent", label: "Decrease Indent") { controller.outdentBlock() }
+                    barButton("increase.indent", label: "Increase Indent") { controller.indentBlock() }
                 }
                 .padding(.horizontal, 16)
                 .frame(maxHeight: .infinity)
@@ -5065,16 +5327,18 @@ struct FormatAccessoryBar: View {
                 Image(systemName: "keyboard.chevron.compact.down")
             }
             .padding(.horizontal, 16)
+            .accessibilityLabel("Dismiss Keyboard")
         }
         .font(.system(size: 20))
         .frame(maxHeight: .infinity)
         .background(.bar)
     }
 
-    private func barButton(_ symbol: String, action: @escaping () -> Void) -> some View {
+    private func barButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol).foregroundStyle(Color.primary)
         }
+        .accessibilityLabel(label)
     }
 }
 
@@ -5094,6 +5358,7 @@ struct FormatSheet: View {
                         .foregroundStyle(Color.secondary, Color(.systemFill))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Close Format")
             }
             .padding(.horizontal, 20)
             .padding(.top, 20)
@@ -5114,34 +5379,36 @@ struct FormatSheet: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 9))
                         }
                         .buttonStyle(.plain)
+                        .accessibilityValue(active ? "Selected" : "Not selected")
+                        .accessibilityAddTraits(active ? .isSelected : [])
                     }
                 }
                 .padding(.horizontal, 20)
             }
 
             HStack(spacing: 0) {
-                markCell(active: controller.strongActive, action: controller.toggleStrong) {
+                markCell("Bold", active: controller.strongActive, action: controller.toggleStrong) {
                     Text("B").font(.system(size: 16, weight: .bold))
                 }
-                markCell(active: controller.emActive, action: controller.toggleEm) {
+                markCell("Italic", active: controller.emActive, action: controller.toggleEm) {
                     Text("I").font(.system(size: 16).italic())
                 }
-                markCell(active: controller.underlineActive, action: controller.toggleUnderline) {
+                markCell("Underline", active: controller.underlineActive, action: controller.toggleUnderline) {
                     Text("U").underline().font(.system(size: 16))
                 }
-                markCell(active: controller.strikethroughActive, action: controller.toggleStrikethrough) {
+                markCell("Strikethrough", active: controller.strikethroughActive, action: controller.toggleStrikethrough) {
                     Text("S").strikethrough().font(.system(size: 16))
                 }
-                markCell(active: controller.codeActive, action: controller.toggleCode) {
+                markCell("Inline Code", active: controller.codeActive, action: controller.toggleCode) {
                     Image(systemName: "chevron.left.forwardslash.chevron.right").font(.system(size: 13))
                 }
-                markCell(active: controller.superscriptActive, action: controller.toggleSuperscript) {
+                markCell("Superscript", active: controller.superscriptActive, action: controller.toggleSuperscript) {
                     Image(systemName: "textformat.superscript").font(.system(size: 13))
                 }
-                markCell(active: controller.subscriptActive, action: controller.toggleSubscript) {
+                markCell("Subscript", active: controller.subscriptActive, action: controller.toggleSubscript) {
                     Image(systemName: "textformat.subscript").font(.system(size: 13))
                 }
-                markCell(active: controller.linkActive != nil, action: controller.editLink) {
+                markCell("Link", active: controller.linkActive != nil, action: controller.editLink) {
                     Image(systemName: "link").font(.system(size: 13))
                 }
                 Menu {
@@ -5164,6 +5431,8 @@ struct FormatSheet: View {
                         .foregroundStyle(controller.highlightActive != nil ? Color.accentColor : Color.primary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+                .accessibilityLabel("Highlight")
+                .accessibilityValue(controller.highlightActive?.capitalized ?? "None")
             }
             .frame(height: 44)
             .background(Color(.secondarySystemFill))
@@ -5172,8 +5441,8 @@ struct FormatSheet: View {
 
             HStack(spacing: 10) {
                 HStack(spacing: 0) {
-                    indentCell("increase.indent") { controller.indentBlock() }
-                    indentCell("decrease.indent") { controller.outdentBlock() }
+                    indentCell("increase.indent", label: "Increase Indent") { controller.indentBlock() }
+                    indentCell("decrease.indent", label: "Decrease Indent") { controller.outdentBlock() }
                 }
                 .frame(height: 44)
                 .background(Color(.secondarySystemFill))
@@ -5225,16 +5494,19 @@ struct FormatSheet: View {
     }
 
     @ViewBuilder
-    private func markCell(active: Bool, action: @escaping () -> Void, @ViewBuilder label: () -> some View) -> some View {
+    private func markCell(_ name: String, active: Bool, action: @escaping () -> Void, @ViewBuilder label: () -> some View) -> some View {
         Button(action: action) {
             label()
                 .foregroundStyle(active ? Color.accentColor : Color.primary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(name)
+        .accessibilityValue(active ? "Selected" : "Not selected")
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
-    private func indentCell(_ symbol: String, action: @escaping () -> Void) -> some View {
+    private func indentCell(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .foregroundStyle(Color.primary)
@@ -5242,6 +5514,7 @@ struct FormatSheet: View {
                 .frame(maxHeight: .infinity)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 }
 

@@ -221,23 +221,26 @@ struct FolderContentWidgetView: View {
     }
 
     private func itemRow(_ item: LushWidgetItemSnapshot) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Image(systemName: iconName(for: item.kind))
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 14)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(item.title)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                if family != .systemSmall, !item.preview.isEmpty {
-                    Text(item.preview)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+        Link(destination: LushWidgetURL.note(item.url)) {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: iconName(for: item.kind))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.title)
+                        .font(.caption.weight(.semibold))
                         .lineLimit(1)
+                    if family != .systemSmall, !item.preview.isEmpty {
+                        Text(item.preview)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
         }
+        .buttonStyle(.plain)
     }
 
     private func iconName(for kind: String) -> String {

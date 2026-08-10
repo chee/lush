@@ -344,7 +344,7 @@ struct SmartNotebookEditor: View {
                 TextField("Untitled", text: $name)
                     .textFieldStyle(.plain)
                     .labelsHidden()
-                    .font(Font(EditorSettings.font(ofSize: EditorSettings.bodySize + 10, weight: .bold)))
+                    .font(Font(EditorSettings.font(ofSize: EditorSettings.bodySize * 1.6, weight: .bold)))
                 SmartRuleGroup(rule: $root, depth: 0, move: move)
                 Text(
                     "“Contains” is loose: it ignores case and accents, and a Note rule also "

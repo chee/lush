@@ -44,6 +44,90 @@ struct SearchFieldToken: Identifiable, Equatable {
 }
 
 #if os(macOS)
+struct MainWindowRoute: Codable, Hashable {
+    let id: UUID
+    let selection: String?
+}
+
+@MainActor
+enum MainWindowTabs {
+    private static var parents: [UUID: NSWindow] = [:]
+
+    static func open(selection: String?, using openWindow: OpenWindowAction) {
+        let route = MainWindowRoute(id: UUID(), selection: selection)
+        if let window = NSApp.keyWindow {
+            parents[route.id] = window
+        }
+        openWindow(id: "main", value: route)
+    }
+
+    static func attach(_ window: NSWindow, route: MainWindowRoute?) {
+        window.tabbingIdentifier = "lush-main"
+        window.tabbingMode = .preferred
+        guard let route, let parent = parents.removeValue(forKey: route.id), parent !== window else { return }
+        let frame = parent.frame
+        window.orderOut(nil)
+        DispatchQueue.main.async {
+            window.setFrame(frame, display: false)
+            parent.addTabbedWindow(window, ordered: .above)
+            for tab in window.tabbedWindows ?? [parent, window] {
+                tab.setFrame(frame, display: true)
+            }
+            window.makeKeyAndOrderFront(nil)
+            DispatchQueue.main.async {
+                for tab in window.tabbedWindows ?? [window] {
+                    tab.setFrame(frame, display: true)
+                }
+            }
+        }
+    }
+}
+
+struct OpenInTabKey: EnvironmentKey {
+    static let defaultValue: ((String) -> Void)? = nil
+}
+
+extension EnvironmentValues {
+    var openInTab: ((String) -> Void)? {
+        get { self[OpenInTabKey.self] }
+        set { self[OpenInTabKey.self] = newValue }
+    }
+}
+
+private struct MainWindowBridge: NSViewRepresentable {
+    let route: MainWindowRoute?
+    let title: String
+    let connected: (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> BridgeView {
+        BridgeView()
+    }
+
+    func updateNSView(_ view: BridgeView, context: Context) {
+        view.update = { window in
+            window.title = title
+            window.tab.title = title
+            MainWindowTabs.attach(window, route: route)
+            DispatchQueue.main.async { connected(window) }
+        }
+        view.apply()
+    }
+
+    final class BridgeView: NSView {
+        var update: ((NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            apply()
+        }
+
+        func apply() {
+            guard let window, let update else { return }
+            update(window)
+        }
+    }
+}
+
 private struct SidebarHistoryEntry: Equatable {
     let tag: String
     let identity: String
@@ -100,6 +184,7 @@ struct ContentView: View {
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
     @State private var selectedItemUrls: Set<String> = []
+    @State private var sidebarSelectionAnchor: String?
     @State private var searchText = ""
     @State private var searchTokens: [SearchFieldToken] = []
     @State private var preserveSearchInputOnce = false
@@ -129,6 +214,10 @@ struct ContentView: View {
     @State private var sidebarHistory: [SidebarHistoryEntry] = []
     @State private var sidebarHistoryIndex = -1
     @State private var movingThroughSidebarHistory = false
+    @State private var selectedDocumentUrl: String?
+    @State private var appliedInitialRoute = false
+    @State private var hostWindow: NSWindow?
+    private let initialRoute: MainWindowRoute?
 
     private static let expandedKey = "expandedFolders"
     private static let seededRootsKey = "seededRoots"
@@ -136,6 +225,16 @@ struct ContentView: View {
     private static let collapsedSectionsKey = "collapsedSidebarSections"
     #else
     @State private var path: [NavRoute] = []
+    @State private var wideRoute: NavRoute?
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+
+    #if os(macOS)
+    init(initialRoute: MainWindowRoute? = nil) {
+        self.initialRoute = initialRoute
+    }
+    #else
+    init() {}
     #endif
 
     var body: some View {
@@ -145,16 +244,29 @@ struct ContentView: View {
         } detail: {
             detail
         }
+        .background {
+            MainWindowBridge(route: initialRoute, title: windowTitle) { window in
+                if hostWindow !== window {
+                    hostWindow = window
+                }
+            }
+            .frame(width: 0, height: 0)
+        }
+        .environment(\.openInTab) { url in
+            MainWindowTabs.open(selection: url, using: openWindow)
+        }
         .overlay {
             if model.focusModeEnabled {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(Color.purple, lineWidth: 3)
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .strokeBorder(Color.purple, lineWidth: 2)
+                    .padding(1)
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
             }
         }
         .onChange(of: selectedItemUrls) {
             recordSidebarHistory(selectedItemUrls)
+            selectedDocumentUrl = documentUrl(in: selectedItemUrls)
             // Selecting the top search hit must not pull focus out of the
             // field mid-query.
             if !searchFocused { sidebarFocused = true }
@@ -199,17 +311,34 @@ struct ContentView: View {
         // actions queued while no window existed
         .task { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
-            guard let url else { return }
+            guard let url, hostWindow?.isKeyWindow != false else { return }
             selectedHistoryEntry = nil
+            selectedDocumentUrl = url
             if !selectedItemUrls.contains(where: { Self.sidebarUrl($0) == url }) {
                 selectedItemUrls = [rowTag(for: url)]
             }
         }
+        .onChange(of: initialRoute, initial: true) { _, route in
+            guard let route, !appliedInitialRoute else { return }
+            appliedInitialRoute = true
+            if let selection = route.selection {
+                selectedItemUrls = [selection]
+                selectedDocumentUrl = documentUrl(in: [selection])
+            } else {
+                selectedItemUrls = []
+                selectedDocumentUrl = nil
+            }
+        }
         .onAppear {
-            if let url = model.selectedNoteUrl,
+            if !appliedInitialRoute, let url = model.selectedNoteUrl,
                !selectedItemUrls.contains(where: { Self.sidebarUrl($0) == url }) {
+                selectedDocumentUrl = url
                 selectedItemUrls = [rowTag(for: url)]
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+            guard let window = notification.object as? NSWindow, window === hostWindow else { return }
+            model.selectedNoteUrl = selectedDocumentUrl
         }
         .focusedSceneValue(\.noteSearchActions, NoteSearchActions(
             focusNoteSearch: focusCurrentNoteSearch,
@@ -222,30 +351,28 @@ struct ContentView: View {
             patchworkCreateSheet(request)
         }
         #else
-        NavigationStack(path: $path) {
-            FolderScreen(folderUrl: nil) { path.append($0) }
-                .navigationDestination(for: NavRoute.self) { route in
-                    switch route {
-                    case .folder(let url):
-                        FolderScreen(folderUrl: url) { path.append($0) }
-                    case .note(let url):
-                        NoteDetail(noteUrl: model.resolvedNoteUrl(url))
-                            .onAppear { model.selectedNoteUrl = url }
-                    case .patchwork(let url):
-                        PatchworkDetail(docUrl: url)
-                    case .script(let url):
-                        ScriptEditorView(url: url)
-                            .environment(model)
-                    case .recents:
-                        RecentsScreen(push: { path.append($0) })
-                    case .smart(let id):
-                        SmartNotebookScreen(smartNotebookId: id, push: { path.append($0) })
-                    case .calendar:
-                        AgendaScreen { path.append(.note($0)) }
-                    case .meetingNotes:
-                        MeetingNotesScreen { path.append(.note($0)) }
+        Group {
+            if usesWideLayout {
+                NavigationSplitView {
+                    FolderScreen(folderUrl: nil, push: openMobile)
+                        .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 420)
+                } detail: {
+                    NavigationStack {
+                        if let wideRoute {
+                            mobileDestination(wideRoute)
+                        } else {
+                            ContentUnavailableView("Select a Note", systemImage: "doc.text")
+                        }
                     }
                 }
+            } else {
+                NavigationStack(path: $path) {
+                    FolderScreen(folderUrl: nil, push: openMobile)
+                        .navigationDestination(for: NavRoute.self) { route in
+                            mobileDestination(route)
+                        }
+                }
+            }
         }
         .overlay(alignment: .bottomTrailing) {
             if model.focusModeEnabled {
@@ -285,12 +412,20 @@ struct ContentView: View {
         // actions queued while no window existed
         .task { processPending() }
         .onChange(of: model.selectedNoteUrl) { _, url in
-            guard let url, path.isEmpty else { return }
-            path = [.note(url)]
+            guard let url else { return }
+            if usesWideLayout {
+                wideRoute = .note(url)
+            } else if path.isEmpty {
+                path = [.note(url)]
+            }
         }
         .onAppear {
-            if let url = model.selectedNoteUrl, path.isEmpty {
-                path = [.note(url)]
+            if let url = model.selectedNoteUrl {
+                if usesWideLayout {
+                    wideRoute = .note(url)
+                } else if path.isEmpty {
+                    path = [.note(url)]
+                }
             }
         }
         .sheet(item: incomingContentBinding) { content in
@@ -321,13 +456,16 @@ struct ContentView: View {
             #if os(macOS)
             selectedItemUrls = [rowTag(for: url)]
             #else
-            path = [.patchwork(url)]
+            openMobile(.patchwork(url))
             #endif
         })
         .environment(model)
     }
 
     private func processPending() {
+        #if os(macOS)
+        guard hostWindow?.isKeyWindow != false else { return }
+        #endif
         guard let action = router.pending, model.folderUrl != nil else { return }
         router.pending = nil
         switch action {
@@ -363,8 +501,7 @@ struct ContentView: View {
         case .insertQuickNote(let text):
             Task { _ = await model.appendToQuickNote(text) }
         case .note(let url):
-            model.pendingFocusUrl = url
-            open(url)
+            Task { await openDispatched(url) }
         case .folder(let url):
             Task { await model.selectFolder(url) }
             openFolder(url)
@@ -381,6 +518,7 @@ struct ContentView: View {
             runSearch()
             #else
             path = []
+            wideRoute = nil
             model.searchQuery = query
             #endif
         case .createPatchwork(let preferredType, let toolId, let folderUrl):
@@ -398,18 +536,52 @@ struct ContentView: View {
 
     private func open(_ url: String) {
         #if os(macOS)
+        selectedDocumentUrl = url
         model.selectedNoteUrl = url
         selectedItemUrls = [rowTag(for: url)]
         #else
-        path = [.note(url)]
+        openMobile(.note(url))
         #endif
+    }
+
+    private func openDispatched(_ url: String) async {
+        let kind: String?
+        if let known = model.node(for: url)?.kind {
+            kind = known
+        } else {
+            kind = await model.documentKind(for: url)
+        }
+        switch kind {
+        case "folder":
+            await model.selectFolder(url)
+            openFolder(url)
+        case "lush:script":
+            #if os(macOS)
+            open(url)
+            #else
+            openMobile(.script(url))
+            #endif
+        case "rich", "lush":
+            model.pendingFocusUrl = url
+            open(url)
+        case .some(_):
+            model.rememberPatchworkDocument(url)
+            #if os(macOS)
+            open(url)
+            #else
+            openMobile(.patchwork(url))
+            #endif
+        case nil:
+            model.pendingFocusUrl = url
+            open(url)
+        }
     }
 
     private func openFolder(_ url: String) {
         #if os(macOS)
         selectedItemUrls = [rowTag(for: url)]
         #else
-        path = [.folder(url)]
+        openMobile(.folder(url))
         #endif
     }
 
@@ -417,9 +589,47 @@ struct ContentView: View {
         #if os(macOS)
         selectedItemUrls = [Agenda.sidebarTag]
         #else
-        path = [.calendar]
+        openMobile(.calendar)
         #endif
     }
+
+    #if os(iOS)
+    private var usesWideLayout: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad && horizontalSizeClass == .regular
+    }
+
+    private func openMobile(_ route: NavRoute) {
+        if usesWideLayout {
+            wideRoute = route
+        } else {
+            path.append(route)
+        }
+    }
+
+    @ViewBuilder
+    private func mobileDestination(_ route: NavRoute) -> some View {
+        switch route {
+        case .folder(let url):
+            FolderScreen(folderUrl: url, push: openMobile)
+        case .note(let url):
+            NoteDetail(noteUrl: model.resolvedNoteUrl(url))
+                .onAppear { model.selectedNoteUrl = url }
+        case .patchwork(let url):
+            PatchworkDetail(docUrl: url)
+        case .script(let url):
+            ScriptEditorView(url: url)
+                .environment(model)
+        case .recents:
+            RecentsScreen(push: openMobile)
+        case .smart(let id):
+            SmartNotebookScreen(smartNotebookId: id, push: openMobile)
+        case .calendar:
+            AgendaScreen { openMobile(.note($0)) }
+        case .meetingNotes:
+            MeetingNotesScreen { openMobile(.note($0)) }
+        }
+    }
+    #endif
 
     #if os(macOS)
 
@@ -582,14 +792,37 @@ struct ContentView: View {
     }
 
     private func selectSidebarRow(_ tag: String) {
-        if NSEvent.modifierFlags.contains(.command) {
+        if let event = NSApp.currentEvent {
+            switch event.type {
+            case .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+                return
+            case .leftMouseDown, .leftMouseUp where event.modifierFlags.contains(.control):
+                return
+            default:
+                break
+            }
+        }
+        let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers.contains(.shift) {
+            let rows = visibleSidebarRowTags
+            let anchor = sidebarSelectionAnchor.flatMap { rows.firstIndex(of: $0) }
+                ?? rows.firstIndex(where: { selectedItemUrls.contains($0) })
+            if let anchor, let target = rows.firstIndex(of: tag) {
+                let range = Set(rows[min(anchor, target)...max(anchor, target)])
+                selectedItemUrls = modifiers.contains(.command) ? selectedItemUrls.union(range) : range
+            } else {
+                selectedItemUrls.insert(tag)
+            }
+        } else if modifiers.contains(.command) {
             if selectedItemUrls.contains(tag) {
                 selectedItemUrls.remove(tag)
             } else {
                 selectedItemUrls.insert(tag)
             }
+            sidebarSelectionAnchor = tag
         } else {
             selectedItemUrls = [tag]
+            sidebarSelectionAnchor = tag
         }
         if selectedItemUrls.count == 1,
            let selected = selectedItemUrls.first,
@@ -662,6 +895,7 @@ struct ContentView: View {
         let tag = rows[index]
         deferredSidebarTag = tag
         selectedItemUrls = [tag]
+        sidebarSelectionAnchor = tag
         revealTarget = tag
         return .handled
     }
@@ -804,6 +1038,12 @@ struct ContentView: View {
                 AgendaStore.shared.focusDay = Calendar.current.startOfDay(for: Date())
             })
             .contextMenu {
+                Button {
+                    MainWindowTabs.open(selection: Agenda.sidebarTag, using: openWindow)
+                } label: {
+                    Label("Open in New Tab", systemImage: "plus.square.on.square")
+                }
+                Divider()
                 Button("Show Meeting Notes") {
                     selectedItemUrls = [Agenda.meetingNotesTag]
                 }
@@ -1001,6 +1241,12 @@ struct ContentView: View {
         .modifier(SmartReorderTarget(id: folder.id, model: model))
         .contextMenu {
             Group {
+                Button {
+                    MainWindowTabs.open(selection: tag, using: openWindow)
+                } label: {
+                    Label("Open in New Tab", systemImage: "plus.square.on.square")
+                }
+                Divider()
                 Button {
                     smartEditor = SmartNotebookEdit(folder: folder)
                 } label: {
@@ -1296,6 +1542,12 @@ struct ContentView: View {
 
     @ViewBuilder
     private func folderContextMenuContent(for node: FolderNode) -> some View {
+        Button {
+            MainWindowTabs.open(selection: rowTag(for: node.url), using: openWindow)
+        } label: {
+            Label("Open in New Tab", systemImage: "plus.square.on.square")
+        }
+        Divider()
         Menu("New") {
             NewItemMenuItems(
                 model: model,
@@ -1437,6 +1689,28 @@ struct ContentView: View {
             )
     }
 
+    private func documentUrl(in selection: Set<String>) -> String? {
+        guard selection.count == 1, let tag = selection.first,
+              !tag.hasPrefix("smart:"),
+              tag != Agenda.sidebarTag,
+              tag != Agenda.meetingNotesTag
+        else { return nil }
+        let url = Self.sidebarUrl(tag)
+        guard url.hasPrefix("automerge:"), model.node(for: url)?.kind != "folder" else { return nil }
+        return url
+    }
+
+    private var windowTitle: String {
+        guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return "Lush" }
+        if tag == Agenda.sidebarTag { return "Calendar" }
+        if tag == Agenda.meetingNotesTag { return "Meeting Notes" }
+        if tag.hasPrefix("smart:") {
+            return model.smartNotebook(id: String(tag.dropFirst(6)))?.name ?? "Smart Notebook"
+        }
+        guard let node = model.node(for: Self.sidebarUrl(tag)) else { return "Lush" }
+        return node.displayName
+    }
+
     @ViewBuilder
     private var detail: some View {
         // Not HSplitView: a second pane makes AppKit align the search item to
@@ -1454,7 +1728,7 @@ struct ContentView: View {
                     MeetingNotesScreen { open($0) }
                 } else if calendarSelected {
                     AgendaScreen { open($0) }
-                } else if let url = model.selectedNoteUrl {
+                } else if let url = selectedDocumentUrl {
                     detailContent(for: url)
                 } else {
                     Color.clear
@@ -1462,7 +1736,7 @@ struct ContentView: View {
             }
             .frame(minWidth: 360, maxWidth: .infinity)
 
-            if rightSidebarVisible, let url = model.selectedNoteUrl {
+            if rightSidebarVisible, let url = selectedDocumentUrl {
                 rightSidebarDivider
                 RightSidebarView(
                     url: url,
@@ -1477,21 +1751,6 @@ struct ContentView: View {
         .navigationTitle("")
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
-                Button {
-                    moveThroughSidebarHistory(by: -1)
-                } label: {
-                    Label("Back", systemImage: "chevron.left")
-                }
-                .disabled(sidebarHistoryIndex <= 0)
-                .keyboardShortcut("[", modifiers: .command)
-                Button {
-                    moveThroughSidebarHistory(by: 1)
-                } label: {
-                    Label("Forward", systemImage: "chevron.right")
-                }
-                .disabled(sidebarHistoryIndex < 0 || sidebarHistoryIndex >= sidebarHistory.count - 1)
-                .keyboardShortcut("]", modifiers: .command)
-                FocusModeControl(model: model)
                 Menu {
                     NewItemMenuItems(
                         model: model,
@@ -1507,6 +1766,20 @@ struct ContentView: View {
                     }
                 }
                 .disabled(model.folderUrl == nil)
+                Button {
+                    moveThroughSidebarHistory(by: -1)
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .disabled(sidebarHistoryIndex <= 0)
+                if sidebarHistoryIndex >= 0, sidebarHistoryIndex < sidebarHistory.count - 1 {
+                    Button {
+                        moveThroughSidebarHistory(by: 1)
+                    } label: {
+                        Label("Forward", systemImage: "chevron.right")
+                    }
+                }
+                FocusModeControl(model: model)
             }
             #if os(macOS)
             ToolbarSpacer(.flexible)
@@ -1713,14 +1986,21 @@ struct ContentView: View {
         revealTarget = tag
     }
 
-    @ViewBuilder
     private func singleNoteContextMenu(for node: FolderNode, showInFolder: Bool = false) -> some View {
-        NoteContextMenu(
-            node: node,
-            showInFolder: showInFolder ? { showNoteInFolder(node) } : nil,
-            move: { moveTarget = MoveTarget(urls: [node.url]) },
-            rename: { beginRename(node) }
-        )
+        Group {
+            Button {
+                MainWindowTabs.open(selection: node.url, using: openWindow)
+            } label: {
+                Label("Open in New Tab", systemImage: "plus.square.on.square")
+            }
+            NoteContextMenu(
+                node: node,
+                showInFolder: showInFolder ? { showNoteInFolder(node) } : nil,
+                move: { moveTarget = MoveTarget(urls: [node.url]) },
+                rename: { beginRename(node) }
+            )
+        }
+        .tint(.primary)
     }
 
     #endif
@@ -2079,18 +2359,27 @@ struct FolderScreen: View {
         List {
             if searchText.isEmpty, folderUrl == nil {
                 Section {
-                    NavigationLink(value: NavRoute.calendar) {
+                    Button {
+                        push(.calendar)
+                    } label: {
                         CalendarSidebarLabel()
                     }
+                    .buttonStyle(.plain)
                 }
                 Section(isExpanded: pinnedExpansionBinding) {
-                    NavigationLink(value: NavRoute.recents) {
+                    Button {
+                        push(.recents)
+                    } label: {
                         Label("Recents", systemImage: "clock")
                     }
+                    .buttonStyle(.plain)
                     ForEach(model.pinnedNodes) { node in
-                        NavigationLink(value: NavRoute.note(node.url)) {
+                        Button {
+                            push(.note(node.url))
+                        } label: {
                             NoteRowView(node: node, showFolder: true)
                         }
+                        .buttonStyle(.plain)
                         .contextMenu {
                             nodeMenu(node)
                             if let parentUrl = node.parentUrl {
@@ -2111,7 +2400,9 @@ struct FolderScreen: View {
                 if !model.smartNotebooks.isEmpty {
                     Section {
                         ForEach(model.smartNotebooks) { folder in
-                            NavigationLink(value: NavRoute.smart(folder.id)) {
+                            Button {
+                                push(.smart(folder.id))
+                            } label: {
                                 HStack {
                                     Label(folder.displayName, systemImage: "folder.badge.gearshape")
                                         .lineLimit(1)
@@ -2123,6 +2414,7 @@ struct FolderScreen: View {
                                     }
                                 }
                             }
+                            .buttonStyle(.plain)
                             .contextMenu {
                                 Group {
                                     Button {
@@ -2157,16 +2449,18 @@ struct FolderScreen: View {
                     .onMove(perform: moveNodes)
                 } else {
                     OutlineGroup(nodes, children: \.children) { node in
-                        NavigationLink(value: node.kind == "folder"
-                            ? NavRoute.folder(node.url)
-                            : node.kind == "lush:script"
-                                ? NavRoute.script(node.url)
-                                : node.isNote
-                                    ? NavRoute.note(node.url)
-                                    : NavRoute.patchwork(node.url)
-                        ) {
+                        Button {
+                            push(node.kind == "folder"
+                                ? .folder(node.url)
+                                : node.kind == "lush:script"
+                                    ? .script(node.url)
+                                    : node.isNote
+                                        ? .note(node.url)
+                                        : .patchwork(node.url))
+                        } label: {
                             nodeLabel(node)
                         }
+                        .buttonStyle(.plain)
                         .contextMenu { nodeMenu(node) }
                     }
                 }
@@ -2185,7 +2479,9 @@ struct FolderScreen: View {
                     }
                 }
                 ForEach(searchHits, id: \.url) { hit in
-                    NavigationLink(value: NavRoute.note(hit.url)) {
+                    Button {
+                        push(.note(hit.url))
+                    } label: {
                         if let node = model.node(for: hit.url) {
                             NoteRowView(node: node)
                         } else {
@@ -2200,6 +2496,7 @@ struct FolderScreen: View {
                             }
                         }
                     }
+                    .buttonStyle(.plain)
                     .contextMenu {
                         if let node = model.node(for: hit.url) {
                             nodeMenu(node)
@@ -2259,6 +2556,20 @@ struct FolderScreen: View {
             }
             ToolbarItem {
                 EditButton()
+            }
+            ToolbarItemGroup {
+                Button {
+                    model.undoManager.undo()
+                } label: {
+                    Label("Undo", systemImage: "arrow.uturn.backward")
+                }
+                .disabled(!model.undoManager.canUndo)
+                Button {
+                    model.undoManager.redo()
+                } label: {
+                    Label("Redo", systemImage: "arrow.uturn.forward")
+                }
+                .disabled(!model.undoManager.canRedo)
             }
             ToolbarItem {
                 Menu {
@@ -2333,6 +2644,7 @@ struct FolderScreen: View {
                         }
                     }
                 }
+                    .accessibilityLabel("New")
                     .disabled(model.folderUrl == nil)
                 }
                 .padding(.horizontal)
@@ -2747,6 +3059,8 @@ struct RightSidebarView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(tab.rawValue)
+                .accessibilityValue(isActive ? "Selected" : "Not selected")
+                .accessibilityAddTraits(isActive ? .isSelected : [])
             }
         }
         .padding(.horizontal, 10)
@@ -2951,8 +3265,9 @@ private struct DraftCardView: View {
                     .padding(9)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear Search")
 
                 Button {
                     withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
@@ -3699,6 +4014,12 @@ struct NoteDetail: View {
                 Label("Record Audio", systemImage: "waveform")
             }
             Button {
+                editor.startLiveTranscription()
+            } label: {
+                Label("Live Transcription", systemImage: "mic.fill")
+            }
+            .disabled(editor.liveTranscriptionActive)
+            Button {
                 editor.attachFileFromPanel()
             } label: {
                 Label("Attach File…", systemImage: "doc")
@@ -3770,6 +4091,28 @@ struct NoteDetail: View {
             #endif
         }
         #if !os(macOS)
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                if editor.undoManager?.canUndo == true {
+                    editor.undo()
+                } else {
+                    model.undoManager.undo()
+                }
+            } label: {
+                Label("Undo", systemImage: "arrow.uturn.backward")
+            }
+            .disabled(editor.undoManager?.canUndo != true && !model.undoManager.canUndo)
+            Button {
+                if editor.undoManager?.canRedo == true {
+                    editor.redo()
+                } else {
+                    model.undoManager.redo()
+                }
+            } label: {
+                Label("Redo", systemImage: "arrow.uturn.forward")
+            }
+            .disabled(editor.undoManager?.canRedo != true && !model.undoManager.canRedo)
+        }
         if !model.focusModeEnabled {
             ToolbarItem(placement: .primaryAction) {
                 FocusModeControl(model: model)

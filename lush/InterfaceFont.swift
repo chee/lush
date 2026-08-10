@@ -76,8 +76,12 @@ enum InterfaceFont {
 
     static func applyNavigationBarAppearance(family: String) {
         #if os(iOS)
-        let large = platformFont(ofSize: 34, weight: .medium, family: family)
-        let inline = platformFont(ofSize: 17, weight: .regular, family: family)
+        let large = UIFontMetrics(forTextStyle: .largeTitle).scaledFont(
+            for: platformFont(ofSize: 34, weight: .medium, family: family)
+        )
+        let inline = UIFontMetrics(forTextStyle: .headline).scaledFont(
+            for: platformFont(ofSize: 17, weight: .regular, family: family)
+        )
         let standard = UINavigationBarAppearance()
         standard.configureWithDefaultBackground()
         standard.largeTitleTextAttributes = [.font: large]

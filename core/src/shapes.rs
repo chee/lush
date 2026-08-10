@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const RICH_TOOL_URL: &str =
-    "automerge:2XoPZihn6Vo2aqeVu2WN39W8cdAN#28JkzFqXzKReCZ3DGo81Z4QbCUnxcPh7uy84e2wY4FZNT8M2xq";
+pub const RICH_TOOL_URL: &str = "automerge:2XoPZihn6Vo2aqeVu2WN39W8cdAN";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -1859,6 +1858,10 @@ mod tests {
         assert!(field_is_text(&doc, &pw, "type"));
         assert!(field_is_text(&doc, &pw, "title"));
         assert!(field_is_text(&doc, &pw, "suggestedImportUrl"));
+        assert_eq!(
+            string_at(&doc, &pw, "suggestedImportUrl").as_deref(),
+            Some("automerge:2XoPZihn6Vo2aqeVu2WN39W8cdAN")
+        );
         assert_eq!(doc_title(&doc), "hi");
     }
 

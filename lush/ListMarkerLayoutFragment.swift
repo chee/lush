@@ -19,6 +19,45 @@ enum MarkerDrawing {
     static let decoratedTypes: Set<String> = [
         "blockquote", "unordered-list-item", "ordered-list-item", "todo-list-item",
     ]
+    static let listTypes: Set<String> = [
+        "unordered-list-item", "ordered-list-item", "todo-list-item",
+    ]
+
+    static func orderedMarker(_ ordinal: Int, depth: Int) -> String {
+        switch depth % 3 {
+        case 1: return "\(alphabeticOrdinal(ordinal))."
+        case 2: return "\(romanOrdinal(ordinal))."
+        default: return "\(ordinal)."
+        }
+    }
+
+    static func alphabeticOrdinal(_ ordinal: Int) -> String {
+        var value = max(1, ordinal)
+        var result = ""
+        while value > 0 {
+            value -= 1
+            result.insert(Character(UnicodeScalar(97 + value % 26)!), at: result.startIndex)
+            value /= 26
+        }
+        return result
+    }
+
+    static func romanOrdinal(_ ordinal: Int) -> String {
+        let numerals: [(Int, String)] = [
+            (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+            (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+            (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+        ]
+        var value = max(1, ordinal)
+        var result = ""
+        for (amount, numeral) in numerals {
+            while value >= amount {
+                result += numeral
+                value -= amount
+            }
+        }
+        return result
+    }
 
     static func marker(
         block: BlockValue,
@@ -30,39 +69,58 @@ enum MarkerDrawing {
     ) {
         let baseline = origin.y + lineRect.minY + itemFont.ascender
         let diameter: CGFloat = 6.5
+        let gap: CGFloat = 1
         switch block.type {
         case "todo-list-item":
             let side = itemFont.pointSize * 0.94
             let rect = CGRect(
-                x: origin.x + indent - side - 6,
+                x: origin.x + indent - side - gap,
                 y: baseline - itemFont.xHeight / 2 - side / 2,
                 width: side,
                 height: side
             )
             checkbox(in: rect, state: block.todoState)
         case "unordered-list-item":
+            let markerColumnWidth = itemFont.pointSize * 0.94
             let rect = CGRect(
-                x: origin.x + indent - diameter - 5,
+                x: origin.x + indent - gap - markerColumnWidth / 2 - diameter / 2,
                 y: baseline - itemFont.xHeight / 2 - diameter / 2,
                 width: diameter,
                 height: diameter
             )
-            PColor.pLabel.setFill()
+            let depth = block.parents.filter { listTypes.contains($0) }.count
             #if os(macOS)
-            NSBezierPath(ovalIn: rect).fill()
+            if depth % 3 == 1 {
+                let path = NSBezierPath(ovalIn: rect)
+                path.lineWidth = 1.2
+                PColor.pLabel.setStroke()
+                path.stroke()
+            } else {
+                PColor.pLabel.setFill()
+                (depth % 3 == 2 ? NSBezierPath(rect: rect) : NSBezierPath(ovalIn: rect)).fill()
+            }
             #else
-            UIBezierPath(ovalIn: rect).fill()
+            if depth % 3 == 1 {
+                let path = UIBezierPath(ovalIn: rect)
+                path.lineWidth = 1.2
+                PColor.pLabel.setStroke()
+                path.stroke()
+            } else {
+                PColor.pLabel.setFill()
+                (depth % 3 == 2 ? UIBezierPath(rect: rect) : UIBezierPath(ovalIn: rect)).fill()
+            }
             #endif
         default:
-            let marker = "\(ordinal)."
-            let font = PFont.monospacedDigitSystemFont(ofSize: RichText.bodySize, weight: .regular)
+            let depth = block.parents.filter { listTypes.contains($0) }.count
+            let marker = orderedMarker(ordinal, depth: depth)
+            let font = PFont.monospacedDigitSystemFont(ofSize: itemFont.pointSize, weight: .regular)
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: font,
                 .foregroundColor: PColor.pLabel,
             ]
             let markerWidth = (marker as NSString).size(withAttributes: attrs).width
             let point = CGPoint(
-                x: origin.x + indent - markerWidth - 6,
+                x: origin.x + indent - markerWidth - gap,
                 y: baseline - font.ascender
             )
             marker.draw(at: point, withAttributes: attrs)
@@ -349,10 +407,10 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
     }
 
     private var paragraphAttributes: [NSAttributedString.Key: Any]? {
-        guard let paragraph = textElement as? NSTextParagraph,
-              paragraph.attributedString.length > 0
+        guard let (storage, location) = storageContext(),
+              location < storage.length
         else { return nil }
-        return paragraph.attributedString.attributes(at: 0, effectiveRange: nil)
+        return storage.attributes(at: location, effectiveRange: nil)
     }
 
     private func decoratedBlock(_ attrs: [NSAttributedString.Key: Any]?) -> BlockValue? {

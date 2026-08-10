@@ -25,6 +25,8 @@ export default defineConfig({
     ],
   },
   build: {
+	 sourcemap: false,
+	 minify: true,
     rollupOptions: {
       output: {
         // Keep each automerge package in one chunk; rollup otherwise splits

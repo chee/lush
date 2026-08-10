@@ -704,6 +704,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func docStorageChunks(url: String)  -> [StorageChunk]
     
+    func documentKind(url: String) async throws  -> String
+    
     func draftAddChild(draftUrl: String, childUrl: String) throws 
     
     func draftMarkMerged(draftUrl: String, timestampMs: Int64) throws 
@@ -775,6 +777,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * title, and their type is whatever their datatype says, not "rich".
      */
     func linkNoteToFolder(noteUrl: String, title: String) async throws 
+    
+    func linkNoteToFolderIn(folderUrl: String, noteUrl: String, title: String) throws 
     
     func listNotes() async  -> [NoteInfo]
     
@@ -1445,6 +1449,23 @@ open func docStorageChunks(url: String) -> [StorageChunk]  {
 })
 }
     
+open func documentKind(url: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_document_kind(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
+}
+    
 open func draftAddChild(draftUrl: String, childUrl: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_draft_add_child(self.uniffiClonePointer(),
         FfiConverterString.lower(draftUrl),
@@ -1665,6 +1686,15 @@ open func linkNoteToFolder(noteUrl: String, title: String)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+open func linkNoteToFolderIn(folderUrl: String, noteUrl: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_link_note_to_folder_in(self.uniffiClonePointer(),
+        FfiConverterString.lower(folderUrl),
+        FfiConverterString.lower(noteUrl),
+        FfiConverterString.lower(title),$0
+    )
+}
 }
     
 open func listNotes()async  -> [NoteInfo]  {
@@ -3660,7 +3690,7 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
             try FolderSettings(
                 url: FfiConverterString.read(from: &buf), 
                 showCount: FfiConverterBool.read(from: &buf), 
-                recursiveCount: FfiConverterBool.read(from: &buf),
+                recursiveCount: FfiConverterBool.read(from: &buf), 
                 notifyOnChange: FfiConverterBool.read(from: &buf)
         )
     }
@@ -3723,7 +3753,7 @@ public struct IndexedNote {
          */modified: Int64, 
         /**
          * Unix seconds of the doc's first change; 0 when its history carries none.
-         */created: Int64, tags: [String], weather: [String], locations: [String], has: [String],
+         */created: Int64, tags: [String], weather: [String], locations: [String], has: [String], 
         /**
          * The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
          */when: String) {
@@ -3809,9 +3839,9 @@ public struct FfiConverterTypeIndexedNote: FfiConverterRustBuffer {
                 modified: FfiConverterInt64.read(from: &buf), 
                 created: FfiConverterInt64.read(from: &buf), 
                 tags: FfiConverterSequenceString.read(from: &buf), 
-                weather: FfiConverterSequenceString.read(from: &buf),
-                locations: FfiConverterSequenceString.read(from: &buf),
-                has: FfiConverterSequenceString.read(from: &buf),
+                weather: FfiConverterSequenceString.read(from: &buf), 
+                locations: FfiConverterSequenceString.read(from: &buf), 
+                has: FfiConverterSequenceString.read(from: &buf), 
                 when: FfiConverterString.read(from: &buf)
         )
     }
@@ -5886,6 +5916,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_doc_storage_chunks() != 51003) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_document_kind() != 24464) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_draft_add_child() != 12925) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5947,6 +5980,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 43907) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_link_note_to_folder_in() != 48471) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_list_notes() != 11889) {

@@ -415,16 +415,19 @@ struct CalendarSettingsPane: View {
 }
 
 struct FontsSettingsPane: View {
-    @State private var fontSize = Int(EditorSettings.bodySize)
+    @State private var textSize = EditorSettings.textSize
 
     var body: some View {
         Form {
-            Section("Base Size") {
-                Stepper(value: $fontSize, in: 9...32) {
-                    LabeledContent("Size", value: "\(fontSize) pt")
+            Section("Text Size") {
+                Picker("Text Size", selection: $textSize) {
+                    ForEach(EditorTextSize.allCases) { size in
+                        Text(size.label).tag(size)
+                    }
                 }
-                .onChange(of: fontSize) {
-                    EditorSettings.setBodySize(Double(fontSize))
+                .pickerStyle(.segmented)
+                .onChange(of: textSize) {
+                    EditorSettings.setTextSize(textSize)
                 }
             }
             FontSettingsSections()

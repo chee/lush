@@ -113,13 +113,17 @@ enum NoteExporter {
 
     // MARK: - HTML builder
 
-    static func htmlFragment(from spans: [SpanNode]) -> String {
-        htmlBody(from: spans, assetResolver: .none)
+    static func htmlFragment(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+        htmlBody(
+            from: spans,
+            assetResolver: inlineImages.isEmpty ? .none : .inlineImages(inlineImages)
+        )
     }
 
     private enum AssetResolver {
         case none
         case relativePaths([String: String])
+        case inlineImages([String: Data])
     }
 
     private static func buildHTML(title: String, spans: [SpanNode], assetResolver: AssetResolver) -> String {
@@ -208,8 +212,8 @@ enum NoteExporter {
                     closeLists()
                     if b.type == "html", let source = b.htmlSource {
                         out += source + "\n"
-                    } else if let url = b.embedUrl {
-                        out += assetTag(url: url, assetResolver: assetResolver) + "\n"
+                    } else if b.embedUrl != nil {
+                        out += assetTag(block: b, assetResolver: assetResolver) + "\n"
                     }
                     continue
                 }
@@ -293,7 +297,8 @@ enum NoteExporter {
         return out
     }
 
-    private static func assetTag(url: String, assetResolver: AssetResolver) -> String {
+    private static func assetTag(block: BlockValue, assetResolver: AssetResolver) -> String {
+        guard let url = block.embedUrl else { return "" }
         switch assetResolver {
         case .none:
             return "<p><em>[attachment]</em></p>"
@@ -307,10 +312,17 @@ enum NoteExporter {
             } else if AssetCache.audioExtensions.contains(ext) {
                 return "<audio controls src=\"\(src)\"></audio>"
             } else if ["jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif"].contains(ext) {
-                return "<img src=\"\(src)\" alt=\"\(name)\">"
+                let alt = escape(block.altText.isEmpty ? (path as NSString).lastPathComponent : block.altText)
+                return "<img src=\"\(src)\" alt=\"\(alt)\">"
             } else {
                 return "<a href=\"\(src)\">\(name)</a>"
             }
+        case .inlineImages(let images):
+            guard let data = images[url] else {
+                return block.altText.isEmpty ? "" : "<p>\(escape(block.altText))</p>"
+            }
+            let src = "data:image/png;base64,\(data.base64EncodedString())"
+            return "<img src=\"\(src)\" alt=\"\(escape(block.altText))\">"
         }
     }
 

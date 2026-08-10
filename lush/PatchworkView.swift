@@ -204,7 +204,7 @@ enum PatchworkWeb {
 
     static let shellHTML = #"""
     <!doctype html>
-    <html>
+    <html theme="apple-light" data-theme-light="apple-light" data-theme-dark="apple-dark">
     <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />

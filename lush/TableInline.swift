@@ -84,6 +84,7 @@ final class InlineViewManager {
         let id = ObjectIdentifier(box)
         if let hit = hosts[id], hit.box === box { return hit }
         var host: Host? = switch box {
+        case let transcription as LiveTranscriptionBox: makeLiveTranscriptionHost(for: transcription)
         case let table as TableBox: makeTableHost(for: table)
         case let columns as ColumnsBox: makeColumnsHost(for: columns)
         case let block as BlockBox where block.value.isEmbedBlock: makeEmbedHost(for: block)
@@ -92,6 +93,18 @@ final class InlineViewManager {
         host?.box = box
         hosts[id] = host
         return host
+    }
+
+    private func makeLiveTranscriptionHost(for box: LiveTranscriptionBox) -> Host {
+        let root = LiveTranscriptionInlineView { [weak self] in
+            self?.core?.stopLiveTranscription()
+        }
+        let (view, _, retained) = makeHosting(root)
+        return Host(
+            view: view,
+            preferredSize: { _ in CGSize(width: 82, height: 25) },
+            retained: retained
+        )
     }
 
     /// A box's content changed shape (rows added, embed resized) — re-ask the
@@ -327,6 +340,28 @@ final class InlineViewManager {
             controller
         )
         #endif
+    }
+}
+
+private struct LiveTranscriptionInlineView: View {
+    let stop: () -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "mic.fill")
+                .foregroundStyle(.purple)
+            Button(action: stop) {
+                Label("Stop", systemImage: "stop.fill")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.plain)
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .padding(.horizontal, 7)
+        .frame(height: 23)
+        .background(.purple.opacity(0.13), in: Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Live transcription")
     }
 }
 

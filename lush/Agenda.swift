@@ -684,7 +684,7 @@ struct CalendarEventInlineView: View {
         return HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(block.calendarEventTitle ?? "Calendar Item")
-                    .font(.system(size: max(11, RichText.bodySize - 1), weight: .semibold))
+                    .font(.system(size: RichText.bodySize * 0.92, weight: .semibold))
                     .lineLimit(1)
                 HStack(spacing: 4) {
                     Image(systemName: isReminder ? "checklist" : "clock")
@@ -698,13 +698,13 @@ struct CalendarEventInlineView: View {
                         Text("· \(calendar)").lineLimit(1)
                     }
                 }
-                .font(.system(size: max(10, RichText.bodySize - 3)))
+                .font(.system(size: RichText.bodySize * 0.82))
                 .opacity(0.75)
             }
             Spacer(minLength: 8)
             if block.opensExternally {
                 Image(systemName: "arrow.up.forward")
-                    .font(.system(size: max(13, RichText.bodySize - 1), weight: .semibold))
+                    .font(.system(size: RichText.bodySize * 0.92, weight: .semibold))
                     .frame(width: 32, height: 32)
                     .background(
                         RoundedRectangle(cornerRadius: 7)

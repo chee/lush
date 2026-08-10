@@ -1749,6 +1749,52 @@ impl Core {
         Ok(())
     }
 
+    pub fn link_note_to_folder_in(
+        &self,
+        folder_url: String,
+        note_url: String,
+        title: String,
+    ) -> Result<(), CoreError> {
+        let folder = DocId::from_url(&folder_url)?;
+        let repo = self.repo.clone();
+        self.runtime.block_on(async move {
+            let mut name = title;
+            let mut kind = "rich".to_string();
+            if let Ok(id) = DocId::from_url(&note_url) {
+                let _ = repo.ensure_doc(id).await;
+                if repo.wait_for_doc(id, LINK_TIMEOUT).await {
+                    if let Ok((doc_name, doc_kind)) = repo
+                        .read_doc(id, |doc| {
+                            Ok((shapes::doc_title(doc), shapes::doc_patchwork_type(doc)))
+                        })
+                        .await
+                    {
+                        if name.is_empty() {
+                            name = doc_name;
+                        }
+                        if let Some(doc_kind) = doc_kind {
+                            kind = doc_kind;
+                        }
+                    }
+                }
+            }
+            repo.change_doc(folder, |doc| {
+                shapes::add_folder_entry(
+                    doc,
+                    &shapes::DocLink {
+                        name,
+                        kind,
+                        url: note_url,
+                        lush: None,
+                    },
+                )
+            })
+            .await?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
     pub fn delete_note(&self, url: String) -> Result<(), CoreError> {
         let folder = self
             .folder
@@ -1807,6 +1853,21 @@ impl Core {
         })
         .await??;
         Ok(())
+    }
+
+    pub async fn document_kind(&self, url: String) -> Result<String, CoreError> {
+        let repo = self.repo.clone();
+        let id = DocId::from_url(&url)?;
+        let kind = self
+            .run(async move {
+                repo.ensure_doc(id).await?;
+                if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
+                    anyhow::bail!("document unavailable");
+                }
+                repo.read_doc(id, |doc| Ok(shapes::doc_kind(doc))).await
+            })
+            .await??;
+        Ok(kind)
     }
 
     /// Start tracking + syncing docs without waiting for them to arrive,

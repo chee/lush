@@ -57,13 +57,13 @@ enum RichTextClipboard {
         return [webCustomMapIdentifier: map, webCustomPayloadIdentifier: payload]
     }
 
-    static func html(from spans: [SpanNode]) -> String {
-        NoteExporter.htmlFragment(from: spans)
+    static func html(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+        NoteExporter.htmlFragment(from: spans, inlineImages: inlineImages)
     }
 
     static func markdown(
         from spans: [SpanNode],
-        attachmentLabel: (Int) -> String = { _ in "[attachment]" }
+        attachmentLabel: (BlockValue, Int) -> String = { _, _ in "[attachment]" }
     ) -> String {
         var lines: [String] = []
         var attachments = 0
@@ -122,7 +122,7 @@ enum RichTextClipboard {
                 }
             default:
                 if block.isEmbedBlock {
-                    lines.append(attachmentLabel(attachments))
+                    lines.append(attachmentLabel(block, attachments))
                     attachments += 1
                 } else {
                     lines.append(escapeLeadingMarker(content))

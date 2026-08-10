@@ -20,6 +20,7 @@ func reordered<T: Equatable>(_ items: [T], moving item: T, adjacentTo target: T,
 @Observable @MainActor
 final class NotesModel {
     static let shared = NotesModel()
+    @ObservationIgnored let undoManager = UndoManager()
     private static let applyIncomingKey = "focusApplyIncoming"
     private static let sendChangesKey = "focusSendChanges"
     private static let presenceKey = "focusPresence"
@@ -723,11 +724,45 @@ final class NotesModel {
 
     func removeEntry(parentUrl: String?, url: String) {
         guard let core, let parent = parentUrl ?? folderUrl else { return }
-        Task.detached { [core, weak self, parent, url] in
+        let title = node(for: url)?.name ?? ""
+        removeEntry(core: core, parent: parent, url: url, title: title)
+    }
+
+    private func removeEntry(core: Core, parent: String, url: String, title: String) {
+        Task.detached { [core, weak self, parent, url, title] in
             do {
                 try core.removeEntry(folderUrl: parent, url: url)
             } catch {
-                print("removeEntry failed: parent=\(parent) url=\(url) error=\(error)")
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't remove note: \(error.localizedDescription)"
+                }
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.undoManager.registerUndo(withTarget: self) { model in
+                    model.restoreEntry(parent: parent, url: url, title: title)
+                }
+                self.undoManager.setActionName("Remove Note")
+                self.refreshNotes()
+            }
+        }
+    }
+
+    private func restoreEntry(parent: String, url: String, title: String) {
+        guard let core else { return }
+        undoManager.registerUndo(withTarget: self) { model in
+            model.removeEntry(core: core, parent: parent, url: url, title: title)
+        }
+        undoManager.setActionName("Remove Note")
+        Task.detached { [core, weak self, parent, url, title] in
+            do {
+                try core.linkNoteToFolderIn(folderUrl: parent, noteUrl: url, title: title)
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "Couldn't restore note: \(error.localizedDescription)"
+                }
+                return
             }
             await MainActor.run { [weak self] in self?.refreshNotes() }
         }
@@ -1755,6 +1790,19 @@ final class NotesModel {
     func openInPatchwork(_ documentUrl: String) {
         guard let url = URL(string: Self.patchworkUrl(for: documentUrl)) else { return }
         ExternalBrowser.open(url)
+    }
+
+    func documentKind(for url: String) async -> String? {
+        if core == nil {
+            await start()
+        }
+        guard let core else { return nil }
+        return try? await core.documentKind(url: url)
+    }
+
+    func rememberPatchworkDocument(_ url: String) {
+        patchworkDocUrls.insert(url)
+        UserDefaults.standard.set(Array(patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
     }
 
     func moveItem(_ url: String, into destination: String) {

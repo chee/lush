@@ -166,7 +166,7 @@ struct ContextInlineView: View {
             Spacer(minLength: 0)
         }
         .labelStyle(.titleAndIcon)
-        .font(.system(size: max(10, RichText.bodySize - 4)))
+        .font(.system(size: RichText.bodySize * 0.76))
         .foregroundStyle(.tertiary)
         .lineLimit(1)
         .padding(.vertical, 4)

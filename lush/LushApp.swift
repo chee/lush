@@ -16,6 +16,7 @@ private extension NSResponder {
 @MainActor
 final class LushAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = true
         NotesModel.bootLog("appDelegate willFinishLaunching")
         LushShared.migrateDefaults()
         NotesModel.bootLog("defaults migrated")
@@ -202,6 +203,21 @@ struct FolderCommands: Commands {
     }
 }
 
+#if os(macOS)
+struct MainWindowCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("New Tab") {
+                MainWindowTabs.open(selection: nil, using: openWindow)
+            }
+            .keyboardShortcut("t", modifiers: .command)
+        }
+    }
+}
+#endif
+
 struct ViewCommands: Commands {
     @AppStorage(EditorSettings.zenModeKey) private var zenMode = false
     @AppStorage(EditorSettings.typewriterModeKey) private var typewriterMode = false
@@ -333,6 +349,39 @@ struct FormatCommands: Commands {
 }
 
 #if os(macOS)
+struct UndoCommands: Commands {
+    let model: NotesModel
+    @FocusedValue(\.editorController) private var editor
+    @Environment(\.undoManager) private var systemUndoManager
+
+    private var undoManager: UndoManager? {
+        if editor?.undoManager?.canUndo == true { return editor?.undoManager }
+        if systemUndoManager?.canUndo == true { return systemUndoManager }
+        return model.undoManager
+    }
+
+    private var redoManager: UndoManager? {
+        if editor?.undoManager?.canRedo == true { return editor?.undoManager }
+        if systemUndoManager?.canRedo == true { return systemUndoManager }
+        return model.undoManager
+    }
+
+    var body: some Commands {
+        CommandGroup(replacing: .undoRedo) {
+            Button(undoManager?.undoMenuItemTitle ?? "Undo") {
+                undoManager?.undo()
+            }
+            .keyboardShortcut("z")
+            .disabled(undoManager?.canUndo != true)
+            Button(redoManager?.redoMenuItemTitle ?? "Redo") {
+                redoManager?.redo()
+            }
+            .keyboardShortcut("z", modifiers: [.command, .shift])
+            .disabled(redoManager?.canRedo != true)
+        }
+    }
+}
+
 struct SearchCommands: Commands {
     @FocusedValue(\.noteSearchActions) private var searchActions
     @FocusedValue(\.editorController) private var editor
@@ -412,8 +461,8 @@ struct LushApp: App {
 
     var body: some Scene {
         #if os(macOS)
-        WindowGroup(id: "main") {
-            ContentView()
+        WindowGroup(id: "main", for: MainWindowRoute.self) { $route in
+            ContentView(initialRoute: route)
                 .environment(model)
                 .environment(contextTracker)
                 .interfaceFont()
@@ -425,11 +474,13 @@ struct LushApp: App {
         }
         .windowToolbarStyle(.unified(showsTitle: false))
         .commands {
+            UndoCommands(model: model)
             EditCommands()
             SearchCommands()
             ViewCommands()
             FormatCommands()
             FolderCommands(model: model)
+            MainWindowCommands()
         }
 
         WindowGroup(id: "note-detail", for: String.self) { $noteUrl in
@@ -488,6 +539,14 @@ struct LushApp: App {
                     )
                 ) { _ in
                     Task { await NotesModel.shared.focus.reconcileWithSystemFocus() }
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: UIContentSizeCategory.didChangeNotification
+                    )
+                ) { _ in
+                    EditorSettings.refreshDynamicType()
+                    InterfaceFont.applyNavigationBarAppearance(family: InterfaceFont.family)
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(

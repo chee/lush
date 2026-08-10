@@ -1,0 +1,99 @@
+[theme="apple-light"] {
+  color-scheme: light;
+  --studio-fill: #ffffff;
+  --studio-line: #1d1d1f;
+  --studio-primary: #007aff;
+  --studio-secondary: #5856d6;
+  --studio-danger: #ff3b30;
+  --studio-warning: #ff9500;
+  --studio-added: #248a3d;
+  --studio-deleted: #ff3b30;
+  --studio-modified: #bf5af2;
+  --studio-link: #007aff;
+  --studio-selection-fill: #007aff33;
+  --studio-offset-tint: #007aff;
+  --studio-offset-tint-amount: 3%;
+  --studio-chrome-fill: #f5f5f7;
+  --studio-chrome-line: #1d1d1f;
+  --text-editor-fill: #ffffff;
+  --text-editor-line: #1d1d1f;
+  --text-editor-cursor-fill: #007aff;
+  --text-editor-selection-fill: #007aff33;
+  --text-editor-selection-line: #1d1d1f;
+  --text-editor-active-line-fill: #007aff0a;
+  --text-editor-active-line-fill--gutter: #f5f5f7;
+  --text-editor-gutter-fill: #f5f5f7;
+  --text-editor-gutter-line: #6e6e73;
+  --text-editor-tooltip-fill: #ffffff;
+  --text-editor-tooltip-color: #1d1d1f;
+  --syntax-comment: #6e6e73;
+  --syntax-meta: #9f6e00;
+  --syntax-invalid: #ff3b30;
+  --syntax-keyword: #ad3da4;
+  --syntax-type-name: #0b4f79;
+  --syntax-class-name: #0b4f79;
+  --syntax-function--variable-name: #326d74;
+  --syntax-function--property-name: #326d74;
+  --syntax-variable-name: #1d1d1f;
+  --syntax-string: #c41a16;
+  --syntax-number: #1c00cf;
+  --syntax-tag-name: #ad3da4;
+  --syntax-attribute-name: #836c28;
+  --syntax-heading: #0b4f79;
+  --syntax-link: #007aff;
+}
+
+[theme="apple-dark"] {
+  color-scheme: dark;
+  --studio-fill: #1c1c1e;
+  --studio-line: #f5f5f7;
+  --studio-primary: #0a84ff;
+  --studio-secondary: #5e5ce6;
+  --studio-danger: #ff453a;
+  --studio-warning: #ff9f0a;
+  --studio-added: #30d158;
+  --studio-deleted: #ff453a;
+  --studio-modified: #bf5af2;
+  --studio-link: #0a84ff;
+  --studio-selection-fill: #0a84ff55;
+  --studio-offset-tint: #0a84ff;
+  --studio-offset-tint-amount: 4%;
+  --studio-chrome-fill: #2c2c2e;
+  --studio-chrome-line: #f5f5f7;
+  --text-editor-fill: #1c1c1e;
+  --text-editor-line: #f5f5f7;
+  --text-editor-cursor-fill: #0a84ff;
+  --text-editor-selection-fill: #0a84ff55;
+  --text-editor-selection-line: #f5f5f7;
+  --text-editor-active-line-fill: #0a84ff14;
+  --text-editor-active-line-fill--gutter: #2c2c2e;
+  --text-editor-gutter-fill: #2c2c2e;
+  --text-editor-gutter-line: #aeaeb2;
+  --text-editor-tooltip-fill: #3a3a3c;
+  --text-editor-tooltip-color: #f5f5f7;
+  --syntax-comment: #98989d;
+  --syntax-meta: #ffd60a;
+  --syntax-invalid: #ff453a;
+  --syntax-keyword: #ff7ab2;
+  --syntax-type-name: #5ac8fa;
+  --syntax-class-name: #5ac8fa;
+  --syntax-function--variable-name: #63e6e2;
+  --syntax-function--property-name: #63e6e2;
+  --syntax-variable-name: #f5f5f7;
+  --syntax-string: #ff8170;
+  --syntax-number: #d0bf69;
+  --syntax-tag-name: #ff7ab2;
+  --syntax-attribute-name: #ffd60a;
+  --syntax-heading: #5ac8fa;
+  --syntax-link: #0a84ff;
+}
+
+[theme="apple-light"],
+[theme="apple-dark"] {
+  --studio-family-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --studio-family-code: "SF Mono", ui-monospace, monospace;
+  --studio-family: var(--studio-family-sans);
+  --studio-family-ui: var(--studio-family-sans);
+  --studio-font-size: 16px;
+  --studio-line-height: 1.45;
+}
