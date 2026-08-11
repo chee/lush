@@ -1425,6 +1425,13 @@ final class EditorCore {
         guard !replacement.contains("\n"),
               !replacement.contains("\u{FFFC}")
         else { return false }
+        if !replacement.isEmpty {
+            guard let view else { return false }
+            let block = typingBlock()
+            guard RichText.marks(from: view.pTypingAttributes, block: block).isEmpty else {
+                return false
+            }
+        }
         if range.length > 0 {
             guard !string.substring(with: range).contains("\n") else { return false }
             let paragraph = string.paragraphRange(for: NSRange(location: range.location, length: 0))
@@ -1487,6 +1494,12 @@ final class EditorCore {
                 || (attrs[.amBlock] as? BlockBox)?.value.isAtomic == true {
                 ok = false
                 stop.pointee = true
+                return
+            }
+            let block = (attrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+            if !RichText.marks(from: attrs, block: block).isEmpty {
+                ok = false
+                stop.pointee = true
             }
         }
         return ok
@@ -1532,12 +1545,29 @@ final class EditorCore {
             storage.enumerateAttribute(.amDisplayOnly, in: range) { displayOnly, runRange, _ in
                 guard displayOnly == nil else { return }
                 let start = runRange.location - range.location
-                for i in start ..< start + runRange.length {
+                let end = start + runRange.length
+                var i = start
+                while i < end {
                     let unit = units[i]
-                    if unit == 0xFFFC { continue }
-                    if unit >= 0xDC00, unit < 0xE000, i > start,
-                       units[i - 1] >= 0xD800, units[i - 1] < 0xDC00 { continue }
+                    if unit == 0xFFFC {
+                        i += 1
+                        continue
+                    }
+                    if unit >= 0xD800, unit < 0xDC00 {
+                        if i + 1 < end, units[i + 1] >= 0xDC00, units[i + 1] < 0xE000 {
+                            count += 1
+                            i += 2
+                        } else {
+                            i += 1
+                        }
+                        continue
+                    }
+                    if unit >= 0xDC00, unit < 0xE000 {
+                        i += 1
+                        continue
+                    }
                     count += 1
+                    i += 1
                 }
             }
             return count
