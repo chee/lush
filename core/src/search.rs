@@ -139,13 +139,36 @@ impl SearchIndex {
                 PRIMARY KEY (url, chunk)
             );
             CREATE TABLE IF NOT EXISTS search_parents (
-                url TEXT PRIMARY KEY NOT NULL,
-                parent TEXT NOT NULL
+                url TEXT NOT NULL,
+                parent TEXT NOT NULL,
+                PRIMARY KEY (url, parent)
             );
             CREATE INDEX IF NOT EXISTS search_parents_parent
                 ON search_parents(parent);
             "#,
         )?;
+        let parent_pk: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(pk), 0) FROM pragma_table_info('search_parents') WHERE name = 'parent'",
+            [],
+            |row| row.get(0),
+        )?;
+        if parent_pk != 2 {
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS search_parents_parent;
+                 BEGIN;
+                 CREATE TABLE search_parents_new (
+                    url TEXT NOT NULL,
+                    parent TEXT NOT NULL,
+                    PRIMARY KEY (url, parent)
+                 );
+                 INSERT OR IGNORE INTO search_parents_new(url, parent)
+                    SELECT url, parent FROM search_parents;
+                 DROP TABLE search_parents;
+                 ALTER TABLE search_parents_new RENAME TO search_parents;
+                 CREATE INDEX search_parents_parent ON search_parents(parent);
+                 COMMIT;",
+            )?;
+        }
         // Pre-existing databases were created without `modified`; the error on
         // a second run is "duplicate column name" and is the expected outcome.
         let _ = conn.execute(
@@ -286,13 +309,13 @@ impl SearchIndex {
     /// Replaces the whole parent map in one go. Folder membership lives in the
     /// folder docs, not the notes, so only a full tree walk knows it; the walker
     /// hands the finished edges over rather than the index guessing at them.
-    pub fn set_parents(&self, parents: &HashMap<String, String>) -> Result<()> {
+    pub fn set_parents(&self, parents: &[(String, String)]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM search_parents", [])?;
         {
             let mut stmt =
-                tx.prepare("INSERT OR REPLACE INTO search_parents(url, parent) VALUES (?1, ?2)")?;
+                tx.prepare("INSERT OR IGNORE INTO search_parents(url, parent) VALUES (?1, ?2)")?;
             for (url, parent) in parents {
                 stmt.execute(params![url, parent])?;
             }
@@ -880,12 +903,13 @@ mod tests {
             .unwrap();
         index.upsert(indexed("outside", "cake", &[], "")).unwrap();
         index
-            .set_parents(&HashMap::from([
+            .set_parents(&[
                 ("note".into(), "work".into()),
+                ("note".into(), "home".into()),
                 ("sub".into(), "work".into()),
                 ("deep".into(), "sub".into()),
                 ("outside".into(), "home".into()),
-            ]))
+            ])
             .unwrap();
         index
     }
@@ -900,6 +924,19 @@ mod tests {
         assert_eq!(
             urls(index.search("cake", &filter).unwrap()),
             ["deep", "note"]
+        );
+    }
+
+    #[test]
+    fn scope_keeps_notes_with_multiple_parents() {
+        let index = fixture();
+        let filter = SearchFilter {
+            scope: Some("home".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            urls(index.search("cake", &filter).unwrap()),
+            ["note", "outside"]
         );
     }
 
@@ -948,5 +985,44 @@ mod tests {
             urls(index.search("cake", &SearchFilter::default()).unwrap()),
             ["note"]
         );
+    }
+
+    #[test]
+    fn single_parent_schema_is_migrated() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lush-search-parent-migration-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("search.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE search_parents (
+                url TEXT PRIMARY KEY NOT NULL,
+                parent TEXT NOT NULL
+             );
+             INSERT INTO search_parents(url, parent) VALUES ('note', 'work');",
+        )
+        .unwrap();
+        drop(conn);
+        let index = SearchIndex::open(&dir).unwrap();
+        index
+            .set_parents(&[
+                ("note".into(), "work".into()),
+                ("note".into(), "home".into()),
+            ])
+            .unwrap();
+        let conn = index.conn.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM search_parents WHERE url = 'note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

@@ -60,7 +60,7 @@ struct NotebookTree {
                 if entry.kind == "folder" { queue.append(entry.url) }
             }
         }
-        core.setSearchParents(parents: tree.parents)
+        core.setSearchParents(parents: tree.parents.map { SearchParent(url: $0.key, parent: $0.value) })
         return tree
     }
 }

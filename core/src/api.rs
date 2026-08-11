@@ -57,6 +57,12 @@ pub struct NoteInfo {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct SearchParent {
+    pub url: String,
+    pub parent: String,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct NoteSpansSnapshot {
     pub spans_json: String,
     pub heads: Vec<String>,
@@ -2017,7 +2023,11 @@ impl Core {
     /// search can narrow inside SQL instead of throwing away rows the limit
     /// already cut. Folder membership lives on the folder docs, so only a
     /// caller that has walked the tree knows this.
-    pub fn set_search_parents(&self, parents: HashMap<String, String>) {
+    pub fn set_search_parents(&self, parents: Vec<SearchParent>) {
+        let parents: Vec<_> = parents
+            .into_iter()
+            .map(|edge| (edge.url, edge.parent))
+            .collect();
         let _ = self.index.set_parents(&parents);
     }
 
@@ -2875,6 +2885,9 @@ impl Core {
         })
     }
 }
+
+#[cfg(test)]
+mod fuzz;
 
 #[cfg(test)]
 mod tests {

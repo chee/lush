@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use lush_core::api::Core;
+use lush_core::api::{Core, SearchParent};
 
 fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all("/tmp/searchtest-data");
@@ -37,11 +37,20 @@ fn main() -> anyhow::Result<()> {
         println!("hit: {} | {} | {}", h.name, h.url, h.snippet);
     }
     assert_eq!(hits.len(), 2, "expected hits from root and subfolder");
-    core.set_search_parents(std::collections::HashMap::from([
-        (note1.clone(), root.clone()),
-        (sub.clone(), root.clone()),
-        (note2.clone(), sub.clone()),
-    ]));
+    core.set_search_parents(vec![
+        SearchParent {
+            url: note1.clone(),
+            parent: root.clone(),
+        },
+        SearchParent {
+            url: sub.clone(),
+            parent: root.clone(),
+        },
+        SearchParent {
+            url: note2.clone(),
+            parent: sub.clone(),
+        },
+    ]);
     let scoped = core.search_notes(
         "walrus".into(),
         Some(lush_core::api::SearchFilter {

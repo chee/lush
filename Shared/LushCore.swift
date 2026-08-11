@@ -983,7 +983,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * already cut. Folder membership lives on the folder docs, so only a
      * caller that has walked the tree knows this.
      */
-    func setSearchParents(parents: [String: String]) 
+    func setSearchParents(parents: [SearchParent]) 
     
     func setSendChanges(enabled: Bool) async 
     
@@ -2363,9 +2363,9 @@ open func setNoteEmbeddings(url: String, name: String, digest: String, chunks: [
      * already cut. Folder membership lives on the folder docs, so only a
      * caller that has walked the tree knows this.
      */
-open func setSearchParents(parents: [String: String])  {try! rustCall() {
+open func setSearchParents(parents: [SearchParent])  {try! rustCall() {
     uniffi_lush_core_fn_method_core_set_search_parents(self.uniffiClonePointer(),
-        FfiConverterDictionaryStringString.lower(parents),$0
+        FfiConverterSequenceTypeSearchParent.lower(parents),$0
     )
 }
 }
@@ -4580,6 +4580,76 @@ public func FfiConverterTypeSearchHit_lower(_ value: SearchHit) -> RustBuffer {
 }
 
 
+public struct SearchParent {
+    public var url: String
+    public var parent: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, parent: String) {
+        self.url = url
+        self.parent = parent
+    }
+}
+
+#if compiler(>=6)
+extension SearchParent: Sendable {}
+#endif
+
+
+extension SearchParent: Equatable, Hashable {
+    public static func ==(lhs: SearchParent, rhs: SearchParent) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.parent != rhs.parent {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(parent)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSearchParent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SearchParent {
+        return
+            try SearchParent(
+                url: FfiConverterString.read(from: &buf), 
+                parent: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SearchParent, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.parent, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchParent_lift(_ buf: RustBuffer) throws -> SearchParent {
+    return try FfiConverterTypeSearchParent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSearchParent_lower(_ value: SearchParent) -> RustBuffer {
+    return FfiConverterTypeSearchParent.lower(value)
+}
+
+
 /**
  * A saved search. `rules` is the JSON rule tree the editor writes; the flat
  * `query`/`kind`/`scope`/`within_days` fields carry a best-effort projection
@@ -5773,6 +5843,31 @@ fileprivate struct FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSearchParent: FfiConverterRustBuffer {
+    typealias SwiftType = [SearchParent]
+
+    public static func write(_ value: [SearchParent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSearchParent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SearchParent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SearchParent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSearchParent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSmartNotebook: FfiConverterRustBuffer {
     typealias SwiftType = [SmartNotebook]
 
@@ -6225,7 +6320,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_note_embeddings() != 49168) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_set_search_parents() != 11459) {
+    if (uniffi_lush_core_checksum_method_core_set_search_parents() != 43125) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_send_changes() != 8485) {

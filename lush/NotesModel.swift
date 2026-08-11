@@ -951,7 +951,8 @@ final class NotesModel {
                 self.folderNodeCache = newCache
                 self.writeWidgetSnapshot()
             }
-            core.setSearchParents(parents: await self.notebookTree.parents)
+            let parentMap = await self.notebookTree.parents
+            core.setSearchParents(parents: parentMap.map { SearchParent(url: $0.key, parent: $0.value) })
         }
     }
 
