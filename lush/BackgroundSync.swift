@@ -8,6 +8,29 @@ enum BackgroundSync {
     static let processingIdentifier = "party.chee.patchwork.lush.sync.processing"
 
     private static var assertion = UIBackgroundTaskIdentifier.invalid
+    private static var assertionWork: Task<Void, Never>?
+    private static var assertionToken: UUID?
+
+    private final class Completion: @unchecked Sendable {
+        private let task: BGTask
+        private let lock = NSLock()
+        private var completed = false
+
+        init(_ task: BGTask) {
+            self.task = task
+        }
+
+        func finish(success: Bool) {
+            lock.lock()
+            guard !completed else {
+                lock.unlock()
+                return
+            }
+            completed = true
+            lock.unlock()
+            task.setTaskCompleted(success: success)
+        }
+    }
 
     static func register() {
         BGTaskScheduler.shared.register(forTaskWithIdentifier: refreshIdentifier, using: nil) { task in
@@ -40,13 +63,23 @@ enum BackgroundSync {
         schedule()
         guard assertion == .invalid else { return }
         assertion = UIApplication.shared.beginBackgroundTask(withName: "lush.sync") {
+            assertionWork?.cancel()
+            assertionWork = nil
+            assertionToken = nil
             endAssertion()
         }
-        Task { @MainActor in
+        let token = UUID()
+        assertionToken = token
+        let work = Task { @MainActor in
             await NotesModel.shared.syncNow(budget: .seconds(15))
+            guard !Task.isCancelled else { return }
             await NotesModel.shared.checkSmartNotebooks()
+            guard assertionToken == token else { return }
+            assertionWork = nil
+            assertionToken = nil
             endAssertion()
         }
+        assertionWork = work
     }
 
     private static func endAssertion() {
@@ -57,13 +90,18 @@ enum BackgroundSync {
 
     private static func run(_ task: BGTask, budget: Duration) async {
         schedule()
+        let completion = Completion(task)
         let work = Task { @MainActor in
             await NotesModel.shared.syncNow(budget: budget)
+            guard !Task.isCancelled else { return }
             await NotesModel.shared.checkSmartNotebooks()
         }
-        task.expirationHandler = { work.cancel() }
+        task.expirationHandler = {
+            work.cancel()
+            completion.finish(success: false)
+        }
         await work.value
-        task.setTaskCompleted(success: !work.isCancelled)
+        completion.finish(success: !work.isCancelled)
     }
 }
 #endif
