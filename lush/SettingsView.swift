@@ -397,7 +397,7 @@ struct SyncSettingsPane: View {
 
 struct EditorSettingsPane: View {
     var body: some View {
-        SettingsSubtabs(["Fonts", "Page", "Logline"]) { section in
+        SettingsSubtabs(sections) { section in
             switch section {
             case "Page": PageSettingsPane()
             case "Logline": LoglineSettingsPane()
@@ -405,6 +405,13 @@ struct EditorSettingsPane: View {
             }
         }
         .navigationTitle("Editor")
+    }
+
+    private var sections: [String] {
+        #if os(iOS)
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return ["Fonts", "Logline"] }
+        #endif
+        return ["Fonts", "Page", "Logline"]
     }
 }
 

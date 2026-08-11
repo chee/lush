@@ -798,6 +798,9 @@ enum EditorSettings {
     /// The character measure in points, at the body font and size. Zero when
     /// notes fill the editor.
     static var maxNoteWidth: CGFloat {
+        #if os(iOS)
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return 0 }
+        #endif
         let characters = maxNoteCharacters
         guard characters > 0 else { return 0 }
         let advance = ("0" as NSString)
@@ -807,7 +810,10 @@ enum EditorSettings {
     }
 
     static var minimapVisible: Bool {
-        UserDefaults.standard.bool(forKey: minimapKey)
+        #if os(iOS)
+        guard UIDevice.current.userInterfaceIdiom == .pad else { return false }
+        #endif
+        return UserDefaults.standard.bool(forKey: minimapKey)
     }
 
     static func setMinimapVisible(_ visible: Bool) {
