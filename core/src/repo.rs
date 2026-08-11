@@ -703,7 +703,10 @@ pub struct Repo {
     apply_incoming: AtomicBool,
     send_changes: AtomicBool,
     local_port: Option<u16>,
-    iroh_endpoint: Option<Arc<iroh::Endpoint>>,
+    iroh_key_path: PathBuf,
+    iroh_endpoint: std::sync::Mutex<Option<Arc<iroh::Endpoint>>>,
+    /// Serializes enable/disable so a bind and a close can't interleave.
+    iroh_lifecycle: Mutex<()>,
     peers_path: PathBuf,
     peers: std::sync::Mutex<Peers>,
 }
@@ -1234,17 +1237,76 @@ impl Repo {
             .map(|port| format!("http://127.0.0.1:{port}"))
     }
 
+    fn iroh_endpoint(&self) -> Option<Arc<iroh::Endpoint>> {
+        self.iroh_endpoint.lock().unwrap().clone()
+    }
+
     pub fn iroh_node_id(&self) -> Option<String> {
-        self.iroh_endpoint.as_ref().map(|ep| ep.id().to_string())
+        self.iroh_endpoint().map(|ep| ep.id().to_string())
     }
 
     /// What you hand a friend: both of this device's public keys, the iroh one
     /// that says where to dial and the subduction one that says who will answer.
     pub fn iroh_friend_code(&self) -> Option<String> {
         let peer_id = PeerId::from(self.signer.verifying_key());
-        self.iroh_endpoint
-            .as_ref()
+        self.iroh_endpoint()
             .map(|ep| format!("{}:{peer_id}", ep.id()))
+    }
+
+    /// Peer-to-peer sync is off until she turns it on. Binding the endpoint
+    /// reaches for a relay, so it never happens on the startup path.
+    pub async fn set_iroh_enabled(self: &Arc<Self>, enabled: bool) -> Result<()> {
+        let _lifecycle = self.iroh_lifecycle.lock().await;
+        if enabled == self.iroh_endpoint().is_some() {
+            return Ok(());
+        }
+        if enabled {
+            self.start_iroh().await?;
+        } else {
+            let endpoint = self.iroh_endpoint.lock().unwrap().take();
+            if let Some(ep) = endpoint {
+                ep.close().await;
+            }
+        }
+        let _ = self.events.send(RepoEvent::PeersChanged);
+        Ok(())
+    }
+
+    /// The accept loop ends on its own when the endpoint closes, so disabling
+    /// only has to drop it.
+    async fn start_iroh(self: &Arc<Self>) -> Result<()> {
+        let key = load_or_create_iroh_key(&self.iroh_key_path)?;
+        let endpoint = Arc::new(
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(key)
+                .alpns(vec![subduction_iroh::ALPN.to_vec()])
+                .bind()
+                .await
+                .context("binding iroh endpoint")?,
+        );
+        tracing::info!(node_id = %endpoint.id(), "iroh endpoint bound");
+        *self.iroh_endpoint.lock().unwrap() = Some(endpoint.clone());
+        tokio::spawn(accept_iroh_peer(endpoint, self.clone()));
+        let dialer = self.clone();
+        tokio::spawn(async move {
+            for peer in dialer.iroh_peers() {
+                if !peer.added {
+                    continue;
+                }
+                let code = match &peer.peer_id {
+                    Some(peer_id) => format!("{}:{peer_id}", peer.node_id),
+                    None => peer.node_id.clone(),
+                };
+                let dial = async {
+                    let (node_id, expected) = parse_friend_code(&code)?;
+                    dialer.dial_iroh_peer(node_id, expected).await
+                };
+                if let Err(e) = dial.await {
+                    tracing::warn!(peer = %peer.node_id, error = %e, "iroh: dialing saved peer failed");
+                }
+            }
+        });
+        Ok(())
     }
 
     /// Every peer we know about. Not-added peers are ones who dialed us — the
@@ -1331,15 +1393,14 @@ impl Repo {
         expected: Option<PeerId>,
     ) -> Result<PeerId> {
         let ep = self
-            .iroh_endpoint
-            .as_ref()
+            .iroh_endpoint()
             .ok_or_else(|| anyhow!("iroh endpoint not running"))?;
         if node_id == ep.id() {
             return Err(anyhow!("that's this device's own node id"));
         }
         let addr = iroh::EndpointAddr::from(node_id);
         let audience = expected.map_or_else(|| iroh_audience(&node_id), Audience::known);
-        let result = subduction_iroh::client::connect(ep, addr, &self.signer, audience)
+        let result = subduction_iroh::client::connect(&ep, addr, &self.signer, audience)
             .await
             .map_err(|e| match e {
                 subduction_iroh::error::ConnectError::Handshake(_) => anyhow!(
@@ -1404,12 +1465,16 @@ impl Repo {
         chunks
     }
 
-    pub async fn start(data_dir: PathBuf, server_url: String) -> Result<Arc<Repo>> {
+    pub async fn start(
+        data_dir: PathBuf,
+        server_url: String,
+        enable_iroh: bool,
+    ) -> Result<Arc<Repo>> {
         let boot = std::time::Instant::now();
         std::fs::create_dir_all(&data_dir).context("creating data dir")?;
         let outbox_dir = data_dir.join("outbox");
         std::fs::create_dir_all(&outbox_dir).context("creating outbox dir")?;
-        let iroh_key = load_or_create_iroh_key(&data_dir.join("iroh.key"))?;
+        let iroh_key_path = data_dir.join("iroh.key");
         let peers_path = data_dir.join("iroh-peers.json");
         let signer = load_or_create_signer(&data_dir.join("identity.seed"))?;
         let storage =
@@ -1491,27 +1556,6 @@ impl Repo {
             }
         });
 
-        let iroh_endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(iroh_key)
-            .alpns(vec![subduction_iroh::ALPN.to_vec()])
-            .bind()
-            .await
-        {
-            Ok(ep) => {
-                tracing::info!(node_id = %ep.id(), "iroh endpoint bound");
-                Some(Arc::new(ep))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "iroh endpoint failed to bind; peer-to-peer sync unavailable");
-                None
-            }
-        };
-        tracing::info!(
-            elapsed_ms = boot.elapsed().as_millis(),
-            iroh = iroh_endpoint.is_some(),
-            "repo peer endpoint ready"
-        );
-
         let (events, _) = broadcast::channel(256);
         {
             let events = events.clone();
@@ -1545,7 +1589,9 @@ impl Repo {
             apply_incoming: AtomicBool::new(true),
             send_changes: AtomicBool::new(true),
             local_port,
-            iroh_endpoint,
+            iroh_key_path,
+            iroh_endpoint: std::sync::Mutex::new(None),
+            iroh_lifecycle: Mutex::new(()),
             peers: std::sync::Mutex::new(load_peers(&peers_path)),
             peers_path,
         });
@@ -1598,29 +1644,6 @@ impl Repo {
             });
         }
 
-        if let Some(iroh_ep) = repo.iroh_endpoint.clone() {
-            tokio::spawn(accept_iroh_peer(iroh_ep, repo.clone()));
-            let dialer = repo.clone();
-            tokio::spawn(async move {
-                for peer in dialer.iroh_peers() {
-                    if !peer.added {
-                        continue;
-                    }
-                    let code = match &peer.peer_id {
-                        Some(peer_id) => format!("{}:{peer_id}", peer.node_id),
-                        None => peer.node_id.clone(),
-                    };
-                    let dial = async {
-                        let (node_id, expected) = parse_friend_code(&code)?;
-                        dialer.dial_iroh_peer(node_id, expected).await
-                    };
-                    if let Err(e) = dial.await {
-                        tracing::warn!(peer = %peer.node_id, error = %e, "iroh: dialing saved peer failed");
-                    }
-                }
-            });
-        }
-
         {
             let repo = repo.clone();
             tokio::spawn(async move {
@@ -1656,7 +1679,7 @@ impl Repo {
                 }
             });
         }
-        repo.start_storage_load();
+        repo.start_storage_load(enable_iroh);
         Ok(repo)
     }
 
@@ -1769,7 +1792,7 @@ impl Repo {
 
     /// Reads what is on disk, then says so and dials out. Owning the order here
     /// means no caller has to judge when the local load is done.
-    fn start_storage_load(self: &Arc<Self>) {
+    fn start_storage_load(self: &Arc<Self>, enable_iroh: bool) {
         let repo = self.clone();
         tokio::spawn(async move {
             match <ObservedStorage as Storage<Sendable>>::load_all_sedimentree_ids(&repo.storage)
@@ -1780,6 +1803,11 @@ impl Repo {
             }
             let _ = repo.events.send(RepoEvent::StorageLoaded);
             repo.start_connect_loop_if_needed();
+            if enable_iroh {
+                if let Err(error) = repo.set_iroh_enabled(true).await {
+                    tracing::warn!(%error, "iroh endpoint failed to start; peer-to-peer sync unavailable");
+                }
+            }
         });
     }
 
@@ -2650,7 +2678,7 @@ mod tests {
 
     async fn test_repo() -> (TempDir, Arc<Repo>) {
         let dir = tempfile::tempdir().unwrap();
-        let repo = Repo::start(dir.path().to_path_buf(), "http://[".to_string())
+        let repo = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
             .await
             .unwrap();
         (dir, repo)
@@ -2682,23 +2710,50 @@ mod tests {
         assert!(parse_friend_code("beep").is_err());
     }
 
+    async fn iroh_test_repo() -> (TempDir, Arc<Repo>) {
+        let (dir, repo) = test_repo().await;
+        repo.set_iroh_enabled(true).await.unwrap();
+        (dir, repo)
+    }
+
     /// Dialing by node id goes through iroh discovery, so the endpoint being
     /// dialed has to have published its address before the test can find it.
     async fn wait_until_dialable(repo: &Repo) {
-        timeout(
-            Duration::from_secs(20),
-            repo.iroh_endpoint.as_ref().unwrap().online(),
-        )
-        .await
-        .expect("iroh endpoint should come online");
+        timeout(Duration::from_secs(20), repo.iroh_endpoint().unwrap().online())
+            .await
+            .expect("iroh endpoint should come online");
+    }
+
+    #[tokio::test]
+    async fn iroh_stays_off_until_it_is_turned_on() {
+        let (dir, repo) = test_repo().await;
+        assert!(repo.iroh_node_id().is_none());
+        assert!(!dir.path().join("iroh.key").exists());
+    }
+
+    /// Turning it off and on again keeps the same node id, so a friend code
+    /// she has already shared stays good.
+    #[tokio::test]
+    async fn iroh_keeps_its_node_id_across_a_toggle() {
+        let (dir, repo) = test_repo().await;
+        if repo.set_iroh_enabled(true).await.is_err() {
+            return;
+        }
+        let node_id = repo.iroh_node_id().unwrap();
+        assert!(dir.path().join("iroh.key").exists());
+        repo.set_iroh_enabled(false).await.unwrap();
+        assert!(repo.iroh_node_id().is_none());
+        repo.set_iroh_enabled(true).await.unwrap();
+        assert_eq!(repo.iroh_node_id().as_deref(), Some(node_id.as_str()));
+        repo.set_iroh_enabled(false).await.unwrap();
     }
 
     /// Needs the network: dialing by node id goes through iroh discovery.
     #[tokio::test]
     #[ignore]
     async fn iroh_peers_handshake_and_remember_each_other() {
-        let (_dir_a, a) = test_repo().await;
-        let (_dir_b, b) = test_repo().await;
+        let (_dir_a, a) = iroh_test_repo().await;
+        let (_dir_b, b) = iroh_test_repo().await;
         wait_until_dialable(&a).await;
         wait_until_dialable(&b).await;
 
@@ -2739,8 +2794,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn dialing_refuses_a_peer_id_the_code_did_not_name() {
-        let (_dir_a, a) = test_repo().await;
-        let (_dir_b, b) = test_repo().await;
+        let (_dir_a, a) = iroh_test_repo().await;
+        let (_dir_b, b) = iroh_test_repo().await;
         wait_until_dialable(&a).await;
         wait_until_dialable(&b).await;
         let wrong = format!("{}:{}", b.iroh_node_id().unwrap(), "2".repeat(64));

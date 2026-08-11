@@ -24,6 +24,7 @@ final class NotesModel {
     private static let applyIncomingKey = "focusApplyIncoming"
     private static let sendChangesKey = "focusSendChanges"
     private static let presenceKey = "focusPresence"
+    private static let irohKey = "peerSyncEnabled"
 
     private(set) var core: Core?
     var notes: [NoteInfo] = []
@@ -42,6 +43,11 @@ final class NotesModel {
     private(set) var sharingPresence = UserDefaults.standard.object(forKey: presenceKey) as? Bool ?? true
     private(set) var changingIncomingChanges = false
     private(set) var changingSendingChanges = false
+    /// Peer-to-peer sync. Off unless she asks for it: binding the iroh
+    /// endpoint reaches for a relay, which can hang a fresh install's launch.
+    private(set) var irohEnabled = UserDefaults.standard.bool(forKey: irohKey)
+    private(set) var changingIroh = false
+    private(set) var irohError: String?
 
     var focusModeEnabled: Bool {
         !applyingIncomingChanges && !sendingChanges && !sharingPresence
@@ -82,6 +88,33 @@ final class NotesModel {
             self.sendingChanges = actual
             self.changingSendingChanges = false
             UserDefaults.standard.set(actual, forKey: Self.sendChangesKey)
+        }
+    }
+
+    func setIrohEnabled(_ enabled: Bool) {
+        guard let core else {
+            irohEnabled = enabled
+            UserDefaults.standard.set(enabled, forKey: Self.irohKey)
+            return
+        }
+        changingIroh = true
+        irohError = nil
+        Task { [weak self] in
+            let failure = await Task.detached { () -> String? in
+                do {
+                    try await core.setIrohEnabled(enabled: enabled)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            guard let self else { return }
+            let actual = core.irohNodeId() != nil
+            self.irohEnabled = actual
+            self.irohError = actual == enabled ? nil : failure
+            self.changingIroh = false
+            UserDefaults.standard.set(actual, forKey: Self.irohKey)
+            self.refreshPeers()
         }
     }
 
@@ -562,6 +595,7 @@ final class NotesModel {
         let saved = LushShared.rootFolderUrls
         let applyIncoming = applyingIncomingChanges
         let sendChanges = sendingChanges
+        let enableIroh = irohEnabled
         let bridge = DelegateBridge(model: self)
         delegateBridge = bridge
         let priority: String? = {
@@ -571,7 +605,11 @@ final class NotesModel {
         }()
         let task = Task.detached { () -> Core? in
             Self.bootLog("prewarm begin")
-            guard let core = try? Core(dataDir: dataDir.path, serverUrl: nil) else { return nil }
+            guard let core = try? Core.newWithIroh(
+                dataDir: dataDir.path,
+                serverUrl: nil,
+                enableIroh: enableIroh
+            ) else { return nil }
             Self.bootLog("core constructed")
             await core.setApplyIncoming(enabled: applyIncoming)
             await core.setSendChanges(enabled: sendChanges)

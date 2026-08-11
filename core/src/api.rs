@@ -495,6 +495,26 @@ impl std::io::Write for OsLogWriter {
 impl Core {
     #[uniffi::constructor]
     pub fn new(data_dir: String, server_url: Option<String>) -> Result<Arc<Self>, CoreError> {
+        Self::new_with_options(data_dir, server_url, false)
+    }
+
+    #[uniffi::constructor]
+    pub fn new_with_iroh(
+        data_dir: String,
+        server_url: Option<String>,
+        enable_iroh: bool,
+    ) -> Result<Arc<Self>, CoreError> {
+        Self::new_with_options(data_dir, server_url, enable_iroh)
+    }
+
+}
+
+impl Core {
+    fn new_with_options(
+        data_dir: String,
+        server_url: Option<String>,
+        enable_iroh: bool,
+    ) -> Result<Arc<Self>, CoreError> {
         let boot = std::time::Instant::now();
         static TRACING: std::sync::Once = std::sync::Once::new();
         TRACING.call_once(|| {
@@ -523,7 +543,7 @@ impl Core {
             elapsed_ms = boot.elapsed().as_millis(),
             "search index opened"
         );
-        let repo = runtime.block_on(Repo::start(data_dir, server))?;
+        let repo = runtime.block_on(Repo::start(data_dir, server, enable_iroh))?;
         tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "repo started");
         let core = Arc::new(Core {
             runtime,
@@ -537,7 +557,10 @@ impl Core {
         tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "core constructed");
         Ok(core)
     }
+}
 
+#[uniffi::export]
+impl Core {
     pub fn set_delegate(&self, delegate: Box<dyn CoreDelegate>) {
         let mut events = self.repo.subscribe();
         self.runtime.spawn(async move {
@@ -779,6 +802,13 @@ impl Core {
 
     pub fn iroh_node_id(&self) -> Option<String> {
         self.repo.iroh_node_id()
+    }
+
+    pub async fn set_iroh_enabled(&self, enabled: bool) -> Result<(), CoreError> {
+        let repo = self.repo.clone();
+        self.run(async move { repo.set_iroh_enabled(enabled).await })
+            .await??;
+        Ok(())
     }
 
     pub fn local_http_url(&self) -> Option<String> {

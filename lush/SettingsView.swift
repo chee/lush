@@ -252,6 +252,16 @@ struct SyncSettingsPane: View {
             }
             #endif
             Section {
+                Toggle("Sync directly with peers", isOn: Binding(
+                    get: { model.irohEnabled },
+                    set: { model.setIrohEnabled($0) }
+                ))
+                .disabled(model.changingIroh || model.core == nil)
+                if let irohError = model.irohError {
+                    Text(irohError)
+                        .uiFont(.caption)
+                        .foregroundStyle(.red)
+                }
                 if let code = model.core?.irohFriendCode() {
                     HStack {
                         DocumentLabel(title: "This device", url: code, symbol: "laptopcomputer")
@@ -288,14 +298,14 @@ struct SyncSettingsPane: View {
                             .uiFont(.caption)
                             .foregroundStyle(.red)
                     }
-                } else {
-                    Text("iroh endpoint not running.")
+                } else if model.irohEnabled {
+                    Text("Starting the iroh endpoint…")
                         .foregroundStyle(.secondary)
                 }
             } header: {
                 Text("Peers (iroh)")
             } footer: {
-                Text("Share this device's friend code and add a friend's; the rust subduction cores then sync directly via iroh. The code is two public keys — where to dial, and who should answer.")
+                Text("Off until you turn it on — binding the endpoint reaches for a relay, and a slow one would hold up launch. Once it's on, share this device's friend code and add a friend's; the rust subduction cores then sync directly via iroh. The code is two public keys — where to dial, and who should answer.")
             }
             Section {
                 Button("Force Resync") {

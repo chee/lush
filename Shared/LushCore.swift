@@ -968,6 +968,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func setDelegate(delegate: CoreDelegate) 
     
+    func setIrohEnabled(enabled: Bool) async throws 
+    
     func setMainDraftUrl(docUrl: String, draftUrl: String) throws 
     
     /**
@@ -1092,6 +1094,16 @@ public convenience init(dataDir: String, serverUrl: String?)throws  {
         try! rustCall { uniffi_lush_core_fn_free_core(pointer, $0) }
     }
 
+    
+public static func newWithIroh(dataDir: String, serverUrl: String?, enableIroh: Bool)throws  -> Core  {
+    return try  FfiConverterTypeCore_lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_constructor_core_new_with_iroh(
+        FfiConverterString.lower(dataDir),
+        FfiConverterOptionString.lower(serverUrl),
+        FfiConverterBool.lower(enableIroh),$0
+    )
+})
+}
     
 
     
@@ -2305,6 +2317,23 @@ open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
         FfiConverterCallbackInterfaceCoreDelegate_lower(delegate),$0
     )
 }
+}
+    
+open func setIrohEnabled(enabled: Bool)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_set_iroh_enabled(
+                    self.uniffiClonePointer(),
+                    FfiConverterBool.lower(enabled)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func setMainDraftUrl(docUrl: String, draftUrl: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
@@ -6187,6 +6216,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_set_iroh_enabled() != 20138) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_set_main_draft_url() != 11311) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6224,6 +6256,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_constructor_core_new() != 29324) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_constructor_core_new_with_iroh() != 20242) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_coredelegate_on_doc_changed() != 53266) {

@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let args = Args::parse();
-    let repo = Repo::start(args.data, args.server).await?;
+    let repo = Repo::start(args.data, args.server, false).await?;
 
     match args.command {
         Command::Fetch { url } => {

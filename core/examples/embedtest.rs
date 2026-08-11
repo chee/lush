@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
     let repo = Repo::start(
         "/tmp/embedtest-data".into(),
         lush_core::repo::DEFAULT_SERVER.into(),
+        false,
     )
     .await?;
     repo.wait_connected(Duration::from_secs(15)).await;
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let fresh = Repo::start(
         "/tmp/embedtest-fresh".into(),
         lush_core::repo::DEFAULT_SERVER.into(),
+        false,
     )
     .await?;
     fresh.ensure_doc(note).await?;
