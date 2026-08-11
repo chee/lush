@@ -1192,6 +1192,20 @@ final class EditorCore {
         return true
     }
 
+    func preserveTypingAttributes(forReplacement range: NSRange) {
+        guard let view,
+              let storage = view.pStorage,
+              range.length > 0,
+              range.location < storage.length
+        else { return }
+        let attributes = storage.attributes(at: range.location, effectiveRange: nil)
+        guard let box = attributes[.amBlock] as? BlockBox, !box.value.isAtomic else { return }
+        view.pTypingAttributes = RichText.attributes(
+            block: box.value,
+            marks: RichText.marks(from: attributes, block: box.value)
+        )
+    }
+
     func textDidChange() {
         guard session.loaded, !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
         guard let pending = pendingTextSplice else {
@@ -1323,7 +1337,7 @@ final class EditorCore {
         saveTask?.cancel()
         saveTask = nil
         guard let storage = noteView?.pStorage else { return }
-        let typing = typingBlock()
+        let typing = typingBlock(in: noteView)
         let spans = RichText.spans(from: storage, trailingBlock: typing.isAtomic ? nil : typing)
         let json = SpanNode.encodeList(spans)
         guard json != session.lastKnownJSON else { return }
@@ -2642,8 +2656,9 @@ final class EditorCore {
         return typingBlock()
     }
 
-    private func typingBlock() -> BlockValue {
-        guard let view, let box = view.pTypingAttributes[.amBlock] as? BlockBox else {
+    private func typingBlock(in target: (any EditorTextViewLike)? = nil) -> BlockValue {
+        guard let view = target ?? view,
+              let box = view.pTypingAttributes[.amBlock] as? BlockBox else {
             return .paragraph
         }
         return box.value
@@ -5177,6 +5192,9 @@ struct RichTextEditor: UIViewRepresentable {
             if text == " ", range.length == 0,
                core.handleMarkdownTrigger(at: range.location) {
                 return false
+            }
+            if !text.isEmpty {
+                core.preserveTypingAttributes(forReplacement: range)
             }
             _ = core.prepareTextSplice(range: range, replacement: text)
             return true
