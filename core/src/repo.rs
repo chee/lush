@@ -2649,6 +2649,9 @@ impl Repo {
 }
 
 #[cfg(test)]
+pub(crate) mod fuzz;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering as AtomicOrdering;
 
