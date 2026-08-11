@@ -1671,14 +1671,30 @@ enum RichText {
 
         // text typed on an attachment's line survives as its own paragraph
         func strayParagraph(in range: NSRange) -> [SpanNode] {
-            var stray = ""
+            guard range.length > 0 else { return [] }
+            var nodes: [SpanNode] = []
+            var pendingText = ""
+            var pendingMarks: [String: JSONValue] = [:]
             attr.enumerateAttributes(in: range) { runAttrs, runRange, _ in
                 guard runAttrs[.amDisplayOnly] == nil else { return }
-                stray += str.substring(with: runRange)
+                let text = str.substring(with: runRange)
                     .replacingOccurrences(of: "\u{FFFC}", with: "")
+                guard !text.isEmpty else { return }
+                let marks = self.marks(from: runAttrs, block: .paragraph)
+                if marks == pendingMarks {
+                    pendingText += text
+                } else {
+                    if !pendingText.isEmpty {
+                        nodes.append(.text(pendingText, pendingMarks))
+                    }
+                    pendingText = text
+                    pendingMarks = marks
+                }
             }
-            stray = stray.trimmingCharacters(in: .newlines)
-            return stray.isEmpty ? [] : [.block(.paragraph), .text(stray, [:])]
+            if !pendingText.isEmpty {
+                nodes.append(.text(pendingText, pendingMarks))
+            }
+            return nodes.isEmpty ? [] : [.block(.paragraph)] + nodes
         }
 
         var previousBlock = BlockValue.paragraph
@@ -1692,20 +1708,44 @@ enum RichText {
                 var boxes: [(location: Int, spans: [SpanNode])] = []
                 attr.enumerateAttribute(.amTableBox, in: range) { value, runRange, _ in
                     if let box = value as? TableBox {
-                        boxes.append((runRange.location, box.spans))
+                        let run = str.substring(with: runRange) as NSString
+                        let attachment = run.range(of: "\u{FFFC}")
+                        let location = attachment.location == NSNotFound
+                            ? runRange.location
+                            : runRange.location + attachment.location
+                        boxes.append((location, box.spans))
                     }
                 }
                 attr.enumerateAttribute(.amColumnsBox, in: range) { value, runRange, _ in
                     if let box = value as? ColumnsBox {
-                        boxes.append((runRange.location, box.spans))
+                        let run = str.substring(with: runRange) as NSString
+                        let attachment = run.range(of: "\u{FFFC}")
+                        let location = attachment.location == NSNotFound
+                            ? runRange.location
+                            : runRange.location + attachment.location
+                        boxes.append((location, box.spans))
                     }
                 }
                 if !boxes.isEmpty {
                     boxes.sort { $0.location < $1.location }
+                    let contentEnd = range.location + contentLength
+                    var cursor = range.location
                     for box in boxes {
+                        if cursor < box.location {
+                            spans.append(contentsOf: strayParagraph(in: NSRange(
+                                location: cursor,
+                                length: box.location - cursor
+                            )))
+                        }
                         spans.append(contentsOf: box.spans)
+                        cursor = max(cursor, min(box.location + 1, contentEnd))
                     }
-                    spans.append(contentsOf: strayParagraph(in: range))
+                    if cursor < contentEnd {
+                        spans.append(contentsOf: strayParagraph(in: NSRange(
+                            location: cursor,
+                            length: contentEnd - cursor
+                        )))
+                    }
                     previousBlock = .paragraph
                     activeBlockquotePath = nil
                     continue
@@ -1738,10 +1778,25 @@ enum RichText {
                 let content = contentLength > 0
                     ? str.substring(with: NSRange(location: range.location, length: contentLength))
                     : ""
-                if content.contains("\u{FFFC}") {
+                let attachment = (content as NSString).range(of: "\u{FFFC}")
+                if attachment.location != NSNotFound {
+                    let location = range.location + attachment.location
+                    if location > range.location {
+                        spans.append(contentsOf: strayParagraph(in: NSRange(
+                            location: range.location,
+                            length: location - range.location
+                        )))
+                    }
                     spans.append(.block(block))
-                    spans.append(contentsOf: strayParagraph(in: range))
-                    previousBlock = block
+                    let after = location + attachment.length
+                    let contentEnd = range.location + contentLength
+                    if after < contentEnd {
+                        spans.append(contentsOf: strayParagraph(in: NSRange(
+                            location: after,
+                            length: contentEnd - after
+                        )))
+                    }
+                    previousBlock = .paragraph
                     continue
                 }
                 block = .paragraph
