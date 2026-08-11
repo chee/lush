@@ -12,16 +12,20 @@ enum NoteExporter {
     // MARK: - Public entry point (macOS)
 
     #if os(macOS)
-    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
-        let json = await model.spansJSON(for: noteUrl)
-        let spans = SpanNode.decodeList(json)
+    private struct FetchedAsset: Sendable {
+        let url: String
+        let data: Data
+        let name: String
+    }
 
-        struct FetchedAsset {
-            let url: String
-            let data: Data
-            let name: String
-            let mime: String
+    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
+        model.exportsInFlight += 1
+        defer { model.exportsInFlight -= 1 }
+        guard let snapshot = await model.spansSnapshot(for: noteUrl) else {
+            model.status = "Couldn't export note"
+            return
         }
+        let spans = SpanNode.decodeList(snapshot.spansJson)
 
         var fetched: [FetchedAsset] = []
         var usedNames = Set<String>()
@@ -42,8 +46,7 @@ enum NoteExporter {
                 suffix += 1
             }
             usedNames.insert(name.lowercased())
-            let mime = info?.mimeType.isEmpty == false ? info!.mimeType : "application/octet-stream"
-            fetched.append(FetchedAsset(url: assetUrl, data: data, name: name, mime: mime))
+            fetched.append(FetchedAsset(url: assetUrl, data: data, name: name))
         }
 
         let safeName = title.isEmpty ? "note" : title
@@ -55,7 +58,9 @@ enum NoteExporter {
             panel.nameFieldStringValue = safeName + ".html"
             panel.begin { response in
                 guard response == .OK, let dest = panel.url else { return }
-                try? html.write(to: dest, atomically: true, encoding: .utf8)
+                Task.detached {
+                    try? html.write(to: dest, atomically: true, encoding: .utf8)
+                }
             }
         } else {
             var pathMap: [String: String] = [:]
@@ -63,51 +68,65 @@ enum NoteExporter {
 
             let html = buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
 
-            let tmp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
-            let assetsDir = tmp.appendingPathComponent("assets", isDirectory: true)
-            do {
-                try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
-                try Data(html.utf8).write(to: tmp.appendingPathComponent("index.html"))
-                for asset in fetched {
-                    try asset.data.write(to: assetsDir.appendingPathComponent(asset.name))
+            let archive = await Task.detached { () -> URL? in
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
+                let assetsDir = tmp.appendingPathComponent("assets", isDirectory: true)
+                do {
+                    try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
+                    try Data(html.utf8).write(to: tmp.appendingPathComponent("index.html"))
+                    for asset in fetched {
+                        try asset.data.write(to: assetsDir.appendingPathComponent(asset.name))
+                    }
+                } catch {
+                    try? FileManager.default.removeItem(at: tmp)
+                    return nil
                 }
-            } catch {
+
+                let zipTmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("lush-\(UUID().uuidString).zip")
+                guard zipDirectory(tmp, to: zipTmp) else {
+                    try? FileManager.default.removeItem(at: tmp)
+                    try? FileManager.default.removeItem(at: zipTmp)
+                    return nil
+                }
                 try? FileManager.default.removeItem(at: tmp)
+                return zipTmp
+            }.value
+            guard let zipTmp = archive else {
                 let alert = NSAlert()
                 alert.messageText = "Export failed"
-                alert.informativeText = error.localizedDescription
+                alert.informativeText = "The note archive could not be created."
                 alert.runModal()
                 return
             }
-
-            let zipTmp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("lush-\(UUID().uuidString).zip")
-            guard zipDirectory(tmp, to: zipTmp) else {
-                try? FileManager.default.removeItem(at: tmp)
-                return
-            }
-            try? FileManager.default.removeItem(at: tmp)
 
             let panel = NSSavePanel()
             panel.allowedContentTypes = [UTType(filenameExtension: "zip") ?? .data]
             panel.nameFieldStringValue = safeName + ".zip"
             panel.begin { response in
-                defer { try? FileManager.default.removeItem(at: zipTmp) }
-                guard response == .OK, let dest = panel.url else { return }
-                let fm = FileManager.default
-                if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
-                try? fm.moveItem(at: zipTmp, to: dest)
+                let dest = response == .OK ? panel.url : nil
+                Task.detached {
+                    defer { try? FileManager.default.removeItem(at: zipTmp) }
+                    guard let dest else { return }
+                    let fm = FileManager.default
+                    if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
+                    try? fm.moveItem(at: zipTmp, to: dest)
+                }
             }
         }
     }
 
-    private static func zipDirectory(_ dir: URL, to output: URL) -> Bool {
+    nonisolated private static func zipDirectory(_ dir: URL, to output: URL) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
         process.arguments = ["-r", output.path, "."]
         process.currentDirectoryURL = dir
-        try? process.run()
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
         process.waitUntilExit()
         return process.terminationStatus == 0
     }

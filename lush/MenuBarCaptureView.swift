@@ -4,11 +4,22 @@ import SwiftUI
 import AppKit
 
 struct LushMenuBarIcon: View {
+    @Environment(NotesModel.self) private var model
+
     var body: some View {
-        Image(systemName: "note.text")
-            .symbolRenderingMode(.monochrome)
-            .font(.system(size: 15, weight: .semibold))
-            .frame(width: 18, height: 18)
+        Group {
+            if model.exportsInFlight > 0 {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .symbolRenderingMode(.monochrome)
+                    .font(.system(size: 15, weight: .semibold))
+                    .symbolEffect(.rotate, options: .repeat(.continuous))
+            } else {
+                Image(systemName: "note.text")
+                    .symbolRenderingMode(.monochrome)
+                    .font(.system(size: 15, weight: .semibold))
+            }
+        }
+        .frame(width: 18, height: 18)
     }
 }
 

@@ -530,6 +530,7 @@ struct LushApp: App {
                 .interfaceFont()
         } label: {
             LushMenuBarIcon()
+                .environment(model)
                 .accessibilityLabel("Lush")
         }
         .menuBarExtraStyle(.window)

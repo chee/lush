@@ -159,6 +159,7 @@ final class NotesModel {
     }
     var pendingFocusUrl: String?
     var status: String = "Starting…"
+    var exportsInFlight = 0
     @ObservationIgnored private var noteRows: [String: NoteRow] = [:]
     var rootFolderUrl: String? { rootFolderUrls.first }
     var rootFolderUrls: [String] = []
