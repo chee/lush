@@ -862,9 +862,7 @@ final class EditorCore {
                 continue
             }
             populated = true
-            if let image = PImage(data: data) {
-                cache.images[url] = image
-            } else {
+            if cache.storeImage(data, for: url) == nil {
                 let info = await model.assetInfo(url)
                 let name = info?.name.isEmpty == false ? info!.name : "attachment"
                 cache.names[url] = name
@@ -3641,8 +3639,7 @@ final class EditorCore {
                 fileExtension: fileExtension,
                 mimeType: mime
             ) else { return }
-            if let image = PImage(data: data) {
-                self.cache.images[url] = image
+            if self.cache.storeImage(data, for: url) != nil {
                 // vision metadata in the background; searchable once written
                 Task.detached { [weak model = self.model] in
                     if let result = await VisionAnalyzer.analyze(data) {

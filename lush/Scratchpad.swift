@@ -291,8 +291,7 @@ final class PadStore {
             fileExtension: fileExtension,
             mimeType: mime
         ) else { return }
-        if let image = PImage(data: data) {
-            cache.images[assetUrl] = image
+        if let image = cache.storeImage(data, for: assetUrl) {
             add(
                 imageItem(
                     assetUrl: assetUrl,
@@ -369,9 +368,8 @@ final class PadStore {
         guard !urls.isEmpty else { return }
         for url in urls {
             guard let data = await model.assetBytes(url) else { continue }
-            if let image = PImage(data: data) {
-                cache.images[url] = image
-            } else if let info = await model.assetInfo(url) {
+            if cache.storeImage(data, for: url) == nil,
+               let info = await model.assetInfo(url) {
                 cache.names[url] = info.name.isEmpty ? "attachment" : info.name
             }
         }

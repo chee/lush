@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreText
+import ImageIO
 #if os(macOS)
 import AppKit
 #else
@@ -441,7 +442,8 @@ final class EmbedAttachment: NSTextAttachment {
     }
 
     required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not supported")
+        box = NSObject()
+        super.init(coder: coder)
     }
 
     override func viewProvider(
@@ -493,6 +495,7 @@ final class BlockBox: NSObject {
 @MainActor
 final class AssetCache {
     var images: [String: PImage] = [:]
+    var displayImages: [String: PImage] = [:]
     var names: [String: String] = [:]
     var fileURLs: [String: URL] = [:]
     var videoThumbs: [String: PImage] = [:]
@@ -503,6 +506,35 @@ final class AssetCache {
 
     static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
     static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
+
+    @discardableResult
+    func storeImage(_ data: Data, for url: String) -> PImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        #if os(macOS)
+        let scale: CGFloat = 2
+        #else
+        let scale: CGFloat = 3
+        #endif
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(420 * scale),
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            options as CFDictionary
+        ) else { return nil }
+        #if os(macOS)
+        let image = NSImage(cgImage: thumbnail, size: .zero)
+        #else
+        let image = UIImage(cgImage: thumbnail, scale: scale, orientation: .up)
+        #endif
+        images[url] = image
+        displayImages[url] = image
+        return image
+    }
 
     static func kind(forName name: String) -> String {
         let ext = (name as NSString).pathExtension.lowercased()
@@ -1432,10 +1464,14 @@ enum RichText {
             attachment = liveBox(width: 460, height: 300)
         } else if let url, let image = cache.images[url] {
             let size = Self.fitted(image.size)
-            attachment = imageBox(image, bounds: CGRect(origin: .zero, size: size), ideal: size)
-        } else if let url, cache.videoThumbs[url] != nil {
+            attachment = imageBox(
+                cache.displayImages[url] ?? image,
+                bounds: CGRect(origin: .zero, size: size),
+                ideal: size
+            )
+        } else if let url, let thumbnail = cache.videoThumbs[url] {
             // the live VideoInlineView plays in place of the poster
-            let size = Self.fitted(cache.videoThumbs[url]!.size)
+            let size = Self.fitted(thumbnail.size)
             attachment = liveBox(width: size.width, height: size.height)
         } else if let url, let name = cache.names[url],
                   AssetCache.kind(forName: name) == "audio",

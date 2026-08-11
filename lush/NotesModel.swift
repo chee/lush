@@ -2173,9 +2173,8 @@ final class NotesModel {
         }
         let cache = AssetCache()
         for (url, data, info) in assets {
-            if let data, let image = PImage(data: data) {
-                cache.images[url] = image
-            } else if let info, !info.name.isEmpty {
+            if let data, cache.storeImage(data, for: url) != nil { continue }
+            if let info, !info.name.isEmpty {
                 cache.names[url] = info.name
             } else if data == nil {
                 cache.patchworkDocs.insert(url)
