@@ -1,5 +1,6 @@
 import Foundation
 import Network
+@preconcurrency import Dispatch
 
 #if os(macOS)
 @MainActor
@@ -20,7 +21,7 @@ final class LushAgentServer {
             let listener = try NWListener(using: parameters)
             let token = self.token
             listener.newConnectionHandler = { [weak self] connection in
-                self?.read(connection)
+                self?.accept(connection)
             }
             listener.stateUpdateHandler = { state in
                 guard case .ready = state, let port = listener.port?.rawValue else { return }
@@ -34,20 +35,37 @@ final class LushAgentServer {
         }
     }
 
-    private nonisolated func read(_ connection: NWConnection, data: Data = Data()) {
+    private nonisolated func accept(_ connection: NWConnection) {
+        let timeout = DispatchWorkItem { connection.cancel() }
+        queue.asyncAfter(deadline: .now() + 15, execute: timeout)
         connection.start(queue: queue)
+        read(connection, timeout: timeout)
+    }
+
+    private nonisolated func read(
+        _ connection: NWConnection,
+        data: Data = Data(),
+        timeout: DispatchWorkItem
+    ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] chunk, _, complete, error in
-            guard let self else { return }
+            guard let self else {
+                timeout.cancel()
+                connection.cancel()
+                return
+            }
             var received = data
             if let chunk { received.append(chunk) }
-            if let request = HTTPRequest(data: received) {
+            switch HTTPRequest.parse(received) {
+            case .request(let request):
+                timeout.cancel()
                 Task { @MainActor in
                     let response = await self.route(request)
                     self.send(response, through: connection)
                 }
-            } else if error == nil && !complete && received.count < 1_048_576 {
-                self.read(connection, data: received)
-            } else {
+            case .needMoreData where error == nil && !complete && received.count < 1_048_576:
+                self.read(connection, data: received, timeout: timeout)
+            default:
+                timeout.cancel()
                 self.send(.json(status: 400, value: ["error": "Invalid request."]), through: connection)
             }
         }
@@ -229,44 +247,12 @@ final class LushAgentServer {
     }
 }
 
-private struct HTTPRequest {
+struct HTTPRequest {
     let method: String
     let path: String
     let query: [String: String]
     let authorization: String?
     let body: Data
-
-    init?(data: Data) {
-        let separator = Data("\r\n\r\n".utf8)
-        guard let boundary = data.range(of: separator),
-              let header = String(data: data[..<boundary.lowerBound], encoding: .utf8)
-        else { return nil }
-        let lines = header.components(separatedBy: "\r\n")
-        let first = lines.first?.split(separator: " ").map(String.init) ?? []
-        guard first.count >= 2,
-              let components = URLComponents(string: "http://127.0.0.1\(first[1])")
-        else { return nil }
-        var headers: [String: String] = [:]
-        for line in lines.dropFirst() {
-            let pair = line.split(separator: ":", maxSplits: 1).map(String.init)
-            if pair.count == 2 {
-                headers[pair[0].lowercased()] = pair[1].trimmingCharacters(in: .whitespaces)
-            }
-        }
-        let length = Int(headers["content-length"] ?? "0") ?? 0
-        guard length >= 0, length <= 1_048_576 else { return nil }
-        let bodyStart = boundary.upperBound
-        let bodyEnd = bodyStart + length
-        guard bodyEnd >= bodyStart, data.count >= bodyEnd else { return nil }
-        method = first[0]
-        path = components.path
-        query = Dictionary((components.queryItems ?? []).compactMap {
-            guard let value = $0.value else { return nil }
-            return ($0.name, value)
-        }, uniquingKeysWith: { first, _ in first })
-        authorization = headers["authorization"]
-        body = data.subdata(in: bodyStart..<bodyEnd)
-    }
 
     func jsonBody() throws -> [String: Any] {
         guard let value = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
@@ -276,13 +262,60 @@ private struct HTTPRequest {
     }
 }
 
-private enum HTTPRequestError: LocalizedError {
+extension HTTPRequest {
+    enum Parse {
+        case request(HTTPRequest)
+        case needMoreData
+        case malformed
+    }
+
+    init?(data: Data) {
+        guard case .request(let request) = Self.parse(data) else { return nil }
+        self = request
+    }
+
+    static func parse(_ data: Data) -> Parse {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let boundary = data.range(of: separator) else { return .needMoreData }
+        guard let header = String(data: data[..<boundary.lowerBound], encoding: .utf8)
+        else { return .malformed }
+        let lines = header.components(separatedBy: "\r\n")
+        let first = lines.first?.split(separator: " ").map(String.init) ?? []
+        guard first.count >= 2,
+              let components = URLComponents(string: "http://127.0.0.1\(first[1])")
+        else { return .malformed }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            let pair = line.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard pair.count == 2, !pair[0].isEmpty else { return .malformed }
+            headers[pair[0].lowercased()] = pair[1].trimmingCharacters(in: .whitespaces)
+        }
+        let length = Int(headers["content-length"] ?? "0") ?? 0
+        guard length >= 0, length <= 1_048_576 else { return .malformed }
+        let bodyStart = boundary.upperBound
+        let bodyEnd = bodyStart + length
+        guard bodyEnd >= bodyStart else { return .malformed }
+        guard data.count >= bodyEnd else { return .needMoreData }
+        return .request(HTTPRequest(
+            method: first[0],
+            path: components.path,
+            query: Dictionary((components.queryItems ?? []).compactMap {
+                guard let value = $0.value else { return nil }
+                return ($0.name, value)
+            }, uniquingKeysWith: { first, _ in first }),
+            authorization: headers["authorization"],
+            body: data.subdata(in: bodyStart..<bodyEnd)
+        ))
+    }
+}
+
+enum HTTPRequestError: LocalizedError {
     case invalidJSON
 
     var errorDescription: String? { "The request body is not a JSON object." }
 }
 
-private struct HTTPResponse {
+struct HTTPResponse {
     let data: Data
 
     static func json(status: Int, value: Any) -> HTTPResponse {
