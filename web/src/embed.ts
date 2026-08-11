@@ -215,14 +215,6 @@ async function boot() {
       console.warn("lush: module loading failed", error);
     },
   );
-  const toolsAvailable = new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, 15_000);
-    void toolsLoaded.then(() => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-
   // Tool selection and the tools menu catch up in the background once
   // modules finish loading; the view element finds the doc on its own.
   const finishSetDoc = async (
@@ -230,7 +222,6 @@ async function boot() {
     toolId: string | null | undefined,
     view: Element,
   ) => {
-    await toolsAvailable;
     if (!view.isConnected) return;
     let doc: any;
     try {
