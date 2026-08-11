@@ -37,6 +37,16 @@ enum DockTilePreview {
         }
     }
 
+    static func clearStoredImage() async {
+        let url = DockMenuSnapshot.tileImageURL
+        await withCheckedContinuation { continuation in
+            writeQueue.async {
+                if let url { try? FileManager.default.removeItem(at: url) }
+                continuation.resume()
+            }
+        }
+    }
+
     private static let ruleFractions: [CGFloat] = [0.451, 0.584, 0.713]
     private static let rulePitch: CGFloat = 0.131
 

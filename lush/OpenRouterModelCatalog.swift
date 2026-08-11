@@ -33,6 +33,7 @@ enum OpenRouterModelCatalog {
 
     static func fetch() async throws -> [OpenRouterModel] {
         var request = URLRequest(url: URL(string: "https://openrouter.ai/api/v1/models")!)
+        request.timeoutInterval = 20
         request.setValue("Lush", forHTTPHeaderField: "X-OpenRouter-Title")
         let key = ModelCredentialStore.apiKey(for: .openRouter)
         if !key.isEmpty {
@@ -81,7 +82,9 @@ enum OllamaModelCatalog {
     /// configured chat endpoint.
     static func fetch() async throws -> [OllamaModel] {
         guard let url = tagsURL() else { throw CatalogError.endpointUnreadable }
-        let (data, response) = try await URLSession.shared.data(from: url)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw CatalogError.requestFailed
         }

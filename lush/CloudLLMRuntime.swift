@@ -66,6 +66,13 @@ enum ModelCredentialStore {
 }
 
 enum CloudLLMRuntime {
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForResource = 300
+        return URLSession(configuration: configuration)
+    }()
+
     enum RuntimeError: LocalizedError {
         case modelNotConfigured
         case endpointNotConfigured
@@ -199,7 +206,7 @@ enum CloudLLMRuntime {
             ))
         }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw RuntimeError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
             let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: data)

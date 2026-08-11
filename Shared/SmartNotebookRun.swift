@@ -43,8 +43,10 @@ struct NotebookTree {
 
     func contains(_ url: String, under folderUrl: String) -> Bool {
         var parent = parents[url]
+        var seen: Set<String> = []
         while let current = parent {
             if current == folderUrl { return true }
+            guard seen.insert(current).inserted else { return false }
             parent = parents[current]
         }
         return false
@@ -53,7 +55,10 @@ struct NotebookTree {
     static func walk(core: Core, roots: [String]) async -> NotebookTree {
         var tree = NotebookTree()
         var queue = roots
+        var seen: Set<String> = []
         while let url = queue.popLast() {
+            guard seen.insert(url).inserted else { continue }
+            tree.kinds[url] = "folder"
             for entry in await core.folderEntriesOf(url: url) {
                 tree.kinds[entry.url] = entry.kind
                 tree.parents[entry.url] = url

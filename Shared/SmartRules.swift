@@ -125,6 +125,10 @@ struct SearchSyntax {
 
     func removing(_ clause: Clause, from source: String) -> String {
         let value = NSMutableString(string: source)
+        guard clause.range.location != NSNotFound,
+              clause.range.location <= value.length,
+              clause.range.length <= value.length - clause.range.location
+        else { return source }
         value.replaceCharacters(in: clause.range, with: "")
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
@@ -163,6 +167,10 @@ struct SearchSyntax {
 
     static func completing(_ suggestion: Suggestion, in source: String) -> String {
         let value = NSMutableString(string: source)
+        guard suggestion.range.location != NSNotFound,
+              suggestion.range.location <= value.length,
+              suggestion.range.length <= value.length - suggestion.range.location
+        else { return source }
         value.replaceCharacters(in: suggestion.range, with: suggestion.replacement)
         return value as String
     }
