@@ -12,8 +12,6 @@ final class EditorRenderingAttributes {
     var findMatches: [NSRange] = []
     var currentFindMatch: NSRange?
     var globalMatches: [NSRange] = []
-    var focusDimEnabled = false
-    var focusParagraph: NSRange?
 
     /// The accent is a dynamic colour; asking it for an alpha variant without
     /// first resolving it into a real colour space can paint nothing at all.
@@ -42,20 +40,7 @@ final class EditorRenderingAttributes {
 
     private func apply(_ textLayoutManager: NSTextLayoutManager, _ fragment: NSTextLayoutFragment) {
         let fragmentRange = Self.characterRange(of: fragment, in: textLayoutManager)
-        var dimmed = false
-        if focusDimEnabled, let focus = focusParagraph, let fragmentRange {
-            dimmed = NSIntersectionRange(fragmentRange, focus).length == 0
-        }
-        if dimmed, let fragmentRange,
-           let contentStorage = textLayoutManager.textContentManager as? NSTextContentStorage,
-           let textRange = contentStorage.textRange(for: fragmentRange) {
-            textLayoutManager.setRenderingAttributes(
-                [.foregroundColor: PColor.pSecondaryLabel.withAlphaComponent(0.55)],
-                for: textRange
-            )
-        } else {
-            CodeHighlight.applyRenderingAttributes(textLayoutManager, fragment)
-        }
+        CodeHighlight.applyRenderingAttributes(textLayoutManager, fragment)
         applyMatches(textLayoutManager, fragment, fragmentRange: fragmentRange)
     }
 

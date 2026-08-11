@@ -617,10 +617,8 @@ enum EditorSettings {
     private static let handFamilyKey = "editorHandFamily"
     private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
-    static let typewriterModeKey = "editorTypewriterMode"
     static let maxNoteCharactersKey = "editorMaxNoteCharacters"
     static let minimapKey = "editorMinimapVisible"
-    static let zenModeKey = "editorZenMode"
 
     static let fontFamilies: [(key: String, label: String)] = [
         ("sans", "Sans"),
@@ -754,10 +752,6 @@ enum EditorSettings {
         NotificationCenter.default.post(name: changed, object: nil)
     }
 
-    static var typewriterMode: Bool {
-        UserDefaults.standard.bool(forKey: typewriterModeKey)
-    }
-
     /// How many characters wide a note's text may get before it stops growing
     /// and centres. Zero fills the editor.
     static var maxNoteCharacters: Int {
@@ -786,11 +780,6 @@ enum EditorSettings {
 
     static func setMinimapVisible(_ visible: Bool) {
         UserDefaults.standard.set(visible, forKey: minimapKey)
-        NotificationCenter.default.post(name: changed, object: nil)
-    }
-
-    static func setTypewriterMode(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: typewriterModeKey)
         NotificationCenter.default.post(name: changed, object: nil)
     }
 

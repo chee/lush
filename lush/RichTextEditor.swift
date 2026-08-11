@@ -317,8 +317,6 @@ protocol EditorTextViewLike: AnyObject {
     func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void)
     func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int?
     func pScrollRangeToVisible(_ range: NSRange)
-    func pCenterCaretRect(_ containerRect: CGRect)
-    func pApplyTypewriterPadding(_ enabled: Bool)
     func pApplyMaxWidth()
     var pVisibleRect: CGRect { get }
     func pScrollToY(_ y: CGFloat)
@@ -482,8 +480,6 @@ final class EditorCore {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.view?.pApplyMaxWidth()
-                self?.updateFocusDim()
-                self?.centerCaretIfTypewriter()
                 guard let self else { return }
                 if self.session.loaded {
                     self.apply(spans: SpanNode.decodeList(self.session.lastKnownJSON))
@@ -685,7 +681,6 @@ final class EditorCore {
                         self.updateGlobalMatches()
                     }
                     self.controller.docVersion &+= 1
-                    self.centerCaretIfTypewriter(editedAt: editedLocation)
                     self.scheduleMinimapUpdate()
                     // Only typing inside a folded heading can change the
                     // hidden set from here (its key stops matching, so the
@@ -2337,51 +2332,6 @@ final class EditorCore {
         view.pScrollToY(clamped * controller.minimapDocHeight - view.pVisibleRect.height / 2)
     }
 
-    // MARK: typewriter
-
-    func updateFocusDim() {
-        let enabled = EditorSettings.typewriterMode
-        let old = (rendering.focusDimEnabled, rendering.focusParagraph)
-        rendering.focusDimEnabled = enabled
-        view?.pApplyTypewriterPadding(enabled)
-        if enabled, let view, let storage = view.pStorage, storage.length > 0 {
-            let caret = min(view.pSelectedRange.location, storage.length - 1)
-            rendering.focusParagraph = (storage.string as NSString)
-                .paragraphRange(for: NSRange(location: max(0, caret), length: 0))
-        } else {
-            rendering.focusParagraph = nil
-        }
-        if old.0 != rendering.focusDimEnabled {
-            invalidateRendering()
-        } else if old.1 != rendering.focusParagraph {
-            invalidateRendering(ranges: [old.1, rendering.focusParagraph].compactMap { $0 })
-        }
-    }
-
-    func centerCaretIfTypewriter(editedAt editedLocation: Int? = nil) {
-        guard EditorSettings.typewriterMode,
-              let view, let storage = view.pStorage, storage.length > 0,
-              let textLayoutManager = view.pTextLayoutManager,
-              let contentManager = textLayoutManager.textContentManager
-        else { return }
-        let caret = view.pSelectedRange.location
-        // only chase local typing — remote patches land away from the caret
-        if let editedLocation, abs(caret - editedLocation) > 2 { return }
-        guard let caretRange = contentManager.textRange(for: NSRange(location: caret, length: 0)) else { return }
-        var rect: CGRect?
-        textLayoutManager.enumerateTextSegments(
-            in: caretRange,
-            type: .selection,
-            options: [.rangeNotRequired]
-        ) { _, frame, _, _ in
-            rect = frame
-            return false
-        }
-        if let rect {
-            view.pCenterCaretRect(rect)
-        }
-    }
-
     // MARK: find
 
     func updateFindMatches(resetIndex: Bool = true) {
@@ -2591,8 +2541,6 @@ final class EditorCore {
         controller.fontRoleActive = marks["font"]?.stringValue
         controller.linkActive = marks["link"]?.stringValue
         refreshTrailingMarker()
-        updateFocusDim()
-        centerCaretIfTypewriter()
         unfoldIfCaretHidden()
         broadcastCaret()
         redrawCodeSelection()
@@ -4036,19 +3984,6 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         scrollRangeToVisible(range)
     }
 
-    func pCenterCaretRect(_ containerRect: CGRect) {
-        pScrollToY(containerRect.midY + textContainerOrigin.y - pVisibleRect.height / 2)
-    }
-
-    /// Without half a screen of slack at each end the first and last lines can
-    /// never reach the middle, which is where most typing happens.
-    func pApplyTypewriterPadding(_ enabled: Bool) {
-        let visibleHeight = enclosingScrollView?.contentView.bounds.height ?? 0
-        let height = enabled ? max(16, visibleHeight / 2) : 16
-        guard abs(textContainerInset.height - height) > 1 else { return }
-        textContainerInset = NSSize(width: textContainerInset.width, height: height)
-    }
-
     /// The container tracks the view's width, so a wide window is narrowed by
     /// growing the side insets equally, which centres the text.
     func pApplyMaxWidth() {
@@ -4788,27 +4723,6 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         contentInset.bottom = max(saved, height)
         scrollRangeToVisible(range)
         contentInset.bottom = saved
-    }
-
-    func pCenterCaretRect(_ containerRect: CGRect) {
-        let caretMidY = containerRect.midY + textContainerInset.top
-        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
-        guard visibleHeight > 0 else { return }
-        pScrollToY(caretMidY - adjustedContentInset.top - visibleHeight / 2)
-    }
-
-    /// Without half a screen of slack at each end the first and last lines can
-    /// never reach the middle, which is where most typing happens.
-    func pApplyTypewriterPadding(_ enabled: Bool) {
-        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
-        let inset = enabled ? max(16, visibleHeight / 2) : 16
-        guard abs(textContainerInset.top - inset) > 1 else { return }
-        textContainerInset = UIEdgeInsets(
-            top: inset,
-            left: textContainerInset.left,
-            bottom: inset,
-            right: textContainerInset.right
-        )
     }
 
     /// The container tracks the view's width, so a wide window is narrowed by

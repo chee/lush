@@ -231,19 +231,10 @@ struct HelpCommands: Commands {
 #endif
 
 struct ViewCommands: Commands {
-    @AppStorage(EditorSettings.zenModeKey) private var zenMode = false
-    @AppStorage(EditorSettings.typewriterModeKey) private var typewriterMode = false
     @AppStorage(EditorSettings.minimapKey) private var minimapVisible = false
 
     var body: some Commands {
         CommandGroup(after: .toolbar) {
-            Toggle("Zen Mode", isOn: $zenMode)
-                .keyboardShortcut("z", modifiers: [.command, .control])
-            Toggle("Typewriter Mode", isOn: Binding(
-                get: { typewriterMode },
-                set: { EditorSettings.setTypewriterMode($0) }
-            ))
-            .keyboardShortcut("t", modifiers: [.command, .control])
             Toggle("Show Minimap", isOn: Binding(
                 get: { minimapVisible },
                 set: { EditorSettings.setMinimapVisible($0) }

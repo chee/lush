@@ -79,7 +79,6 @@ final class PadCardTextView: EditorTextView, PadCardEditing {
 
     // the card sets its own width; the note's centring insets have no place here
     override func pApplyMaxWidth() {}
-    override func pApplyTypewriterPadding(_ enabled: Bool) {}
 }
 
 struct PadCardEditor: NSViewRepresentable {
