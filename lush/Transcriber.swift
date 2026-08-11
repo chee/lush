@@ -63,7 +63,15 @@ final class LiveTranscriber {
     private var resultsTask: Task<Void, Never>?
     private var stopped = false
 
-    func start(onText: @escaping @MainActor (String) -> Void) async -> Bool {
+    /// `onInterim` carries the volatile text for the utterance in progress and
+    /// is superseded by the next call; `onFinal` carries one finalized segment
+    /// and is never revised. Neither accumulates — the caller owns the
+    /// transcript so it can commit finalized text once and rewrite only the
+    /// volatile tail.
+    func start(
+        onInterim: @escaping @MainActor (String) -> Void,
+        onFinal: @escaping @MainActor (String) -> Void
+    ) async -> Bool {
         guard SpeechTranscriber.isAvailable,
               await AVAudioApplication.requestRecordPermission(),
               !stopped,
@@ -106,15 +114,13 @@ final class LiveTranscriber {
             self.analyzer = analyzer
             self.input = input
             resultsTask = Task {
-                var final = ""
                 do {
                     for try await result in transcriber.results {
                         let text = String(result.text.characters)
                         if result.isFinal {
-                            final += text
-                            onText(final)
+                            onFinal(text)
                         } else {
-                            onText(final + text)
+                            onInterim(text)
                         }
                     }
                 } catch {}

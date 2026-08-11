@@ -3757,7 +3757,9 @@ final class EditorCore {
         Task { [weak self, weak transcriber] in
             guard let self, let transcriber else { return }
             let started = await transcriber.start { [weak self] text in
-                self?.updateLiveTranscription(text, id: id)
+                self?.updateLiveTranscription(text, id: id, isFinal: false)
+            } onFinal: { [weak self] text in
+                self?.updateLiveTranscription(text, id: id, isFinal: true)
             }
             if !started {
                 self.finishLiveTranscription(id: id, registerUndo: false)
@@ -3773,20 +3775,18 @@ final class EditorCore {
         }
     }
 
-    private func updateLiveTranscription(_ text: String, id: String) {
+    /// Only the volatile tail is rewritten. Finalized segments keep the plain
+    /// `id` attribute and are never spliced again, so dictating a long passage
+    /// doesn't delete and reinsert everything said so far on each result.
+    private func updateLiveTranscription(_ text: String, id: String, isFinal: Bool) {
         guard id == liveTranscriptionID, let view = noteView, let storage = view.pStorage,
               let marker = liveTranscriptionMarker(id, in: storage)
         else { return }
-        let start = NSMaxRange(marker)
-        var old = NSRange(location: start, length: 0)
-        if start < storage.length,
-           storage.attribute(.amLiveTranscription, at: start, effectiveRange: &old) as? String != id {
-            old = NSRange(location: start, length: 0)
-        }
+        let old = liveTranscriptionVolatile(id, in: storage, from: NSMaxRange(marker))
         let replacement = NSMutableAttributedString(string: text, attributes: liveTranscriptionAttributes)
         replacement.addAttribute(
             .amLiveTranscription,
-            value: id,
+            value: isFinal ? id : "\(id):volatile",
             range: NSRange(location: 0, length: replacement.length)
         )
         let selection = view.pSelectedRange
@@ -3805,14 +3805,37 @@ final class EditorCore {
         textDidChange()
         flushQueuedTextSplice()
         let delta = replacement.length - old.length
+        let end = old.location + replacement.length
         if selection.location >= NSMaxRange(old) {
             view.pSelectedRange = NSRange(
-                location: max(start + replacement.length, selection.location + delta),
+                location: max(end, selection.location + delta),
                 length: selection.length
             )
         } else if NSIntersectionRange(selection, old).length > 0 {
-            view.pSelectedRange = NSRange(location: start + replacement.length, length: 0)
+            view.pSelectedRange = NSRange(location: end, length: 0)
         }
+    }
+
+    /// The run holding the utterance in progress, or an empty range just past
+    /// the finalized text when there isn't one.
+    private func liveTranscriptionVolatile(
+        _ id: String,
+        in storage: NSTextStorage,
+        from start: Int
+    ) -> NSRange {
+        var location = start
+        while location < storage.length {
+            var run = NSRange(location: location, length: 0)
+            let value = storage.attribute(
+                .amLiveTranscription,
+                at: location,
+                effectiveRange: &run
+            ) as? String
+            if value == "\(id):volatile" { return run }
+            guard value == id else { break }
+            location = NSMaxRange(run)
+        }
+        return NSRange(location: location, length: 0)
     }
 
     private func finishLiveTranscription(id: String, registerUndo shouldRegisterUndo: Bool) {
