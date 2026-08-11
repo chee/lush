@@ -647,6 +647,57 @@ struct PatchworkWebView: UIViewRepresentable {
 }
 #endif
 
+/// Admission control that queues instead of refusing: a caller over the
+/// ceiling waits for a slot, so back-pressure slows the webview down rather
+/// than failing its storage. The wait is bounded, so a slot that never comes
+/// back fails one op instead of every op after it.
+private actor Slots {
+    private let limit: Int
+    private var used = 0
+    private var waiting: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var queue: [UUID] = []
+
+    init(_ limit: Int) { self.limit = limit }
+
+    /// A waiter gives up rather than queueing behind a slot that may never
+    /// come back: an unbounded wait turns one leaked transfer into a
+    /// permanent stall for every later page.
+    func acquire(for timeout: Duration) async -> Bool {
+        if used < limit {
+            used += 1
+            return true
+        }
+        let id = UUID()
+        let expiry = Task { [weak self] in
+            try await Task.sleep(for: timeout)
+            await self?.expire(id)
+        }
+        let granted = await withCheckedContinuation { continuation in
+            waiting[id] = continuation
+            queue.append(id)
+        }
+        expiry.cancel()
+        return granted
+    }
+
+    func release() {
+        while let id = queue.first {
+            queue.removeFirst()
+            if let continuation = waiting.removeValue(forKey: id) {
+                continuation.resume(returning: true)
+                return
+            }
+        }
+        if used > 0 { used -= 1 }
+    }
+
+    private func expire(_ id: UUID) {
+        guard let continuation = waiting.removeValue(forKey: id) else { return }
+        queue.removeAll { $0 == id }
+        continuation.resume(returning: false)
+    }
+}
+
 /// The webviews' automerge-repo storage adapter, backed by app-local files
 /// plus a read-through into the Rust core's own storage: the first load of a
 /// doc the webview has never stored answers with the core's blobs, so docs
@@ -662,20 +713,256 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
     )[0].appendingPathComponent("LushWebStorage", isDirectory: true)
 
     private nonisolated static let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+    private nonisolated static let ipcBytes = 512 * 1024
+    private nonisolated static let encodedIPCBytes = ((ipcBytes + 2) / 3) * 4
+    private nonisolated static let pageEntries = 32
+    private nonisolated static let activeMessages = 64
+    private nonisolated static let activeTransfers = 256
+    private nonisolated static let activeRanges = 64
+    private nonisolated static let transferIdle: TimeInterval = 600
+    private nonisolated static let reapInterval: Duration = .seconds(5)
+    private nonisolated static let slotWait: Duration = .seconds(60)
+    private nonisolated static let maxKeyComponents = 32
+    private nonisolated static let maxKeyBytes = 4096
+    private nonisolated static let maxComponentBytes = 240
+    private nonisolated static let maxSafeInteger: UInt64 = 9_007_199_254_740_991
+    private nonisolated static let transfersName = ".lush-transfers"
+
+    private enum Failure: LocalizedError {
+        case message(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .message(text): text
+            }
+        }
+    }
+
+    /// The page a transfer belongs to, held weakly: a webview torn down
+    /// mid-boot never runs the JS that ends its loads and ranges, so the
+    /// entries it opened are only recognisable as garbage by their owner
+    /// going away.
+    private final class PageOwner: @unchecked Sendable {
+        private weak var view: AnyObject?
+        init(_ view: AnyObject) { self.view = view }
+        var gone: Bool { view == nil }
+    }
+
+    private struct Victim {
+        let file: FileHandle?
+        let temporary: URL?
+
+        func discard() {
+            if let file { try? file.close() }
+            if let temporary { try? FileManager.default.removeItem(at: temporary) }
+        }
+    }
+
+    private struct SaveTransfer {
+        let file: FileHandle
+        let temporary: URL
+        let destination: URL
+        let owner: PageOwner?
+        var offset: UInt64
+        var touched: Date
+        var busy = false
+    }
+
+    private enum LoadSource {
+        case file(FileHandle)
+        case core(url: String, cursor: String)
+    }
+
+    private struct LoadTransfer {
+        let source: LoadSource
+        let size: UInt64
+        let owner: PageOwner?
+        var offset: UInt64
+        var touched: Date
+        var busy = false
+
+        func close() {
+            if case let .file(file) = source { try? file.close() }
+        }
+    }
+
+    private struct RangeEntry {
+        let cursor: String
+        let size: UInt64
+        let coreCursor: String?
+    }
+
+    private struct RangeTransfer {
+        let prefix: [String]
+        let entries: [RangeEntry]
+        let owner: PageOwner?
+        var offset: Int
+        var touched: Date
+    }
+
+    private let transferLock = NSLock()
+    private let storageLock = NSLock()
+    private let messageSlots = Slots(NativeWebStorage.activeMessages)
+    private let transferSlots = Slots(NativeWebStorage.activeTransfers)
+    private let rangeSlots = Slots(NativeWebStorage.activeRanges)
+    private var saves: [String: SaveTransfer] = [:]
+    private var loads: [String: LoadTransfer] = [:]
+    private var ranges: [String: RangeTransfer] = [:]
+    private var cleared = false
+
+    override init() {
+        super.init()
+        try? FileManager.default.removeItem(at: transfersRoot)
+        Task.detached { [weak self] in
+            guard let container = self?.root.deletingLastPathComponent() else { return }
+            let leftovers = (try? FileManager.default.contentsOfDirectory(
+                at: container,
+                includingPropertiesForKeys: nil
+            )) ?? []
+            for leftover in leftovers where leftover.pathExtension == "clearing" {
+                try? FileManager.default.removeItem(at: leftover)
+            }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.reapInterval)
+                guard let self else { return }
+                reapTransfers()
+            }
+        }
+    }
+
+    private var transfersRoot: URL {
+        root.appendingPathComponent(Self.transfersName, isDirectory: true)
+    }
+
+    private var startupResetMarker: URL {
+        root.deletingLastPathComponent().appendingPathComponent("LushWebStorage.reset")
+    }
+
+    nonisolated var hasPendingStartupReset: Bool {
+        FileManager.default.fileExists(atPath: startupResetMarker.path)
+    }
+
+    nonisolated func clear() async throws {
+        try await Task.detached { [self] in try clear(stopping: true) }.value
+    }
+
+    nonisolated func clearForStartupReset() throws {
+        let fm = FileManager.default
+        try fm.createDirectory(
+            at: startupResetMarker.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: startupResetMarker, options: .atomic)
+        try clear(stopping: false)
+        try fm.removeItem(at: startupResetMarker)
+    }
+
+    nonisolated func quarantinePendingStartupReset(failure: Error) throws -> URL? {
+        storageLock.lock()
+        defer { storageLock.unlock() }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: startupResetMarker.path) else { return nil }
+        for victim in dropAllTransfers() { victim.discard() }
+        let error = failure as NSError
+        let record = [
+            error.domain,
+            String(error.code),
+            error.localizedDescription,
+            String(reflecting: failure),
+        ].joined(separator: "\n")
+        try Data(record.utf8).write(to: startupResetMarker, options: .atomic)
+        var rootQuarantine: URL?
+        if fm.fileExists(atPath: root.path) {
+            let quarantine = root.deletingLastPathComponent().appendingPathComponent(
+                "LushWebStorage-\(UUID().uuidString).quarantine",
+                isDirectory: true
+            )
+            try fm.moveItem(at: root, to: quarantine)
+            rootQuarantine = quarantine
+        }
+        cleared = false
+        let markerQuarantine = startupResetMarker.appendingPathExtension("quarantine")
+        if fm.fileExists(atPath: markerQuarantine.path) {
+            _ = try fm.replaceItemAt(markerQuarantine, withItemAt: startupResetMarker)
+        } else {
+            try fm.moveItem(at: startupResetMarker, to: markerQuarantine)
+        }
+        return rootQuarantine ?? markerQuarantine
+    }
+
+    /// A transfer that is mid-read owns its handle until it reconciles:
+    /// closing it here would pull the file out from under that thread.
+    private nonisolated func dropAllTransfers() -> [Victim] {
+        transferLock.lock()
+        let saveTransfers = saves.values.filter { !$0.busy }
+        let loadTransfers = loads.values.filter { !$0.busy }
+        freeSlots(transferSlots, count: saves.count + loads.count)
+        freeSlots(rangeSlots, count: ranges.count)
+        saves.removeAll()
+        loads.removeAll()
+        ranges.removeAll()
+        transferLock.unlock()
+        return saveTransfers.map { Victim(file: $0.file, temporary: $0.temporary) }
+            + loadTransfers.compactMap { transfer -> Victim? in
+                guard case let .file(file) = transfer.source else { return nil }
+                return Victim(file: file, temporary: nil)
+            }
+    }
+
+    /// The tree is renamed out of the way under the lock and deleted after
+    /// it: the rename is what makes the storage empty, so nothing waits on a
+    /// recursive delete, and no in-flight transfer can land in the tree the
+    /// caller was told was cleared.
+    private nonisolated func clear(stopping: Bool) throws {
+        let discarded = root.deletingLastPathComponent().appendingPathComponent(
+            "LushWebStorage-\(UUID().uuidString).clearing",
+            isDirectory: true
+        )
+        var moved = true
+        storageLock.lock()
+        do {
+            try FileManager.default.moveItem(at: root, to: discarded)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            moved = false
+        } catch {
+            storageLock.unlock()
+            throw error
+        }
+        cleared = stopping
+        let victims = dropAllTransfers()
+        storageLock.unlock()
+        for victim in victims { victim.discard() }
+        if moved { try FileManager.default.removeItem(at: discarded) }
+    }
 
     /// Storage keys come from webview JS, including third-party modules —
     /// dot components must never survive into the path or they escape root.
     private nonisolated func path(for key: [String]) -> URL? {
+        guard !key.isEmpty, key.count <= Self.maxKeyComponents else { return nil }
         var url = root
+        var keyBytes = 0
         for component in key {
-            guard !component.isEmpty, component != ".", component != ".." else { return nil }
+            guard !component.isEmpty, !component.hasPrefix(".") else { return nil }
             let encoded = component.addingPercentEncoding(withAllowedCharacters: Self.safe) ?? component
-            guard !encoded.isEmpty, encoded != ".", encoded != ".." else { return nil }
+            let componentBytes = encoded.utf8.count
+            let (nextBytes, overflow) = keyBytes.addingReportingOverflow(componentBytes)
+            guard !encoded.isEmpty,
+                  !encoded.hasPrefix("."),
+                  componentBytes <= Self.maxComponentBytes,
+                  !overflow,
+                  nextBytes <= Self.maxKeyBytes
+            else { return nil }
+            keyBytes = nextBytes
             url.appendPathComponent(encoded)
         }
         let rootPath = root.standardizedFileURL.path
         guard url.standardizedFileURL.path.hasPrefix(rootPath + "/") else { return nil }
         return url
+    }
+
+    private nonisolated func coreManaged(_ key: [String]) -> Bool {
+        key.count >= 3 && key[1] == "incremental" && key[2].hasPrefix("core-")
     }
 
     func userContentController(
@@ -689,10 +976,32 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
             return
         }
         let key = body["key"] as? [String] ?? []
-        // WebKit delivers script messages on the main thread
-        let core = MainActor.assumeIsolated { self.core }
+        // WebKit delivers script messages on the main thread: nothing here
+        // may take a lock or touch the disk, admission included.
+        let (core, owner) = MainActor.assumeIsolated {
+            (self.core, message.webView.map { PageOwner($0) })
+        }
         Task.detached { [self] in
-            let (reply, error) = handle(op: op, key: key, body: body, core: core)
+            // The slot an opening op needs is taken before the message slot,
+            // so a queue of openers can never hold back the ops that free
+            // transfers. Ranges have their own pool: a range page nests a
+            // load for an oversized entry, and must not be able to starve it.
+            let pool: Slots? = switch op {
+            case "loadStart", "saveStart": transferSlots
+            case "loadRangeStart": rangeSlots
+            default: nil
+            }
+            if let pool, await pool.acquire(for: Self.slotWait) == false {
+                await MainActor.run { replyHandler(nil, "\(op) failed: storage is busy") }
+                return
+            }
+            guard await messageSlots.acquire(for: Self.slotWait) else {
+                if let pool { freeSlots(pool) }
+                await MainActor.run { replyHandler(nil, "\(op) failed: storage is busy") }
+                return
+            }
+            let (reply, error) = handle(op: op, key: key, body: body, core: core, owner: owner)
+            await messageSlots.release()
             await MainActor.run { replyHandler(reply, error) }
         }
     }
@@ -703,79 +1012,696 @@ final class NativeWebStorage: NSObject, WKScriptMessageHandlerWithReply {
         op: String,
         key: [String],
         body: [String: Any],
-        core: Core?
+        core: Core?,
+        owner: PageOwner?
     ) -> ([String: Any]?, String?) {
-        let fm = FileManager.default
-        switch op {
-        case "load":
-            guard let url = path(for: key) else { return (nil, "bad storage key") }
-            guard let data = try? Data(contentsOf: url) else { return ([:], nil) }
-            return (["binary": data.base64EncodedString()], nil)
-        case "save":
-            guard let base64 = body["binary"] as? String,
-                  let data = Data(base64Encoded: base64),
-                  let url = path(for: key) else { return (nil, "bad save request") }
-            do {
-                try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try data.write(to: url)
-                return ([:], nil)
-            } catch {
-                return (nil, "save failed: \(error.localizedDescription)")
-            }
-        case "saveBatch":
-            for entry in body["entries"] as? [[String: Any]] ?? [] {
-                guard let entryKey = entry["key"] as? [String],
-                      let base64 = entry["binary"] as? String,
-                      let data = Data(base64Encoded: base64),
-                      let url = path(for: entryKey) else { return (nil, "bad saveBatch entry") }
+        do {
+            switch op {
+            // The transfer slot the dispatcher took is owned by the entry
+            // these make; it goes back the moment no entry exists to own it.
+            case "loadStart":
                 do {
-                    try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try data.write(to: url)
+                    let transfer = try beginLoad(key: key, core: core, owner: owner)
+                    if transfer.token.isEmpty { freeSlots(transferSlots) }
+                    return (["transfer": transfer.token, "size": NSNumber(value: transfer.size)], nil)
                 } catch {
-                    return (nil, "saveBatch failed: \(error.localizedDescription)")
+                    freeSlots(transferSlots)
+                    throw error
                 }
-            }
-            return ([:], nil)
-        case "remove", "removeRange":
-            guard let url = path(for: key) else { return (nil, "bad storage key") }
-            do {
-                try fm.removeItem(at: url)
-            } catch let error as NSError
-                where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
-                // already gone
-            } catch {
-                return (nil, "remove failed: \(error.localizedDescription)")
-            }
-            return ([:], nil)
-        case "loadRange":
-            var chunks = loadRange(prefix: key)
-            if chunks.isEmpty, key.count == 1, let core {
-                chunks = core.docStorageChunks(url: "automerge:\(key[0])").map { chunk in
-                    ["key": [key[0], "incremental", "core-\(chunk.digest)"],
-                     "binary": Data(chunk.bytes).base64EncodedString()]
+            case "loadChunk":
+                guard let token = body["transfer"] as? String,
+                      let offset = uint64(body["offset"])
+                else { throw Failure.message("bad load chunk") }
+                let data = try readLoad(token: token, offset: offset, core: core)
+                return (["binary": data.base64EncodedString()], nil)
+            case "loadEnd":
+                guard let token = body["transfer"] as? String else {
+                    throw Failure.message("bad load transfer")
                 }
+                endLoad(token: token)
+                return ([:], nil)
+            case "saveBatch":
+                guard let entries = body["entries"] as? [[String: Any]],
+                      entries.count <= Self.pageEntries
+                else { throw Failure.message("bad saveBatch request") }
+                var encodedBytes = 0
+                for entry in entries {
+                    guard let base64 = entry["binary"] as? String else {
+                        throw Failure.message("bad saveBatch entry")
+                    }
+                    let (nextBytes, overflow) = encodedBytes.addingReportingOverflow(base64.utf8.count)
+                    guard !overflow, nextBytes <= Self.encodedIPCBytes else {
+                        throw Failure.message("saveBatch requires chunking")
+                    }
+                    encodedBytes = nextBytes
+                }
+                for entry in entries {
+                    guard let entryKey = entry["key"] as? [String],
+                          let base64 = entry["binary"] as? String,
+                          let url = path(for: entryKey),
+                          !coreManaged(entryKey)
+                    else { throw Failure.message("bad saveBatch entry") }
+                    let data = try decodeChunk(base64)
+                    try commit(data: data, to: url)
+                }
+                return ([:], nil)
+            case "saveStart":
+                do {
+                    return (["transfer": try beginSave(key: key, owner: owner)], nil)
+                } catch {
+                    freeSlots(transferSlots)
+                    throw error
+                }
+            case "saveChunk":
+                guard let token = body["transfer"] as? String,
+                      let offset = uint64(body["offset"]),
+                      let base64 = body["binary"] as? String,
+                      let done = body["done"] as? Bool
+                else { throw Failure.message("bad save chunk") }
+                try appendSave(
+                    token: token,
+                    offset: offset,
+                    data: decodeChunk(base64),
+                    done: done
+                )
+                return ([:], nil)
+            case "saveCancel":
+                guard let token = body["transfer"] as? String else {
+                    throw Failure.message("bad save transfer")
+                }
+                cancelSave(token: token)
+                return ([:], nil)
+            case "remove", "removeRange":
+                try removeStorage(key: key)
+                return ([:], nil)
+            case "loadRangeStart":
+                let token: String
+                do {
+                    token = try beginRange(prefix: key, core: core, owner: owner)
+                } catch {
+                    freeSlots(rangeSlots)
+                    throw error
+                }
+                // The token only reaches JS with the first page: if that
+                // fails nothing will ever end the transfer.
+                do {
+                    return (try readRange(token: token, core: core), nil)
+                } catch {
+                    endRange(token: token)
+                    throw error
+                }
+            case "loadRangePage":
+                guard let token = body["transfer"] as? String else {
+                    throw Failure.message("bad range transfer")
+                }
+                return (try readRange(token: token, core: core), nil)
+            case "loadRangeEnd":
+                guard let token = body["transfer"] as? String else {
+                    throw Failure.message("bad range transfer")
+                }
+                endRange(token: token)
+                return ([:], nil)
+            default:
+                return (nil, "unknown storage op \(op)")
             }
-            return (["chunks": chunks], nil)
-        default:
-            return (nil, "unknown storage op \(op)")
+        } catch {
+            return (nil, "\(op) failed: \(error.localizedDescription)")
         }
     }
 
-    private nonisolated func loadRange(prefix: [String]) -> [[String: Any]] {
-        guard let base = path(for: prefix) else { return [] }
+    private nonisolated func uint64(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber else { return nil }
+        let double = number.doubleValue
+        guard double.isFinite,
+              double >= 0,
+              double <= Double(Self.maxSafeInteger),
+              double.rounded(.towardZero) == double
+        else { return nil }
+        return UInt64(double)
+    }
+
+    private nonisolated func freeSlots(_ slots: Slots, count: Int = 1) {
+        guard count > 0 else { return }
+        Task { for _ in 0..<count { await slots.release() } }
+    }
+
+    private nonisolated func decodeChunk(_ base64: String) throws -> Data {
+        guard base64.utf8.count <= Self.encodedIPCBytes,
+              let data = Data(base64Encoded: base64),
+              data.count <= Self.ipcBytes
+        else { throw Failure.message("invalid storage chunk") }
+        return data
+    }
+
+    /// Runs on a schedule, so a slot is never held hostage by a page that
+    /// went away without ending its transfers. Only idle or orphaned
+    /// transfers are reaped, and never one that is mid-chunk: a client still
+    /// making progress must never have the transfer pulled out from under it.
+    /// Handles are closed and temporaries unlinked with the lock dropped.
+    private nonisolated func reapTransfers() {
+        let now = Date()
+        let dead = { (touched: Date, owner: PageOwner?, busy: Bool) in
+            !busy && (owner?.gone == true || now.timeIntervalSince(touched) > Self.transferIdle)
+        }
+        var victims: [Victim] = []
+        transferLock.lock()
+        for (token, transfer) in saves
+        where dead(transfer.touched, transfer.owner, transfer.busy) {
+            saves.removeValue(forKey: token)
+            freeSlots(transferSlots)
+            victims.append(Victim(file: transfer.file, temporary: transfer.temporary))
+        }
+        for (token, transfer) in loads
+        where dead(transfer.touched, transfer.owner, transfer.busy) {
+            loads.removeValue(forKey: token)
+            freeSlots(transferSlots)
+            if case let .file(file) = transfer.source {
+                victims.append(Victim(file: file, temporary: nil))
+            }
+        }
+        for (token, transfer) in ranges where dead(transfer.touched, transfer.owner, false) {
+            dropRangeLocked(token)
+        }
+        transferLock.unlock()
+        for victim in victims { victim.discard() }
+    }
+
+    private nonisolated func dropRangeLocked(_ token: String) {
+        guard ranges.removeValue(forKey: token) != nil else { return }
+        freeSlots(rangeSlots)
+    }
+
+    private nonisolated func beginSave(key: [String], owner: PageOwner?) throws -> String {
+        guard let destination = path(for: key), !coreManaged(key) else {
+            throw Failure.message("bad storage key")
+        }
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(at: base, includingPropertiesForKeys: [.isRegularFileKey]) else {
-            return []
+        let token = UUID().uuidString
+        let temporary = transfersRoot.appendingPathComponent(token)
+        let file: FileHandle
+        do {
+            storageLock.lock()
+            defer { storageLock.unlock() }
+            guard !cleared else { throw Failure.message("storage was cleared") }
+            try fm.createDirectory(at: transfersRoot, withIntermediateDirectories: true)
+            guard fm.createFile(atPath: temporary.path, contents: nil) else {
+                throw Failure.message("couldn't create save transfer")
+            }
+            file = try FileHandle(forWritingTo: temporary)
+        } catch {
+            try? fm.removeItem(at: temporary)
+            throw error
         }
-        var chunks: [[String: Any]] = []
+        transferLock.lock()
+        saves[token] = SaveTransfer(
+            file: file,
+            temporary: temporary,
+            destination: destination,
+            owner: owner,
+            offset: 0,
+            touched: Date()
+        )
+        transferLock.unlock()
+        return token
+    }
+
+    private nonisolated func appendSave(
+        token: String,
+        offset: UInt64,
+        data: Data,
+        done: Bool
+    ) throws {
+        transferLock.lock()
+        guard var transfer = saves[token], !transfer.busy else {
+            transferLock.unlock()
+            throw Failure.message("invalid save transfer")
+        }
+        let (nextOffset, overflow) = transfer.offset.addingReportingOverflow(UInt64(data.count))
+        guard transfer.offset == offset, !overflow else {
+            transferLock.unlock()
+            cancelSave(token: token)
+            throw Failure.message("invalid save offset")
+        }
+        transfer.busy = true
+        transfer.touched = Date()
+        saves[token] = transfer
+        transferLock.unlock()
+
+        // The write, the fsync and the commit all happen with no lock held;
+        // `busy` is what keeps a second chunk out of this transfer.
+        do {
+            try transfer.file.seek(toOffset: offset)
+            try transfer.file.write(contentsOf: data)
+            if done {
+                try transfer.file.synchronize()
+                try transfer.file.close()
+            }
+        } catch {
+            discard(transfer, token: token)
+            throw error
+        }
+        transfer.offset = nextOffset
+        transfer.touched = Date()
+        transfer.busy = false
+
+        transferLock.lock()
+        guard saves[token] != nil else {
+            transferLock.unlock()
+            discard(transfer, token: token, closing: !done)
+            throw Failure.message("save transfer ended")
+        }
+        if done {
+            saves.removeValue(forKey: token)
+            freeSlots(transferSlots)
+        } else {
+            saves[token] = transfer
+        }
+        transferLock.unlock()
+        guard done else { return }
+        do {
+            try commit(
+                temporary: transfer.temporary,
+                to: transfer.destination,
+                size: transfer.offset
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: transfer.temporary)
+            throw error
+        }
+    }
+
+    private nonisolated func discard(_ transfer: SaveTransfer, token: String, closing: Bool = true) {
+        transferLock.lock()
+        if saves.removeValue(forKey: token) != nil { freeSlots(transferSlots) }
+        transferLock.unlock()
+        if closing { try? transfer.file.close() }
+        try? FileManager.default.removeItem(at: transfer.temporary)
+    }
+
+    /// A chunk in flight owns the handle; cancelling only unhooks the
+    /// transfer and leaves the closing to that thread.
+    private nonisolated func cancelSave(token: String) {
+        transferLock.lock()
+        let transfer = saves[token]?.busy == true ? nil : saves[token]
+        if saves.removeValue(forKey: token) != nil { freeSlots(transferSlots) }
+        transferLock.unlock()
+        guard let transfer else { return }
+        try? transfer.file.close()
+        try? FileManager.default.removeItem(at: transfer.temporary)
+    }
+
+    private nonisolated func beginLoad(
+        key: [String],
+        core: Core?,
+        owner: PageOwner?
+    ) throws -> (token: String, size: UInt64) {
+        let source: LoadSource
+        let size: UInt64
+        if coreManaged(key), let core, let chunk = try coreChunk(for: key, core: core) {
+            source = .core(url: coreDocURL(key), cursor: chunk.cursor)
+            size = chunk.byteLen
+        } else {
+            guard let url = path(for: key) else { throw Failure.message("bad storage key") }
+            storageLock.lock()
+            defer { storageLock.unlock() }
+            guard !cleared else { throw Failure.message("storage was cleared") }
+            guard FileManager.default.fileExists(atPath: url.path) else { return ("", 0) }
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw Failure.message("bad storage file")
+            }
+            let file = try FileHandle(forReadingFrom: url)
+            size = try file.seekToEnd()
+            try file.seek(toOffset: 0)
+            source = .file(file)
+        }
+        let token = UUID().uuidString
+        transferLock.lock()
+        loads[token] = LoadTransfer(
+            source: source,
+            size: size,
+            owner: owner,
+            offset: 0,
+            touched: Date()
+        )
+        transferLock.unlock()
+        return (token, size)
+    }
+
+    private nonisolated func readLoad(token: String, offset: UInt64, core: Core?) throws -> Data {
+        transferLock.lock()
+        guard var transfer = loads[token], !transfer.busy else {
+            transferLock.unlock()
+            throw Failure.message("invalid load transfer")
+        }
+        guard transfer.offset == offset, offset <= transfer.size else {
+            transferLock.unlock()
+            endLoad(token: token)
+            throw Failure.message("invalid load offset")
+        }
+        transfer.busy = true
+        transfer.touched = Date()
+        loads[token] = transfer
+        transferLock.unlock()
+
+        // The file read and the core slice happen with no lock held; `busy`
+        // is what keeps a second chunk out of this transfer.
+        let remaining = transfer.size - offset
+        let count = Int(min(remaining, UInt64(Self.ipcBytes)))
+        let data: Data
+        do {
+            switch transfer.source {
+            case let .file(file):
+                try file.seek(toOffset: offset)
+                data = try file.read(upToCount: count) ?? Data()
+            case let .core(url, cursor):
+                guard let core else { throw Failure.message("core storage is unavailable") }
+                data = count == 0
+                    ? Data()
+                    : try core.docStorageChunkSlice(url: url, cursor: cursor, offset: offset)
+            }
+            guard data.count <= count, count == 0 || !data.isEmpty else {
+                throw Failure.message("storage value ended early")
+            }
+        } catch {
+            finishLoad(transfer, token: token)
+            throw error
+        }
+        let (nextOffset, overflow) = offset.addingReportingOverflow(UInt64(data.count))
+        guard !overflow, nextOffset <= transfer.size else {
+            finishLoad(transfer, token: token)
+            throw Failure.message("storage value changed while loading")
+        }
+        if nextOffset == transfer.size {
+            finishLoad(transfer, token: token)
+            return data
+        }
+        transferLock.lock()
+        guard loads[token] != nil else {
+            transferLock.unlock()
+            transfer.close()
+            throw Failure.message("load transfer ended")
+        }
+        transfer.offset = nextOffset
+        transfer.touched = Date()
+        transfer.busy = false
+        loads[token] = transfer
+        transferLock.unlock()
+        return data
+    }
+
+    private nonisolated func finishLoad(_ transfer: LoadTransfer, token: String) {
+        transferLock.lock()
+        if loads.removeValue(forKey: token) != nil { freeSlots(transferSlots) }
+        transferLock.unlock()
+        transfer.close()
+    }
+
+    /// A chunk in flight owns the handle; ending only unhooks the transfer
+    /// and leaves the closing to that thread.
+    private nonisolated func endLoad(token: String) {
+        transferLock.lock()
+        let transfer = loads[token]?.busy == true ? nil : loads[token]
+        if loads.removeValue(forKey: token) != nil { freeSlots(transferSlots) }
+        transferLock.unlock()
+        transfer?.close()
+    }
+
+    private nonisolated func loadSmall(
+        key: [String],
+        expectedSize: UInt64? = nil
+    ) throws -> Data? {
+        guard let url = path(for: key) else { throw Failure.message("bad storage key") }
+        storageLock.lock()
+        defer { storageLock.unlock() }
+        guard !cleared else { throw Failure.message("storage was cleared") }
+        guard let size = try storedFileSize(url) else { return nil }
+        guard size <= UInt64(Self.ipcBytes) else {
+            throw Failure.message("load requires chunking")
+        }
+        if let expectedSize, expectedSize != size {
+            throw Failure.message("storage value changed while loading")
+        }
+        let data = try Data(contentsOf: url)
+        guard UInt64(data.count) == size else {
+            throw Failure.message("storage value changed while loading")
+        }
+        return data
+    }
+
+    private nonisolated func storedFileSize(_ url: URL) throws -> UInt64? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let values = try url.resourceValues(
+            forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              size >= 0
+        else { throw Failure.message("bad storage file") }
+        return UInt64(size)
+    }
+
+    private nonisolated func commit(data: Data, to destination: URL) throws {
+        storageLock.lock()
+        defer { storageLock.unlock() }
+        guard !cleared else { throw Failure.message("storage was cleared") }
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: destination, options: .atomic)
+    }
+
+    private nonisolated func commit(
+        temporary: URL,
+        to destination: URL,
+        size: UInt64
+    ) throws {
+        storageLock.lock()
+        defer { storageLock.unlock() }
+        guard !cleared else { throw Failure.message("storage was cleared") }
+        guard try storedFileSize(temporary) == size else {
+            throw Failure.message("save transfer changed")
+        }
+        let fm = FileManager.default
+        try fm.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if fm.fileExists(atPath: destination.path) {
+            _ = try fm.replaceItemAt(destination, withItemAt: temporary)
+        } else {
+            try fm.moveItem(at: temporary, to: destination)
+        }
+    }
+
+    private nonisolated func removeStorage(key: [String]) throws {
+        guard let url = path(for: key) else { throw Failure.message("bad storage key") }
+        storageLock.lock()
+        defer { storageLock.unlock() }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+        }
+    }
+
+    private nonisolated func components(for cursor: String) -> [String] {
+        cursor.split(separator: "/").map {
+            String($0).removingPercentEncoding ?? String($0)
+        }
+    }
+
+    private nonisolated func storedRange(prefix: [String]) throws -> [RangeEntry] {
+        guard let base = path(for: prefix) else { throw Failure.message("bad storage key") }
+        storageLock.lock()
+        defer { storageLock.unlock() }
+        guard !cleared else { throw Failure.message("storage was cleared") }
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: base,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+        ) else { return [] }
+        var entries: [RangeEntry] = []
         for case let file as URL in enumerator {
-            guard (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
-                  let data = try? Data(contentsOf: file) else { continue }
             let relative = file.path.dropFirst(base.path.count).split(separator: "/")
-                .map { String($0).removingPercentEncoding ?? String($0) }
-            chunks.append(["key": prefix + relative, "binary": data.base64EncodedString()])
+            guard !relative.isEmpty else { continue }
+            guard !relative.contains(where: { $0.hasPrefix(".") }) else {
+                enumerator.skipDescendants()
+                continue
+            }
+            let values = try file.resourceValues(
+                forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+            )
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  let fileSize = values.fileSize,
+                  fileSize >= 0
+            else { continue }
+            let cursor = relative.joined(separator: "/")
+            guard cursor.utf8.count <= Self.maxKeyBytes,
+                  path(for: prefix + components(for: cursor))?.standardizedFileURL
+                    == file.standardizedFileURL
+            else {
+                NSLog("lush web storage found unreadable key: %@", cursor)
+                throw Failure.message("storage range holds an unreadable key")
+            }
+            entries.append(RangeEntry(cursor: cursor, size: UInt64(fileSize), coreCursor: nil))
         }
-        return chunks
+        return entries
+    }
+
+    private nonisolated func coreDocURL(_ key: [String]) -> String { "automerge:\(key[0])" }
+
+    /// Read-through, not a copy: the core's blobs are listed alongside what
+    /// the webview wrote and read straight out of core storage on demand.
+    private nonisolated func coreEntries(prefix: [String], core: Core?) throws -> [RangeEntry] {
+        guard let core, prefix.count == 2, prefix[1] == "incremental" else { return [] }
+        return try core.docStorageChunkList(url: coreDocURL(prefix)).map { chunk in
+            guard let encoded = "core-\(chunk.digest)"
+                .addingPercentEncoding(withAllowedCharacters: Self.safe),
+                  !encoded.isEmpty,
+                  encoded.utf8.count <= Self.maxComponentBytes
+            else { throw Failure.message("core storage holds an unreadable digest") }
+            return RangeEntry(cursor: encoded, size: chunk.byteLen, coreCursor: chunk.cursor)
+        }
+    }
+
+    /// The listing a range already took stands in for a fresh one: an entry
+    /// too big to inline comes back as its own load, and re-listing the doc
+    /// once per oversized entry is both slower and a different generation
+    /// than the range the page came from.
+    private nonisolated func coreChunk(for key: [String], core: Core) throws -> StorageChunk? {
+        guard key.count == 3 else { return nil }
+        let digest = String(key[2].dropFirst("core-".count))
+        if let chunk = rangeCoreChunk(prefix: [key[0], key[1]], digest: digest) { return chunk }
+        return try core.docStorageChunkList(url: coreDocURL(key)).first { $0.digest == digest }
+    }
+
+    private nonisolated func rangeCoreChunk(prefix: [String], digest: String) -> StorageChunk? {
+        transferLock.lock()
+        defer { transferLock.unlock() }
+        for transfer in ranges.values where transfer.prefix == prefix {
+            for entry in transfer.entries {
+                guard let cursor = entry.coreCursor,
+                      components(for: entry.cursor) == ["core-\(digest)"]
+                else { continue }
+                return StorageChunk(cursor: cursor, digest: digest, byteLen: entry.size)
+            }
+        }
+        return nil
+    }
+
+    private nonisolated func snapshotRange(prefix: [String], core: Core?) throws -> [RangeEntry] {
+        var entries = try storedRange(prefix: prefix)
+        let stored = Set(entries.map(\.cursor))
+        entries += try coreEntries(prefix: prefix, core: core).filter { !stored.contains($0.cursor) }
+        entries.sort { $0.cursor < $1.cursor }
+        return entries
+    }
+
+    private nonisolated func beginRange(
+        prefix: [String],
+        core: Core?,
+        owner: PageOwner?
+    ) throws -> String {
+        let entries = try snapshotRange(prefix: prefix, core: core)
+        let token = UUID().uuidString
+        transferLock.lock()
+        defer { transferLock.unlock() }
+        ranges[token] = RangeTransfer(
+            prefix: prefix,
+            entries: entries,
+            owner: owner,
+            offset: 0,
+            touched: Date()
+        )
+        return token
+    }
+
+    /// A page carries the bytes of every entry that fits the IPC budget, so
+    /// the common case of many small chunks is one message, not one per chunk.
+    /// An entry whose bytes won't read fails the whole range: a short page
+    /// reads as the document's complete history, and the next compaction
+    /// writes a snapshot from it and deletes the chunks it never saw.
+    private nonisolated func readRange(token: String, core: Core?) throws -> [String: Any] {
+        transferLock.lock()
+        guard var transfer = ranges[token] else {
+            transferLock.unlock()
+            throw Failure.message("invalid range transfer")
+        }
+        transferLock.unlock()
+        var entries: [[String: Any]] = []
+        var inlineBytes: UInt64 = 0
+        var index = transfer.offset
+        while index < transfer.entries.count, entries.count < Self.pageEntries {
+            let entry = transfer.entries[index]
+            let fits = entry.size <= UInt64(Self.ipcBytes) - inlineBytes
+            if !fits, !entries.isEmpty { break }
+            index += 1
+            var payload: [String: Any] = [
+                "key": transfer.prefix + components(for: entry.cursor),
+                "size": NSNumber(value: entry.size),
+            ]
+            if fits {
+                let data = try entryData(prefix: transfer.prefix, entry: entry, core: core)
+                payload["binary"] = data.base64EncodedString()
+                inlineBytes += entry.size
+            }
+            entries.append(payload)
+        }
+        let count = index - transfer.offset
+        let done = index == transfer.entries.count
+        transferLock.lock()
+        defer { transferLock.unlock() }
+        if done {
+            dropRangeLocked(token)
+        } else if ranges[token] != nil {
+            transfer.offset = index
+            transfer.touched = Date()
+            ranges[token] = transfer
+        }
+        return [
+            "transfer": token,
+            "entries": entries,
+            "count": NSNumber(value: count),
+            "done": done,
+        ]
+    }
+
+    private nonisolated func entryData(
+        prefix: [String],
+        entry: RangeEntry,
+        core: Core?
+    ) throws -> Data {
+        guard let cursor = entry.coreCursor else {
+            guard let data = try loadSmall(
+                key: prefix + components(for: entry.cursor),
+                expectedSize: entry.size
+            ) else { throw Failure.message("storage range entry went away") }
+            return data
+        }
+        guard let core else { throw Failure.message("core storage is unavailable") }
+        var data = Data()
+        while UInt64(data.count) < entry.size {
+            let slice = try core.docStorageChunkSlice(
+                url: coreDocURL(prefix),
+                cursor: cursor,
+                offset: UInt64(data.count)
+            )
+            guard !slice.isEmpty, UInt64(data.count + slice.count) <= entry.size else {
+                throw Failure.message("core storage entry changed while loading")
+            }
+            data.append(slice)
+        }
+        return data
+    }
+
+    private nonisolated func endRange(token: String) {
+        transferLock.lock()
+        dropRangeLocked(token)
+        transferLock.unlock()
     }
 }
 
@@ -1474,7 +2400,7 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     private var current: (url: String?, toolId: String?, draftUrl: String?, checkoutUrl: String?)?
     private var backingUrl: String?
     private var loaded = false
-    private var loadWaiters: [CheckedContinuation<Void, any Error>] = []
+    private var loadWaiters: [UUID: CheckedContinuation<Void, any Error>] = [:]
 
     init(query: [URLQueryItem] = [], messageHandler: (any WKScriptMessageHandler)? = nil) {
         webView = makePatchworkWebView(query: query, messageHandler: messageHandler)
@@ -1499,9 +2425,35 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
 
     func waitUntilLoaded() async throws {
         if loaded { return }
-        try await withCheckedThrowingContinuation { continuation in
-            loadWaiters.append(continuation)
+        let id = UUID()
+        let timeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled else { return }
+            self?.finishLoadWaiter(id, with: .failure(URLError(.timedOut)))
         }
+        defer { timeout.cancel() }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if loaded {
+                    continuation.resume()
+                } else if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    loadWaiters[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.finishLoadWaiter(id, with: .failure(CancellationError()))
+            }
+        }
+    }
+
+    private func finishLoadWaiter(
+        _ id: UUID,
+        with result: Result<Void, any Error>
+    ) {
+        loadWaiters.removeValue(forKey: id)?.resume(with: result)
     }
 
     /// The document the view should really read: the checked-out draft's
@@ -1517,7 +2469,7 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
         loaded = true
         let waiters = loadWaiters
         loadWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+        waiters.values.forEach { $0.resume() }
         if let p = pending {
             pending = nil
             webView.callSetDoc(
@@ -1537,7 +2489,7 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     ) {
         let waiters = loadWaiters
         loadWaiters.removeAll()
-        waiters.forEach { $0.resume(throwing: error) }
+        waiters.values.forEach { $0.resume(throwing: error) }
     }
 
     func webView(
@@ -1547,7 +2499,7 @@ final class PatchworkWebViewHost: NSObject, WKNavigationDelegate {
     ) {
         let waiters = loadWaiters
         loadWaiters.removeAll()
-        waiters.forEach { $0.resume(throwing: error) }
+        waiters.values.forEach { $0.resume(throwing: error) }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {

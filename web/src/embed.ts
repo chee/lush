@@ -19,12 +19,12 @@ import {
   createDocOfDatatype2,
 } from "@inkandswitch/patchwork-plugins";
 import * as plugins from "@inkandswitch/patchwork-plugins";
-import { fromBase64, toBase64 } from "./bytes";
 import { configuredSigner, subductionEndpoints } from "./config";
 import { loadAccount } from "./account";
 import { makeImportPackage } from "./packages";
 import { installPatchworkApi } from "./patchwork-api";
 import { installResolver } from "./resolver";
+import { NativeStorageAdapter } from "./storage";
 import type { PatchworkConfig } from "./types";
 
 const reportError = (text: unknown) => {
@@ -46,53 +46,6 @@ const status = (text: string) => {
   const el = document.getElementById("status");
   if (el) el.textContent = text;
 };
-
-// Storage lives in the app: reads and writes go over IPC to native files,
-// and the first load of any doc falls through to the Rust core's own
-// storage, so docs the app already has open with no network sync.
-class NativeStorageAdapter {
-  async #call(message: Record<string, unknown>) {
-    try {
-      return (await window.webkit?.messageHandlers?.lushstorage?.postMessage(
-        message,
-      )) as Record<string, any> | undefined;
-    } catch (error) {
-      reportError(`storage ${message.op} failed: ${error}`);
-      throw error;
-    }
-  }
-  async load(key: string[]) {
-    const result = await this.#call({ op: "load", key });
-    return result?.binary ? fromBase64(result.binary) : undefined;
-  }
-  async save(key: string[], binary: Uint8Array) {
-    await this.#call({ op: "save", key, binary: toBase64(binary) });
-  }
-  async saveBatch(entries: [string[], Uint8Array][]) {
-    await this.#call({
-      op: "saveBatch",
-      entries: entries.map(([key, binary]) => ({
-        key,
-        binary: toBase64(binary),
-      })),
-    });
-  }
-  async remove(key: string[]) {
-    await this.#call({ op: "remove", key });
-  }
-  async loadRange(keyPrefix: string[]) {
-    const result = await this.#call({ op: "loadRange", key: keyPrefix });
-    return (result?.chunks ?? []).map(
-      (chunk: { key: string[]; binary: string }) => ({
-        key: chunk.key,
-        data: fromBase64(chunk.binary),
-      }),
-    );
-  }
-  async removeRange(keyPrefix: string[]) {
-    await this.#call({ op: "removeRange", key: keyPrefix });
-  }
-}
 
 async function findWithin<T>(repo: Repo, url: AutomergeUrl, timeoutMs: number) {
   const controller = new AbortController();
@@ -196,7 +149,16 @@ async function boot() {
 
   const signer = configuredSigner(config);
   const repo = new Repo({
-    storage: new NativeStorageAdapter(),
+    storage: new NativeStorageAdapter(async (message) => {
+      try {
+        return (await window.webkit?.messageHandlers?.lushstorage?.postMessage(
+          message,
+        )) as Record<string, any> | undefined;
+      } catch (error) {
+        reportError(`storage ${message.op} failed: ${error}`);
+        throw error;
+      }
+    }),
     signer,
     peerId: `lush-${Math.random().toString(36).slice(2, 10)}` as PeerId,
     enableRemoteHeadsGossiping: true,
