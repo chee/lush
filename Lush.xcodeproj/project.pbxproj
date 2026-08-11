@@ -47,6 +47,13 @@
 			remoteGlobalIDString = F073172430241AD500FFA544;
 			remoteInfo = LushFinderAction;
 		};
+		F0C0A001000000000000000B /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F001D300301E8AA900E154BD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F001D307301E8AA900E154BD;
+			remoteInfo = Lush;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -84,6 +91,7 @@
 		F073170F30241ABC00FFA544 /* LushShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F073172530241AD500FFA544 /* LushFinderAction.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LushFinderAction.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0872FA3301F62AD003F9B3B /* PatchworkWeb.bundle */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.plug-in"; path = PatchworkWeb.bundle; sourceTree = "<group>"; };
+		F0C0A0010000000000000001 /* LushTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LushTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0DC71D0000000000000000A /* LushDockTile.docktileplugin */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LushDockTile.docktileplugin; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -173,6 +181,11 @@
 			path = Common;
 			sourceTree = "<group>";
 		};
+		F0C0A0010000000000000002 /* LushTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = LushTests;
+			sourceTree = "<group>";
+		};
 		F0DC71D00000000000000008 /* LushDockTile */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -216,6 +229,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0C0A0010000000000000008 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		F0DC71D00000000000000006 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -230,6 +250,7 @@
 			isa = PBXGroup;
 			children = (
 				F07318543024EBD200FFA544 /* fonts */,
+				F0C0A0010000000000000002 /* LushTests */,
 				F07316B63022831200FFA544 /* LushWidget */,
 				F073171030241ABC00FFA544 /* LushShareExtension */,
 				F073172630241AD500FFA544 /* LushFinderAction */,
@@ -247,6 +268,7 @@
 			isa = PBXGroup;
 			children = (
 				F001D308301E8AA900E154BD /* Lush.app */,
+				F0C0A0010000000000000001 /* LushTests.xctest */,
 				F07316B03022831200FFA544 /* LushWidgetExtension.appex */,
 				F073170F30241ABC00FFA544 /* LushShareExtension.appex */,
 				F073172530241AD500FFA544 /* LushFinderAction.appex */,
@@ -370,6 +392,29 @@
 			productReference = F073172530241AD500FFA544 /* LushFinderAction.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		F0C0A0010000000000000003 /* LushTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F0C0A0010000000000000004 /* Build configuration list for PBXNativeTarget "LushTests" */;
+			buildPhases = (
+				F0C0A0010000000000000007 /* Sources */,
+				F0C0A0010000000000000008 /* Frameworks */,
+				F0C0A0010000000000000009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				F0C0A001000000000000000A /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				F0C0A0010000000000000002 /* LushTests */,
+			);
+			name = LushTests;
+			packageProductDependencies = (
+			);
+			productName = LushTests;
+			productReference = F0C0A0010000000000000001 /* LushTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		F0DC71D00000000000000001 /* LushDockTile */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = F0DC71D00000000000000002 /* Build configuration list for PBXNativeTarget "LushDockTile" */;
@@ -415,6 +460,10 @@
 					F073172430241AD500FFA544 = {
 						CreatedOnToolsVersion = 26.6;
 					};
+					F0C0A0010000000000000003 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = F001D307301E8AA900E154BD;
+					};
 					F0DC71D00000000000000001 = {
 						CreatedOnToolsVersion = 26.6;
 					};
@@ -438,6 +487,7 @@
 			projectRoot = "";
 			targets = (
 				F001D307301E8AA900E154BD /* Lush */,
+				F0C0A0010000000000000003 /* LushTests */,
 				F07316AF3022831200FFA544 /* LushWidgetExtension */,
 				F073170E30241ABC00FFA544 /* LushShareExtension */,
 				F073172430241AD500FFA544 /* LushFinderAction */,
@@ -470,6 +520,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		F073172330241AD500FFA544 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F0C0A0010000000000000009 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -536,6 +593,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F0C0A0010000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		F0DC71D00000000000000005 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -568,6 +632,11 @@
 			isa = PBXTargetDependency;
 			target = F073172430241AD500FFA544 /* LushFinderAction */;
 			targetProxy = F073173130241AD500FFA544 /* PBXContainerItemProxy */;
+		};
+		F0C0A001000000000000000A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F001D307301E8AA900E154BD /* Lush */;
+			targetProxy = F0C0A001000000000000000B /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1103,6 +1172,64 @@
 			};
 			name = Release;
 		};
+		F0C0A0010000000000000005 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lushTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/core/bindings/include";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Lush.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Lush";
+			};
+			name = Debug;
+		};
+		F0C0A0010000000000000006 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = R2MP6EU7T3;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				PRODUCT_BUNDLE_IDENTIFIER = party.chee.patchwork.lushTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/core/bindings/include";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Lush.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Lush";
+			};
+			name = Release;
+		};
 		F0DC71D00000000000000003 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -1216,6 +1343,15 @@
 			buildConfigurations = (
 				F073173630241AD500FFA544 /* Debug */,
 				F073173730241AD500FFA544 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F0C0A0010000000000000004 /* Build configuration list for PBXNativeTarget "LushTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F0C0A0010000000000000005 /* Debug */,
+				F0C0A0010000000000000006 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

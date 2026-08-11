@@ -39,7 +39,9 @@ enum CBOR {
         var uintValue: UInt64? {
             switch self {
             case .uint(let n): return n
-            case .double(let d) where d >= 0: return UInt64(d)
+            case .double(let d)
+                where d.isFinite && d >= 0 && d < 18_446_744_073_709_551_616:
+                return UInt64(d)
             default: return nil
             }
         }
@@ -59,6 +61,7 @@ enum CBOR {
         case unsupported(UInt8)
         case invalidString
         case nonStringKey
+        case integerOutOfRange
     }
 
     // MARK: encode
@@ -180,7 +183,9 @@ enum CBOR {
         case 0:
             return .uint(try readLength(info, data, &cursor))
         case 1:
-            return .negint(-1 - Int64(try readLength(info, data, &cursor)))
+            let encoded = try readLength(info, data, &cursor)
+            guard encoded <= UInt64(Int64.max) else { throw DecodeError.integerOutOfRange }
+            return .negint(-1 - Int64(encoded))
         case 2:
             let declared = try readLength(info, data, &cursor)
             guard declared <= UInt64(data.distance(from: cursor, to: data.endIndex)) else { throw DecodeError.truncated }
