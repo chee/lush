@@ -7,6 +7,7 @@ use std::sync::Arc;
 use future_form::Sendable;
 use futures::future::BoxFuture;
 use sedimentree_core::{depth::CountLeadingZeroBytes, id::SedimentreeId};
+use sedimentree_fs_storage::FsStorage;
 use subduction_core::{
     authenticated::Authenticated,
     connection::message::SyncMessage,
@@ -19,7 +20,6 @@ use subduction_core::{
 use subduction_ephemeral::{
     clock::std_clock::StdClock, handler::EphemeralHandler, policy::OpenEphemeralPolicy,
 };
-use sedimentree_fs_storage::FsStorage;
 use subduction_websocket::tokio::{TokioSpawn, TrackedTokioSpawn};
 
 use crate::{wire::WireMessage, Conn};

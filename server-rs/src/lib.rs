@@ -14,6 +14,7 @@ use async_tungstenite::tungstenite::{handshake::server::NoCallback, protocol::We
 use future_form::Sendable;
 use iroh::{endpoint::presets, EndpointAddr};
 use sedimentree_core::depth::CountLeadingZeroBytes;
+use sedimentree_fs_storage::FsStorage;
 use subduction_core::{
     handshake::{
         self,
@@ -32,7 +33,6 @@ use subduction_ephemeral::{
     clock::std_clock::StdClock, config::EphemeralConfig, handler::EphemeralHandler,
     policy::OpenEphemeralPolicy,
 };
-use sedimentree_fs_storage::FsStorage;
 use subduction_websocket::{
     handshake::WebSocketHandshake,
     sleep::TokioSleeper,
@@ -48,6 +48,10 @@ use handler::ServerHandler;
 use transport::UnifiedTransport;
 
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const IROH_BIND_TIMEOUT: Duration = Duration::from_secs(10);
+const IROH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+const IROH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) type Conn = MessageTransport<UnifiedTransport>;
 type Node = Arc<
@@ -99,7 +103,9 @@ fn fail(error: impl std::fmt::Display) -> ServerError {
 /// Returns the actually-bound websocket port.
 #[uniffi::export]
 pub fn server_start(data_dir: String, port: u16) -> Result<u16, ServerError> {
-    let mut guard = SERVER.lock().unwrap();
+    let mut guard = SERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if guard.is_some() {
         return Err(ServerError::AlreadyRunning);
     }
@@ -212,7 +218,10 @@ async fn start_node(
                 tokio::select! {
                     () = cancel.cancelled() => break,
                     accepted = listener.accept() => {
-                        let Ok((tcp, _addr)) = accepted else { continue };
+                        let Ok((tcp, _addr)) = accepted else {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        };
                         tokio::spawn(handle_websocket(
                             tcp, node.clone(), peer_id, discovery_audience,
                         ));
@@ -224,13 +233,16 @@ async fn start_node(
 
     // The same key subduction signs with, so the iroh node id friends dial is
     // also the peer id their handshake addresses, and it survives a restart.
-    let endpoint = iroh::Endpoint::builder(presets::N0)
-        .secret_key(iroh::SecretKey::from_bytes(seed))
-        .alpns(vec![subduction_iroh::ALPN.to_vec()])
-        .bind()
-        .await;
+    let endpoint = tokio::time::timeout(
+        IROH_BIND_TIMEOUT,
+        iroh::Endpoint::builder(presets::N0)
+            .secret_key(iroh::SecretKey::from_bytes(seed))
+            .alpns(vec![subduction_iroh::ALPN.to_vec()])
+            .bind(),
+    )
+    .await;
 
-    let Ok(endpoint) = endpoint else {
+    let Ok(Ok(endpoint)) = endpoint else {
         return Ok((bound_port, node, None));
     };
 
@@ -244,15 +256,18 @@ async fn start_node(
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    result = subduction_iroh::server::accept_one(
-                        &endpoint,
-                        &signer,
-                        &nonce_cache,
-                        peer_id,
-                        discovery_audience,
-                        HANDSHAKE_MAX_DRIFT,
+                    result = tokio::time::timeout(
+                        IROH_ACCEPT_TIMEOUT,
+                        subduction_iroh::server::accept_one(
+                            &endpoint,
+                            &signer,
+                            &nonce_cache,
+                            peer_id,
+                            discovery_audience,
+                            HANDSHAKE_MAX_DRIFT,
+                        ),
                     ) => {
-                        let Ok(accepted) = result else { continue };
+                        let Ok(Ok(accepted)) = result else { continue };
                         let remote = accepted.authenticated.peer_id();
                         tokio::spawn(accepted.listener_task);
                         tokio::spawn(accepted.sender_task);
@@ -280,51 +295,55 @@ async fn handle_websocket(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(DEFAULT_MAX_MESSAGE_SIZE);
 
-    let ws_stream = match async_tungstenite::tokio::accept_hdr_async_with_config(
-        tcp,
-        NoCallback,
-        Some(ws_config),
+    let ws_stream = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        async_tungstenite::tokio::accept_hdr_async_with_config(tcp, NoCallback, Some(ws_config)),
     )
     .await
     {
-        Ok(ws) => ws,
-        Err(_) => return,
+        Ok(Ok(ws)) => ws,
+        _ => return,
     };
 
-    let result = handshake::respond::<Sendable, _, _, _, _>(
-        WebSocketHandshake::new(ws_stream),
-        |ws_handshake, peer_id| {
-            let (ws, sender_fut, keepalive_task) = WebSocket::new_with_keepalive(
-                ws_handshake.into_inner(),
-                peer_id,
-                KeepAlive::balanced(),
-                TokioSleeper,
-            );
-            let listen_ws = ws.clone();
-            tokio::spawn(async move {
-                let _ = listen_ws.listen().await;
-            });
-            tokio::spawn(async move {
-                let _ = sender_fut.await;
-            });
-            tokio::spawn(async move {
-                let _ = keepalive_task.await;
-            });
-            (
-                MessageTransport::new(UnifiedTransport::WebSocket(UnifiedWebSocket::Accepted(ws))),
-                (),
-            )
-        },
-        node.signer(),
-        node.nonce_cache(),
-        server_peer_id,
-        discovery_audience,
-        TimestampSeconds::now(),
-        HANDSHAKE_MAX_DRIFT,
+    let result = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake::respond::<Sendable, _, _, _, _>(
+            WebSocketHandshake::new(ws_stream),
+            |ws_handshake, peer_id| {
+                let (ws, sender_fut, keepalive_task) = WebSocket::new_with_keepalive(
+                    ws_handshake.into_inner(),
+                    peer_id,
+                    KeepAlive::balanced(),
+                    TokioSleeper,
+                );
+                let listen_ws = ws.clone();
+                tokio::spawn(async move {
+                    let _ = listen_ws.listen().await;
+                });
+                tokio::spawn(async move {
+                    let _ = sender_fut.await;
+                });
+                tokio::spawn(async move {
+                    let _ = keepalive_task.await;
+                });
+                (
+                    MessageTransport::new(UnifiedTransport::WebSocket(UnifiedWebSocket::Accepted(
+                        ws,
+                    ))),
+                    (),
+                )
+            },
+            node.signer(),
+            node.nonce_cache(),
+            server_peer_id,
+            discovery_audience,
+            TimestampSeconds::now(),
+            HANDSHAKE_MAX_DRIFT,
+        ),
     )
     .await;
 
-    let Ok((authenticated, ())) = result else {
+    let Ok(Ok((authenticated, ()))) = result else {
         return;
     };
     let _ = node.add_connection(authenticated).await;
@@ -340,7 +359,11 @@ async fn dial_iroh_peer(
     // dialed is who we expect to answer. Every responder accepts its own.
     let audience = Audience::known(PeerId::new(*public_key.as_bytes()));
     let addr = EndpointAddr::new(public_key);
-    let Ok(result) = subduction_iroh::client::connect(&endpoint, addr, &signer, audience).await
+    let Ok(Ok(result)) = tokio::time::timeout(
+        IROH_CONNECT_TIMEOUT,
+        subduction_iroh::client::connect(&endpoint, addr, &signer, audience),
+    )
+    .await
     else {
         return;
     };
@@ -375,7 +398,11 @@ fn save_peers(data_dir: &Path, peers: &[String]) {
 
 #[uniffi::export]
 pub fn server_stop() {
-    if let Some(running) = SERVER.lock().unwrap().take() {
+    let running = SERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(running) = running {
         running.cancel.cancel();
         running.node.shutdown();
         running.runtime.shutdown_timeout(Duration::from_secs(3));
@@ -384,14 +411,18 @@ pub fn server_stop() {
 
 #[uniffi::export]
 pub fn server_port() -> Option<u16> {
-    SERVER.lock().unwrap().as_ref().map(|running| running.port)
+    SERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|running| running.port)
 }
 
 #[uniffi::export]
 pub fn server_peer_id() -> Option<String> {
     SERVER
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .map(|running| running.peer_id.clone())
 }
@@ -401,7 +432,7 @@ pub fn server_peer_id() -> Option<String> {
 pub fn server_iroh_node_id() -> Option<String> {
     SERVER
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .and_then(|running| running.iroh_node_id.clone())
 }
@@ -411,7 +442,7 @@ pub fn server_iroh_node_id() -> Option<String> {
 pub fn server_iroh_peers() -> Vec<String> {
     SERVER
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .map(|running| load_peers(&running.data_dir))
         .unwrap_or_default()
@@ -421,7 +452,9 @@ pub fn server_iroh_peers() -> Vec<String> {
 #[uniffi::export]
 pub fn server_add_iroh_peer(node_id: String) -> Result<(), ServerError> {
     let public_key: iroh::PublicKey = node_id.parse().map_err(fail)?;
-    let guard = SERVER.lock().unwrap();
+    let guard = SERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let running = guard.as_ref().ok_or(ServerError::NotRunning)?;
 
     let mut peers = load_peers(&running.data_dir);
