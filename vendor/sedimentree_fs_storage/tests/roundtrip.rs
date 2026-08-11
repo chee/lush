@@ -28,6 +28,13 @@ fn make_sedimentree_id(seed: u8) -> SedimentreeId {
     SedimentreeId::new([seed; 32])
 }
 
+fn tree_path(root: &std::path::Path, id: SedimentreeId) -> std::path::PathBuf {
+    let bytes = id.as_bytes();
+    root.join("trees")
+        .join(hex::encode(&bytes[..2]))
+        .join(hex::encode(&bytes[2..]))
+}
+
 /// Save a `LooseCommit` via `FsStorage`, reload via `load_loose_commits`, and verify byte identity.
 #[tokio::test]
 async fn save_load_loose_commit_roundtrip() -> testresult::TestResult {
@@ -1080,6 +1087,49 @@ async fn metas_match_full_load() -> testresult::TestResult {
     Storage::<Sendable>::save_fragment(&storage, id, fragment).await?;
 
     conformance::assert_metas_match_full_load::<Sendable, _>(&storage, id).await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn truncated_blob_is_repaired_on_resave() -> testresult::TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = FsStorage::new(dir.path().to_path_buf())?;
+    let signer = test_signer();
+    let id = make_sedimentree_id(0x7C);
+    let head = CommitId::new([0x93; 32]);
+
+    let make = || async {
+        VerifiedMeta::<LooseCommit>::seal::<Sendable, _>(
+            &signer,
+            (id, head, BTreeSet::new()),
+            VerifiedBlobMeta::new(Blob::new(vec![0x44; 64])),
+        )
+        .await
+    };
+    Storage::<Sendable>::save_loose_commit(&storage, id, make().await).await?;
+
+    let id_dir = tree_path(dir.path(), id)
+        .join("commits")
+        .join(hex::encode(head.as_bytes()));
+    let blob_path = std::fs::read_dir(id_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "blob")
+        })
+        .unwrap();
+    let mut corrupt = std::fs::read(&blob_path)?;
+    corrupt.truncate(corrupt.len() / 2);
+    std::fs::write(&blob_path, corrupt)?;
+    let corrupted = Storage::<Sendable>::load_loose_commits(&storage, id).await?;
+    assert_ne!(corrupted[0].blob().contents(), &vec![0x44; 64]);
+
+    Storage::<Sendable>::save_loose_commit(&storage, id, make().await).await?;
+    let loaded = Storage::<Sendable>::load_loose_commits(&storage, id).await?;
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].blob().contents(), &vec![0x44; 64]);
 
     Ok(())
 }
