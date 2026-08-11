@@ -374,12 +374,6 @@ struct EditorSheetView: View {
             )
         case .patchworkCreate:
             PatchworkCreateSheet(controller: controller)
-        case .format:
-            #if os(iOS)
-            FormatSheet(controller: controller)
-            #else
-            EmptyView()
-            #endif
         case .link(let initial):
             LinkSheet(url: initial) { controller.applyLink($0) }
         }

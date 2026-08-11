@@ -4462,6 +4462,49 @@ struct NoteDetail: View {
         ) { handleEditorDrop($0) }
     }
 
+    #if os(iOS)
+    private var formatHeight: CGFloat { editor.isCodeBlockActive ? 316 : 264 }
+
+    @ViewBuilder
+    private var formatIsland: some View {
+        if editor.formatVisible {
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text("Format").uiFont(.headline)
+                    Spacer()
+                    Button {
+                        editor.formatVisible = false
+                        editor.resumeKeyboard()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .uiFont(.title3)
+                            .foregroundStyle(Color.secondary, Color(.systemFill))
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close Format")
+                }
+                .padding(.leading, 18)
+                .padding(.trailing, 4)
+                .frame(height: 52)
+
+                Divider()
+                FormatPanel(controller: editor).padding(.top, 14)
+            }
+            .frame(maxWidth: 440)
+            .frame(height: formatHeight)
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .padding(12)
+            .onAppear {
+                if let textView = editor.core?.view as? EditorTextView {
+                    textView.scrollSelectionAboveSheet(height: formatHeight + 24)
+                }
+            }
+        }
+    }
+    #endif
+
     var body: some View {
         #if os(iOS)
         noteEditorBase
@@ -4503,6 +4546,10 @@ struct NoteDetail: View {
             .presentationDragIndicator(.visible)
             .presentationBackgroundInteraction(.enabled(upThrough: .medium))
             .interactiveDismissDisabled(model.pads.drawing)
+        }
+        .overlay(alignment: .bottom) { formatIsland }
+        .onChange(of: editor.formatVisible) { _, visible in
+            if visible { showingInspector = false }
         }
         #else
         noteEditorBase

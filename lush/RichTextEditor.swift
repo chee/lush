@@ -20,7 +20,6 @@ enum EditorSheet: Identifiable {
     case html(HtmlBlockHandle)
     case info(assetUrl: String, name: String, image: PImage?, block: BlockBox)
     case patchworkCreate
-    case format
     case link(initial: String)
 
     var id: String {
@@ -30,7 +29,6 @@ enum EditorSheet: Identifiable {
         case .html(let handle): "html-\(handle.id)"
         case .info(let url, _, _, _): "info-\(url)"
         case .patchworkCreate: "patchwork-create"
-        case .format: "format"
         case .link: "link"
         }
     }
@@ -108,6 +106,11 @@ final class EditorController {
 
     func minimapJump(fraction: CGFloat) { core?.scrollToFraction(fraction) }
     #if os(iOS)
+    var formatVisible = false {
+        didSet {
+            (core?.view as? EditorTextView)?.suppressesKeyboard = formatVisible
+        }
+    }
     var photoPickerVisible = false
     var filePickerVisible = false
     var cameraPickerVisible = false
@@ -169,7 +172,12 @@ final class EditorController {
     func toggleSubscript() { format { $0.toggleBaseline("subscript") } }
     func applyHighlight(_ name: String?) { format { $0.setHighlight(name) } }
     func applyLink(_ url: String?) { format { $0.setLink(url) } }
-    func editLink() { sheet = .link(initial: linkActive ?? "") }
+    func editLink() {
+        #if os(iOS)
+        formatVisible = false
+        #endif
+        sheet = .link(initial: linkActive ?? "")
+    }
     func applyFontRole(_ role: String?) { format { $0.setFontRole(role) } }
     func moveItemUp() { format { $0.moveListItem(by: -1) } }
     func moveItemDown() { format { $0.moveListItem(by: 1) } }
@@ -191,6 +199,12 @@ final class EditorController {
     #if os(iOS)
     func dismissKeyboard() { core?.endEditing() }
     func resumeKeyboard() { core?.view?.pSelf.becomeFirstResponder() }
+    func showFormatPanel() {
+        guard let view = core?.view else { return }
+        let selection = view.pSelectedRange
+        formatVisible = true
+        view.pSelectedRange = selection
+    }
     #endif
 
     func insertPatchworkEmbed(url: String, tool: String?) {
@@ -4684,8 +4698,33 @@ extension EditorTextView: UIEditMenuInteractionDelegate {
     }
 }
 
+private final class SuppressedKeyboardInputView: UIInputView {
+    override func systemLayoutSizeFitting(_ targetSize: CGSize) -> CGSize {
+        CGSize(width: targetSize.width, height: 1)
+    }
+}
+
 final class EditorTextView: UITextView, EditorTextViewLike {
     weak var core: EditorCore?
+
+    var editorAccessoryView: UIView?
+    private lazy var keyboardSuppressingInputView: UIInputView = {
+        let view = SuppressedKeyboardInputView(frame: .zero, inputViewStyle: .keyboard)
+        view.allowsSelfSizing = true
+        return view
+    }()
+    /// The format panel floats where the keyboard was, so the text view keeps
+    /// first responder — and its selection — while the keyboard stands down.
+    var suppressesKeyboard = false {
+        didSet {
+            guard oldValue != suppressesKeyboard else { return }
+            let selection = selectedRange
+            inputView = suppressesKeyboard ? keyboardSuppressingInputView : nil
+            inputAccessoryView = suppressesKeyboard ? nil : editorAccessoryView
+            reloadInputViews()
+            selectedRange = selection
+        }
+    }
 
     /// `textStorage` can go stale after the content storage adopts the shared
     /// session storage, so everything resolves through the content storage.
@@ -5064,6 +5103,7 @@ struct RichTextEditor: UIViewRepresentable {
         )
         accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 52)
         accessory.view.backgroundColor = .clear
+        textView.editorAccessoryView = accessory.view
         textView.inputAccessoryView = accessory.view
         context.coordinator.accessory = accessory
 
@@ -5082,6 +5122,7 @@ struct RichTextEditor: UIViewRepresentable {
         if context.coordinator.core.noteUrl != noteUrl {
             context.coordinator.core.switchTo(noteUrl)
         }
+        uiView.suppressesKeyboard = controller.formatVisible
         context.coordinator.scenePhaseChanged(to: scenePhase)
     }
 
@@ -5212,8 +5253,7 @@ struct FormatAccessoryBar: View {
                     // the screen instead — dismissing the keyboard takes the
                     // bar and anything it presents with it
                     Button {
-                        controller.dismissKeyboard()
-                        controller.sheet = .format
+                        controller.showFormatPanel()
                     } label: {
                         Text("Aa")
                             .font(.system(size: 17, weight: .semibold))
@@ -5312,8 +5352,11 @@ struct FormatAccessoryBar: View {
             .accessibilityLabel("Dismiss Keyboard")
         }
         .font(.system(size: 20))
-        .frame(maxHeight: .infinity)
-        .background(.bar)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(Capsule())
+        .glassEffect(.regular, in: Capsule())
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
     }
 
     private func barButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
@@ -5325,26 +5368,11 @@ struct FormatAccessoryBar: View {
 }
 
 /// Notes-style format panel — block styles, marks, and indent.
-struct FormatSheet: View {
+struct FormatPanel: View {
     let controller: EditorController
-    @Environment(\.dismiss) var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Format").uiFont(.headline)
-                Spacer()
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .uiFont(.title3)
-                        .foregroundStyle(Color.secondary, Color(.systemFill))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close Format")
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 20)
-
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(EditorController.styles, id: \.key) { style in
@@ -5359,6 +5387,7 @@ struct FormatSheet: View {
                                 .background(active ? Color.accentColor : Color(.secondarySystemFill))
                                 .foregroundStyle(active ? Color.white : Color.primary)
                                 .clipShape(RoundedRectangle(cornerRadius: 9))
+                                .contentShape(RoundedRectangle(cornerRadius: 9))
                         }
                         .buttonStyle(.plain)
                         .accessibilityValue(active ? "Selected" : "Not selected")
@@ -5412,7 +5441,10 @@ struct FormatSheet: View {
                         .font(.system(size: 15))
                         .foregroundStyle(controller.highlightActive != nil ? Color.accentColor : Color.primary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
                 .accessibilityLabel("Highlight")
                 .accessibilityValue(controller.highlightActive?.capitalized ?? "None")
             }
@@ -5459,20 +5491,13 @@ struct FormatSheet: View {
                     .background(Color(.secondarySystemFill))
                     .foregroundStyle(Color.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .contentShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .padding(.horizontal, 20)
             }
 
             Spacer()
         }
-        .presentationDetents([.height(controller.isCodeBlockActive ? 316 : 264)])
-        .presentationDragIndicator(.visible)
-        .onAppear {
-            if let textView = controller.core?.view as? EditorTextView {
-                textView.scrollSelectionAboveSheet(height: controller.isCodeBlockActive ? 316 : 264)
-            }
-        }
-        .onDisappear { controller.resumeKeyboard() }
     }
 
     @ViewBuilder
@@ -5481,7 +5506,10 @@ struct FormatSheet: View {
             label()
                 .foregroundStyle(active ? Color.accentColor : Color.primary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
         .buttonStyle(.plain)
         .accessibilityLabel(name)
         .accessibilityValue(active ? "Selected" : "Not selected")
@@ -5494,7 +5522,9 @@ struct FormatSheet: View {
                 .foregroundStyle(Color.primary)
                 .frame(width: 52)
                 .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
         }
+        .contentShape(Rectangle())
         .buttonStyle(.plain)
         .accessibilityLabel(label)
     }
