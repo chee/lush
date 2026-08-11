@@ -528,6 +528,8 @@ struct ImportSettingsPane: View {
 struct LoglineSettingsPane: View {
     @Environment(ContextTracker.self) private var contextTracker
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var placesEnabled = SavedPlaces.enabled
+    @State private var weatherEnabled = ContextTracker.weatherEnabled
     @State private var places = SavedPlaces.all
     @State private var namingHere = false
     @State private var contactPickerPresented = false
@@ -544,53 +546,63 @@ struct LoglineSettingsPane: View {
                     }
             }
             Section {
-                ForEach($places) { $place in
-                    HStack {
-                        Label {
-                            TextField("Name", text: $place.name)
-                                .textFieldStyle(.plain)
-                                .onSubmit { savePlaces() }
-                        } icon: {
-                            Image(systemName: "mappin.and.ellipse")
-                                .foregroundStyle(.secondary)
-                        }
-                        RowMenu {
-                            Button("Remove", role: .destructive) {
-                                places.removeAll { $0.id == place.id }
-                                savePlaces()
+                Toggle("Include Location in Loglines", isOn: $placesEnabled)
+                    .onChange(of: placesEnabled) {
+                        contextTracker.setPlacesEnabled(placesEnabled)
+                    }
+                Toggle("Include Weather in Loglines", isOn: $weatherEnabled)
+                    .onChange(of: weatherEnabled) {
+                        contextTracker.setWeatherEnabled(weatherEnabled)
+                    }
+                if placesEnabled {
+                    ForEach($places) { $place in
+                        HStack {
+                            Label {
+                                TextField("Name", text: $place.name)
+                                    .textFieldStyle(.plain)
+                                    .onSubmit { savePlaces() }
+                            } icon: {
+                                Image(systemName: "mappin.and.ellipse")
+                                    .foregroundStyle(.secondary)
+                            }
+                            RowMenu {
+                                Button("Remove", role: .destructive) {
+                                    places.removeAll { $0.id == place.id }
+                                    savePlaces()
+                                }
                             }
                         }
                     }
-                }
-                Menu("Add Place…") {
-                    Button("Where I Am Now…") { namingHere = true }
-                        .disabled(currentCoordinate == nil)
-                    Button("On a Map…") { mapPickerPresented = true }
-                    Button("From Contacts…") { contactPickerPresented = true }
-                    #if os(macOS)
-                    Button("Home & Work from My Card") { importMyAddresses() }
-                        .disabled(importingMine)
-                    #endif
-                }
-                .fixedSize()
-                if importingMine {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Looking up addresses…")
+                    Menu("Add Place…") {
+                        Button("Where I Am Now…") { namingHere = true }
+                            .disabled(currentCoordinate == nil)
+                        Button("On a Map…") { mapPickerPresented = true }
+                        Button("From Contacts…") { contactPickerPresented = true }
+                        #if os(macOS)
+                        Button("Home & Work from My Card") { importMyAddresses() }
+                            .disabled(importingMine)
+                        #endif
+                    }
+                    .fixedSize()
+                    if importingMine {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Looking up addresses…")
+                                .uiFont(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let importStatus {
+                        Text(importStatus)
                             .uiFont(.caption)
                             .foregroundStyle(.secondary)
                     }
                 }
-                if let importStatus {
-                    Text(importStatus)
-                        .uiFont(.caption)
-                        .foregroundStyle(.secondary)
-                }
             } header: {
-                Text("Places")
+                Text("Location & Weather")
             } footer: {
-                Text("A logline near a saved place uses its name — \"Home, London, England\" instead of the street. Addresses from Contacts are looked up once; only the coordinates are kept.")
+                Text("Enabling Location or Weather asks for location access when context is next collected. A logline near a saved place uses its name — \"Home, London, England\" instead of the street. Addresses from Contacts are looked up once; only the coordinates are kept.")
             }
         }
         .formStyle(.grouped)
@@ -618,7 +630,6 @@ struct LoglineSettingsPane: View {
                 importStatus = nil
             }
         }
-        .task { contextTracker.start() }
     }
 
     private var currentCoordinate: CLLocationCoordinate2D? {

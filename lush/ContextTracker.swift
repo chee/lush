@@ -14,6 +14,16 @@ struct SavedPlace: Codable, Identifiable, Equatable {
 enum SavedPlaces {
     static let changed = Notification.Name("io.lush.savedPlacesChanged")
     private static let key = "loglinePlaces"
+    private static let enabledKey = "loglinePlacesEnabled"
+
+    static var enabled: Bool {
+        UserDefaults.standard.bool(forKey: enabledKey)
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: enabledKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
 
     static var all: [SavedPlace] {
         guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
@@ -175,7 +185,12 @@ struct ContextInlineView: View {
 
 @MainActor @Observable
 final class ContextTracker {
+    private static let weatherEnabledKey = "loglineWeatherEnabled"
     private(set) var snapshot = ContextSnapshot()
+
+    static var weatherEnabled: Bool {
+        UserDefaults.standard.bool(forKey: weatherEnabledKey)
+    }
 
     /// Extra logline sources. Each tick asks every provider for a value; the
     /// key becomes the context block's attribute name.
@@ -188,13 +203,27 @@ final class ContextTracker {
     private var lastWeatherAttempt: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
     private var weatherFetchInProgress = false
+    private var pendingWeatherLocation: CLLocation?
+    private var weatherGeneration = 0
     private var lastLocation: CLLocation?
+    private var locationNameGeneration = 0
 
     init() {
         locationDelegate.owner = self
     }
 
     func start() {
+        if monitorTask == nil {
+            tick()
+            monitorTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(60))
+                    guard !Task.isCancelled else { break }
+                    self?.tick()
+                }
+            }
+        }
+        guard SavedPlaces.enabled || Self.weatherEnabled else { return }
         // one window per scene calls this; monitors must not accumulate
         guard locationManager == nil else {
             requestLocation()
@@ -206,19 +235,50 @@ final class ContextTracker {
         mgr.distanceFilter = 100
         locationManager = mgr
         requestLocation()
+    }
 
-        tick()
-        monitorTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(60))
-                guard !Task.isCancelled else { break }
-                self?.tick()
+    func setPlacesEnabled(_ enabled: Bool) {
+        SavedPlaces.setEnabled(enabled)
+        locationNameGeneration &+= 1
+        if enabled || Self.weatherEnabled {
+            start()
+        } else {
+            locationManager?.stopUpdatingLocation()
+            locationManager = nil
+            lastLocation = nil
+        }
+        if enabled {
+            if let lastLocation { didUpdateLocation(lastLocation) }
+            return
+        }
+        snapshot.locationName = nil
+        snapshot.latitude = nil
+        snapshot.longitude = nil
+    }
+
+    func setWeatherEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.weatherEnabledKey)
+        weatherGeneration &+= 1
+        lastWeatherFetch = .distantPast
+        lastWeatherAttempt = .distantPast
+        lastWeatherLocation = nil
+        if enabled || SavedPlaces.enabled {
+            start()
+        } else {
+            locationManager?.stopUpdatingLocation()
+            locationManager = nil
+            lastLocation = nil
+        }
+        if !enabled { snapshot.weatherDescription = nil }
+        if enabled, let location = lastLocation {
+            Task {
+                await fetchWeather(lat: location.coordinate.latitude, lon: location.coordinate.longitude)
             }
         }
     }
 
     func requestLocation() {
-        guard let mgr = locationManager else { return }
+        guard SavedPlaces.enabled || Self.weatherEnabled, let mgr = locationManager else { return }
         switch mgr.authorizationStatus {
         case .notDetermined:
             mgr.requestWhenInUseAuthorization()
@@ -239,20 +299,37 @@ final class ContextTracker {
     }
 
     func didUpdateLocation(_ loc: CLLocation) {
+        guard SavedPlaces.enabled || Self.weatherEnabled else { return }
         lastLocation = loc
-        snapshot.latitude = loc.coordinate.latitude
-        snapshot.longitude = loc.coordinate.longitude
         snapshot.timestamp = Date()
-        Task {
-            if let name = await placeName(at: loc) { snapshot.locationName = name }
-            await fetchWeather(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
+        if SavedPlaces.enabled {
+            locationNameGeneration &+= 1
+            let generation = locationNameGeneration
+            snapshot.latitude = loc.coordinate.latitude
+            snapshot.longitude = loc.coordinate.longitude
+            snapshot.locationName = nil
+            Task {
+                let name = await placeName(at: loc)
+                guard SavedPlaces.enabled, locationNameGeneration == generation else { return }
+                snapshot.locationName = name
+            }
+        }
+        if Self.weatherEnabled {
+            Task {
+                await fetchWeather(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
+            }
         }
     }
 
     func refreshPlaceName() {
-        guard let loc = lastLocation else { return }
+        guard SavedPlaces.enabled, let loc = lastLocation else { return }
+        locationNameGeneration &+= 1
+        let generation = locationNameGeneration
+        snapshot.locationName = nil
         Task {
-            if let name = await placeName(at: loc) { snapshot.locationName = name }
+            let name = await placeName(at: loc)
+            guard SavedPlaces.enabled, locationNameGeneration == generation else { return }
+            snapshot.locationName = name
         }
     }
 
@@ -294,20 +371,40 @@ final class ContextTracker {
         requestLocation()
     }
 
-    private func fetchWeather(lat: Double, lon: Double) async {
+    private func fetchWeather(lat: Double, lon: Double, retrying: Bool = false) async {
+        guard Self.weatherEnabled else { return }
+        let generation = weatherGeneration
         let now = Date()
-        guard !weatherFetchInProgress else { return }
-        if let last = lastWeatherLocation {
+        guard !weatherFetchInProgress else {
+            pendingWeatherLocation = CLLocation(latitude: lat, longitude: lon)
+            return
+        }
+        if !retrying, let last = lastWeatherLocation {
             let moved = sqrt(pow(lat - last.0, 2) + pow(lon - last.1, 2)) > 0.01
             let stale = now.timeIntervalSince(lastWeatherFetch) > 1800
             guard moved || stale else { return }
         }
-        guard now.timeIntervalSince(lastWeatherAttempt) > 60 else { return }
+        guard retrying || now.timeIntervalSince(lastWeatherAttempt) > 60 else { return }
         lastWeatherAttempt = now
         weatherFetchInProgress = true
-        defer { weatherFetchInProgress = false }
+        defer {
+            weatherFetchInProgress = false
+            let pending = pendingWeatherLocation
+            pendingWeatherLocation = nil
+            if Self.weatherEnabled,
+               let location = pending ?? (weatherGeneration != generation ? lastLocation : nil) {
+                Task {
+                    await fetchWeather(
+                        lat: location.coordinate.latitude,
+                        lon: location.coordinate.longitude,
+                        retrying: true
+                    )
+                }
+            }
+        }
         let location = CLLocation(latitude: lat, longitude: lon)
         if let current = try? await WeatherService.shared.weather(for: location, including: .current) {
+            guard Self.weatherEnabled, weatherGeneration == generation else { return }
             let formatter = MeasurementFormatter()
             formatter.unitOptions = [.naturalScale, .temperatureWithoutUnit]
             formatter.numberFormatter.maximumFractionDigits = 0
@@ -317,10 +414,13 @@ final class ContextTracker {
             lastWeatherLocation = (lat, lon)
             return
         }
+        guard Self.weatherEnabled, weatherGeneration == generation else { return }
         guard let url = URL(
             string: "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(lon)&current_weather=true"
-        ),
-              let (data, response) = try? await URLSession.shared.data(from: url),
+        ) else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let current = json["current_weather"] as? [String: Any],
@@ -328,6 +428,7 @@ final class ContextTracker {
         else { return }
         let condition = weatherLabel(current["weathercode"] as? Int ?? 0)
         let temp = "\(Int(temperature.rounded()))°C"
+        guard Self.weatherEnabled, weatherGeneration == generation else { return }
         snapshot.weatherDescription = condition.isEmpty ? temp : "\(temp) \(condition)"
         lastWeatherFetch = now
         lastWeatherLocation = (lat, lon)

@@ -107,7 +107,14 @@ enum ContactPlaces {
     static func geocode(_ addresses: [ContactAddress]) async -> [SavedPlace] {
         var places: [SavedPlace] = []
         for (index, address) in addresses.enumerated() {
-            if index > 0 { try? await Task.sleep(for: .milliseconds(1200)) }
+            guard !Task.isCancelled else { return places }
+            if index > 0 {
+                do {
+                    try await Task.sleep(for: .milliseconds(1200))
+                } catch {
+                    return places
+                }
+            }
             if let place = await geocode(address) { places.append(place) }
         }
         return places
@@ -123,6 +130,7 @@ struct ContactPlacePicker: View {
     @State private var loading = true
     @State private var adding = false
     @State private var message: String?
+    @State private var addID = UUID()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -197,6 +205,7 @@ struct ContactPlacePicker: View {
         }
         .frame(width: 460, height: 460)
         .task { await load() }
+        .onDisappear { addID = UUID() }
     }
 
     private var filtered: [ContactAddress] {
@@ -216,6 +225,7 @@ struct ContactPlacePicker: View {
             return
         }
         let found = await Task.detached { try? ContactPlaces.everyone() }.value ?? []
+        guard !Task.isCancelled else { return }
         addresses = found
         loading = false
         if found.isEmpty { message = "None of your contacts have a postal address." }
@@ -223,9 +233,12 @@ struct ContactPlacePicker: View {
 
     private func add() {
         let chosen = addresses.filter { selection.contains($0.id) }
+        let id = UUID()
+        addID = id
         adding = true
         Task {
             let places = await ContactPlaces.geocode(chosen)
+            guard addID == id, !Task.isCancelled else { return }
             adding = false
             onAdd(places)
             dismiss()
@@ -243,6 +256,8 @@ struct MapPlacePicker: View {
     @State private var radius: Double = 150
     @State private var query = ""
     @State private var searching = false
+    @State private var searchID = UUID()
+    @State private var nameID = UUID()
 
     init(start: CLLocationCoordinate2D?, onAdd: @escaping (SavedPlace) -> Void) {
         self.start = start
@@ -262,6 +277,10 @@ struct MapPlacePicker: View {
                     .foregroundStyle(.secondary)
                 TextField("Search for a place or address", text: $query)
                     .textFieldStyle(.plain)
+                    .onChange(of: query) {
+                        searchID = UUID()
+                        searching = false
+                    }
                     .onSubmit { search() }
                 if searching {
                     ProgressView()
@@ -283,6 +302,9 @@ struct MapPlacePicker: View {
                 }
                 .onTapGesture { point in
                     guard let tapped = proxy.convert(point, from: .local) else { return }
+                    searchID = UUID()
+                    nameID = UUID()
+                    searching = false
                     coordinate = tapped
                     Task { await suggestName(at: tapped) }
                 }
@@ -292,6 +314,7 @@ struct MapPlacePicker: View {
 
             Form {
                 TextField("Name", text: $name)
+                    .onChange(of: name) { nameID = UUID() }
                 LabeledContent("Radius") {
                     HStack(spacing: 12) {
                         Slider(value: $radius, in: 25...1000, step: 25)
@@ -317,11 +340,18 @@ struct MapPlacePicker: View {
             .padding(12)
         }
         .frame(width: 520, height: 620)
+        .onDisappear {
+            searchID = UUID()
+            nameID = UUID()
+        }
     }
 
     private func search() {
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        let id = UUID()
+        searchID = id
+        nameID = UUID()
         searching = true
         Task {
             let request = MKLocalSearch.Request()
@@ -333,6 +363,7 @@ struct MapPlacePicker: View {
                 )
             }
             let response = try? await MKLocalSearch(request: request).start()
+            guard searchID == id, !Task.isCancelled else { return }
             searching = false
             guard let item = response?.mapItems.first else { return }
             let found = item.location.coordinate
@@ -349,10 +380,18 @@ struct MapPlacePicker: View {
 
     private func suggestName(at coordinate: CLLocationCoordinate2D) async {
         guard name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        let id = UUID()
+        nameID = id
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
         guard let request = MKReverseGeocodingRequest(location: location),
               let item = try? await request.mapItems.first,
               let found = item.name
+        else { return }
+        guard nameID == id,
+              self.coordinate?.latitude == coordinate.latitude,
+              self.coordinate?.longitude == coordinate.longitude,
+              name.trimmingCharacters(in: .whitespaces).isEmpty,
+              !Task.isCancelled
         else { return }
         name = found
     }
