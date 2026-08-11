@@ -82,7 +82,6 @@ export async function mountFrame(
     siteTitle: "Patchwork",
   });
   await router.route();
-  window.addEventListener("hashchange", () => void router.route());
 
   window.patchwork = {
     repo,

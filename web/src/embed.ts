@@ -94,6 +94,19 @@ class NativeStorageAdapter {
   }
 }
 
+async function findWithin<T>(repo: Repo, url: AutomergeUrl, timeoutMs: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`timed out loading ${url}`)),
+    timeoutMs,
+  );
+  try {
+    return await repo.find<T>(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // The native half of the draft overlay: the app knows which document the
 // view should really be reading — a draft's clone, pinned to the version the
 // history inspector is scrubbed to — and says so directly, rather than
@@ -208,7 +221,7 @@ async function boot() {
   const importToolPackage = async (toolUrl: AutomergeUrl) => {
     let url: string = toolUrl;
     if (!parseAutomergeUrl(toolUrl).heads) {
-      const handle = await repo.find(toolUrl);
+      const handle = await findWithin(repo, toolUrl, 15_000);
       url = handle.view(handle.heads()).url;
     }
     const mod = await importPackage(url);
@@ -240,6 +253,13 @@ async function boot() {
       console.warn("lush: module loading failed", error);
     },
   );
+  const toolsAvailable = new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 15_000);
+    void toolsLoaded.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 
   // Tool selection and the tools menu catch up in the background once
   // modules finish loading; the view element finds the doc on its own.
@@ -248,15 +268,15 @@ async function boot() {
     toolId: string | null | undefined,
     view: Element,
   ) => {
-    await toolsLoaded;
+    await toolsAvailable;
+    if (!view.isConnected) return;
     let doc: any;
     try {
-      const handle = await Promise.race([
-        repo.find(docUrl as AutomergeUrl),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("timed out")), 15000),
-        ),
-      ]);
+      const handle = await findWithin(
+        repo,
+        docUrl as AutomergeUrl,
+        15_000,
+      );
       doc = handle.doc();
     } catch (error) {
       console.warn("lush: could not load embedded doc", error);

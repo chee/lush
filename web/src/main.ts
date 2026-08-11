@@ -69,12 +69,14 @@ async function boot() {
       show("connection", String(error), false);
     }
   };
-  updateConnection();
-  const connectionTimer = setInterval(updateConnection, 2000);
-  (repo as unknown as { on?: (e: string, f: () => void) => void }).on?.(
-    "subduction-connection",
-    updateConnection,
-  );
+  const connectionListener = () => void updateConnection();
+  connectionListener();
+  const connectionTimer = setInterval(connectionListener, 2000);
+  repo.on("subduction-connection", connectionListener);
+  const stopConnectionUpdates = () => {
+    clearInterval(connectionTimer);
+    repo.off("subduction-connection", connectionListener);
+  };
 
   // Non-blocking: intents only need the repo; the account gate can sit open.
   Patchwork.accountReady = (async () => {
@@ -89,15 +91,20 @@ async function boot() {
           false,
         );
       }, 10_000);
-      const account = await loadAccount(repo, accountUrl);
-      clearTimeout(slow);
+      let account;
+      try {
+        account = await loadAccount(repo, accountUrl);
+      } finally {
+        clearTimeout(slow);
+      }
       Patchwork.account = account;
       Patchwork.appleConfig().catch(console.warn);
       const frameId = accountFrameId(account.doc());
       show("frame", frameId ?? "none set on account", !!frameId);
-      mountFrame(repo, account, signer)
+      if (frameId) stopConnectionUpdates();
+      void mountFrame(repo, account, signer)
         .then((mounted) => {
-          if (mounted) clearInterval(connectionTimer);
+          if (mounted) stopConnectionUpdates();
         })
         .catch((error) => {
           show("frame", `${frameId}: ${error}`, false);

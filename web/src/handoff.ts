@@ -11,15 +11,14 @@ declare global {
   }
 }
 
-export function installHandoffListener() {
-  const channel = new BroadcastChannel(HANDOFF_CHANNEL);
-
-  channel.addEventListener("message", async (event) => {
-    const data = event.data;
-    if (data?.type !== "request") return;
-
-    const { id, cachename, request } = data as {
-      id: string;
+async function handleRequest(
+  channel: BroadcastChannel,
+  data: Record<string, any>,
+) {
+  const id = typeof data.id === "string" ? data.id : undefined;
+  if (!id) return;
+  try {
+    const { cachename, request } = data as {
       cachename: string;
       request: {
         url: string;
@@ -29,49 +28,73 @@ export function installHandoffListener() {
         referrer: string;
       };
     };
-
-    let handoffURL: URL;
-    try {
-      handoffURL = new URL(request.handoffURL);
-    } catch {
-      return;
+    if (typeof cachename !== "string" || !request) {
+      throw new Error("invalid handoff request");
     }
 
-    if (handoffURL.protocol !== "automerge:") return;
+    const handoffURL = new URL(request.handoffURL);
+    if (handoffURL.protocol !== "automerge:") {
+      throw new Error("unsupported handoff url");
+    }
 
     const resolve = window.__patchworkResolve;
-    if (!resolve) return;
+    if (!resolve) throw new Error("resolver unavailable");
 
     const raw = new URL(request.url).pathname.slice(1);
     const result = await resolve(raw);
     const bytes = Uint8Array.from(atob(result.base64), (c) => c.charCodeAt(0));
 
     if (isPinned(raw) && CACHEABLE_STATUSES.includes(result.status)) {
-      const response = new Response(bytes, {
+      try {
+        const response = new Response(result.status === 204 ? null : bytes, {
+          status: result.status,
+          headers: { "content-type": result.mimeType },
+        });
+        const cache = await caches.open(cachename);
+        await cache.put(
+          new Request(request.url, {
+            method: request.method,
+            headers: request.headers,
+            referrer: request.referrer,
+          }),
+          response,
+        );
+        channel.postMessage({ id, type: "cached" });
+        return;
+      } catch {}
+    }
+
+    channel.postMessage({
+      id,
+      type: "response",
+      response: {
         status: result.status,
+        body: bytes,
         headers: { "content-type": result.mimeType },
-      });
-      const cache = await caches.open(cachename);
-      await cache.put(
-        new Request(request.url, {
-          method: request.method,
-          headers: request.headers,
-          referrer: request.referrer,
-        }),
-        response
-      );
-      channel.postMessage({ id, type: "cached" });
-    } else {
+      },
+    });
+  } catch (error) {
+    try {
       channel.postMessage({
         id,
         type: "response",
         response: {
-          status: result.status,
-          body: bytes,
-          headers: { "content-type": result.mimeType },
+          status: 500,
+          body: new TextEncoder().encode(String(error)),
+          headers: { "content-type": "text/plain" },
         },
       });
-    }
+    } catch {}
+  }
+}
+
+export function installHandoffListener() {
+  const channel = new BroadcastChannel(HANDOFF_CHANNEL);
+
+  channel.addEventListener("message", (event) => {
+    const data = event.data;
+    if (data?.type !== "request") return;
+    void handleRequest(channel, data);
   });
 
   channel.postMessage({ type: "online" });

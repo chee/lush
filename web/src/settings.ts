@@ -75,14 +75,17 @@ function patchworkApi(): PatchworkApi {
 }
 
 let dismissOpen: (() => void) | undefined;
+let openGeneration = 0;
 
 async function openSettings(): Promise<void> {
+  const generation = ++openGeneration;
   dismissOpen?.();
   const api = patchworkApi();
   const [properties, folders] = await Promise.all([
     api.appleConfigProperties() as Promise<Property[]>,
     api.listRootFolders(),
   ]);
+  if (generation !== openGeneration) return;
 
   const overlay = document.createElement("div");
   overlay.id = "patchwork-settings";
@@ -176,15 +179,29 @@ function row(property: Property, folders: DocLink[]): HTMLElement {
   }
   select.value = property.value ?? "";
   select.onchange = () => {
-    void patchworkApi().setAppleConfigValue(
-      property.key,
-      select.value === "" ? null : select.value,
-    );
+    const value = select.value === "" ? null : select.value;
+    select.disabled = true;
+    void patchworkApi()
+      .setAppleConfigValue(property.key, value)
+      .then(
+        () => {
+          property.value = value;
+        },
+        (error) => {
+          console.warn(error);
+          select.value = property.value ?? "";
+        },
+      )
+      .finally(() => {
+        select.disabled = false;
+      });
   };
   control.appendChild(select);
   return el;
 }
 
 export function installSettings(): void {
-  window.__patchworkOpenSettings = () => void openSettings();
+  window.__patchworkOpenSettings = () => {
+    void openSettings().catch(console.warn);
+  };
 }
