@@ -1133,3 +1133,106 @@ async fn truncated_blob_is_repaired_on_resave() -> testresult::TestResult {
 
     Ok(())
 }
+
+fn temp_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "tmp") {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A save whose CAS check skips (the pair already exists intact) must not
+/// leave staging temps behind, and neither may the committed write itself.
+#[tokio::test]
+async fn stage_then_skip_leaves_no_temp_files() -> testresult::TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = FsStorage::new(dir.path().to_path_buf())?;
+    let signer = test_signer();
+    let id = make_sedimentree_id(0x5C);
+
+    let head = CommitId::new([0x5C; 32]);
+    for _ in 0..2 {
+        let verified: VerifiedMeta<LooseCommit> = VerifiedMeta::seal::<Sendable, _>(
+            &signer,
+            (id, head, BTreeSet::new()),
+            VerifiedBlobMeta::new(Blob::new(vec![9, 9, 9])),
+        )
+        .await;
+        Storage::<Sendable>::save_loose_commit(&storage, id, verified).await?;
+    }
+
+    assert_eq!(
+        temp_files(dir.path()),
+        Vec::<std::path::PathBuf>::new(),
+        "staging temps survived a save/skip cycle"
+    );
+    assert_eq!(
+        Storage::<Sendable>::load_loose_commits(&storage, id)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+/// The startup sweep removes stale staging temps but never touches committed
+/// pairs or temps young enough to belong to a write in flight.
+#[tokio::test]
+async fn sweep_removes_stale_temps_and_spares_committed_pairs() -> testresult::TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = FsStorage::new(dir.path().to_path_buf())?;
+    let signer = test_signer();
+    let id = make_sedimentree_id(0x5D);
+
+    let head = CommitId::new([0x5D; 32]);
+    let verified: VerifiedMeta<LooseCommit> = VerifiedMeta::seal::<Sendable, _>(
+        &signer,
+        (id, head, BTreeSet::new()),
+        VerifiedBlobMeta::new(Blob::new(vec![7, 7])),
+    )
+    .await;
+    Storage::<Sendable>::save_loose_commit(&storage, id, verified).await?;
+
+    let commit_dir = tree_path(dir.path(), id).join("commits");
+    let inner = std::fs::read_dir(&commit_dir)?
+        .flatten()
+        .find(|entry| entry.path().is_dir())
+        .expect("commit dir")
+        .path();
+    let stale_blob = inner.join("deadbeef.1234.blob.tmp");
+    let stale_meta = inner.join("deadbeef.1234.meta.tmp");
+    let fresh = inner.join("cafe.5678.blob.tmp");
+    for path in [&stale_blob, &stale_meta, &fresh] {
+        std::fs::write(path, b"junk")?;
+    }
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 60 * 60);
+    for path in [&stale_blob, &stale_meta] {
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.set_times(std::fs::FileTimes::new().set_modified(long_ago))?;
+    }
+
+    let removed = sedimentree_fs_storage::sweep_stale_temp_files(&dir.path().join("trees"));
+    assert_eq!(removed, 2, "exactly the two stale temps go");
+    assert!(!stale_blob.exists() && !stale_meta.exists());
+    assert!(fresh.exists(), "a young temp may belong to a live write");
+    assert_eq!(
+        Storage::<Sendable>::load_loose_commits(&storage, id)
+            .await?
+            .len(),
+        1,
+        "the committed pair must survive the sweep"
+    );
+    Ok(())
+}

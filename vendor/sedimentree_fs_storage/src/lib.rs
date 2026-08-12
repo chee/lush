@@ -200,18 +200,60 @@ fn stage_compound_write_sync(
     create_dir_all_durable(&item.id_dir)?;
 
     let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
-    let blob_temp = item.blob_path.with_extension(format!("{nonce}.blob.tmp"));
-    let meta_temp = item.meta_path.with_extension(format!("{nonce}.meta.tmp"));
-
-    std::fs::write(&blob_temp, &item.blob_data)?;
-    std::fs::write(&meta_temp, &item.signed_data)?;
-
-    Ok(Some(StagedWrite {
+    // The guard exists before the first byte is written, so a failed or
+    // partial `write` (ENOSPC, IO error) still drops through the cleanup —
+    // returning early here would otherwise strand whatever made it to disk.
+    let staged = StagedWrite {
         item,
-        blob_temp,
-        meta_temp,
+        blob_temp: item.blob_path.with_extension(format!("{nonce}.blob.tmp")),
+        meta_temp: item.meta_path.with_extension(format!("{nonce}.meta.tmp")),
         renamed: false,
-    }))
+    };
+
+    std::fs::write(&staged.blob_temp, &item.blob_data)?;
+    std::fs::write(&staged.meta_temp, &item.signed_data)?;
+
+    Ok(Some(staged))
+}
+
+/// Staged `.tmp` files this old are crash leftovers, never writes in flight —
+/// staging lives for milliseconds.
+const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Remove staging `.tmp` files under `trees_root` older than [`STALE_TMP_AGE`],
+/// returning how many were deleted. Committed `.blob`/`.meta` pairs are never
+/// touched. Runs on a background thread at open; exposed so tests can run it
+/// to completion.
+pub fn sweep_stale_temp_files(trees_root: &Path) -> u64 {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(STALE_TMP_AGE) else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut stack = vec![trees_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let stale = path.extension().is_some_and(|ext| ext == "tmp")
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|modified| modified < cutoff);
+            if stale && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// Fsync `path`'s contents. Opening a fresh read handle is sufficient:
@@ -685,6 +727,17 @@ impl FsStorage {
     pub fn new(root: PathBuf) -> Result<Self, FsStorageError> {
         create_dir_all_durable(&root)?;
         create_dir_all_durable(&root.join("trees"))?;
+
+        // Crash leftovers: staging temps whose process died before the
+        // rename. They are invisible to loads but accumulate forever, so a
+        // reopen sweeps the old ones off the main path.
+        let trees = root.join("trees");
+        std::thread::spawn(move || {
+            let removed = sweep_stale_temp_files(&trees);
+            if removed > 0 {
+                tracing::info!(removed, "swept stale staging temp files");
+            }
+        });
 
         Ok(Self {
             root,
