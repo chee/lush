@@ -702,10 +702,6 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func docHistorySince(url: String, heads: [String])  -> [DocHistoryEntry]
     
-    func docStorageChunkList(url: String) throws  -> [StorageChunk]
-    
-    func docStorageChunkSlice(url: String, cursor: String, offset: UInt64) throws  -> Data
-    
     func documentKind(url: String) async throws  -> String
     
     func draftAddChild(draftUrl: String, childUrl: String) throws 
@@ -1455,24 +1451,6 @@ open func docHistorySince(url: String, heads: [String]) -> [DocHistoryEntry]  {
     uniffi_lush_core_fn_method_core_doc_history_since(self.uniffiClonePointer(),
         FfiConverterString.lower(url),
         FfiConverterSequenceString.lower(heads),$0
-    )
-})
-}
-    
-open func docStorageChunkList(url: String)throws  -> [StorageChunk]  {
-    return try  FfiConverterSequenceTypeStorageChunk.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_doc_storage_chunk_list(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),$0
-    )
-})
-}
-    
-open func docStorageChunkSlice(url: String, cursor: String, offset: UInt64)throws  -> Data  {
-    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
-    uniffi_lush_core_fn_method_core_doc_storage_chunk_slice(self.uniffiClonePointer(),
-        FfiConverterString.lower(url),
-        FfiConverterString.lower(cursor),
-        FfiConverterUInt64.lower(offset),$0
     )
 })
 }
@@ -4794,84 +4772,6 @@ public func FfiConverterTypeSmartNotebook_lower(_ value: SmartNotebook) -> RustB
 }
 
 
-public struct StorageChunk {
-    public var cursor: String
-    public var digest: String
-    public var byteLen: UInt64
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(cursor: String, digest: String, byteLen: UInt64) {
-        self.cursor = cursor
-        self.digest = digest
-        self.byteLen = byteLen
-    }
-}
-
-#if compiler(>=6)
-extension StorageChunk: Sendable {}
-#endif
-
-
-extension StorageChunk: Equatable, Hashable {
-    public static func ==(lhs: StorageChunk, rhs: StorageChunk) -> Bool {
-        if lhs.cursor != rhs.cursor {
-            return false
-        }
-        if lhs.digest != rhs.digest {
-            return false
-        }
-        if lhs.byteLen != rhs.byteLen {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(cursor)
-        hasher.combine(digest)
-        hasher.combine(byteLen)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeStorageChunk: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StorageChunk {
-        return
-            try StorageChunk(
-                cursor: FfiConverterString.read(from: &buf), 
-                digest: FfiConverterString.read(from: &buf), 
-                byteLen: FfiConverterUInt64.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: StorageChunk, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.cursor, into: &buf)
-        FfiConverterString.write(value.digest, into: &buf)
-        FfiConverterUInt64.write(value.byteLen, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeStorageChunk_lift(_ buf: RustBuffer) throws -> StorageChunk {
-    return try FfiConverterTypeStorageChunk.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeStorageChunk_lower(_ value: StorageChunk) -> RustBuffer {
-    return FfiConverterTypeStorageChunk.lower(value)
-}
-
-
 public enum CoreError: Swift.Error {
 
     
@@ -5913,31 +5813,6 @@ fileprivate struct FfiConverterSequenceTypeSmartNotebook: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeStorageChunk: FfiConverterRustBuffer {
-    typealias SwiftType = [StorageChunk]
-
-    public static func write(_ value: [StorageChunk], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypeStorageChunk.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StorageChunk] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [StorageChunk]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeStorageChunk.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
     public static func write(_ value: [String: String], into buf: inout [UInt8]) {
         let len = Int32(value.count)
@@ -6107,12 +5982,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_doc_history_since() != 44313) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_lush_core_checksum_method_core_doc_storage_chunk_list() != 40704) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_lush_core_checksum_method_core_doc_storage_chunk_slice() != 51822) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_document_kind() != 24464) {

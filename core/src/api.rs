@@ -133,15 +133,6 @@ pub struct AssetInfo {
     pub extension: String,
 }
 
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct StorageChunk {
-    pub cursor: String,
-    pub digest: String,
-    pub byte_len: u64,
-}
-
-const STORAGE_CHUNK_SLICE_BYTES: usize = 512 * 1024;
-
 /// An iroh peer. `added` peers are dialed on launch; the rest dialed us and
 /// are offered as suggestions.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -853,35 +844,6 @@ impl Core {
 
     pub fn forget_iroh_peer(&self, node_id: String) {
         self.repo.forget_iroh_peer(&node_id);
-    }
-
-    pub fn doc_storage_chunk_list(&self, url: String) -> Result<Vec<StorageChunk>, CoreError> {
-        let id = DocId::from_url(&url)?;
-        Ok(self
-            .runtime
-            .block_on(self.repo.doc_chunk_list(id))?
-            .into_iter()
-            .map(|entry| StorageChunk {
-                cursor: entry.cursor,
-                digest: entry.digest,
-                byte_len: entry.byte_len,
-            })
-            .collect())
-    }
-
-    pub fn doc_storage_chunk_slice(
-        &self,
-        url: String,
-        cursor: String,
-        offset: u64,
-    ) -> Result<Vec<u8>, CoreError> {
-        let id = DocId::from_url(&url)?;
-        Ok(self.runtime.block_on(self.repo.doc_chunk_slice(
-            id,
-            cursor,
-            offset,
-            STORAGE_CHUNK_SLICE_BYTES,
-        ))?)
     }
 
     /// Open an existing folder doc (waiting for it to arrive if needed) or
