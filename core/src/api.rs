@@ -2183,6 +2183,16 @@ impl Core {
         });
     }
 
+    /// The app is hiding: evict every resident doc, editor pins and the
+    /// folder root included. Pin counts stay put, so open sessions still
+    /// balance on close and their docs re-materialize on the next read.
+    pub fn background_trim(&self) {
+        let repo = self.repo.clone();
+        self.runtime.spawn(async move {
+            repo.background_trim().await;
+        });
+    }
+
     pub async fn document_kind(&self, url: String) -> Result<String, CoreError> {
         let repo = self.repo.clone();
         let id = DocId::from_url(&url)?;

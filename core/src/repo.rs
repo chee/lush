@@ -3250,7 +3250,11 @@ impl Repo {
     /// sedimentree plus the outbox file. Anything doubtful skips — the doc
     /// just stays resident until the next sweep.
     pub async fn evict_doc(&self, id: DocId) -> bool {
-        if self.is_pinned(id)
+        self.evict(id, false).await
+    }
+
+    async fn evict(&self, id: DocId, ignore_pins: bool) -> bool {
+        if (!ignore_pins && self.is_pinned(id))
             || self.pending_saves.lock().await.contains_key(&id)
             || self.deferred_applies.lock().await.contains(&id)
             || self.deferred_sends.lock().await.contains(&id)
@@ -3303,7 +3307,7 @@ impl Repo {
             let Ok(guard) = state.try_lock() else {
                 return false;
             };
-            if guard.doc.get_heads() != heads || self.is_pinned(id) {
+            if guard.doc.get_heads() != heads || (!ignore_pins && self.is_pinned(id)) {
                 return false;
             }
             drop(guard);
@@ -3318,6 +3322,31 @@ impl Repo {
             .await;
         tracing::debug!(doc = %id.to_url(), "evicted idle doc");
         true
+    }
+
+    /// The app has gone dormant: evict every resident doc, pinned or not —
+    /// the editors holding the pins are dormant too. Pin counts are left
+    /// alone, so sessions still balance when they close and their docs
+    /// re-materialize on the next read. Pending debounced saves are flushed
+    /// first; the other refusals hold — a mid-sync, moon-deferred, or not
+    /// provably reconstructable doc just stays resident.
+    pub async fn background_trim(&self) -> usize {
+        let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
+        let mut evicted = 0;
+        for id in ids {
+            if self.pending_saves.lock().await.contains_key(&id) {
+                if let Err(e) = self.save_doc(id).await {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "flush before background trim failed");
+                }
+            }
+            if self.evict(id, true).await {
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            tracing::info!(evicted, "background trim");
+        }
+        evicted
     }
 
     /// Evict unpinned docs oldest first, taking each one `sweep_takes` allows.
@@ -5144,6 +5173,162 @@ mod tests {
         })
         .await
         .expect("once the lock is free the sweep should run again");
+    }
+
+    async fn trim_when_settled(repo: &Arc<Repo>) {
+        timeout(Duration::from_secs(10), async {
+            while !repo.docs.lock().await.is_empty() {
+                repo.background_trim().await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("background trim should clear every doc");
+    }
+
+    #[tokio::test]
+    async fn background_trim_clears_everything_pins_included() {
+        let (_dir, repo) = test_repo().await;
+        let root = repo
+            .create_doc(|doc| {
+                put(doc, "kind", "folder");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let note = repo
+            .create_doc(|doc| {
+                put(doc, "value", "open");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let expected = repo.read_doc(note, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.pin_doc(root);
+        repo.pin_doc(note);
+
+        trim_when_settled(&repo).await;
+        assert!(repo.is_pinned(root), "trim must not touch pin counts");
+        assert!(repo.is_pinned(note), "trim must not touch pin counts");
+
+        let loaded = repo.read_doc(note, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
+
+        repo.sweep_idle_docs(Duration::ZERO).await;
+        assert!(
+            repo.docs.lock().await.get(&note).is_some(),
+            "the session's pin must still hold after re-materializing"
+        );
+
+        repo.unpin_doc(note);
+        timeout(Duration::from_secs(10), async {
+            loop {
+                repo.sweep_idle_docs(Duration::ZERO).await;
+                if repo.docs.lock().await.get(&note).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("balanced unpin should let the sweep take the doc");
+
+        repo.unpin_doc(root);
+        assert!(!repo.is_pinned(root));
+        repo.unpin_doc(root);
+        repo.pin_doc(root);
+        assert!(repo.is_pinned(root), "an extra unpin must not underflow");
+        repo.unpin_doc(root);
+    }
+
+    #[tokio::test]
+    async fn background_trim_flushes_a_pending_save_then_evicts() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+            put(doc, "second", "deferred");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.pin_doc(id);
+
+        trim_when_settled(&repo).await;
+        assert!(repo.pending_saves.lock().await.is_empty());
+
+        let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
+        repo.unpin_doc(id);
+    }
+
+    #[tokio::test]
+    async fn background_trim_leaves_moon_deferred_docs() {
+        let (_dir, repo) = test_repo().await;
+        let sending = repo
+            .create_doc(|doc| {
+                put(doc, "value", "before");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let applying = repo
+            .create_doc(|doc| {
+                put(doc, "value", "before");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        repo.set_send_changes(false).await;
+        repo.change_doc(sending, |doc| {
+            put(doc, "value", "after");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(repo.deferred_sends.lock().await.contains(&sending));
+
+        repo.set_apply_incoming(false).await;
+        let mut remote = repo
+            .read_doc(applying, |doc| Ok(doc.fork()))
+            .await
+            .unwrap();
+        remote.set_actor(ActorId::from([23; 16].as_slice()));
+        put(&mut remote, "remote", "waiting");
+        let ingested = ingest(
+            &remote,
+            applying.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        repo.core
+            .store_built_batch(
+                applying.sedimentree_id(),
+                ingested.commits,
+                ingested.fragments,
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !repo.deferred_applies.lock().await.contains(&applying) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        repo.background_trim().await;
+        assert!(repo.docs.lock().await.get(&sending).is_some());
+        assert!(repo.docs.lock().await.get(&applying).is_some());
     }
 
     #[tokio::test]

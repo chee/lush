@@ -616,6 +616,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func assetsWithoutVision(limit: UInt32)  -> [String]
     
     /**
+     * The app is hiding: evict every resident doc, editor pins and the
+     * folder root included. Pin counts stay put, so open sessions still
+     * balance on close and their docs re-materialize on the next read.
+     */
+    func backgroundTrim() 
+    
+    /**
      * Full-history fork of a doc installed as a new repo doc. `cloned_at`
      * is the source's heads at fork time.
      */
@@ -1272,6 +1279,17 @@ open func assetsWithoutVision(limit: UInt32) -> [String]  {
         FfiConverterUInt32.lower(limit),$0
     )
 })
+}
+    
+    /**
+     * The app is hiding: evict every resident doc, editor pins and the
+     * folder root included. Pin counts stay put, so open sessions still
+     * balance on close and their docs re-materialize on the next read.
+     */
+open func backgroundTrim()  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_background_trim(self.uniffiClonePointer(),$0
+    )
+}
 }
     
     /**
@@ -6789,6 +6807,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_assets_without_vision() != 63793) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_background_trim() != 31378) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_clone_doc() != 45060) {

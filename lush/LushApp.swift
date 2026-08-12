@@ -34,6 +34,7 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         guard Self.systemInitiatedQuit else {
             NSApp.setActivationPolicy(.accessory)
             NSApp.hide(nil)
+            NotesModel.shared.core?.backgroundTrim()
             return .terminateCancel
         }
         Self.quitting = true
