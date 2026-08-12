@@ -27,24 +27,72 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.servicesProvider = LushServicesProvider.shared
     }
 
+    private static var quitting = false
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !Self.quitting else { return .terminateCancel }
+        guard Self.systemInitiatedQuit else {
+            NSApp.setActivationPolicy(.accessory)
+            NSApp.hide(nil)
+            return .terminateCancel
+        }
+        Self.quitting = true
         NSApp.setActivationPolicy(.accessory)
         NSApp.hide(nil)
-        return .terminateCancel
+        Task { @MainActor in
+            await Self.flushAndShutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
 
+    private static var systemInitiatedQuit: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              event.eventID == AEEventID(kAEQuitApplication),
+              let reason = event.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))
+        else { return false }
+        switch reason.enumCodeValue {
+        case kAELogOut, kAEReallyLogOut,
+             kAERestart, kAEShowRestartDialog,
+             kAEShutDown, kAEShowShutdownDialog:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func flushAndShutdown() async {
+        await bounded(seconds: 5) {
+            await PatchworkScripting.shared.flushAll()
+        }
+        NotesModel.shared.activeEditor?.core?.pushNow()
+        NotesModel.shared.presence.leave()
+        NotesModel.shared.core?.shutdown()
+    }
+
+    private static func bounded(
+        seconds: TimeInterval,
+        _ operation: @escaping @Sendable () async -> Void
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await operation() }
+            group.addTask { try? await Task.sleep(for: .seconds(seconds)) }
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
     static func reallyQuit() {
+        guard !quitting else { return }
+        quitting = true
         NSApp.setActivationPolicy(.accessory)
         NSApp.hide(nil)
         Task { @MainActor in
-            await PatchworkScripting.shared.flushAll()
-            NotesModel.shared.activeEditor?.core?.pushNow()
-            NotesModel.shared.presence.leave()
-            NotesModel.shared.core?.shutdown()
+            await flushAndShutdown()
             exit(0)
         }
     }
@@ -54,6 +102,17 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard !Self.quitting else { return }
+        Self.quitting = true
+        let done = DispatchSemaphore(value: 0)
+        Task { @MainActor in
+            await PatchworkScripting.shared.flushAll()
+            done.signal()
+        }
+        let deadline = Date.now + 3
+        while done.wait(timeout: .now()) == .timedOut, Date.now < deadline {
+            _ = RunLoop.current.run(mode: .default, before: Date.now + 0.05)
+        }
         NotesModel.shared.activeEditor?.core?.pushNow()
         NotesModel.shared.presence.leave()
         NotesModel.shared.core?.shutdown()
@@ -574,6 +633,15 @@ struct LushApp: App {
                 .onReceive(
                     NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)
                 ) { _ in
+                    let done = DispatchSemaphore(value: 0)
+                    Task { @MainActor in
+                        await PatchworkScripting.shared.flushAll()
+                        done.signal()
+                    }
+                    let deadline = Date.now + 3
+                    while done.wait(timeout: .now()) == .timedOut, Date.now < deadline {
+                        _ = RunLoop.current.run(mode: .default, before: Date.now + 0.05)
+                    }
                     NotesModel.shared.activeEditor?.core?.pushNow()
                     NotesModel.shared.presence.leave()
                     NotesModel.shared.core?.shutdown()
