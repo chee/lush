@@ -277,6 +277,10 @@ struct MainWindowCommands: Commands {
                 MainWindowTabs.open(selection: nil, using: openWindow)
             }
             .keyboardShortcut("t", modifiers: .command)
+            Button("Open from URL…") {
+                AppRouter.shared.pending = .openFromUrl
+            }
+            .keyboardShortcut("o", modifiers: .command)
         }
     }
 }

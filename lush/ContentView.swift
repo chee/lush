@@ -278,6 +278,7 @@ struct ContentView: View {
     @State private var appliedInitialRoute = false
     @State private var initialRouteSelection: String?
     @State private var hostWindow: NSWindow?
+    @State private var openFromUrlPresented = false
     private let initialRoute: MainWindowRoute?
 
     private static let expandedKey = "expandedFolders"
@@ -419,6 +420,11 @@ struct ContentView: View {
         }
         .sheet(item: $patchworkCreateRequest) { request in
             patchworkCreateSheet(request)
+        }
+        .sheet(isPresented: $openFromUrlPresented) {
+            OpenFromUrlView { url in
+                Task { await openDispatched(url) }
+            }
         }
         .fileImporter(
             isPresented: Binding(
@@ -625,6 +631,10 @@ struct ContentView: View {
             Task { await model.drainSharedIntake() }
         case .shortcutsHelp:
             break
+        case .openFromUrl:
+            #if os(macOS)
+            openFromUrlPresented = true
+            #endif
         }
     }
 

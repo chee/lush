@@ -22,6 +22,7 @@ final class AppRouter {
         case share(String)
         case calendar(day: Date?, item: String?)
         case shortcutsHelp
+        case openFromUrl
     }
 
     var pending: Action?
