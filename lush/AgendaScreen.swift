@@ -85,6 +85,12 @@ struct AgendaScreen: View {
             .frame(maxWidth: .infinity, alignment: .center)
         }
         .scrollPosition($position, anchor: .top)
+        // The toolbar floats over the top of the scroll content, so a day
+        // anchored to the bare container edge lands tucked underneath it.
+        // A top content margin moves the resting edge down for every anchor —
+        // the seeded open, the settle assert, a focus jump — while costing
+        // nothing mid-scroll: it is the container's edge, not the cells'.
+        .contentMargins(.top, 40, for: .scrollContent)
         .scrollIndicators(.hidden)
         // The scroll geometry drives the sliding window: nearing either end
         // extends it, and the position binding keeps the day she is looking
