@@ -14,7 +14,7 @@ struct NewItemMenuItems: View {
         Group {
             content
         }
-        .tint(.primary)
+        .tint(nil)
     }
 
     @ViewBuilder

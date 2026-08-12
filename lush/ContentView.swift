@@ -1325,12 +1325,6 @@ struct ContentView: View {
         .contextMenu {
             Group {
                 Button {
-                    MainWindowTabs.open(selection: tag, using: openWindow)
-                } label: {
-                    Label("Open in New Tab", systemImage: "plus.square.on.square")
-                }
-                Divider()
-                Button {
                     smartEditor = SmartNotebookEdit(folder: folder)
                 } label: {
                     Label("Edit Smart Notebook…", systemImage: "gearshape")
@@ -1350,7 +1344,7 @@ struct ContentView: View {
                     Label("Delete", systemImage: "trash")
                 }
             }
-            .tint(.primary)
+            .tint(nil)
         }
     }
 
@@ -1625,17 +1619,11 @@ struct ContentView: View {
         Group {
             folderContextMenuContent(for: node)
         }
-        .tint(.primary)
+        .tint(nil)
     }
 
     @ViewBuilder
     private func folderContextMenuContent(for node: FolderNode) -> some View {
-        Button {
-            MainWindowTabs.open(selection: rowTag(for: node.url), using: openWindow)
-        } label: {
-            Label("Open in New Tab", systemImage: "plus.square.on.square")
-        }
-        Divider()
         Menu("New") {
             NewItemMenuItems(
                 model: model,
@@ -1743,7 +1731,7 @@ struct ContentView: View {
                             Label("Delete \(targets.count) Items", systemImage: "trash")
                         }
                     }
-                    .tint(.primary)
+                    .tint(nil)
                 } else {
                     singleNoteContextMenu(for: node)
                 }
@@ -2088,7 +2076,7 @@ struct ContentView: View {
                 rename: { beginRename(node) }
             )
         }
-        .tint(.primary)
+        .tint(nil)
     }
 
     #endif
@@ -2598,7 +2586,7 @@ struct FolderScreen: View {
                                         Label("Delete", systemImage: "trash")
                                     }
                                 }
-                                .tint(.primary)
+                                .tint(nil)
                             }
                         }
                         .onMove { from, to in
@@ -2849,7 +2837,7 @@ struct FolderScreen: View {
         Group {
             nodeMenuContent(node)
         }
-        .tint(.primary)
+        .tint(nil)
     }
 
     @ViewBuilder
@@ -2894,7 +2882,7 @@ struct FolderScreen: View {
                 Button {
                     model.openInPatchwork(node.url)
                 } label: {
-                    Label("Open in Patchwork", systemImage: "arrow.up.forward.app")
+                    OpenInPatchworkLabel()
                 }
             }
             Divider()
@@ -4280,7 +4268,7 @@ struct NoteDetail: View {
     private var moreMenu: some View {
         Menu {
             moreMenuContent
-                .tint(.primary)
+                .tint(nil)
         } label: {
             Label("More", systemImage: "ellipsis")
         }
@@ -4330,7 +4318,7 @@ struct NoteDetail: View {
                     Button {
                         model.openInPatchwork(noteUrl)
                     } label: {
-                        Label("Open in Patchwork", systemImage: "arrow.up.forward.app")
+                        OpenInPatchworkLabel()
                     }
                 }
                 #if os(macOS)
