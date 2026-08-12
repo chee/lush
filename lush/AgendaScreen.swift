@@ -11,8 +11,9 @@ struct AgendaScreen: View {
     @State private var dayGroups: [DayGroup] = []
     @State private var highlighted: String?
     @State private var highlightTask: Task<Void, Never>?
-    @State private var ready = false
-    @State private var extendingBack = false
+    @State private var position = ScrollPosition(idType: Date.self)
+    @State private var settled = false
+    @State private var extending = false
 
     var body: some View {
         Group {
@@ -26,7 +27,7 @@ struct AgendaScreen: View {
                         Task { await agenda.requestAccess() }
                     }
                 }
-            } else if agenda.items.isEmpty {
+            } else if agenda.items.isEmpty, agenda.isFreshWindow {
                 ContentUnavailableView(
                     "Nothing Scheduled",
                     systemImage: "calendar",
@@ -39,111 +40,121 @@ struct AgendaScreen: View {
         .navigationTitle("Calendar")
         .task {
             noteUrls = CalendarLinks.noteUrlByItem
+            if agenda.focusDay == nil, agenda.restoreDay == nil { agenda.resetWindow() }
             await agenda.refresh()
         }
         .onReceive(NotificationCenter.default.publisher(for: CalendarLinks.changed)) { _ in
             noteUrls = CalendarLinks.noteUrlByItem
         }
         .onChange(of: agenda.items, initial: true) { regroup() }
-        .onChange(of: agenda.horizon) { regroup() }
     }
 
     private func regroup() {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let first = calendar.date(byAdding: .day, value: -agenda.backHorizon, to: today) ?? today
         dayGroups = Agenda
-            .days(agenda.items, from: first, count: agenda.backHorizon + agenda.horizon)
+            .days(agenda.items, from: agenda.windowStart, count: agenda.windowDayCount)
             .map(DayGroup.init)
     }
 
     private var list: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                // Each day is a Section: a lazy stack tracks its children
-                // through those, and a loose header plus a nested ForEach left
-                // it dropping rows until they were scrolled well past.
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    // Reaching the top of the list loads the previous
-                    // fortnight. Keying the sentinel to the horizon makes each
-                    // extension a fresh view, so its onAppear fires again when
-                    // she scrolls up to the new top.
-                    Color.clear
-                        .frame(height: 1)
-                        .id("back-\(agenda.backHorizon)")
-                        .onAppear { extendBack(proxy) }
-                    ForEach(dayGroups) { group in
-                        Section {
-                            // An event running over several days appears in
-                            // each of them, so the day has to be part of the
-                            // identity — one lazy stack holding the same id
-                            // twice draws it once and leaves a hole.
-                            ForEach(group.rows) { entry in
-                                row(entry.item)
-                            }
-                        } header: {
-                            header(group.day)
-                                .id(group.day)
-                                // The last header to scroll past the top is
-                                // where she was; a lazy stack only builds those
-                                // as they come into view, which is the signal.
-                                .onAppear { agenda.restoreDay = group.day }
+        ScrollView {
+            // Each day is one child of the lazy stack — a loose header plus a
+            // nested ForEach left it dropping rows until they were scrolled
+            // well past, and a single view per day also gives the scroll
+            // target layout one date to anchor by.
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(dayGroups) { group in
+                    VStack(alignment: .leading, spacing: 0) {
+                        header(group.day)
+                        // An event running over several days appears in each
+                        // of them, so the day has to be part of the identity —
+                        // one lazy stack holding the same id twice draws it
+                        // once and leaves a hole.
+                        ForEach(group.rows) { entry in
+                            row(entry.item)
                         }
                     }
-                    Color.clear
-                        .frame(height: 1)
-                        .id("forward-\(agenda.horizon)")
-                        .onAppear { Task { await agenda.extendHorizon() } }
-                }
-                .padding(.horizontal, 28)
-                .padding(.bottom, 40)
-                .frame(maxWidth: 720)
-                .frame(maxWidth: .infinity, alignment: .center)
-            }
-            .scrollIndicators(.hidden)
-            .onAppear { settle(proxy) }
-            .onChange(of: dayGroups.isEmpty) { settle(proxy) }
-            .onChange(of: agenda.focusDay, initial: true) {
-                guard let day = agenda.focusDay else { return }
-                withAnimation { proxy.scrollTo(day, anchor: .top) }
-                agenda.focusDay = nil
-                guard let item = agenda.focusItem else { return }
-                agenda.focusItem = nil
-                withAnimation { highlighted = item }
-                highlightTask?.cancel()
-                highlightTask = Task {
-                    try? await Task.sleep(for: .seconds(3))
-                    guard !Task.isCancelled else { return }
-                    withAnimation { highlighted = nil }
+                    // The last day to come into view is where she was; a lazy
+                    // stack only builds them as they arrive, which is the
+                    // signal.
+                    .onAppear { agenda.restoreDay = group.day }
                 }
             }
+            .scrollTargetLayout()
+            .padding(.horizontal, 28)
+            .padding(.bottom, 40)
+            .frame(maxWidth: 720)
+            .frame(maxWidth: .infinity, alignment: .center)
         }
+        .scrollPosition($position, anchor: .top)
+        .scrollIndicators(.hidden)
+        // The scroll geometry drives the sliding window: nearing either end
+        // extends it, and the position binding keeps the day she is looking
+        // at where it is while days are spliced in and out of the far ends —
+        // no sentinel views, nothing to get stuck on at the very top.
+        .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
+            slide(from: old, to: new)
+        }
+        .onChange(of: dayGroups.isEmpty, initial: true) { settle() }
+        .onChange(of: agenda.focusDay, initial: true) { focusChanged() }
     }
 
-
-    /// The list now opens with a fortnight of the past above today, so today
-    /// has to be scrolled to rather than simply being the top. Until that
-    /// scroll has landed the back sentinel is ignored — it is visible at first
-    /// layout, and extending then would drag the view into the past.
-    private func settle(_ proxy: ScrollViewProxy) {
-        guard !ready, !dayGroups.isEmpty else { return }
-        if agenda.focusDay == nil {
-            proxy.scrollTo(agenda.restoreDay ?? Calendar.current.startOfDay(for: Date()), anchor: .top)
-        }
-        Task { ready = true }
+    /// A fresh window starts at yesterday and simply renders from the top, so
+    /// today sits a little way down with a taste of the past above it —
+    /// nothing to scroll, nothing to race. Coming back to where she was is
+    /// the one case that needs a scroll, and the position binding resolves a
+    /// day id without the day having to be built yet.
+    private func settle() {
+        guard !settled, !dayGroups.isEmpty else { return }
+        settled = true
+        guard agenda.focusDay == nil, let day = agenda.restoreDay else { return }
+        position.scrollTo(id: day, anchor: .top)
     }
 
-    /// The day that was first stays put: it was at the top of the viewport
-    /// when the sentinel appeared, and pinning it back there after the prepend
-    /// is what keeps the list from jumping.
-    private func extendBack(_ proxy: ScrollViewProxy) {
-        guard ready, !extendingBack, let anchor = dayGroups.first?.day else { return }
-        extendingBack = true
+    private func focusChanged() {
+        guard let day = agenda.focusDay else { return }
+        agenda.focusDay = nil
+        let item = agenda.focusItem
+        agenda.focusItem = nil
         Task {
-            await agenda.extendBack()
+            await agenda.ensureWindow(around: day)
             regroup()
-            proxy.scrollTo(anchor, anchor: .top)
-            extendingBack = false
+            withAnimation { position.scrollTo(id: day, anchor: .top) }
+            guard let item else { return }
+            withAnimation { highlighted = item }
+            highlightTask?.cancel()
+            highlightTask = Task {
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else { return }
+                withAnimation { highlighted = nil }
+            }
+        }
+    }
+
+    /// Extension is asked for two screens before either edge and only while
+    /// actually scrolling toward it, so the splice happens out of sight and a
+    /// flick that reaches the very top still recovers — the trigger is the
+    /// geometry, not a view that has to reappear. The forward edge also
+    /// extends when new content still doesn't fill the viewport.
+    private func slide(from old: ScrollGeometry, to new: ScrollGeometry) {
+        guard settled, !extending, !dayGroups.isEmpty else { return }
+        let margin = new.containerSize.height * 2
+        let top = new.contentOffset.y + new.contentInsets.top
+        let oldTop = old.contentOffset.y + old.contentInsets.top
+        let bottom = new.contentSize.height - new.containerSize.height - new.contentOffset.y
+        let oldBottom = old.contentSize.height - old.containerSize.height - old.contentOffset.y
+        if top < margin, top < oldTop {
+            extend { await agenda.extendBack() }
+        } else if bottom < margin, bottom < oldBottom || new.contentSize.height != old.contentSize.height {
+            extend { await agenda.extendHorizon() }
+        }
+    }
+
+    private func extend(_ work: @escaping () async -> Void) {
+        extending = true
+        Task {
+            await work()
+            regroup()
+            extending = false
         }
     }
 

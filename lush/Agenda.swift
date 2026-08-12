@@ -102,9 +102,9 @@ enum Agenda {
     static let reminderPrefix = "reminder:"
     static let dayInIconKey = "calendarIconShowsDay"
     static let horizonDays = 14
-    /// EventKit quietly truncates an event predicate to four years, so a long
-    /// window is fetched in slices no wider than this.
-    static let predicateSpanDays = 1095
+    /// How many days stay loaded at once. The window slides: scrolling past
+    /// this lets the far edge go rather than accumulating the whole calendar.
+    static let windowLimit = 180
 
     #if os(macOS)
     private static func fourCharCode(_ text: String) -> FourCharCode {
@@ -309,13 +309,48 @@ final class AgendaStore {
     static let shared = AgendaStore()
 
     private(set) var items: [AgendaItem] = []
-    /// How many days the list currently reaches. Grows as she scrolls rather
-    /// than fetching a year nobody asked for.
-    private(set) var horizon = Agenda.horizonDays
-    /// How many days before today the list reaches. Starts one page back so
-    /// there is somewhere to scroll up to, and grows without limit — the past
-    /// runs as far as her calendar does.
-    private(set) var backHorizon = Agenda.horizonDays
+    /// The stretch of days currently loaded. Fresh, it runs from yesterday —
+    /// a little past showing above today says the list scrolls both ways — to
+    /// a fortnight out. It slides as she scrolls, and once it would pass
+    /// `Agenda.windowLimit` the far edge is let go, so neither the list nor
+    /// its memory grows without bound. The calendar itself has no edge: any
+    /// day is reachable, it just isn't all held at once.
+    private(set) var windowStart = AgendaStore.freshStart
+    private(set) var windowEnd = AgendaStore.freshEnd
+
+    static var freshStart: Date {
+        let today = Calendar.current.startOfDay(for: Date())
+        return Calendar.current.date(byAdding: .day, value: -1, to: today) ?? today
+    }
+
+    static var freshEnd: Date {
+        let today = Calendar.current.startOfDay(for: Date())
+        return Calendar.current.date(byAdding: .day, value: Agenda.horizonDays, to: today) ?? today
+    }
+
+    var windowDayCount: Int {
+        Calendar.current.dateComponents([.day], from: windowStart, to: windowEnd).day ?? 0
+    }
+
+    var isFreshWindow: Bool {
+        windowStart == Self.freshStart && windowEnd == Self.freshEnd
+    }
+
+    func resetWindow() {
+        windowStart = Self.freshStart
+        windowEnd = Self.freshEnd
+    }
+
+    /// Brings a linked day into the window if it has wandered off — the
+    /// window may have slid months away by the time a note link is clicked.
+    func ensureWindow(around day: Date) async {
+        let calendar = Calendar.current
+        let target = calendar.startOfDay(for: day)
+        guard target < windowStart || target >= windowEnd else { return }
+        windowStart = calendar.date(byAdding: .day, value: -1, to: target) ?? target
+        windowEnd = calendar.date(byAdding: .day, value: Agenda.horizonDays, to: target) ?? target
+        await reload()
+    }
     /// Where she was when she last left the calendar, so coming back lands
     /// there instead of at today.
     var restoreDay: Date?
@@ -463,41 +498,51 @@ final class AgendaStore {
     }
 
     private func reload() async {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let from = calendar.date(byAdding: .day, value: -backHorizon, to: today) ?? today
-        let to = calendar.date(byAdding: .day, value: horizon, to: today) ?? today
-        items = await fetch(from: from, to: to)
+        items = await fetch(from: windowStart, to: windowEnd)
     }
 
-    /// Another fortnight, each time the end of the list comes into view. Like
-    /// the past, the future has no cap: only the new slice is fetched, and an
-    /// item spanning the seam is dropped by its row key.
+    /// Another fortnight of the future. Only the new slice is fetched — an
+    /// item spanning the seam arrives twice and is dropped by its row key —
+    /// and once the window would pass its limit, the deepest past is let go.
     func extendHorizon() async {
         let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        guard let from = calendar.date(byAdding: .day, value: horizon, to: today),
-              let to = calendar.date(byAdding: .day, value: horizon + Agenda.horizonDays, to: today)
-        else { return }
-        horizon += Agenda.horizonDays
-        let newer = await fetch(from: from, to: to)
+        guard let end = calendar.date(byAdding: .day, value: Agenda.horizonDays, to: windowEnd) else { return }
+        let seam = windowEnd
+        windowEnd = end
+        if let floor = calendar.date(byAdding: .day, value: -Agenda.windowLimit, to: end), windowStart < floor {
+            windowStart = floor
+        }
+        let newer = await fetch(from: seam, to: end)
         let known = Set(items.map(\.rowKey))
-        items = (items + newer.filter { !known.contains($0.rowKey) }).sorted { $0.start < $1.start }
+        let start = windowStart
+        items = (items.filter { ($0.end ?? $0.start) >= start } + newer.filter { !known.contains($0.rowKey) })
+            .sorted { $0.start < $1.start }
     }
 
-    /// Another fortnight of the past, each time the top of the list comes into
-    /// view. Only the new slice is fetched; an item spanning the seam arrives
-    /// twice and is dropped by its row key.
+    /// Another fortnight of the past, mirrored: the farthest future is let go
+    /// once the window would pass its limit.
     func extendBack() async {
         let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        guard let to = calendar.date(byAdding: .day, value: -backHorizon, to: today),
-              let from = calendar.date(byAdding: .day, value: -(backHorizon + Agenda.horizonDays), to: today)
-        else { return }
-        backHorizon += Agenda.horizonDays
-        let older = await fetch(from: from, to: to)
+        guard let start = calendar.date(byAdding: .day, value: -Agenda.horizonDays, to: windowStart) else { return }
+        let seam = windowStart
+        windowStart = start
+        if let ceiling = calendar.date(byAdding: .day, value: Agenda.windowLimit, to: start), windowEnd > ceiling {
+            windowEnd = ceiling
+        }
+        let older = await fetch(from: start, to: seam)
         let known = Set(items.map(\.rowKey))
-        items = (older.filter { !known.contains($0.rowKey) } + items).sorted { $0.start < $1.start }
+        let end = windowEnd
+        items = (older.filter { !known.contains($0.rowKey) } + items.filter { $0.start < end })
+            .sorted { $0.start < $1.start }
+    }
+
+    /// A straight read for the chat tools: the coming days, fetched fresh so
+    /// it doesn't depend on where the window has slid to.
+    func next(days: Int) async -> [AgendaItem] {
+        let calendar = Calendar.current
+        let from = calendar.startOfDay(for: Date())
+        let to = calendar.date(byAdding: .day, value: days, to: from) ?? from
+        return await fetch(from: from, to: to)
     }
 
     private func fetch(from: Date, to: Date) async -> [AgendaItem] {
@@ -507,23 +552,16 @@ final class AgendaStore {
             let ekCalendars: [EKCalendar]? = shownIds.isEmpty
                 ? nil
                 : store.calendars(for: .event).filter { shownIds.contains($0.calendarIdentifier) }
+            let predicate = store.predicateForEvents(withStart: from, end: to, calendars: ekCalendars)
             let store = self.store
-            let calendar = Calendar.current
-            var sliceFrom = from
-            while sliceFrom < to {
-                let sliceTo = min(calendar.date(byAdding: .day, value: Agenda.predicateSpanDays, to: sliceFrom) ?? to, to)
-                let predicate = store.predicateForEvents(withStart: sliceFrom, end: sliceTo, calendars: ekCalendars)
-                next += await Task.detached {
-                    store.events(matching: predicate).compactMap(AgendaItem.init)
-                }.value
-                sliceFrom = sliceTo
-            }
+            next += await Task.detached {
+                store.events(matching: predicate).compactMap(AgendaItem.init)
+            }.value
         }
         if reminderAccess == .fullAccess {
             next += await reminders(from: from, to: to, shownIds: shownIds)
         }
-        var seen = Set<String>()
-        return next.filter { seen.insert($0.rowKey).inserted }.sorted { $0.start < $1.start }
+        return next.sorted { $0.start < $1.start }
     }
 
     private func reminders(from: Date, to: Date, shownIds: Set<String>) async -> [AgendaItem] {

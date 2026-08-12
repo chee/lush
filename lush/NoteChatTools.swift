@@ -432,15 +432,10 @@ final class NoteChatSession {
         case "read_agenda":
             let days = (arguments["days"] as? Int) ?? (arguments["days"] as? NSNumber)?.intValue ?? 7
             let store = AgendaStore.shared
-            if store.items.isEmpty, store.access == .fullAccess {
-                await store.refresh()
-            }
             guard store.access == .fullAccess || store.reminderAccess == .fullAccess else {
                 return "Lush does not have calendar access."
             }
-            let horizon = Date().addingTimeInterval(TimeInterval(max(days, 1)) * 86_400)
-            let today = Calendar.current.startOfDay(for: Date())
-            let items = store.items.filter { $0.start <= horizon && ($0.end ?? $0.start) >= today }
+            let items = await store.next(days: max(days, 1))
             guard !items.isEmpty else { return "Nothing scheduled in the next \(days) days." }
             return items.prefix(40).map {
                 "\($0.id) — \($0.title) — \($0.start.formatted(date: .abbreviated, time: .shortened)) — \($0.listName)"
