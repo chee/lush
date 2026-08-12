@@ -19,7 +19,6 @@ enum PermissionState {
 
 enum PermissionKind: String, CaseIterable, Identifiable {
     case location
-    case filesAndFolders
     case calendar
     case reminders
     case contacts
@@ -34,7 +33,6 @@ enum PermissionKind: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .location: "Location"
-        case .filesAndFolders: "Files and Folders"
         case .calendar: "Calendar"
         case .reminders: "Reminders"
         case .contacts: "Contacts"
@@ -49,7 +47,6 @@ enum PermissionKind: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .location: "Names the place in a logline and lets you save places."
-        case .filesAndFolders: "Reads and attaches files from your Desktop, Documents, and Downloads."
         case .calendar: "Adds what you were doing to a logline."
         case .reminders: "Adds reminders to a logline and lets notes create them."
         case .contacts: "Names the people you were with in a logline."
@@ -64,7 +61,6 @@ enum PermissionKind: String, CaseIterable, Identifiable {
     var symbolName: String {
         switch self {
         case .location: "location"
-        case .filesAndFolders: "folder"
         case .calendar: "calendar"
         case .reminders: "checklist"
         case .contacts: "person.crop.circle"
@@ -80,14 +76,13 @@ enum PermissionKind: String, CaseIterable, Identifiable {
         #if os(macOS)
         self != .camera
         #else
-        self != .filesAndFolders && self != .appleNotes
+        self != .appleNotes
         #endif
     }
 
     var privacyAnchor: String {
         switch self {
         case .location: "Privacy_LocationServices"
-        case .filesAndFolders: "Privacy_FilesAndFolders"
         case .calendar: "Privacy_Calendars"
         case .reminders: "Privacy_Reminders"
         case .contacts: "Privacy_Contacts"
@@ -144,11 +139,6 @@ final class PermissionsModel {
             _ = await AVCaptureDevice.requestAccess(for: .video)
         case .photos:
             _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-        case .filesAndFolders:
-            #if os(macOS)
-            let result = await Task.detached { UserFolders.probe() }.value
-            UserFolders.remember(result)
-            #endif
         case .appleNotes:
             #if os(macOS)
             _ = await Task.detached { AppleEventPermission.state(for: "com.apple.notes", askUser: true) }.value
@@ -211,12 +201,6 @@ final class PermissionsModel {
             case .denied, .restricted: .denied
             default: .notDetermined
             }
-        case .filesAndFolders:
-            #if os(macOS)
-            UserFolders.lastResult
-            #else
-            .unavailable
-            #endif
         case .appleNotes:
             #if os(macOS)
             AppleEventPermission.state(for: "com.apple.notes", askUser: false)
@@ -239,48 +223,6 @@ final class PermissionsModel {
 }
 
 #if os(macOS)
-enum UserFolders {
-    private static let key = "userFolderAccess"
-
-    static var directories: [FileManager.SearchPathDirectory] {
-        [.desktopDirectory, .documentDirectory, .downloadsDirectory]
-    }
-
-    static var lastResult: PermissionState {
-        switch UserDefaults.standard.string(forKey: key) {
-        case "granted": .granted
-        case "partial": .partial
-        case "denied": .denied
-        default: .notDetermined
-        }
-    }
-
-    static func remember(_ state: PermissionState) {
-        switch state {
-        case .granted: UserDefaults.standard.set("granted", forKey: key)
-        case .partial: UserDefaults.standard.set("partial", forKey: key)
-        default: UserDefaults.standard.set("denied", forKey: key)
-        }
-    }
-
-    static func probe() -> PermissionState {
-        var readable = 0
-        var checked = 0
-        for directory in directories {
-            guard let url = FileManager.default.urls(for: directory, in: .userDomainMask).first else {
-                continue
-            }
-            checked += 1
-            if (try? FileManager.default.contentsOfDirectory(atPath: url.path)) != nil {
-                readable += 1
-            }
-        }
-        if checked == 0 { return .unavailable }
-        if readable == checked { return .granted }
-        return readable == 0 ? .denied : .partial
-    }
-}
-
 enum AppleEventPermission {
     static func state(for bundleIdentifier: String, askUser: Bool) -> PermissionState {
         let target = NSAppleEventDescriptor(bundleIdentifier: bundleIdentifier)
