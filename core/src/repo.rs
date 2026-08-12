@@ -696,6 +696,8 @@ pub struct Repo {
     pending_saves: Mutex<HashMap<DocId, PendingSave>>,
     last_server_heads: Mutex<HashMap<DocId, BTreeSet<CommitId>>>,
     last_synced_local_heads: Mutex<HashMap<DocId, BTreeSet<CommitId>>>,
+    deferred_applies: Mutex<HashSet<DocId>>,
+    deferred_sends: Mutex<HashSet<DocId>>,
     next_save: AtomicU64,
     events: broadcast::Sender<RepoEvent>,
     connected: AtomicBool,
@@ -1168,11 +1170,18 @@ impl Repo {
         if !enabled {
             return;
         }
-        for id in self.tracked_doc_ids().await {
-            if let Err(e) = self.apply_new_blobs(id).await {
-                tracing::warn!(doc = %id.to_url(), error = %e, "future changes failed to apply");
+        let ids = std::mem::take(&mut *self.deferred_applies.lock().await);
+        let repo = self.clone();
+        tokio::spawn(async move {
+            for id in ids {
+                if repo.docs.lock().await.get(&id).is_none() {
+                    continue;
+                }
+                if let Err(e) = repo.apply_new_blobs(id).await {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "future changes failed to apply");
+                }
             }
-        }
+        });
     }
 
     pub async fn set_send_changes(self: &Arc<Self>, enabled: bool) {
@@ -1180,15 +1189,22 @@ impl Repo {
         if !enabled {
             return;
         }
-        for id in self.tracked_doc_ids().await {
-            match self.save_doc(id).await {
-                Ok(true) => self.request_sync_forced(id).await,
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(doc = %id.to_url(), error = %e, "staged changes failed to publish")
+        let ids = std::mem::take(&mut *self.deferred_sends.lock().await);
+        let repo = self.clone();
+        tokio::spawn(async move {
+            for id in ids {
+                if repo.docs.lock().await.get(&id).is_none() {
+                    continue;
+                }
+                match repo.save_doc(id).await {
+                    Ok(true) => repo.request_sync_forced(id).await,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "staged changes failed to publish")
+                    }
                 }
             }
-        }
+        });
     }
 
     pub fn is_applying_incoming(&self) -> bool {
@@ -1575,6 +1591,8 @@ impl Repo {
             pending_saves: Mutex::new(HashMap::new()),
             last_server_heads: Mutex::new(HashMap::new()),
             last_synced_local_heads: Mutex::new(HashMap::new()),
+            deferred_applies: Mutex::new(HashSet::new()),
+            deferred_sends: Mutex::new(HashSet::new()),
             next_save: AtomicU64::new(0),
             events,
             connected: AtomicBool::new(false),
@@ -1644,6 +1662,7 @@ impl Repo {
                     let id = DocId::from_sedimentree_id(batch.sedimentree_id);
                     if !repo.apply_incoming.load(Ordering::Relaxed) && repo.doc_has_heads(id).await
                     {
+                        repo.deferred_applies.lock().await.insert(id);
                         let _ = repo.events.send(RepoEvent::SyncEvent(format!(
                             "{}: changes waiting in the future",
                             short(id)
@@ -2184,6 +2203,7 @@ impl Repo {
     async fn save_doc_now(&self, id: DocId) -> Result<bool> {
         if !self.send_changes.load(Ordering::Relaxed) {
             self.stage_doc(id).await?;
+            self.deferred_sends.lock().await.insert(id);
             return Ok(false);
         }
         let sid = id.sedimentree_id();
@@ -3086,9 +3106,19 @@ mod tests {
 
         repo.set_send_changes(true).await;
 
-        let published = repo.stored_batch(id).await.unwrap();
-        assert!(published.commits.len() + published.fragments.len() > before_count);
-        assert!(!repo.outbox_path(id).exists());
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let published = repo.stored_batch(id).await.unwrap();
+                if published.commits.len() + published.fragments.len() > before_count
+                    && !repo.outbox_path(id).exists()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3126,8 +3156,11 @@ mod tests {
             .unwrap();
         assert!(!has_remote);
         assert_eq!(repo.pending_change_count(id).await, 1);
+        assert!(repo.deferred_applies.lock().await.contains(&id));
 
+        let mut events = repo.subscribe();
         repo.set_apply_incoming(true).await;
+        wait_for_change(&mut events, id).await;
 
         let has_remote = repo
             .read_doc(id, |doc| Ok(doc.get(ROOT, "remote")?.is_some()))
@@ -3135,6 +3168,138 @@ mod tests {
             .unwrap();
         assert!(has_remote);
         assert_eq!(repo.pending_change_count(id).await, 0);
+        assert!(repo.deferred_applies.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reenabling_apply_drains_only_recorded_docs() {
+        let (_dir, repo) = test_repo().await;
+        let mut ids = Vec::new();
+        for n in 0u8..3 {
+            let id = repo
+                .create_doc(|doc| {
+                    put(doc, "local", n.to_string());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        repo.set_apply_incoming(false).await;
+
+        for (id, actor) in [(a, 41u8), (b, 42u8)] {
+            let mut remote = repo.read_doc(id, |doc| Ok(doc.fork())).await.unwrap();
+            remote.set_actor(ActorId::from([actor; 16].as_slice()));
+            put(&mut remote, "remote", "waiting");
+            let ingested = ingest(
+                &remote,
+                id.sedimentree_id(),
+                &HashSet::new(),
+                &HashSet::new(),
+                false,
+            )
+            .unwrap();
+            repo.core
+                .store_built_batch(id.sedimentree_id(), ingested.commits, ingested.fragments)
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if repo.deferred_applies.lock().await.len() == 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *repo.deferred_applies.lock().await,
+            HashSet::from([a, b])
+        );
+
+        repo.drop_doc(b).await;
+        repo.set_apply_incoming(true).await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let applied = repo
+                    .read_doc(a, |doc| Ok(doc.get(ROOT, "remote")?.is_some()))
+                    .await
+                    .unwrap();
+                if applied {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(repo.deferred_applies.lock().await.is_empty());
+        let untouched = repo
+            .read_doc(c, |doc| Ok(doc.get(ROOT, "remote")?.is_some()))
+            .await
+            .unwrap();
+        assert!(!untouched);
+    }
+
+    #[tokio::test]
+    async fn reenabling_send_drains_only_recorded_docs() {
+        let (_dir, repo) = test_repo().await;
+        let mut ids = Vec::new();
+        for n in 0u8..3 {
+            let id = repo
+                .create_doc(|doc| {
+                    put(doc, "value", n.to_string());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let mut counts = HashMap::new();
+        for id in [a, b, c] {
+            let batch = repo.stored_batch(id).await.unwrap();
+            counts.insert(id, batch.commits.len() + batch.fragments.len());
+        }
+
+        repo.set_send_changes(false).await;
+        for id in [a, b] {
+            let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+            repo.change_doc_at_deferred_save(id, heads, |doc| {
+                put(doc, "value", "after");
+                Ok(())
+            })
+            .await
+            .unwrap();
+            repo.save_doc(id).await.unwrap();
+        }
+        assert_eq!(*repo.deferred_sends.lock().await, HashSet::from([a, b]));
+
+        repo.set_send_changes(true).await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let mut published = true;
+                for id in [a, b] {
+                    let batch = repo.stored_batch(id).await.unwrap();
+                    published &= batch.commits.len() + batch.fragments.len() > counts[&id]
+                        && !repo.outbox_path(id).exists();
+                }
+                if published {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(repo.deferred_sends.lock().await.is_empty());
+        let batch = repo.stored_batch(c).await.unwrap();
+        assert_eq!(batch.commits.len() + batch.fragments.len(), counts[&c]);
     }
 
     #[tokio::test]
