@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 @preconcurrency import Dispatch
 
 #if os(macOS)
@@ -23,14 +24,29 @@ final class LushAgentServer {
             listener.newConnectionHandler = { [weak self] connection in
                 self?.accept(connection)
             }
-            listener.stateUpdateHandler = { state in
-                guard case .ready = state, let port = listener.port?.rawValue else { return }
-                listener.stateUpdateHandler = nil
-                Self.writeConnectionFile(port: port, token: token)
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let listener else { return }
+                switch state {
+                case .ready:
+                    guard let port = listener.port?.rawValue else { return }
+                    Self.writeConnectionFile(port: port, token: token)
+                case .failed(let error):
+                    Self.log.error("listener failed: \(error.localizedDescription, privacy: .public)")
+                    fallthrough
+                case .cancelled:
+                    listener.stateUpdateHandler = nil
+                    Task { @MainActor [weak self, weak listener] in
+                        guard let self, self.listener === listener else { return }
+                        self.listener = nil
+                    }
+                default:
+                    break
+                }
             }
             self.listener = listener
             listener.start(queue: queue)
         } catch {
+            Self.log.error("listener setup failed: \(error.localizedDescription, privacy: .public)")
             listener = nil
         }
     }
@@ -231,19 +247,57 @@ final class LushAgentServer {
         })
     }
 
+    private nonisolated static let log = Logger(subsystem: "party.chee.patchwork.lush", category: "agent-server")
+
+    private nonisolated static func connectionFileDirectories() -> [URL] {
+        let fm = FileManager.default
+        let home: URL
+        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
+            home = URL(fileURLWithPath: String(cString: dir), isDirectory: true)
+        } else {
+            home = fm.homeDirectoryForCurrentUser
+        }
+        var directories = [
+            home.appendingPathComponent(
+                "Library/Containers/party.chee.patchwork.lush/Data/Library/Application Support/Lush",
+                isDirectory: true
+            ),
+            home.appendingPathComponent("Library/Application Support/Lush", isDirectory: true),
+        ]
+        if let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            directories.append(support.appendingPathComponent("Lush", isDirectory: true))
+        }
+        var seen = Set<String>()
+        return directories.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    }
+
     private nonisolated static func writeConnectionFile(port: UInt16, token: String) {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let directory = support.appendingPathComponent("Lush", isDirectory: true)
-        let file = directory.appendingPathComponent("agent.json")
         let value: [String: Any] = [
             "protocol": "lush-agent-v1",
             "url": "http://127.0.0.1:\(port)",
             "token": token,
         ]
-        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try? data.write(to: file, options: [.atomic])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) else {
+            log.error("connection file serialization failed")
+            return
+        }
+        let fm = FileManager.default
+        var wroteAny = false
+        for directory in connectionFileDirectories() {
+            let file = directory.appendingPathComponent("agent.json")
+            do {
+                try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+                try data.write(to: file, options: [.atomic])
+                try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                wroteAny = true
+                log.info("connection file written for port \(port) at \(file.path, privacy: .public)")
+            } catch {
+                log.error("connection file write failed at \(file.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if !wroteAny {
+            log.fault("no connection file written for port \(port)")
+        }
     }
 }
 
