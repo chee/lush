@@ -228,10 +228,26 @@ struct SyncSettingsPane: View {
     @State private var showingClearConfirm = false
     @State private var compacting = false
     @State private var compactionResult: String?
+    @State private var serverDraft = NotesModel.shared.syncServerUrl ?? ""
+    @State private var serverChanged = false
     var body: some View {
         Form {
             Section("Sync") {
-                LabeledContent("Server", value: "subduction.sync.inkandswitch.com")
+                TextField(
+                    "Server",
+                    text: $serverDraft,
+                    prompt: Text("wss://subduction.sync.inkandswitch.com")
+                )
+                .autocorrectionDisabled()
+                .onChange(of: serverDraft) {
+                    model.setSyncServerUrl(serverDraft)
+                    serverChanged = true
+                }
+                if serverChanged {
+                    Text("Takes effect on next launch.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 LabeledContent("Status") {
                     HStack(spacing: 6) {
                         Circle()

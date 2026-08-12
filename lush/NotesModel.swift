@@ -37,6 +37,7 @@ final class NotesModel {
     private static let sendChangesKey = "focusSendChanges"
     private static let presenceKey = "focusPresence"
     private static let irohKey = "peerSyncEnabled"
+    private static let serverUrlKey = "syncServerUrl"
 
     private(set) var core: Core?
     var notes: [NoteInfo] = []
@@ -60,6 +61,9 @@ final class NotesModel {
     private(set) var irohEnabled = UserDefaults.standard.bool(forKey: irohKey)
     private(set) var changingIroh = false
     private(set) var irohError: String?
+    /// Overrides the hardcoded sync server. The core reads it once at
+    /// construction, so a change takes effect on the next launch.
+    private(set) var syncServerUrl = UserDefaults.standard.string(forKey: serverUrlKey)
 
     var focusModeEnabled: Bool {
         !applyingIncomingChanges && !sendingChanges && !sharingPresence
@@ -135,6 +139,12 @@ final class NotesModel {
             UserDefaults.standard.set(actual, forKey: Self.irohKey)
             self.refreshPeers()
         }
+    }
+
+    func setSyncServerUrl(_ url: String?) {
+        let trimmed = url?.trimmingCharacters(in: .whitespacesAndNewlines)
+        syncServerUrl = trimmed?.isEmpty == false ? trimmed : nil
+        UserDefaults.standard.set(syncServerUrl, forKey: Self.serverUrlKey)
     }
 
     func setSharingPresence(_ enabled: Bool) {
@@ -644,6 +654,7 @@ final class NotesModel {
         let applyIncoming = applyingIncomingChanges
         let sendChanges = sendingChanges
         let enableIroh = irohEnabled
+        let serverUrl = syncServerUrl
         let bridge = DelegateBridge(model: self)
         delegateBridge = bridge
         let priority: String? = {
@@ -655,7 +666,7 @@ final class NotesModel {
             Self.bootLog("prewarm begin")
             guard let core = try? Core.newWithIroh(
                 dataDir: dataDir.path,
-                serverUrl: nil,
+                serverUrl: serverUrl,
                 enableIroh: enableIroh
             ) else { return nil }
             Self.bootLog("core constructed")
