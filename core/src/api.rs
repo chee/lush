@@ -1386,6 +1386,11 @@ impl Core {
     /// already holds. That folder goes to the top of the account's root folder
     /// and is appended to the lush config's `.folders`. Returns the merged
     /// folder list.
+    ///
+    /// Idempotent: anything already reachable from the account's folder tree
+    /// is skipped, an adopted folder from an earlier run is reused instead of
+    /// making another, and duplicate adopted folders left by earlier runs are
+    /// merged into the first.
     pub async fn adopt_local_docs(
         &self,
         account_url: String,
@@ -1416,17 +1421,82 @@ impl Core {
                 let mut folders = repo
                     .read_doc(config, |doc| Ok(shapes::config_folders(doc)))
                     .await?;
-                let mut linked: HashSet<String> = repo
-                    .read_doc(root, shapes::folder_entries)
-                    .await?
-                    .into_iter()
-                    .map(|entry| entry.url)
+                let mut root_entries = repo.read_doc(root, shapes::folder_entries).await?;
+
+                // Past runs each made a fresh adopted folder. Merge them into
+                // the first so old duplicates collapse instead of piling up.
+                let adopted_urls: Vec<String> = root_entries
+                    .iter()
+                    .filter(|e| e.kind == "folder" && e.name == ADOPTED_FOLDER_TITLE)
+                    .map(|e| e.url.clone())
                     .collect();
+                let existing_adopted = adopted_urls.first().cloned();
+                if adopted_urls.len() > 1 {
+                    let keep = DocId::from_url(&adopted_urls[0])?;
+                    let mut kept: HashSet<String> = repo
+                        .read_doc(keep, shapes::folder_entries)
+                        .await?
+                        .into_iter()
+                        .map(|entry| entry.url)
+                        .collect();
+                    for url in &adopted_urls[1..] {
+                        let Ok(id) = DocId::from_url(url) else {
+                            continue;
+                        };
+                        let Ok(entries) = repo.read_doc(id, shapes::folder_entries).await else {
+                            continue;
+                        };
+                        for entry in entries {
+                            if !kept.insert(entry.url.clone()) {
+                                continue;
+                            }
+                            repo.change_doc(keep, move |doc| shapes::add_folder_entry(doc, &entry, true))
+                                .await?;
+                        }
+                        let gone = url.clone();
+                        repo.change_doc(root, move |doc| {
+                            shapes::remove_folder_entry(doc, &gone)?;
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                    root_entries.retain(|e| !adopted_urls[1..].contains(&e.url));
+                    let before = folders.clone();
+                    folders.retain(|url| !adopted_urls[1..].contains(url));
+                    if folders != before {
+                        let urls = folders.clone();
+                        repo.change_doc(config, move |doc| shapes::config_set_folders(doc, &urls))
+                            .await?;
+                    }
+                }
+
+                // Everything already reachable from the account — the root's
+                // subtree and every config folder's subtree, adopted folders
+                // included — so a doc adopted last time never counts as loose.
+                let mut linked: HashSet<String> = HashSet::new();
                 linked.insert(root_url.clone());
+                let mut stack = root_entries;
+                stack.extend(folders.iter().map(|url| shapes::DocLink {
+                    name: String::new(),
+                    kind: "folder".into(),
+                    url: url.clone(),
+                    lush: None,
+                }));
+                while let Some(entry) = stack.pop() {
+                    if !linked.insert(entry.url.clone()) || entry.kind != "folder" {
+                        continue;
+                    }
+                    let Ok(id) = DocId::from_url(&entry.url) else {
+                        continue;
+                    };
+                    if let Ok(children) = repo.read_doc(id, shapes::folder_entries).await {
+                        stack.extend(children);
+                    }
+                }
+
                 let mut adopted: Vec<shapes::DocLink> = Vec::new();
-                let mut held: HashSet<String> = HashSet::new();
                 for url in folder_urls {
-                    if linked.contains(&url) || folders.contains(&url) {
+                    if linked.contains(&url) {
                         continue;
                     }
                     let Ok(id) = DocId::from_url(&url) else {
@@ -1445,7 +1515,7 @@ impl Core {
                     }
                     let mut stack = entries;
                     while let Some(entry) = stack.pop() {
-                        if !held.insert(entry.url.clone()) || entry.kind != "folder" {
+                        if !linked.insert(entry.url.clone()) || entry.kind != "folder" {
                             continue;
                         }
                         let Ok(id) = DocId::from_url(&entry.url) else {
@@ -1464,7 +1534,7 @@ impl Core {
                     });
                 }
                 for url in doc_urls {
-                    if linked.contains(&url) || held.contains(&url) {
+                    if !linked.insert(url.clone()) {
                         continue;
                     }
                     let Ok(id) = DocId::from_url(&url) else {
@@ -1478,7 +1548,6 @@ impl Core {
                     else {
                         continue;
                     };
-                    held.insert(url.clone());
                     adopted.push(shapes::DocLink {
                         name,
                         kind: kind.unwrap_or_else(|| "rich".into()),
@@ -1489,28 +1558,36 @@ impl Core {
                 if adopted.is_empty() {
                     return Ok(folders);
                 }
-                let title = ADOPTED_FOLDER_TITLE.to_string();
-                let adopted_folder = repo
-                    .create_doc(|doc| shapes::init_folder(doc, ADOPTED_FOLDER_TITLE))
-                    .await?;
+                let adopted_folder = match &existing_adopted {
+                    Some(url) => DocId::from_url(url)?,
+                    None => {
+                        repo.create_doc(|doc| shapes::init_folder(doc, ADOPTED_FOLDER_TITLE))
+                            .await?
+                    }
+                };
                 for link in adopted.into_iter().rev() {
                     repo.change_doc(adopted_folder, move |doc| {
                         shapes::add_folder_entry(doc, &link, true)
                     })
                     .await?;
                 }
-                let link = shapes::DocLink {
-                    name: title,
-                    kind: "folder".into(),
-                    url: adopted_folder.to_url(),
-                    lush: None,
-                };
-                repo.change_doc(root, move |doc| shapes::add_folder_entry(doc, &link, true))
-                    .await?;
-                folders.push(adopted_folder.to_url());
-                let urls = folders.clone();
-                repo.change_doc(config, move |doc| shapes::config_set_folders(doc, &urls))
-                    .await?;
+                if existing_adopted.is_none() {
+                    let link = shapes::DocLink {
+                        name: ADOPTED_FOLDER_TITLE.to_string(),
+                        kind: "folder".into(),
+                        url: adopted_folder.to_url(),
+                        lush: None,
+                    };
+                    repo.change_doc(root, move |doc| shapes::add_folder_entry(doc, &link, true))
+                        .await?;
+                }
+                let adopted_url = adopted_folder.to_url();
+                if !folders.contains(&adopted_url) {
+                    folders.push(adopted_url);
+                    let urls = folders.clone();
+                    repo.change_doc(config, move |doc| shapes::config_set_folders(doc, &urls))
+                        .await?;
+                }
                 Ok::<_, anyhow::Error>(folders)
             })
             .await??;
@@ -3797,5 +3874,158 @@ mod tests {
             .unwrap();
         assert_eq!(kind.as_deref(), Some("rich"));
         assert_eq!(title, "host");
+    }
+
+    fn test_account(core: &Arc<Core>) -> (String, String, String) {
+        let repo = core.repo.clone();
+        core.runtime.block_on(async move {
+            let root = repo
+                .create_doc(|doc| shapes::init_folder(doc, "account root"))
+                .await
+                .unwrap();
+            let config = repo.create_doc(shapes::init_lush_config).await.unwrap();
+            let root_url = root.to_url();
+            let config_url = config.to_url();
+            let account = repo
+                .create_doc(|doc| {
+                    use automerge::transaction::Transactable;
+                    doc.transact(|t| t.put(automerge::ROOT, "rootFolderUrl", root_url.as_str()))
+                        .map(|_| ())
+                        .map_err(|f| anyhow::Error::new(f.error))?;
+                    shapes::set_account_tools_lush(doc, &config_url)
+                })
+                .await
+                .unwrap();
+            (account.to_url(), root.to_url(), config.to_url())
+        })
+    }
+
+    fn folder_urls(core: &Arc<Core>, url: &str) -> Vec<String> {
+        let id = DocId::from_url(url).unwrap();
+        core.runtime
+            .block_on(core.repo.read_doc(id, shapes::folder_entries))
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.url)
+            .collect()
+    }
+
+    #[test]
+    fn adopt_local_docs_is_idempotent() {
+        let (_dir, core) = test_core();
+        let (account, root, _config) = test_account(&core);
+        let local_folder = core
+            .runtime
+            .block_on(core.repo.create_doc(|doc| shapes::init_folder(doc, "mine")))
+            .unwrap()
+            .to_url();
+        let filed_note = core.create_note_doc("filed".into()).unwrap();
+        {
+            let id = DocId::from_url(&local_folder).unwrap();
+            let link = shapes::DocLink {
+                name: "filed".into(),
+                kind: "rich".into(),
+                url: filed_note.clone(),
+                lush: None,
+            };
+            core.runtime
+                .block_on(
+                    core.repo
+                        .change_doc(id, move |doc| shapes::add_folder_entry(doc, &link, true)),
+                )
+                .unwrap();
+        }
+        let calendar_note = core.create_note_doc("meeting".into()).unwrap();
+
+        let first = core
+            .runtime
+            .block_on(core.adopt_local_docs(
+                account.clone(),
+                vec![local_folder.clone()],
+                vec![calendar_note.clone()],
+            ))
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let adopted = first[0].clone();
+        assert_eq!(
+            folder_urls(&core, &adopted),
+            vec![local_folder.clone(), calendar_note.clone()]
+        );
+        assert_eq!(folder_urls(&core, &root), vec![adopted.clone()]);
+
+        // Same inputs again — a note filed in an already-adopted folder and a
+        // calendar note adopted last time must not be re-added.
+        let second = core
+            .runtime
+            .block_on(core.adopt_local_docs(
+                account.clone(),
+                vec![local_folder.clone()],
+                vec![calendar_note.clone(), filed_note.clone()],
+            ))
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            folder_urls(&core, &adopted),
+            vec![local_folder, calendar_note]
+        );
+        assert_eq!(folder_urls(&core, &root), vec![adopted]);
+    }
+
+    #[test]
+    fn adopt_local_docs_merges_duplicate_adopted_folders() {
+        let (_dir, core) = test_core();
+        let (account, root, config) = test_account(&core);
+        let note = core.create_note_doc("meeting".into()).unwrap();
+        let repo = core.repo.clone();
+        let root_id = DocId::from_url(&root).unwrap();
+        let config_id = DocId::from_url(&config).unwrap();
+        let dupes: Vec<String> = core.runtime.block_on({
+            let note = note.clone();
+            async move {
+                let mut urls = Vec::new();
+                for _ in 0..2 {
+                    let folder = repo
+                        .create_doc(|doc| shapes::init_folder(doc, ADOPTED_FOLDER_TITLE))
+                        .await
+                        .unwrap();
+                    let link = shapes::DocLink {
+                        name: "meeting".into(),
+                        kind: "rich".into(),
+                        url: note.clone(),
+                        lush: None,
+                    };
+                    repo.change_doc(folder, move |doc| shapes::add_folder_entry(doc, &link, true))
+                        .await
+                        .unwrap();
+                    let root_link = shapes::DocLink {
+                        name: ADOPTED_FOLDER_TITLE.into(),
+                        kind: "folder".into(),
+                        url: folder.to_url(),
+                        lush: None,
+                    };
+                    repo.change_doc(root_id, move |doc| {
+                        shapes::add_folder_entry(doc, &root_link, true)
+                    })
+                    .await
+                    .unwrap();
+                    urls.push(folder.to_url());
+                }
+                let list = urls.clone();
+                repo.change_doc(config_id, move |doc| shapes::config_set_folders(doc, &list))
+                    .await
+                    .unwrap();
+                urls
+            }
+        });
+        // add_folder_entry inserts at the front, so root order is newest first.
+        let kept = dupes[1].clone();
+
+        let folders = core
+            .runtime
+            .block_on(core.adopt_local_docs(account, vec![], vec![note.clone()]))
+            .unwrap();
+        assert_eq!(folders, vec![kept.clone()]);
+        assert_eq!(folder_urls(&core, &root), vec![kept.clone()]);
+        assert_eq!(folder_urls(&core, &kept), vec![note]);
     }
 }
