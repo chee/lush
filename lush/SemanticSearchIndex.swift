@@ -6,6 +6,7 @@ import CryptoKit
 /// and does the similarity scan.
 actor SemanticSearchIndex {
     private static let digestVersion = "2"
+    private static let legacyStoreByteLimit = 16 * 1024 * 1024
     private var core: Core?
 
     func attach(_ core: Core) {
@@ -105,10 +106,21 @@ actor SemanticSearchIndex {
     private func migrateLegacyStore() {
         guard let core else { return }
         let url = legacyStoreURL
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let store = try? JSONDecoder().decode(LegacyStore.self, from: data)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize,
+              size >= 0
         else { return }
+        guard size <= Self.legacyStoreByteLimit else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return }
+        guard data.count <= Self.legacyStoreByteLimit else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        guard let store = try? JSONDecoder().decode(LegacyStore.self, from: data) else { return }
         for (noteUrl, entry) in store.entries {
             let chunks = entry.chunks.map {
                 EmbeddingChunk(text: $0.text, vector: $0.vector.map(Float.init))

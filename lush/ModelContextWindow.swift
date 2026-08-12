@@ -140,7 +140,12 @@ enum ModelContextWindow {
             }
         }
         for url in candidates {
-            guard let data = try? Data(contentsOf: url),
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+                  let size = values.fileSize,
+                  size >= 0,
+                  size <= 1_048_576,
+                  let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  data.count <= 1_048_576,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
             if let tokens = contextLength(in: json) { return tokens }
