@@ -67,6 +67,7 @@ struct MenuBarCaptureView: View {
                     Label("Clipboard", systemImage: "doc.on.clipboard")
                 }
                 .buttonStyle(.bordered)
+                .tint(.primary)
             }
 
             Divider()
@@ -266,6 +267,7 @@ struct MenuBarCaptureView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .buttonStyle(.bordered)
+        .tint(.primary)
         .frame(width: 142)
     }
 
