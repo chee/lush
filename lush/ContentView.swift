@@ -4601,13 +4601,65 @@ struct NoteDetail: View {
 
 private struct FocusModeControl: View {
     @Bindable var model: NotesModel
+    @State private var showingOptions = false
 
     private var engaged: Bool {
         model.focusModeEnabled || !model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence
     }
 
-    private var focusOptions: some View {
-        Group {
+    var body: some View {
+        HStack(spacing: 2) {
+            Button {
+                model.setFocusMode(!model.focusModeEnabled)
+            } label: {
+                Label {
+                    Text("Moon Mode")
+                } icon: {
+                    if model.focusModeEnabled {
+                        Image(systemName: "moon.fill")
+                            .foregroundStyle(Color.purple)
+                    } else {
+                        Image(systemName: "moon")
+                            .overlay {
+                                if engaged {
+                                    Image(systemName: "moon.fill")
+                                        .foregroundStyle(Color.purple)
+                                        .mask(alignment: .leading) {
+                                            Rectangle().scaleEffect(x: 0.5, anchor: .leading)
+                                        }
+                                }
+                            }
+                    }
+                }
+                .overlay {
+                    if engaged {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.purple.opacity(0.6), lineWidth: 1)
+                            .padding(-4)
+                    }
+                }
+            }
+            .disabled(model.changingIncomingChanges || model.changingSendingChanges)
+            .help(model.focusModeEnabled ? "Leave Moon Mode" : "Enter Moon Mode")
+            Button {
+                showingOptions = true
+            } label: {
+                Label("Moon Mode Options", systemImage: "chevron.down")
+                    .imageScale(.small)
+            }
+            .help("Moon Mode Options")
+            .popover(isPresented: $showingOptions, arrowEdge: .bottom) {
+                FocusModeOptions(model: model)
+            }
+        }
+    }
+}
+
+private struct FocusModeOptions: View {
+    @Bindable var model: NotesModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Toggle("Apply incoming changes", isOn: Binding(
                 get: { model.applyingIncomingChanges },
                 set: model.setApplyingIncomingChanges
@@ -4623,43 +4675,12 @@ private struct FocusModeControl: View {
                 set: model.setSharingPresence
             ))
         }
-    }
-
-    var body: some View {
-        Menu {
-            focusOptions
-        } label: {
-            Label {
-                Text("Moon Mode")
-            } icon: {
-                if model.focusModeEnabled {
-                    Image(systemName: "moon.fill")
-                        .foregroundStyle(Color.purple)
-                } else {
-                    Image(systemName: "moon")
-                        .overlay {
-                            if engaged {
-                                Image(systemName: "moon.fill")
-                                    .foregroundStyle(Color.purple)
-                                    .mask(alignment: .leading) {
-                                        Rectangle().scaleEffect(x: 0.5, anchor: .leading)
-                                    }
-                            }
-                        }
-                }
-            }
-            .overlay {
-                if engaged {
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(Color.purple.opacity(0.6), lineWidth: 1)
-                        .padding(-4)
-                }
-            }
-        } primaryAction: {
-            model.setFocusMode(!model.focusModeEnabled)
-        }
-        .disabled(model.changingIncomingChanges || model.changingSendingChanges)
-        .help(model.focusModeEnabled ? "Leave Moon Mode" : "Enter Moon Mode")
+        .toggleStyle(.switch)
+        .padding(10)
+        .frame(width: 220)
+        #if os(iOS)
+        .presentationCompactAdaptation(.popover)
+        #endif
     }
 }
 
