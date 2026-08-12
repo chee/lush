@@ -125,6 +125,7 @@ private struct InterfaceFontRoot: ViewModifier {
         content
             .environment(\.interfaceFontFamily, family)
             .font(InterfaceFont.font(.body, family: family, weight: nil))
+            .tint(Color.accentColor)
             .onChange(of: family, initial: true) {
                 InterfaceFont.applyNavigationBarAppearance(family: family)
             }
