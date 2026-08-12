@@ -5,13 +5,16 @@
 set -e
 cd "$(dirname "$0")"
 ~/.cargo/bin/cargo build --release --target aarch64-apple-darwin
-~/.cargo/bin/cargo build --release --target x86_64-apple-darwin
+#~/.cargo/bin/cargo build --release --target x86_64-apple-darwin
 ~/.cargo/bin/cargo build --release --lib --target aarch64-apple-ios
 ~/.cargo/bin/cargo build --release --lib --target aarch64-apple-ios-sim
 mkdir -p lib/macosx lib/iphoneos lib/iphonesimulator
+# lipo -create \
+#   target/aarch64-apple-darwin/release/liblush_core.a \
+#   target/x86_64-apple-darwin/release/liblush_core.a \
+#   -output lib/macosx/liblush_core.a
 lipo -create \
   target/aarch64-apple-darwin/release/liblush_core.a \
-  target/x86_64-apple-darwin/release/liblush_core.a \
   -output lib/macosx/liblush_core.a
 cp target/aarch64-apple-ios/release/liblush_core.a lib/iphoneos/
 cp target/aarch64-apple-ios-sim/release/liblush_core.a lib/iphonesimulator/
