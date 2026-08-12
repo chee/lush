@@ -79,6 +79,12 @@ struct AgendaScreen: View {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(dayGroups) { group in
                     VStack(alignment: .leading, spacing: 0) {
+                        // Inside the day cell, so each day stays one child
+                        // with one date identity — anchoring and the window
+                        // splices never have to know months exist.
+                        if Calendar.current.component(.day, from: group.day) == 1 {
+                            monthHeader(group.day)
+                        }
                         header(group.day)
                         // An event running over several days appears in each
                         // of them, so the day has to be part of the identity —
@@ -105,6 +111,10 @@ struct AgendaScreen: View {
         }
         .contentMargins(.top, 12, for: .scrollContent)
         .scrollIndicators(.hidden)
+        .overlay(alignment: .top) {
+            MonthChip(days: $visibleDays)
+                .padding(.top, 6)
+        }
         // The scroll geometry drives the sliding window: crossing into either
         // end extends it, and the anchor machinery pins the day she was on
         // while days are spliced in — no sentinel views, nothing to get
@@ -228,6 +238,18 @@ struct AgendaScreen: View {
         }
     }
 
+    private func monthHeader(_ day: Date) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(day.formatted(.dateTime.month(.wide)))
+                .font(.system(size: 34, weight: .bold))
+                .foregroundStyle(.primary)
+            Text(day.formatted(.dateTime.year()))
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 46)
+    }
+
     private func header(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("\(Calendar.current.component(.day, from: day))")
@@ -278,6 +300,27 @@ struct DayGroup: Identifiable {
         day = group.day
         rows = group.items.map {
             Row(id: "\(group.day.timeIntervalSince1970)|\($0.rowKey)", item: $0)
+        }
+    }
+}
+
+private struct MonthChip: View {
+    @Binding var days: Set<Date>
+
+    var body: some View {
+        if let top = days.min() {
+            HStack(spacing: 4) {
+                Text(top.formatted(.dateTime.month(.abbreviated)))
+                    .font(.system(size: 12, weight: .semibold))
+                Text(top.formatted(.dateTime.year()))
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(.separator.opacity(0.5), lineWidth: 0.5))
+            .animation(.default, value: top.formatted(.dateTime.month().year()))
         }
     }
 }
