@@ -676,6 +676,19 @@ pub struct FsStorage {
     ids_cache: Arc<Mutex<Option<Set<SedimentreeId>>>>,
 }
 
+/// One stored blob, named by the cursor `load_blob_slice` takes.
+#[derive(Debug, Clone)]
+pub struct BlobEntry {
+    pub cursor: String,
+    pub digest: String,
+    pub byte_len: u64,
+}
+
+/// Absurd upper bound on how many blobs one document can hold, there to turn a
+/// corrupt or hostile directory into an error instead of an endless scan. A
+/// real document is orders of magnitude below it.
+const MAX_BLOB_ENTRIES: usize = 1_000_000;
+
 impl FsStorage {
     /// Create a new filesystem storage backend at the given root directory.
     ///
@@ -696,6 +709,126 @@ impl FsStorage {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn valid_blob_cursor(cursor: &str) -> bool {
+        let parts: Vec<_> = cursor.split('/').collect();
+        parts.len() == 3
+            && matches!(parts[0], "0" | "1")
+            && Self::parse_commit_id_from_dirname(parts[1]).is_some()
+            && hex::decode(parts[2]).is_ok_and(|digest| digest.len() == 32)
+    }
+
+    /// Metadata for every blob stored under `id`, from a single directory
+    /// scan. Metadata only, so the cost is one `stat` per blob and the result
+    /// stays small however large the document is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a directory cannot be read, or if the document
+    /// holds an implausible number of blobs.
+    pub async fn list_blobs(&self, id: SedimentreeId) -> Result<Vec<BlobEntry>, FsStorageError> {
+        let commits = self.commits_dir(id);
+        let fragments = self.fragments_dir(id);
+        tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::new();
+            for (kind, parent) in [("0", fragments), ("1", commits)] {
+                for (name, path) in list_compound_dirs_sync(&parent)? {
+                    let Some(names) = list_dir_names_sync(&path)? else {
+                        continue;
+                    };
+                    let Some(stem) = complete_pair_stems_sorted(&names).first().copied() else {
+                        continue;
+                    };
+                    if !hex::decode(stem).is_ok_and(|digest| digest.len() == 32) {
+                        continue;
+                    }
+                    let blob_path = path.join(format!("{stem}.blob"));
+                    let byte_len = match std::fs::metadata(&blob_path) {
+                        Ok(metadata) => metadata.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    };
+                    if entries.len() >= MAX_BLOB_ENTRIES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stored blob count is implausible",
+                        )
+                        .into());
+                    }
+                    entries.push(BlobEntry {
+                        cursor: format!("{kind}/{name}/{stem}"),
+                        digest: stem.to_owned(),
+                        byte_len,
+                    });
+                }
+            }
+            Ok(entries)
+        })
+        .await?
+    }
+
+    pub async fn load_blob_slice(
+        &self,
+        id: SedimentreeId,
+        cursor: String,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FsStorageError> {
+        use std::io::{Read, Seek, SeekFrom};
+        if max_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty blob slice limit",
+            )
+            .into());
+        }
+        if !Self::valid_blob_cursor(&cursor) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid blob cursor",
+            )
+            .into());
+        }
+        let parts: Vec<_> = cursor.split('/').collect();
+        let parent = if parts[0] == "0" {
+            self.fragments_dir(id)
+        } else {
+            self.commits_dir(id)
+        };
+        let directory = parent.join(parts[1]);
+        let names = tokio::task::spawn_blocking({
+            let directory = directory.clone();
+            move || list_dir_names_sync(&directory)
+        })
+        .await??;
+        let Some(names) = names else {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "stored blob not found").into(),
+            );
+        };
+        if complete_pair_stems_sorted(&names).first().copied() != Some(parts[2]) {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "stored blob not found").into(),
+            );
+        }
+        let path = directory.join(format!("{}.blob", parts[2]));
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::File::open(path)?;
+            if offset > file.metadata()?.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid blob offset",
+                )
+                .into());
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+            file.take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+        .await?
     }
 
     /// Runs `f` against the id set, scanning `trees/` on first use. The lock is

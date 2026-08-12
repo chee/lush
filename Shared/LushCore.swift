@@ -702,7 +702,9 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func docHistorySince(url: String, heads: [String])  -> [DocHistoryEntry]
     
-    func docStorageChunks(url: String)  -> [StorageChunk]
+    func docStorageChunkList(url: String) throws  -> [StorageChunk]
+    
+    func docStorageChunkSlice(url: String, cursor: String, offset: UInt64) throws  -> Data
     
     func documentKind(url: String) async throws  -> String
     
@@ -1457,10 +1459,20 @@ open func docHistorySince(url: String, heads: [String]) -> [DocHistoryEntry]  {
 })
 }
     
-open func docStorageChunks(url: String) -> [StorageChunk]  {
-    return try!  FfiConverterSequenceTypeStorageChunk.lift(try! rustCall() {
-    uniffi_lush_core_fn_method_core_doc_storage_chunks(self.uniffiClonePointer(),
+open func docStorageChunkList(url: String)throws  -> [StorageChunk]  {
+    return try  FfiConverterSequenceTypeStorageChunk.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_doc_storage_chunk_list(self.uniffiClonePointer(),
         FfiConverterString.lower(url),$0
+    )
+})
+}
+    
+open func docStorageChunkSlice(url: String, cursor: String, offset: UInt64)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_doc_storage_chunk_slice(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(cursor),
+        FfiConverterUInt64.lower(offset),$0
     )
 })
 }
@@ -4783,14 +4795,16 @@ public func FfiConverterTypeSmartNotebook_lower(_ value: SmartNotebook) -> RustB
 
 
 public struct StorageChunk {
+    public var cursor: String
     public var digest: String
-    public var bytes: Data
+    public var byteLen: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(digest: String, bytes: Data) {
+    public init(cursor: String, digest: String, byteLen: UInt64) {
+        self.cursor = cursor
         self.digest = digest
-        self.bytes = bytes
+        self.byteLen = byteLen
     }
 }
 
@@ -4801,18 +4815,22 @@ extension StorageChunk: Sendable {}
 
 extension StorageChunk: Equatable, Hashable {
     public static func ==(lhs: StorageChunk, rhs: StorageChunk) -> Bool {
+        if lhs.cursor != rhs.cursor {
+            return false
+        }
         if lhs.digest != rhs.digest {
             return false
         }
-        if lhs.bytes != rhs.bytes {
+        if lhs.byteLen != rhs.byteLen {
             return false
         }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
+        hasher.combine(cursor)
         hasher.combine(digest)
-        hasher.combine(bytes)
+        hasher.combine(byteLen)
     }
 }
 
@@ -4825,14 +4843,16 @@ public struct FfiConverterTypeStorageChunk: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StorageChunk {
         return
             try StorageChunk(
+                cursor: FfiConverterString.read(from: &buf), 
                 digest: FfiConverterString.read(from: &buf), 
-                bytes: FfiConverterData.read(from: &buf)
+                byteLen: FfiConverterUInt64.read(from: &buf)
         )
     }
 
     public static func write(_ value: StorageChunk, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.cursor, into: &buf)
         FfiConverterString.write(value.digest, into: &buf)
-        FfiConverterData.write(value.bytes, into: &buf)
+        FfiConverterUInt64.write(value.byteLen, into: &buf)
     }
 }
 
@@ -6089,7 +6109,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_doc_history_since() != 44313) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_doc_storage_chunks() != 51003) {
+    if (uniffi_lush_core_checksum_method_core_doc_storage_chunk_list() != 40704) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_doc_storage_chunk_slice() != 51822) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_document_kind() != 24464) {

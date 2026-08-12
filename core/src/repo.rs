@@ -1438,31 +1438,24 @@ impl Repo {
     /// Raw stored blobs for a doc, each a loadable automerge chunk. Serves the
     /// webviews' storage read-through; order is irrelevant because automerge
     /// backlogs changes whose dependencies haven't been applied yet.
-    pub async fn doc_chunks(&self, id: DocId) -> Vec<(String, Vec<u8>)> {
-        let sid = id.sedimentree_id();
-        let fragments = <ObservedStorage as Storage<Sendable>>::load_fragments(&self.storage, sid)
-            .await
-            .unwrap_or_default();
-        let commits =
-            <ObservedStorage as Storage<Sendable>>::load_loose_commits(&self.storage, sid)
-                .await
-                .unwrap_or_default();
-        let mut chunks = Vec::new();
-        for record in &fragments {
-            let blob = record.blob();
-            chunks.push((
-                BlobMeta::new(blob).digest().to_string(),
-                blob.as_slice().to_vec(),
-            ));
-        }
-        for record in &commits {
-            let blob = record.blob();
-            chunks.push((
-                BlobMeta::new(blob).digest().to_string(),
-                blob.as_slice().to_vec(),
-            ));
-        }
-        chunks
+    pub async fn doc_chunk_list(
+        &self,
+        id: DocId,
+    ) -> Result<Vec<sedimentree_fs_storage::BlobEntry>> {
+        Ok(self.storage.list_blobs(id.sedimentree_id()).await?)
+    }
+
+    pub async fn doc_chunk_slice(
+        &self,
+        id: DocId,
+        cursor: String,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        Ok(self
+            .storage
+            .load_blob_slice(id.sedimentree_id(), cursor, offset, max_bytes)
+            .await?)
     }
 
     pub async fn start(
@@ -2685,6 +2678,66 @@ mod tests {
             .await
             .unwrap();
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn document_storage_lists_every_blob_and_slices_them() {
+        let (_dir, repo) = test_repo().await;
+        let mut state = 0xA5A5_5A5A_D3C1_B7E9u64;
+        let large: String = (0..1_100_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'!' + (state % 90) as u8)
+            })
+            .collect();
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "large", large.clone());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.change_doc(id, |doc| {
+            put(doc, "small", "second");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        repo.save_doc_now(id).await.unwrap();
+
+        let chunks = repo.doc_chunk_list(id).await.unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|entry| entry.cursor.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+        let entry = chunks
+            .iter()
+            .max_by_key(|entry| entry.byte_len)
+            .unwrap()
+            .clone();
+        assert!(entry.byte_len > 512 * 1024);
+
+        let mut loaded = Vec::new();
+        while (loaded.len() as u64) < entry.byte_len {
+            let slice = repo
+                .doc_chunk_slice(id, entry.cursor.clone(), loaded.len() as u64, 512 * 1024)
+                .await
+                .unwrap();
+            assert!(!slice.is_empty());
+            assert!(slice.len() <= 512 * 1024);
+            loaded.extend(slice);
+        }
+        assert_eq!(loaded.len() as u64, entry.byte_len);
+        assert!(repo
+            .doc_chunk_slice(id, "invalid".into(), 0, 512 * 1024)
+            .await
+            .is_err());
     }
 
     async fn wait_for_change(events: &mut broadcast::Receiver<RepoEvent>, id: DocId) {

@@ -6,7 +6,7 @@ use sedimentree_core::{
     id::SedimentreeId,
     loose_commit::{id::CommitId, LooseCommit},
 };
-use sedimentree_fs_storage::{FsStorage, FsStorageError};
+use sedimentree_fs_storage::{BlobEntry, FsStorage, FsStorageError};
 use subduction_core::storage::traits::Storage;
 use subduction_crypto::verified_meta::VerifiedMeta;
 use tokio::sync::mpsc;
@@ -39,6 +39,25 @@ pub(crate) struct ObservedStorage {
 impl ObservedStorage {
     pub(crate) fn new(inner: FsStorage, stored: mpsc::Sender<StoredBatch>) -> Self {
         Self { inner, stored }
+    }
+
+    pub(crate) async fn list_blobs(
+        &self,
+        sedimentree_id: SedimentreeId,
+    ) -> Result<Vec<BlobEntry>, FsStorageError> {
+        self.inner.list_blobs(sedimentree_id).await
+    }
+
+    pub(crate) async fn load_blob_slice(
+        &self,
+        sedimentree_id: SedimentreeId,
+        cursor: String,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FsStorageError> {
+        self.inner
+            .load_blob_slice(sedimentree_id, cursor, offset, max_bytes)
+            .await
     }
 }
 
