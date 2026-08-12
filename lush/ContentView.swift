@@ -4602,8 +4602,8 @@ struct NoteDetail: View {
 private struct FocusModeControl: View {
     @Bindable var model: NotesModel
 
-    private var partial: Bool {
-        !model.focusModeEnabled && (!model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence)
+    private var engaged: Bool {
+        model.focusModeEnabled || !model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence
     }
 
     private var focusOptions: some View {
@@ -4629,15 +4629,32 @@ private struct FocusModeControl: View {
         Menu {
             focusOptions
         } label: {
-            Label("Moon Mode", systemImage: model.focusModeEnabled ? "moon.fill" : "moon")
-                .overlay(alignment: .topTrailing) {
-                    if partial {
-                        Circle()
-                            .fill(Color.purple)
-                            .frame(width: 5, height: 5)
-                            .offset(x: 2, y: -2)
-                    }
+            Label {
+                Text("Moon Mode")
+            } icon: {
+                if model.focusModeEnabled {
+                    Image(systemName: "moon.fill")
+                        .foregroundStyle(Color.purple)
+                } else {
+                    Image(systemName: "moon")
+                        .overlay {
+                            if engaged {
+                                Image(systemName: "moon.fill")
+                                    .foregroundStyle(Color.purple)
+                                    .mask(alignment: .leading) {
+                                        Rectangle().scaleEffect(x: 0.5, anchor: .leading)
+                                    }
+                            }
+                        }
                 }
+            }
+            .overlay {
+                if engaged {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.purple.opacity(0.6), lineWidth: 1)
+                        .padding(-4)
+                }
+            }
         } primaryAction: {
             model.setFocusMode(!model.focusModeEnabled)
         }
