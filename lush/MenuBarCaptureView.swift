@@ -33,6 +33,7 @@ struct MenuBarCaptureView: View {
     @State private var status: String?
     @State private var recorder = AudioRecorder()
     @State private var isTranscribing = false
+    @State private var pendingTranscript: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -73,7 +74,7 @@ struct MenuBarCaptureView: View {
 
             actionGrid
 
-            if recorder.isRecording || recorder.permissionDenied || isTranscribing {
+            if recorder.isRecording || recorder.permissionDenied || recorder.saveFailed || isTranscribing {
                 recordingSection
             }
 
@@ -92,10 +93,25 @@ struct MenuBarCaptureView: View {
         }
         .task {
             await model.start()
+            recorder.configureRecovery("quick-note:\(model.accountConfigUrl ?? "local")")
             textFieldFocused = true
+        }
+        .onChange(of: model.accountConfigUrl) { _, accountUrl in
+            recorder.configureRecovery("quick-note:\(accountUrl ?? "local")")
         }
         .onExitCommand {
             closeMenuWindow()
+        }
+        .onDisappear {
+            if isTranscribing { return }
+            if recorder.isRecording {
+                if recorder.saveState == nil {
+                    _ = recorder.captureSaveState(recordingState(accountUrl: model.accountConfigUrl))
+                }
+                Task { _ = await recorder.stop() }
+            } else if !recorder.saveFailed {
+                recorder.cancel()
+            }
         }
     }
 
@@ -129,6 +145,7 @@ struct MenuBarCaptureView: View {
                 menuAction("Record", systemImage: recorder.isRecording ? "stop.circle" : "waveform.circle") {
                     toggleRecording()
                 }
+                .disabled(recorder.recordingTooLarge)
             }
             GridRow {
                 menuAction("Search", systemImage: "magnifyingglass") {
@@ -185,6 +202,18 @@ struct MenuBarCaptureView: View {
                     Text("Transcribing")
                         .uiFont(.caption)
                         .foregroundStyle(.secondary)
+                } else if recorder.saveFailed {
+                    Button("Cancel", role: .cancel) {
+                        recorder.cancel()
+                        pendingTranscript = nil
+                        status = "Recording cancelled"
+                    }
+                    if !recorder.recordingTooLarge {
+                        Button("Retry") {
+                            finishRecording()
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
                 } else if recorder.permissionDenied {
                     Text("Microphone access denied")
                         .uiFont(.caption)
@@ -269,34 +298,70 @@ struct MenuBarCaptureView: View {
     }
 
     private func toggleRecording() {
-        if recorder.isRecording {
+        if recorder.isRecording || recorder.saveFailed {
+            guard !recorder.recordingTooLarge else { return }
             finishRecording()
             return
         }
         status = nil
         recorder.permissionDenied = false
-        Task { await recorder.start() }
+        let state = recordingState(accountUrl: model.accountConfigUrl)
+        guard recorder.saveState != nil || recorder.captureSaveState(state) else {
+            status = recorder.saveError
+            return
+        }
+        Task {
+            await recorder.start()
+        }
     }
 
     private func finishRecording() {
-        guard let data = recorder.stop() else {
-            status = "Recording was empty"
-            return
-        }
+        guard !isTranscribing, !recorder.recordingTooLarge else { return }
+        guard recorder.saveState != nil
+            || recorder.captureSaveState(recordingState(accountUrl: model.accountConfigUrl))
+        else { return }
         isTranscribing = true
         status = nil
         Task {
-            let transcript = await Transcriber.transcribe(data, fileExtension: "m4a")
-            isTranscribing = false
-            let url = await model.appendRecordingToQuickNote(data: data, transcript: transcript)
-            if url == nil {
-                status = "Couldn't update Quick Note"
-            } else if transcript == nil {
-                status = "Recording added; transcript unavailable"
-            } else {
-                status = "Recording and transcript added"
+            guard let data = await recorder.stop() else {
+                isTranscribing = false
+                status = recorder.saveError ?? "Recording was empty"
+                return
             }
+            let transcript: String?
+            if let pendingTranscript {
+                transcript = pendingTranscript
+            } else {
+                transcript = await Transcriber.transcribe(data, fileExtension: "m4a")
+                pendingTranscript = transcript
+            }
+            isTranscribing = false
+            let result = await model.appendRecordingToQuickNote(
+                data: data,
+                transcript: transcript,
+                state: recorder.saveState
+            )
+            if !result.succeeded || result.url == nil {
+                recorder.retainSaveState(result.state)
+                status = "Couldn't update Quick Note"
+                return
+            }
+            recorder.completeSave(result.state)
+            pendingTranscript = nil
+            status = transcript == nil
+                ? "Recording added; transcript unavailable"
+                : "Recording and transcript added"
         }
+    }
+
+    private func recordingState(accountUrl: String?) -> RecordingSaveState {
+        RecordingSaveState(
+            assetUrl: nil,
+            name: "recording-\(Int(Date().timeIntervalSince1970)).m4a",
+            noteUrl: "",
+            accountUrl: accountUrl,
+            embedded: false
+        )
     }
 
     private func openLush() {

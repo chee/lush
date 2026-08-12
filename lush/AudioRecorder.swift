@@ -1,77 +1,321 @@
 import SwiftUI
 import AVFoundation
+import CryptoKit
+
+struct RecordingSaveState: Codable, Sendable {
+    var assetUrl: String?
+    let name: String
+    var noteUrl: String
+    let accountUrl: String?
+    var embedded: Bool
+}
+
+struct RecordingSaveResult: Sendable {
+    let state: RecordingSaveState?
+    let succeeded: Bool
+}
+
+private struct RecordingRecovery: Codable {
+    let state: RecordingSaveState?
+    let completed: Bool?
+
+    init(state: RecordingSaveState?, completed: Bool = false) {
+        self.state = state
+        self.completed = completed
+    }
+}
 
 @MainActor @Observable
 final class AudioRecorder {
+    nonisolated static let maximumRecordingBytes = 33_554_432
+    nonisolated private static let automaticStopBytes = 31_457_280
+    nonisolated private static let maximumRecordingDuration: TimeInterval = 2_200
+
     var isRecording = false
     var elapsed: TimeInterval = 0
     var level: Float = 0
     var permissionDenied = false
+    var saveFailed = false
+    var recordingTooLarge = false
+    var saveError: String?
 
     @ObservationIgnored private var recorder: AVAudioRecorder?
     @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored private var fileURL: URL?
+    @ObservationIgnored private(set) var saveState: RecordingSaveState?
+    @ObservationIgnored private var recoveryKey: String?
+    @ObservationIgnored private var requestedRecoveryKey: String?
+    @ObservationIgnored private var isStarting = false
     @ObservationIgnored private var generation = 0
 
+    func configureRecovery(_ key: String) {
+        requestedRecoveryKey = key
+        guard recoveryKey != key, !isStarting, !isRecording, fileURL == nil else { return }
+        recoveryKey = key
+        saveState = nil
+        saveFailed = false
+        recordingTooLarge = false
+        saveError = nil
+        guard let urls = recoveryURLs() else { return }
+        let recovery: RecordingRecovery? = {
+            guard let values = try? urls.state.resourceValues(forKeys: [.fileSizeKey]),
+                  let size = values.fileSize,
+                  size <= 1_048_576,
+                  let data = try? Data(contentsOf: urls.state, options: .mappedIfSafe)
+            else { return nil }
+            return try? JSONDecoder().decode(RecordingRecovery.self, from: data)
+        }()
+        if recovery?.completed == true {
+            do {
+                try FileManager.default.removeItem(at: urls.audio)
+            } catch let error as NSError
+                where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            } catch {
+                return
+            }
+            try? FileManager.default.removeItem(at: urls.state)
+            return
+        }
+        guard FileManager.default.fileExists(atPath: urls.audio.path) else {
+            try? FileManager.default.removeItem(at: urls.state)
+            return
+        }
+        fileURL = urls.audio
+        if let values = try? urls.audio.resourceValues(forKeys: [.fileSizeKey]),
+           let size = values.fileSize,
+           size > Self.maximumRecordingBytes {
+            recordingTooLarge = true
+        }
+        saveState = recovery?.state
+        saveFailed = true
+        saveError = recordingTooLarge
+            ? "This recording is larger than the 32 MB save limit."
+            : "A recording is waiting to be saved."
+    }
+
     func start() async {
-        guard !isRecording else { return }
+        guard !isStarting, !isRecording, fileURL == nil else { return }
+        isStarting = true
+        defer {
+            isStarting = false
+            if fileURL == nil,
+               let requestedRecoveryKey,
+               requestedRecoveryKey != recoveryKey {
+                configureRecovery(requestedRecoveryKey)
+            }
+        }
+        saveFailed = false
+        recordingTooLarge = false
+        saveError = nil
         let gen = generation
         let granted = await AVAudioApplication.requestRecordPermission()
         guard granted else {
             permissionDenied = true
             return
         }
+        permissionDenied = false
         guard !isRecording, gen == generation, !Task.isCancelled else { return }
         #if os(iOS)
         try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
-        let url = FileManager.default.temporaryDirectory
+        let url = recoveryURLs()?.audio ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("recording-\(UUID().uuidString).m4a")
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 44_100,
             AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 96_000,
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
         ]
         guard let recorder = try? AVAudioRecorder(url: url, settings: settings) else {
+            try? FileManager.default.removeItem(at: url)
+            #if os(iOS)
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            #endif
             return
         }
         recorder.isMeteringEnabled = true
-        recorder.record()
+        guard recorder.record(forDuration: Self.maximumRecordingDuration) else {
+            try? FileManager.default.removeItem(at: url)
+            #if os(iOS)
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            #endif
+            return
+        }
         self.recorder = recorder
         fileURL = url
         elapsed = 0
         isRecording = true
         ticker = Task { [weak self] in
+            var nextSizeCheck: TimeInterval = 1
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard let self, let recorder = self.recorder else { return }
+                if !recorder.isRecording {
+                    self.finishRecorder()
+                    self.saveFailed = true
+                    self.saveError = "Recording stopped. Select Done to save it."
+                    self.persistRecovery()
+                    return
+                }
                 recorder.updateMeters()
                 self.elapsed = recorder.currentTime
                 // -60dB..0dB -> 0..1
                 self.level = max(0, min(1, (recorder.averagePower(forChannel: 0) + 60) / 60))
+                if recorder.currentTime >= nextSizeCheck {
+                    nextSizeCheck = recorder.currentTime + 1
+                    if let size = try? recorder.url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                       size >= Self.automaticStopBytes {
+                        self.finishRecorder()
+                        self.saveFailed = true
+                        self.saveError = "Recording stopped at the size limit."
+                        self.persistRecovery()
+                        return
+                    }
+                }
             }
         }
     }
 
     deinit {
         ticker?.cancel()
+        recorder?.stop()
     }
 
     func cancel() {
         finishRecorder()
-        cleanupFile()
+        saveFailed = false
+        recordingTooLarge = false
+        saveError = nil
+        saveState = nil
+        let stateURL = recoveryURLs()?.state
+        guard let fileURL else {
+            if let stateURL { try? FileManager.default.removeItem(at: stateURL) }
+            if let requestedRecoveryKey, requestedRecoveryKey != recoveryKey {
+                configureRecovery(requestedRecoveryKey)
+            }
+            return
+        }
+        var removed = false
+        do {
+            try FileManager.default.removeItem(at: fileURL)
+            removed = true
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            removed = true
+        } catch {
+        }
+        if removed {
+            if let stateURL { try? FileManager.default.removeItem(at: stateURL) }
+        } else {
+            _ = persistRecovery(completed: true)
+        }
+        self.fileURL = nil
+        if let requestedRecoveryKey, requestedRecoveryKey != recoveryKey {
+            configureRecovery(requestedRecoveryKey)
+        }
     }
 
-    func stop() -> Data? {
+    func stop() async -> Data? {
         finishRecorder()
-        guard let fileURL, let data = try? Data(contentsOf: fileURL) else {
-            cleanupFile()
+        guard let fileURL else {
+            saveFailed = true
+            saveError = "Couldn't read this recording."
             return nil
         }
-        cleanupFile()
+        let result = await Task.detached { () -> (Data?, Bool) in
+            let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey])
+            guard let size = values?.fileSize else { return (nil, false) }
+            guard size <= Self.maximumRecordingBytes else { return (nil, true) }
+            guard
+                  let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
+                  data.count <= Self.maximumRecordingBytes else { return (nil, false) }
+            return (data, false)
+        }.value
+        let data = result.0
+        saveFailed = true
+        recordingTooLarge = result.1
+        saveError = recordingTooLarge
+            ? "This recording is larger than the 32 MB save limit."
+            : data == nil ? "Couldn't read this recording." : nil
+        persistRecovery()
         return data
+    }
+
+    func retainSaveState(_ state: RecordingSaveState?) {
+        saveState = state
+        saveFailed = true
+        recordingTooLarge = false
+        saveError = "Couldn't save this recording. It is still available to retry."
+        persistRecovery()
+    }
+
+    @discardableResult
+    func captureSaveState(_ state: RecordingSaveState) -> Bool {
+        let previous = saveState
+        saveState = state
+        guard persistRecovery() else {
+            saveState = previous
+            saveError = "Couldn't preserve this recording yet."
+            return false
+        }
+        return true
+    }
+
+    func completeSave(_ state: RecordingSaveState? = nil) {
+        if let state { saveState = state }
+        saveFailed = false
+        recordingTooLarge = false
+        saveError = nil
+        defer {
+            saveState = nil
+            fileURL = nil
+            if let requestedRecoveryKey, requestedRecoveryKey != recoveryKey {
+                configureRecovery(requestedRecoveryKey)
+            }
+        }
+        guard let fileURL else { return }
+        guard let urls = recoveryURLs() else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
+        _ = persistRecovery(completed: true)
+        do {
+            try FileManager.default.removeItem(at: fileURL)
+            try? FileManager.default.removeItem(at: urls.state)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            try? FileManager.default.removeItem(at: urls.state)
+        } catch {
+        }
+    }
+
+    private func recoveryURLs() -> (audio: URL, state: URL)? {
+        guard let recoveryKey, let root = LushShared.container else { return nil }
+        let directory = root.appendingPathComponent("RecordingRecovery", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let name = SHA256.hash(data: Data(recoveryKey.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return (
+            directory.appendingPathComponent("\(name).m4a"),
+            directory.appendingPathComponent("\(name).json")
+        )
+    }
+
+    @discardableResult
+    private func persistRecovery(completed: Bool = false) -> Bool {
+        guard let urls = recoveryURLs(),
+              let data = try? JSONEncoder().encode(
+                  RecordingRecovery(state: saveState, completed: completed)
+              ) else { return false }
+        do {
+            try data.write(to: urls.state, options: .atomic)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func finishRecorder() {
@@ -81,20 +325,22 @@ final class AudioRecorder {
         recorder?.stop()
         recorder = nil
         isRecording = false
-    }
-
-    private func cleanupFile() {
-        if let fileURL {
-            try? FileManager.default.removeItem(at: fileURL)
-        }
-        fileURL = nil
+        level = 0
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        #endif
     }
 }
 
 /// Apple Notes-style recording bar: red dot, level, elapsed time, Done.
 struct RecorderBar: View {
     let recorder: AudioRecorder
-    let onFinish: (Data?) -> Void
+    let recoveryKey: String
+    let prepareSave: () -> RecordingSaveState
+    let onSave: (Data, RecordingSaveState?) async -> RecordingSaveResult
+    let onSaved: () -> Void
+    let onCancel: () -> Void
+    @State private var isStopping = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -116,23 +362,65 @@ struct RecorderBar: View {
                     .uiFont(.caption)
                     .foregroundStyle(.secondary)
             }
+            if let saveError = recorder.saveError {
+                Text(saveError)
+                    .uiFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Button("Cancel", role: .cancel) {
                 recorder.cancel()
-                onFinish(nil)
+                onCancel()
             }
+            .disabled(isStopping)
             Button("Done") {
-                onFinish(recorder.stop())
+                guard !isStopping else { return }
+                guard recorder.saveState != nil || recorder.captureSaveState(prepareSave()) else { return }
+                isStopping = true
+                Task {
+                    guard let data = await recorder.stop() else {
+                        isStopping = false
+                        return
+                    }
+                    let result = await onSave(data, recorder.saveState)
+                    if result.succeeded {
+                        recorder.completeSave(result.state)
+                        onSaved()
+                    } else {
+                        recorder.retainSaveState(result.state)
+                        isStopping = false
+                    }
+                }
             }
             .buttonStyle(.borderedProminent)
+            .disabled(
+                isStopping
+                    || recorder.recordingTooLarge
+                    || (!recorder.isRecording && !recorder.saveFailed)
+            )
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.bar)
-        .task {
-            await recorder.start()
+        .task(id: recoveryKey) {
+            recorder.configureRecovery(recoveryKey)
+            if !recorder.saveFailed {
+                let state = prepareSave()
+                guard recorder.saveState != nil || recorder.captureSaveState(state) else { return }
+                await recorder.start()
+            }
         }
         .onDisappear {
-            recorder.cancel()
+            if isStopping {
+                return
+            }
+            if recorder.isRecording {
+                if recorder.saveState == nil {
+                    _ = recorder.captureSaveState(prepareSave())
+                }
+                Task { _ = await recorder.stop() }
+            } else if !recorder.saveFailed {
+                recorder.cancel()
+            }
         }
     }
 

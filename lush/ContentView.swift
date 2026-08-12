@@ -4398,13 +4398,33 @@ struct NoteDetail: View {
                 FindBar(controller: editor)
             }
             if editor.recorderVisible, historyVersion == nil {
-                RecorderBar(recorder: recorder) { data in
-                    editor.recorderVisible = false
-                    if let data {
+                RecorderBar(
+                    recorder: recorder,
+                    recoveryKey: "note:\(model.accountConfigUrl ?? "local"):\(noteUrl)",
+                    prepareSave: {
                         let stamp = Date().formatted(date: .abbreviated, time: .shortened)
-                        editor.insertRecording(data: data, name: "Recording \(stamp).m4a")
+                        return RecordingSaveState(
+                            assetUrl: nil,
+                            name: "Recording \(stamp).m4a",
+                            noteUrl: noteUrl,
+                            accountUrl: model.accountConfigUrl,
+                            embedded: false
+                        )
+                    },
+                    onSave: { data, state in
+                        await editor.insertRecording(
+                            data: data,
+                            name: state?.name ?? "Recording.m4a",
+                            state: state
+                        )
+                    },
+                    onSaved: {
+                        editor.recorderVisible = false
+                    },
+                    onCancel: {
+                        editor.recorderVisible = false
                     }
-                }
+                )
             }
             #if os(macOS)
             if let historyVersion {

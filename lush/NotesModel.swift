@@ -3119,29 +3119,67 @@ final class NotesModel {
         return true
     }
 
-    func appendRecordingToQuickNote(data: Data, transcript: String?) async -> String? {
-        guard let target = await quickNoteTarget() else { return nil }
-        let core = target.core
-        let url = target.url
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let name = "recording-\(timestamp).m4a"
+    func appendRecordingToQuickNote(
+        data: Data,
+        transcript: String?,
+        state: RecordingSaveState?
+    ) async -> (url: String?, state: RecordingSaveState?, succeeded: Bool) {
+        let core: Core
+        var pending: RecordingSaveState
+        if let state {
+            guard state.accountUrl == accountConfigUrl else { return (nil, state, false) }
+            pending = state
+            if state.noteUrl.isEmpty {
+                guard let target = await quickNoteTarget() else { return (nil, state, false) }
+                core = target.core
+                pending.noteUrl = target.url
+            } else {
+                if self.core == nil { await start() }
+                guard state.accountUrl == accountConfigUrl, let currentCore = self.core else {
+                    return (nil, state, false)
+                }
+                core = currentCore
+            }
+        } else {
+            guard let target = await quickNoteTarget() else { return (nil, nil, false) }
+            core = target.core
+            pending = RecordingSaveState(
+                assetUrl: nil,
+                name: "recording-\(Int(Date().timeIntervalSince1970)).m4a",
+                noteUrl: target.url,
+                accountUrl: accountConfigUrl,
+                embedded: false
+            )
+        }
+        let url = pending.noteUrl
+        let recordingName = pending.name
         do {
-            let assetUrl = try await Task.detached {
-                try core.createAsset(
-                    name: name,
-                    extension: "m4a",
-                    mimeType: "audio/mp4",
-                    data: data
-                )
-            }.value
-            if let transcript, !transcript.isEmpty {
+            let created = pending.assetUrl == nil
+            if pending.assetUrl == nil {
+                pending.assetUrl = try await Task.detached {
+                    try core.createAsset(
+                        name: recordingName,
+                        extension: "m4a",
+                        mimeType: "audio/mp4",
+                        data: data
+                    )
+                }.value
+            }
+            guard let assetUrl = pending.assetUrl else { return (nil, pending, false) }
+            if created, let transcript, !transcript.isEmpty {
                 await updateAssetVision(assetUrl, description: "voice recording", ocr: transcript)
-                await generateAssetML(assetUrl, name: name)
+                await generateAssetML(assetUrl, name: recordingName)
             }
             let written = await chainedNoteWrite(url) {
                 try? await core.openNote(url: url)
                 let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
                 var spans = SpanNode.decodeList(json)
+                if spans.contains(where: {
+                    guard case .block(let block) = $0 else { return false }
+                    return block.isEmbedBlock && block.embedUrl == assetUrl
+                }) {
+                    return []
+                }
                 if !spans.isEmpty {
                     spans.append(.text("\n", [:]))
                 }
@@ -3155,14 +3193,15 @@ final class NotesModel {
             }
             guard written != nil else {
                 status = "Couldn't add recording to Quick Note"
-                return nil
+                return (nil, pending, false)
             }
+            pending.embedded = true
             notifyNoteObservers(url)
             refreshQuickNote(url, core: core)
-            return url
+            return (url, pending, true)
         } catch {
             status = "Couldn't add recording to Quick Note: \(error.localizedDescription)"
-            return nil
+            return (nil, pending, false)
         }
     }
 

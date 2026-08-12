@@ -236,8 +236,21 @@ final class EditorController {
         )
     }
 
-    func insertRecording(data: Data, name: String) {
-        core?.insertAsset(data: data, name: name, fileExtension: "m4a", mime: "audio/mp4")
+    func insertRecording(
+        data: Data,
+        name: String,
+        state: RecordingSaveState?
+    ) async -> RecordingSaveResult {
+        guard let core else {
+            return RecordingSaveResult(state: state ?? RecordingSaveState(
+                assetUrl: nil,
+                name: name,
+                noteUrl: "",
+                accountUrl: nil,
+                embedded: false
+            ), succeeded: false)
+        }
+        return await core.insertRecording(data: data, name: name, state: state)
     }
 
     func saveHtml(_ handle: HtmlBlockHandle, html: String) {
@@ -3671,6 +3684,70 @@ final class EditorCore {
         }
     }
 
+    func insertRecording(
+        data: Data,
+        name: String,
+        state: RecordingSaveState?
+    ) async -> RecordingSaveResult {
+        var pending = state
+        if pending?.noteUrl.isEmpty == true { pending = nil }
+        let targetName = pending?.name ?? name
+        let targetNoteUrl = pending?.noteUrl ?? noteUrl
+        let accountUrl = pending?.accountUrl ?? model.accountConfigUrl
+        pending = pending ?? RecordingSaveState(
+            assetUrl: nil,
+            name: targetName,
+            noteUrl: targetNoteUrl,
+            accountUrl: accountUrl,
+            embedded: false
+        )
+        guard targetNoteUrl == noteUrl, accountUrl == model.accountConfigUrl else {
+            return RecordingSaveResult(state: pending, succeeded: false)
+        }
+        if pending?.embedded == true, let url = pending?.assetUrl {
+            let spans = SpanNode.decodeList(session.lastKnownJSON)
+            let present = spans.contains {
+                guard case .block(let block) = $0 else { return false }
+                return block.isEmbedBlock && block.embedUrl == url
+            }
+            if present {
+                return RecordingSaveResult(state: pending, succeeded: await confirmLocalWrite())
+            }
+            pending?.embedded = false
+        }
+        let targetSession = session
+        let created = pending?.assetUrl == nil
+        if pending?.assetUrl == nil {
+            pending?.assetUrl = await model.createAsset(
+                data: data,
+                name: targetName,
+                fileExtension: "m4a",
+                mimeType: "audio/mp4"
+            )
+        }
+        guard let url = pending?.assetUrl,
+              noteUrl == targetNoteUrl,
+              session === targetSession else {
+            return RecordingSaveResult(state: pending, succeeded: false)
+        }
+        cache.names[url] = targetName
+        cache.fileURLs[url] = Self.mediaFile(for: url, name: targetName, data: data)
+        if created {
+            transcribeIfAudio(url: url, data: data, name: targetName)
+        }
+        guard insertEmbedBlock(url: url) else {
+            return RecordingSaveResult(state: pending, succeeded: false)
+        }
+        pending?.embedded = true
+        return RecordingSaveResult(state: pending, succeeded: await confirmLocalWrite())
+    }
+
+    private func confirmLocalWrite() async -> Bool {
+        pushNow()
+        guard let task = localWriteHeadsTask else { return true }
+        return await task.value != nil
+    }
+
     private func transcribeIfAudio(url: String, data: Data, name: String) {
         guard AssetCache.kind(forName: name) == "audio" else { return }
         let ext = (name as NSString).pathExtension.lowercased()
@@ -3886,9 +3963,10 @@ final class EditorCore {
         return marker
     }
 
-    private func insertEmbedBlock(url: String) {
+    @discardableResult
+    private func insertEmbedBlock(url: String) -> Bool {
         let block = BlockValue.embed(url: url)
-        insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache))
+        return insertBlockAttachment(RichText.embedAttachment(for: block, cache: cache)) != nil
     }
 
     @discardableResult
