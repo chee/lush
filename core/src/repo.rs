@@ -1197,8 +1197,7 @@ impl Repo {
                     continue;
                 }
                 match repo.save_doc(id).await {
-                    Ok(true) => repo.request_sync_forced(id).await,
-                    Ok(false) => {}
+                    Ok(_) => repo.request_sync_forced(id).await,
                     Err(e) => {
                         tracing::warn!(doc = %id.to_url(), error = %e, "staged changes failed to publish")
                     }
@@ -2012,6 +2011,9 @@ impl Repo {
         if !self.is_connected() {
             return;
         }
+        if !self.send_changes.load(Ordering::Relaxed) && self.outbox_path(id).exists() {
+            return;
+        }
         if !force {
             if let Some(heads) = self.local_heads_for_sync(id).await {
                 if !heads.is_empty()
@@ -2178,13 +2180,20 @@ impl Repo {
     }
 
     async fn save_doc_now(&self, id: DocId) -> Result<bool> {
-        if !self.send_changes.load(Ordering::Relaxed) {
-            self.stage_doc(id).await?;
-            self.deferred_sends.lock().await.insert(id);
-            return Ok(false);
-        }
         let sid = id.sedimentree_id();
         let shared = self.doc_state(id).await?;
+        let muted = !self.send_changes.load(Ordering::Relaxed);
+        if muted {
+            let synced_before = {
+                let state = shared.lock().await;
+                !state.stored_commits.is_empty() || !state.stored_fragments.is_empty()
+            };
+            if synced_before {
+                self.stage_doc(id).await?;
+                self.deferred_sends.lock().await.insert(id);
+                return Ok(false);
+            }
+        }
         let ingested = {
             let state = shared.lock().await;
             let rebundle = state.stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD;
@@ -2206,7 +2215,7 @@ impl Repo {
             return Ok(false);
         };
         if ingested.commits.is_empty() && ingested.fragments.is_empty() {
-            if !ingested.skipped {
+            if !ingested.skipped && !muted {
                 self.clear_outbox(id).await;
             }
             return Ok(false);
@@ -2230,7 +2239,10 @@ impl Repo {
             state.stored_commits.extend(commit_heads);
             state.stored_fragments.extend(fragment_heads);
         }
-        if !skipped {
+        if muted {
+            self.stage_doc(id).await?;
+            self.deferred_sends.lock().await.insert(id);
+        } else if !skipped {
             self.clear_outbox(id).await;
         }
         if wrote_fragments {
@@ -2526,23 +2538,32 @@ impl Repo {
                 (0, false, false)
             }
         };
-        cpu_heavy(|| {
+        let merged_staged = cpu_heavy(|| {
             let Ok(bytes) = std::fs::read(self.outbox_path(id)) else {
-                return;
+                return false;
             };
             match Automerge::load(&bytes) {
                 Ok(mut staged) => {
                     if let Err(e) = guard.doc.merge(&mut staged) {
-                        tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to merge")
+                        tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to merge");
+                        false
+                    } else {
+                        true
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to load")
+                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to load");
+                    false
                 }
             }
         });
         drop(guard);
         self.emit_batch_events(id, count, advanced, failed);
+        if merged_staged {
+            if let Err(e) = self.save_doc_now(id).await {
+                tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to persist");
+            }
+        }
         self.request_sync(id).await;
     }
 
@@ -2623,6 +2644,9 @@ impl Repo {
                 .filter(|(_, slot)| slot.running || slot.again)
                 .map(|(id, _)| *id),
         );
+        if !self.send_changes.load(Ordering::Relaxed) {
+            dirty.retain(|id| !self.outbox_path(*id).exists());
+        }
         if dirty.is_empty() || !self.is_connected() {
             return;
         }
@@ -3036,6 +3060,37 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn docs_created_while_muted_are_stored_locally() {
+        let (_dir, repo) = test_repo().await;
+        repo.set_send_changes(false).await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "here");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let stored = repo.stored_batch(id).await.unwrap();
+        assert!(stored.commits.len() + stored.fragments.len() > 0);
+        assert!(repo.outbox_path(id).exists());
+        assert!(repo.deferred_sends.lock().await.contains(&id));
+
+        repo.change_doc(id, |doc| {
+            put(doc, "value", "edited");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let after_edit = repo.stored_batch(id).await.unwrap();
+        assert_eq!(
+            after_edit.commits.len() + after_edit.fragments.len(),
+            stored.commits.len() + stored.fragments.len()
+        );
+        assert!(repo.outbox_path(id).exists());
     }
 
     #[tokio::test]

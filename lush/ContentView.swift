@@ -5067,8 +5067,10 @@ final class SidebarDropHighlight {
     private var row: String?
     private var mark: DropMark?
     private var sweep: Task<Void, Never>?
+    private var suppressUntil: ContinuousClock.Instant = .now
 
     func show(_ row: String, _ mark: DropMark) {
+        guard ContinuousClock.now >= suppressUntil else { return }
         self.row = row
         self.mark = mark
         armSweep(after: .seconds(4))
@@ -5084,6 +5086,7 @@ final class SidebarDropHighlight {
 
     func dropCompleted() {
         clear()
+        suppressUntil = .now + .milliseconds(300)
         armSweep(after: .milliseconds(250))
     }
 
