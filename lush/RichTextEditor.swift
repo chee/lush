@@ -412,10 +412,12 @@ private enum EditorDocumentSessions {
         }
         let session = EditorDocumentSession(noteUrl: noteUrl)
         sessions[noteUrl] = session
+        NotesModel.shared.pinNote(noteUrl)
         while sessions.count > capacity,
               let oldest = recency.first(where: { $0 != noteUrl && sessions[$0] != nil }) {
             sessions.removeValue(forKey: oldest)
             recency.removeAll { $0 == oldest }
+            NotesModel.shared.unpinNote(oldest)
         }
         return session
     }
@@ -481,6 +483,7 @@ final class EditorCore {
         self.session = EditorDocumentSessions.session(for: noteUrl)
         self.model = model
         self.controller = controller
+        model.pinNote(noteUrl)
         controller.core = self
         inline.core = self
         noteObserverId = model.addNoteObserver { [weak self] url in
@@ -510,6 +513,7 @@ final class EditorCore {
         caretBroadcastTask?.cancel()
         let identity = ObjectIdentifier(self)
         Task { @MainActor [model, noteObserverId, peersObserverId, noteUrl] in
+            model.unpinNote(noteUrl)
             if let noteObserverId {
                 model.removeNoteObserver(noteObserverId)
             }
@@ -547,6 +551,8 @@ final class EditorCore {
         // undo entries hold snapshots and ranges of the OLD note; replaying
         // them against the next note corrupts it
         view?.pUndoManager?.removeAllActions()
+        model.unpinNote(noteUrl)
+        model.pinNote(url)
         noteUrl = url
         localWriteHeadsTask = nil
         session = EditorDocumentSessions.session(for: url)

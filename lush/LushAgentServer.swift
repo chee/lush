@@ -137,6 +137,7 @@ final class LushAgentServer {
                     return .json(status: 400, value: ["error": "Missing note URL."])
                 }
                 try? await core.openNote(url: url)
+                defer { try? core.closeNote(url: url) }
                 async let title = core.noteTitle(url: url)
                 async let snapshot = core.noteSpansSnapshot(url: url)
                 let value = try await snapshot

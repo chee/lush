@@ -621,6 +621,12 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func cloneDoc(url: String) async throws  -> CloneResult
     
+    /**
+     * Release an `open_note` pin. The doc stays synced and on disk; its
+     * in-memory state just becomes eligible for the idle sweep.
+     */
+    func closeNote(url: String) throws 
+    
     func configState(configUrl: String)  -> ConfigState?
     
     /**
@@ -851,7 +857,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     /**
      * Start tracking + syncing a note. Returns once the doc is available
-     * locally (immediately for docs we already have).
+     * locally (immediately for docs we already have). The note is pinned
+     * resident until a matching `close_note`.
      */
     func openNote(url: String) async throws 
     
@@ -1007,6 +1014,11 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * lock: a busy doc is an error the caller retries on its next tick.
      */
     func textCursor(url: String, index: UInt64) throws  -> String
+    
+    /**
+     * Memory-pressure hook: evict every unpinned, quiescent doc right away.
+     */
+    func trimMemory() 
     
     /**
      * Write generated ML metadata onto a UnixFileEntry doc.
@@ -1223,6 +1235,17 @@ open func cloneDoc(url: String)async throws  -> CloneResult  {
             liftFunc: FfiConverterTypeCloneResult_lift,
             errorHandler: FfiConverterTypeCoreError_lift
         )
+}
+    
+    /**
+     * Release an `open_note` pin. The doc stays synced and on disk; its
+     * in-memory state just becomes eligible for the idle sweep.
+     */
+open func closeNote(url: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_close_note(self.uniffiClonePointer(),
+        FfiConverterString.lower(url),$0
+    )
+}
 }
     
 open func configState(configUrl: String) -> ConfigState?  {
@@ -1966,7 +1989,8 @@ open func noteTitle(url: String)async  -> String  {
     
     /**
      * Start tracking + syncing a note. Returns once the doc is available
-     * locally (immediately for docs we already have).
+     * locally (immediately for docs we already have). The note is pinned
+     * resident until a matching `close_note`.
      */
 open func openNote(url: String)async throws   {
     return
@@ -2426,6 +2450,15 @@ open func textCursor(url: String, index: UInt64)throws  -> String  {
         FfiConverterUInt64.lower(index),$0
     )
 })
+}
+    
+    /**
+     * Memory-pressure hook: evict every unpinned, quiescent doc right away.
+     */
+open func trimMemory()  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_trim_memory(self.uniffiClonePointer(),$0
+    )
+}
 }
     
     /**
@@ -5924,6 +5957,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_clone_doc() != 45060) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_close_note() != 17636) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_config_state() != 45575) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6107,7 +6143,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_note_title() != 25066) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_open_note() != 44259) {
+    if (uniffi_lush_core_checksum_method_core_open_note() != 45227) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_pad_items() != 39030) {
@@ -6228,6 +6264,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_text_cursor() != 65402) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_trim_memory() != 19715) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_update_asset_ml() != 2016) {

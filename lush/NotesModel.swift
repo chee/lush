@@ -629,6 +629,7 @@ final class NotesModel {
         prewarmWalkTask = Task.detached { () -> TreeWalk? in
             guard let core = await task.value else { return nil }
             try? await core.openNote(url: first)
+            defer { try? core.closeNote(url: first) }
             Self.bootLog("root folder loaded")
             let walk = await Self.walkTree(core: core, rootUrls: saved, cache: [:], prefetched: [])
             Self.bootLog("prewarm walk done visible=\(walk.visible.count) localMs=\(walk.localMs)")
@@ -666,6 +667,7 @@ final class NotesModel {
             }
             Self.bootLog("Core adopted")
             self.core = core
+            watchMemoryPressure()
             LushAgentServer.shared.start(model: self)
             applyingIncomingChanges = core.isApplyingIncoming()
             sendingChanges = core.isSendingChanges()
@@ -2066,12 +2068,57 @@ final class NotesModel {
 
     // Editor support -----------------------------------------------------
 
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+
+    /// Under memory pressure the core evicts every unpinned doc's in-memory
+    /// state right away; pinned editor sessions and the folder root stay.
+    private func watchMemoryPressure() {
+        guard memoryPressureSource == nil, let core else { return }
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .global(qos: .utility)
+        )
+        source.setEventHandler { core.trimMemory() }
+        source.activate()
+        memoryPressureSource = source
+    }
+
+    /// Keep a note's doc resident while an editor holds it. Counted in the
+    /// core, so every pin needs a matching `unpinNote`. Operations on one url
+    /// are chained: an unpin can never overtake the open it is balancing.
+    private var pinChains: [String: Task<Void, Never>] = [:]
+
+    func pinNote(_ url: String) {
+        chainPinOperation(url) { core in try? await core.openNote(url: url) }
+    }
+
+    func unpinNote(_ url: String) {
+        chainPinOperation(url) { core in try? core.closeNote(url: url) }
+    }
+
+    private func chainPinOperation(_ url: String, _ op: @escaping (Core) async -> Void) {
+        guard url.hasPrefix("automerge:") else { return }
+        let previous = pinChains[url]
+        let task = Task { [weak self] in
+            await previous?.value
+            if self?.core == nil { await self?.start() }
+            guard let core = self?.core else { return }
+            await op(core)
+        }
+        pinChains[url] = task
+        Task { [weak self] in
+            await task.value
+            if self?.pinChains[url] == task { self?.pinChains[url] = nil }
+        }
+    }
+
     func spansJSON(for url: String) async -> String {
         if core == nil {
             await start()
         }
         guard let core else { return "[]" }
         try? await core.openNote(url: url)
+        defer { try? core.closeNote(url: url) }
         return (try? await core.noteSpansJson(url: url)) ?? "[]"
     }
 
@@ -2082,6 +2129,7 @@ final class NotesModel {
         guard let core else { return nil }
         let start = Date()
         try? await core.openNote(url: url)
+        defer { try? core.closeNote(url: url) }
         guard let snapshot = try? await core.noteSpansSnapshot(url: url),
               !snapshot.heads.isEmpty
         else {
@@ -2115,6 +2163,7 @@ final class NotesModel {
         }
         guard let core else { return NoteSpansSnapshot(spansJson: "[]", heads: heads) }
         try? await core.openNote(url: url)
+        defer { try? core.closeNote(url: url) }
         let snapshot: NoteSpansSnapshot
         if heads.isEmpty {
             snapshot = (try? await core.noteSpansSnapshot(url: url))
@@ -2689,6 +2738,7 @@ final class NotesModel {
                 let current = await core.docHeads(url: url).sorted().joined(separator: ",")
                 if !current.isEmpty, known[url] == current { continue }
                 try? await core.openNote(url: url)
+                defer { try? core.closeNote(url: url) }
                 guard let json = try? await core.noteSpansJson(url: url) else { continue }
                 let ids = CalendarLinks.eventIds(in: SpanNode.decodeList(json))
                 if !ids.isEmpty { links[url] = ids }
@@ -2771,6 +2821,7 @@ final class NotesModel {
         var resolvedName = name ?? node(for: url)?.displayName
         if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
         try? await core.openNote(url: url)
+        defer { try? core.closeNote(url: url) }
         guard let json = try? await core.noteSpansJson(url: url) else { return }
         let eventIds = await Task.detached { CalendarLinks.eventIds(in: SpanNode.decodeList(json)) }.value
         guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
@@ -2797,6 +2848,7 @@ final class NotesModel {
         var resolvedName = name ?? node(for: url)?.displayName
         if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
         try? await core.openNote(url: url)
+        defer { try? core.closeNote(url: url) }
         guard let json = try? await core.noteSpansJson(url: url) else { return }
         guard spotlightIndexTokens[url] == token, !Task.isCancelled else { return }
         await spotlightIndex.index(url: url, title: resolvedName ?? "", spansJson: json)
@@ -3100,6 +3152,7 @@ final class NotesModel {
     private func append(_ text: String, to url: String, using core: Core) async -> Bool {
         let written = await chainedNoteWrite(url) {
             try? await core.openNote(url: url)
+            defer { try? core.closeNote(url: url) }
             let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
             var spans = SpanNode.decodeList(json)
             if !spans.isEmpty {
@@ -3172,6 +3225,7 @@ final class NotesModel {
             }
             let written = await chainedNoteWrite(url) {
                 try? await core.openNote(url: url)
+                defer { try? core.closeNote(url: url) }
                 let json = (try? await core.noteSpansJson(url: url)) ?? "[]"
                 var spans = SpanNode.decodeList(json)
                 if spans.contains(where: {

@@ -368,6 +368,20 @@ impl Core {
         });
     }
 
+    /// The active folder root stays pinned: the sidebar rebuilds from it
+    /// constantly and it must never be swept.
+    fn set_folder(&self, id: DocId) {
+        let mut folder = self.folder.lock().unwrap();
+        if *folder == Some(id) {
+            return;
+        }
+        if let Some(old) = folder.take() {
+            self.repo.unpin_doc(old);
+        }
+        self.repo.pin_doc(id);
+        *folder = Some(id);
+    }
+
     /// Queue an index update for a doc a write path just touched. Goes through
     /// the same per-doc slots as change events, so it can't race one, and the
     /// caller isn't held for a read plus an FTS write.
@@ -872,7 +886,7 @@ impl Core {
                 }
             }
         })?;
-        *self.folder.lock().unwrap() = Some(id);
+        self.set_folder(id);
         Ok(id.to_url())
     }
 
@@ -881,7 +895,7 @@ impl Core {
     /// so the UI can be ready immediately.
     pub fn start_folder_url(&self, url: String) -> Result<(), CoreError> {
         let id = DocId::from_url(&url)?;
-        *self.folder.lock().unwrap() = Some(id);
+        self.set_folder(id);
         let repo = self.repo.clone();
         self.runtime.spawn(async move {
             let _ = repo.ensure_doc(id).await;
@@ -1903,24 +1917,53 @@ impl Core {
     }
 
     /// Start tracking + syncing a note. Returns once the doc is available
-    /// locally (immediately for docs we already have).
+    /// locally (immediately for docs we already have). The note is pinned
+    /// resident until a matching `close_note`.
     pub async fn open_note(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let index = self.index.clone();
         let id = DocId::from_url(&url)?;
-        self.run(async move {
-            repo.ensure_doc(id).await?;
-            if repo.wait_for_doc(id, OPEN_TIMEOUT).await {
-                repo.change_doc(id, shapes::normalize_strings).await?;
+        repo.pin_doc(id);
+        let opened = self
+            .run(async move {
+                repo.ensure_doc(id).await?;
+                if repo.wait_for_doc(id, OPEN_TIMEOUT).await {
+                    repo.change_doc(id, shapes::normalize_strings).await?;
+                }
+                // Not awaited: the search index is one mutex, and at startup the
+                // prefetch walk holds it for every note on disk. The caller wants
+                // the document, not the search row.
+                tokio::spawn(index_doc(repo, index, id));
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+        match opened {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.repo.unpin_doc(id);
+                Err(e.into())
             }
-            // Not awaited: the search index is one mutex, and at startup the
-            // prefetch walk holds it for every note on disk. The caller wants
-            // the document, not the search row.
-            tokio::spawn(index_doc(repo, index, id));
-            Ok::<_, anyhow::Error>(())
-        })
-        .await??;
+            Err(e) => {
+                self.repo.unpin_doc(id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Release an `open_note` pin. The doc stays synced and on disk; its
+    /// in-memory state just becomes eligible for the idle sweep.
+    pub fn close_note(&self, url: String) -> Result<(), CoreError> {
+        let id = DocId::from_url(&url)?;
+        self.repo.unpin_doc(id);
         Ok(())
+    }
+
+    /// Memory-pressure hook: evict every unpinned, quiescent doc right away.
+    pub fn trim_memory(&self) {
+        let repo = self.repo.clone();
+        self.runtime.spawn(async move {
+            repo.sweep_idle_docs(Duration::ZERO).await;
+        });
     }
 
     pub async fn document_kind(&self, url: String) -> Result<String, CoreError> {
