@@ -143,6 +143,14 @@ enum PatchworkWeb {
     @MainActor
     static var coreServerPort: UInt16?
 
+    @MainActor
+    static func awaitCoreServerPort() async -> UInt16? {
+        for _ in 0..<300 where coreServerPort == nil {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return coreServerPort
+    }
+
     private static let lastToolsKey = "patchworkLastTools"
 
     @MainActor
@@ -182,10 +190,12 @@ enum PatchworkWeb {
     @MainActor
     static func configScriptTag() async -> String {
         let seed = await signerSeedHex
-        let ports = [coreServerPort, LocalSyncServer.wsPort].compactMap { $0 }
+        let corePort = await awaitCoreServerPort()
+        let ports = [corePort, LocalSyncServer.wsPort].compactMap { $0 }
         let localPort = ports.isEmpty
             ? ""
             : ", \"localWsPorts\": [\(ports.map(String.init).joined(separator: ", "))]"
+        let coreEntry = corePort.map { ", \"coreWsPort\": \($0)" } ?? ""
         // "</script>" inside a module url would break out of the tag and
         // inject script into the privileged page
         let modules = ((try? JSONSerialization.data(withJSONObject: moduleUrls))
@@ -202,7 +212,7 @@ enum PatchworkWeb {
         return """
         <script>window.__patchwork_CONFIG = {"publicEndpoint": "\(endpoint)", \
         "signerSeedHex": "\(seed)", "moduleUrls": \(modules), \
-        "accountModuleUrl": \(accountModule), "accountUrl": \(account)\(localPort)};</script>
+        "accountModuleUrl": \(accountModule), "accountUrl": \(account)\(localPort)\(coreEntry)};</script>
         """
     }
 
@@ -598,6 +608,10 @@ extension PatchworkContextToolsView: NSViewRepresentable {
     func updateNSView(_ nsView: WKWebView, context: Context) {
         update(coordinator: context.coordinator)
     }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: PatchworkContextBridge) {
+        flushPatchworkWebViewSoon(nsView)
+    }
 }
 #else
 extension PatchworkContextToolsView: UIViewRepresentable {
@@ -609,6 +623,10 @@ extension PatchworkContextToolsView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         update(coordinator: context.coordinator)
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: PatchworkContextBridge) {
+        flushPatchworkWebViewSoon(uiView)
     }
 }
 #endif
@@ -628,6 +646,10 @@ struct PatchworkWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: PatchworkEmbedBridge?) {
+        flushPatchworkWebViewSoon(nsView)
+    }
 }
 #else
 struct PatchworkWebView: UIViewRepresentable {
@@ -644,6 +666,10 @@ struct PatchworkWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: PatchworkEmbedBridge?) {
+        flushPatchworkWebViewSoon(uiView)
+    }
 }
 #endif
 
@@ -1778,6 +1804,38 @@ final class EmbedWebView: WKWebView {
     #endif
 }
 
+/// A storageless embed repo only persists through the core's local server:
+/// before a webview goes away, wait (bounded) until the server confirms it
+/// holds the page's current heads.
+@MainActor
+func flushPatchworkWebView(_ webView: WKWebView) async {
+    let flush = Task { @MainActor in
+        _ = try? await webView.callAsyncJavaScript(
+            "return await window.__patchworkFlush?.(3000)",
+            arguments: [:],
+            contentWorld: .page
+        )
+    }
+    let deadline = Task {
+        try? await Task.sleep(for: .seconds(4))
+    }
+    await withTaskGroup(of: Void.self) { group in
+        group.addTask { await flush.value }
+        group.addTask { await deadline.value }
+        await group.next()
+        group.cancelAll()
+    }
+    flush.cancel()
+    deadline.cancel()
+}
+
+@MainActor
+func flushPatchworkWebViewSoon(_ webView: WKWebView) {
+    Task { @MainActor in
+        await flushPatchworkWebView(webView)
+    }
+}
+
 @MainActor
 func makePatchworkWebView(
     query: [URLQueryItem],
@@ -1892,6 +1950,7 @@ struct PatchworkPickerView: NSViewRepresentable {
 
     static func dismantleNSView(_ nsView: WKWebView, coordinator: MutablePickerBridge) {
         coordinator.onPick = nil
+        flushPatchworkWebViewSoon(nsView)
     }
 }
 #else
@@ -1921,6 +1980,7 @@ struct PatchworkPickerView: UIViewRepresentable {
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: MutablePickerBridge) {
         coordinator.onPick = nil
+        flushPatchworkWebViewSoon(uiView)
     }
 }
 #endif
@@ -2092,6 +2152,10 @@ struct PatchworkBoxWebViewWrapper: NSViewRepresentable {
         }
     }
 
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: PatchworkBoxCoordinator) {
+        flushPatchworkWebViewSoon(nsView)
+    }
+
     @MainActor
     private func configureActivation(_ webView: WKWebView) {
         guard let embed = webView as? EmbedWebView else { return }
@@ -2162,6 +2226,10 @@ struct PatchworkBoxWebViewWrapper: UIViewRepresentable {
             coord.lastDraftUrl = draftUrl
             coord.lastCheckoutUrl = checkoutUrl
         }
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: PatchworkBoxCoordinator) {
+        flushPatchworkWebViewSoon(uiView)
     }
 
     /// Inert on touch means the reader's one-finger pan belongs to the page:

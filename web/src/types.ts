@@ -19,6 +19,7 @@ export type PatchworkConfig = {
   publicEndpoint?: string;
   subductionEndpoints?: string[];
   localWsPorts?: number[];
+  coreWsPort?: number;
   signerSeedHex?: string;
   accountUrl?: string;
   moduleUrls?: string[];
@@ -59,6 +60,7 @@ declare global {
         lushstorage?: { postMessage: (message: unknown) => Promise<unknown> };
       };
     };
+    __patchworkFlush?: (timeoutMs?: number) => Promise<boolean>;
     __patchworkResolve?: (path: string) => Promise<{
       status: number;
       mimeType: string;

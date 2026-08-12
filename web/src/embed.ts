@@ -19,12 +19,12 @@ import {
   createDocOfDatatype2,
 } from "@inkandswitch/patchwork-plugins";
 import * as plugins from "@inkandswitch/patchwork-plugins";
-import { configuredSigner, subductionEndpoints } from "./config";
+import { configuredSigner, embedSubductionEndpoints } from "./config";
 import { loadAccount } from "./account";
 import { makeImportPackage } from "./packages";
 import { installPatchworkApi } from "./patchwork-api";
 import { installResolver } from "./resolver";
-import { NativeStorageAdapter } from "./storage";
+import { flushToServer, type FlushRepo } from "./flush";
 import type { PatchworkConfig } from "./types";
 
 const reportError = (text: unknown) => {
@@ -141,6 +141,7 @@ function hasScrollableContent(root: Element): boolean {
 
 async function boot() {
   const config: PatchworkConfig = window.__patchwork_CONFIG ?? {};
+  if (!config.coreWsPort) setTimeout(() => location.reload(), 3000);
   status("loading wasm…");
   await Promise.all([
     initializeWasm(fetch("/automerge.wasm") as never),
@@ -149,22 +150,14 @@ async function boot() {
 
   const signer = configuredSigner(config);
   const repo = new Repo({
-    storage: new NativeStorageAdapter(async (message) => {
-      try {
-        return (await window.webkit?.messageHandlers?.lushstorage?.postMessage(
-          message,
-        )) as Record<string, any> | undefined;
-      } catch (error) {
-        reportError(`storage ${message.op} failed: ${error}`);
-        throw error;
-      }
-    }),
     signer,
     peerId: `lush-${Math.random().toString(36).slice(2, 10)}` as PeerId,
     enableRemoteHeadsGossiping: true,
-    subductionWebsocketEndpoints: subductionEndpoints(config),
+    subductionWebsocketEndpoints: embedSubductionEndpoints(config),
   } as never);
   window.repo = repo;
+  window.__patchworkFlush = (timeoutMs) =>
+    flushToServer(repo as unknown as FlushRepo, timeoutMs);
   installResolver(repo);
   const Patchwork = installPatchworkApi(repo);
   Patchwork.accountReady = isValidAutomergeUrl(config.accountUrl ?? "")

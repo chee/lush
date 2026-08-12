@@ -38,11 +38,15 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     static func reallyQuit() {
-        NotesModel.shared.activeEditor?.core?.pushNow()
-        NotesModel.shared.presence.leave()
-        NotesModel.shared.core?.shutdown()
         NSApp.setActivationPolicy(.accessory)
-        exit(0)
+        NSApp.hide(nil)
+        Task { @MainActor in
+            await PatchworkScripting.shared.flushAll()
+            NotesModel.shared.activeEditor?.core?.pushNow()
+            NotesModel.shared.presence.leave()
+            NotesModel.shared.core?.shutdown()
+            exit(0)
+        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {

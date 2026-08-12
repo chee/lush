@@ -53,6 +53,18 @@ final class PatchworkScripting {
         slots[target]?.webView != nil
     }
 
+    func flushAll() async {
+        var webViews = slots.values.compactMap(\.webView)
+        if let headless { webViews.append(headless.webView) }
+        await withTaskGroup(of: Void.self) { group in
+            for webView in webViews {
+                group.addTask { @MainActor in
+                    await flushPatchworkWebView(webView)
+                }
+            }
+        }
+    }
+
     /// Evaluates `source` as an async function body with `repo`, `handle`,
     /// `doc`, and `url` in scope. Returns whatever it returns as JSON text;
     /// values JSON can't hold come back stringified.

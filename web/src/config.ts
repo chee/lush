@@ -14,6 +14,10 @@ export function subductionEndpoints(config: PatchworkConfig): string[] {
   return [...new Set([...endpoints, ...local])];
 }
 
+export function embedSubductionEndpoints(config: PatchworkConfig): string[] {
+  return config.coreWsPort ? [`ws://127.0.0.1:${config.coreWsPort}`] : [];
+}
+
 export function configuredSigner(config: PatchworkConfig): MemorySigner {
   return config.signerSeedHex
     ? MemorySigner.fromBytes(hexToBytes(config.signerSeedHex))
