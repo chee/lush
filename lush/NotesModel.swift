@@ -3418,17 +3418,45 @@ final class NotesModel {
         guard let core else { return }
         do {
             var textSpans: [SpanNode] = []
+            var textIndexes: Set<Int> = []
             var importedUrls: [String] = []
+            let completed = content.completedHandoffItems
 
-            for payload in content.flattenedPayloads {
+            for (index, payload) in content.flattenedPayloads.enumerated() where !completed.contains(index) {
                 switch payload {
                 case .text(let text):
                     appendText(text, to: &textSpans)
+                    textIndexes.insert(index)
                 case .file(let url):
                     if textFilesAsNotes, Self.canImportAsNote(url) {
-                        importedUrls.append(try importFileAsNote(url, core: core, folderUrl: nil))
+                        let operationKey = "file-note:\(index)"
+                        importedUrls.append(try importFileAsNote(
+                            url,
+                            core: core,
+                            folderUrl: nil,
+                            existingUrl: content.handoffCreatedUrl(for: operationKey),
+                            didCreate: {
+                                content.markHandoffCreatedUrl($0, for: operationKey)
+                            }
+                        ))
                     } else {
-                        importedUrls += try await importFileEntries(from: url, core: core)
+                        importedUrls += try await importFileEntries(
+                            from: url,
+                            core: core,
+                            completedRelativePaths: content.completedHandoffChildren(for: index),
+                            didImport: {
+                                content.markHandoffChildCompleted(index: index, relativePath: $0)
+                            },
+                            existingUrl: {
+                                content.handoffCreatedUrl(for: "file:\(index):\($0)")
+                            },
+                            didCreate: { relativePath, url in
+                                content.markHandoffCreatedUrl(url, for: "file:\(index):\(relativePath)")
+                            }
+                        )
+                    }
+                    guard content.markHandoffItemsCompleted([index]) else {
+                        throw CocoaError(.fileWriteUnknown)
                     }
                 case .batch:
                     break
@@ -3437,9 +3465,21 @@ final class NotesModel {
 
             let textJson = SpanNode.encodeList(textSpans)
             if textJson != "[]" {
-                let noteUrl = try core.createNote(title: content.textDisplayTitle)
+                let operationKey = "text:\(textIndexes.sorted().map(String.init).joined(separator: ","))"
+                let noteUrl: String
+                if let existing = content.handoffCreatedUrl(for: operationKey) {
+                    noteUrl = existing
+                } else {
+                    noteUrl = try core.createNote(title: content.textDisplayTitle)
+                    guard content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+                }
                 _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
                 importedUrls.insert(noteUrl, at: 0)
+                guard content.markHandoffItemsCompleted(textIndexes) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
             }
 
             refreshNotes()
@@ -3477,28 +3517,59 @@ final class NotesModel {
                 try? FileManager.default.removeItem(at: entry)
                 continue
             }
-            await importToInbox(content)
+            if await importToInbox(content) {
+                content.cleanupHandoff()
+            }
         }
     }
 
-    func importToInbox(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) async {
-        guard let core else { return }
-        defer { content.cleanupHandoff() }
+    @discardableResult
+    func importToInbox(_ content: IncomingContent, textFilesAsNotes: Bool = importsTextFilesAsNotes) async -> Bool {
+        guard let core else { return false }
         let target = effectiveInboxUrl ?? folderUrl
         var textSpans: [SpanNode] = []
+        var textIndexes: Set<Int> = []
         var importedUrls: [String] = []
         var failures: [String] = []
+        let completed = content.completedHandoffItems
 
-        for payload in content.flattenedPayloads {
+        for (index, payload) in content.flattenedPayloads.enumerated() where !completed.contains(index) {
             switch payload {
             case .text(let text):
                 appendText(text, to: &textSpans)
+                textIndexes.insert(index)
             case .file(let url):
                 do {
                     if textFilesAsNotes, Self.canImportAsNote(url) {
-                        importedUrls.append(try importFileAsNote(url, core: core, folderUrl: target))
+                        let operationKey = "file-note:\(index)"
+                        importedUrls.append(try importFileAsNote(
+                            url,
+                            core: core,
+                            folderUrl: target,
+                            existingUrl: content.handoffCreatedUrl(for: operationKey),
+                            didCreate: {
+                                content.markHandoffCreatedUrl($0, for: operationKey)
+                            }
+                        ))
                     } else {
-                        importedUrls += try await importFileEntries(from: url, core: core, folderUrl: target)
+                        importedUrls += try await importFileEntries(
+                            from: url,
+                            core: core,
+                            folderUrl: target,
+                            completedRelativePaths: content.completedHandoffChildren(for: index),
+                            didImport: {
+                                content.markHandoffChildCompleted(index: index, relativePath: $0)
+                            },
+                            existingUrl: {
+                                content.handoffCreatedUrl(for: "file:\(index):\($0)")
+                            },
+                            didCreate: { relativePath, url in
+                                content.markHandoffCreatedUrl(url, for: "file:\(index):\(relativePath)")
+                            }
+                        )
+                    }
+                    if !content.markHandoffItemsCompleted([index]) {
+                        failures.append("\(url.lastPathComponent): couldn't record the completed import")
                     }
                 } catch {
                     failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
@@ -3511,14 +3582,25 @@ final class NotesModel {
         let textJson = SpanNode.encodeList(textSpans)
         if textJson != "[]" {
             do {
+                let operationKey = "text:\(textIndexes.sorted().map(String.init).joined(separator: ","))"
                 let noteUrl: String
-                if let target {
-                    noteUrl = try core.createNoteIn(folderUrl: target, title: content.textDisplayTitle)
+                if let existing = content.handoffCreatedUrl(for: operationKey) {
+                    noteUrl = existing
                 } else {
-                    noteUrl = try core.createNote(title: content.textDisplayTitle)
+                    if let target {
+                        noteUrl = try core.createNoteIn(folderUrl: target, title: content.textDisplayTitle)
+                    } else {
+                        noteUrl = try core.createNote(title: content.textDisplayTitle)
+                    }
+                    guard content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
                 }
                 _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
                 importedUrls.insert(noteUrl, at: 0)
+                if !content.markHandoffItemsCompleted(textIndexes) {
+                    failures.append("text: couldn't record the completed import")
+                }
             } catch {
                 failures.append("text: \(error.localizedDescription)")
             }
@@ -3531,6 +3613,7 @@ final class NotesModel {
         if !failures.isEmpty {
             status = "Import incomplete: \(failures.joined(separator: "; "))"
         }
+        return failures.isEmpty
     }
 
     // File import ------------------------------------------------------------
@@ -3581,16 +3664,27 @@ final class NotesModel {
         return imported
     }
 
-    private func importFileAsNote(_ url: URL, core: Core, folderUrl: String?) throws -> String {
+    private func importFileAsNote(
+        _ url: URL,
+        core: Core,
+        folderUrl: String?,
+        existingUrl: String? = nil,
+        didCreate: ((String) -> Bool)? = nil
+    ) throws -> String {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let title = url.deletingPathExtension().lastPathComponent
         let spans = Self.noteSpans(fromFile: url)
         let noteUrl: String
-        if let folderUrl {
-            noteUrl = try core.createNoteIn(folderUrl: folderUrl, title: title)
+        if let existingUrl {
+            noteUrl = existingUrl
         } else {
-            noteUrl = try core.createNote(title: title)
+            if let folderUrl {
+                noteUrl = try core.createNoteIn(folderUrl: folderUrl, title: title)
+            } else {
+                noteUrl = try core.createNote(title: title)
+            }
+            guard didCreate?(noteUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
         if !spans.isEmpty {
             _ = try? core.updateNoteSpans(url: noteUrl, spansJson: SpanNode.encodeList(spans), heads: nil)
@@ -3617,7 +3711,15 @@ final class NotesModel {
         return RichTextClipboard.spans(fromMarkdown: text)
     }
 
-    private func importFileEntries(from url: URL, core: Core, folderUrl: String? = nil) async throws -> [String] {
+    private func importFileEntries(
+        from url: URL,
+        core: Core,
+        folderUrl: String? = nil,
+        completedRelativePaths: Set<String> = [],
+        didImport: ((String) -> Bool)? = nil,
+        existingUrl: ((String) -> String?)? = nil,
+        didCreate: ((String, String) -> Bool)? = nil
+    ) async throws -> [String] {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
@@ -3633,37 +3735,68 @@ final class NotesModel {
             for file in files {
                 let values = try? file.resourceValues(forKeys: [.isRegularFileKey])
                 guard values?.isRegularFile == true else { continue }
-                imported.append(try await importSingleFileEntry(file, displayName: relativeDisplayName(for: file, under: url), core: core, folderUrl: folderUrl))
+                let relativePath = relativeDisplayName(for: file, under: url)
+                guard !completedRelativePaths.contains(relativePath) else { continue }
+                imported.append(try await importSingleFileEntry(
+                    file,
+                    displayName: relativePath,
+                    core: core,
+                    folderUrl: folderUrl,
+                    existingUrl: existingUrl?(relativePath),
+                    didCreate: { didCreate?(relativePath, $0) ?? true }
+                ))
+                guard didImport?(relativePath) ?? true else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
             }
             return imported
         }
-        return [try await importSingleFileEntry(url, displayName: url.lastPathComponent, core: core, folderUrl: folderUrl)]
+        return [try await importSingleFileEntry(
+            url,
+            displayName: url.lastPathComponent,
+            core: core,
+            folderUrl: folderUrl,
+            existingUrl: existingUrl?(url.lastPathComponent),
+            didCreate: { didCreate?(url.lastPathComponent, $0) ?? true }
+        )]
     }
 
     private func importSingleFileEntry(
         _ url: URL,
         displayName: String,
         core: Core,
-        folderUrl: String? = nil
+        folderUrl: String? = nil,
+        existingUrl: String? = nil,
+        didCreate: ((String) -> Bool)? = nil
     ) async throws -> String {
-        let data = try Data(contentsOf: url)
         let ext = url.pathExtension.lowercased()
         let name = displayName.isEmpty ? url.lastPathComponent : displayName
         if let folderUrl {
-            return try core.createAssetIn(
+            if let existingUrl { return existingUrl }
+            let data = try Data(contentsOf: url)
+            let assetUrl = try core.createAssetIn(
                 folderUrl: folderUrl,
                 name: name,
                 extension: ext.isEmpty ? "bin" : ext,
                 mimeType: mimeType(for: ext),
                 data: data
             )
+            guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
+            return assetUrl
         }
-        let assetUrl = try core.createAsset(
-            name: name,
-            extension: ext.isEmpty ? "bin" : ext,
-            mimeType: mimeType(for: ext),
-            data: data
-        )
+        let assetUrl: String
+        if let existingUrl {
+            assetUrl = existingUrl
+        } else {
+            let data = try Data(contentsOf: url)
+            assetUrl = try core.createAsset(
+                name: name,
+                extension: ext.isEmpty ? "bin" : ext,
+                mimeType: mimeType(for: ext),
+                data: data
+            )
+            guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
+        }
         try await core.linkNoteToFolder(noteUrl: assetUrl, title: name)
         return assetUrl
     }

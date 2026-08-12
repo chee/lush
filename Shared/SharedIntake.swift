@@ -9,10 +9,12 @@ struct IncomingContent: Identifiable {
     }
     let payload: Payload
     let handoffDirectory: URL?
+    private let journal: HandoffJournal?
 
     init(payload: Payload, handoffDirectory: URL? = nil) {
         self.payload = payload
         self.handoffDirectory = handoffDirectory
+        journal = handoffDirectory.map(HandoffJournal.init)
     }
 
     var flattenedPayloads: [Payload] {
@@ -54,6 +56,35 @@ struct IncomingContent: Identifiable {
         try? FileManager.default.removeItem(at: handoffDirectory)
     }
 
+    var completedHandoffItems: Set<Int> {
+        journal?.snapshot.completed ?? []
+    }
+
+    func completedHandoffChildren(for index: Int) -> Set<String> {
+        let prefix = "\(index):"
+        let children = journal?.snapshot.completedChildren ?? []
+        return Set(children.compactMap { key in
+            guard key.hasPrefix(prefix) else { return nil }
+            return String(key.dropFirst(prefix.count))
+        })
+    }
+
+    func handoffCreatedUrl(for operationKey: String) -> String? {
+        journal?.snapshot.createdUrls[operationKey]
+    }
+
+    func markHandoffItemsCompleted(_ indexes: Set<Int>) -> Bool {
+        journal?.mutate { $0.completed.formUnion(indexes) } ?? true
+    }
+
+    func markHandoffChildCompleted(index: Int, relativePath: String) -> Bool {
+        journal?.mutate { $0.completedChildren.insert("\(index):\(relativePath)") } ?? true
+    }
+
+    func markHandoffCreatedUrl(_ url: String, for operationKey: String) -> Bool {
+        journal?.mutate { $0.createdUrls[operationKey] = url } ?? true
+    }
+
     static func sharedHandoff(id: String) -> IncomingContent? {
         guard let directory = SharedHandoff.directory(id: id) else { return nil }
         let payloadUrl = directory.appendingPathComponent("payload.json")
@@ -72,4 +103,99 @@ struct IncomingContent: Identifiable {
         guard !payloads.isEmpty else { return nil }
         return IncomingContent(payload: .batch(payloads), handoffDirectory: directory)
     }
+}
+
+private final class HandoffJournal: @unchecked Sendable {
+    private let fileUrl: URL
+    private let lock = NSLock()
+    private var progress: SharedImportProgress
+    private var dirty = false
+    private var writing = false
+    private var failed = false
+
+    init(directory: URL) {
+        fileUrl = directory.appendingPathComponent("progress.json")
+        if let data = boundedHandoffData(at: fileUrl, maximumSize: 16_777_216),
+           let decoded = try? JSONDecoder().decode(SharedImportProgress.self, from: data) {
+            progress = decoded
+        } else {
+            progress = SharedImportProgress()
+        }
+    }
+
+    var snapshot: SharedImportProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        return progress
+    }
+
+    func mutate(_ change: (inout SharedImportProgress) -> Void) -> Bool {
+        lock.lock()
+        change(&progress)
+        dirty = true
+        let ok = !failed
+        let startFlush = !writing
+        if startFlush { writing = true }
+        lock.unlock()
+        if startFlush {
+            Task.detached(priority: .utility) { self.flush() }
+        }
+        return ok
+    }
+
+    private func flush() {
+        while true {
+            lock.lock()
+            guard dirty else {
+                writing = false
+                lock.unlock()
+                return
+            }
+            dirty = false
+            let current = progress
+            lock.unlock()
+            let wrote = (try? JSONEncoder().encode(current).write(to: fileUrl, options: .atomic)) != nil
+            lock.lock()
+            failed = !wrote
+            lock.unlock()
+        }
+    }
+}
+
+private struct SharedImportProgress: Codable {
+    var completed: Set<Int>
+    var completedChildren: Set<String>
+    var createdUrls: [String: String]
+
+    init(
+        completed: Set<Int> = [],
+        completedChildren: Set<String> = [],
+        createdUrls: [String: String] = [:]
+    ) {
+        self.completed = completed
+        self.completedChildren = completedChildren
+        self.createdUrls = createdUrls
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case completed
+        case completedChildren
+        case createdUrls
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        completed = try container.decodeIfPresent(Set<Int>.self, forKey: .completed) ?? []
+        completedChildren = try container.decodeIfPresent(Set<String>.self, forKey: .completedChildren) ?? []
+        createdUrls = try container.decodeIfPresent([String: String].self, forKey: .createdUrls) ?? [:]
+    }
+}
+
+private func boundedHandoffData(at url: URL, maximumSize: Int) -> Data? {
+    guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+          let size = values.fileSize,
+          size <= maximumSize,
+          let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+          data.count <= maximumSize else { return nil }
+    return data
 }
