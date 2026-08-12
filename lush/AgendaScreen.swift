@@ -262,7 +262,10 @@ struct AgendaScreen: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("\(Calendar.current.component(.day, from: day))")
                 .font(.system(size: 30, weight: .bold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(
+                    Calendar.current.isDateInToday(day)
+                        ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary)
+                )
             Text(Agenda.dayName(day))
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.secondary)
