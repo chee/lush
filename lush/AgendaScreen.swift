@@ -11,7 +11,7 @@ struct AgendaScreen: View {
     @State private var dayGroups: [DayGroup] = []
     @State private var highlighted: String?
     @State private var highlightTask: Task<Void, Never>?
-    @State private var position = ScrollPosition(idType: Date.self)
+    @State private var position = ScrollPosition(id: Calendar.current.startOfDay(for: Date()), anchor: .top)
     @State private var settled = false
     @State private var extending = false
 
@@ -98,16 +98,19 @@ struct AgendaScreen: View {
         .onChange(of: agenda.focusDay, initial: true) { focusChanged() }
     }
 
-    /// A fresh window starts at yesterday and simply renders from the top, so
-    /// today sits a little way down with a taste of the past above it —
-    /// nothing to scroll, nothing to race. Coming back to where she was is
-    /// the one case that needs a scroll, and the position binding resolves a
-    /// day id without the day having to be built yet.
+    /// Opens anchored on today, with yesterday loaded above for the scroll
+    /// up. The position is seeded with today before anything renders and
+    /// asserted again in the update the first day groups land — the binding
+    /// resolves a day id through the target layout without the day having to
+    /// be built, so there is no race against lazy layout.
     private func settle() {
         guard !settled, !dayGroups.isEmpty else { return }
         settled = true
-        guard agenda.focusDay == nil, let day = agenda.restoreDay else { return }
-        position.scrollTo(id: day, anchor: .top)
+        guard agenda.focusDay == nil else { return }
+        position.scrollTo(
+            id: agenda.restoreDay ?? Calendar.current.startOfDay(for: Date()),
+            anchor: .top
+        )
     }
 
     private func focusChanged() {
