@@ -670,7 +670,20 @@ final class NotesModel {
             applyingIncomingChanges = core.isApplyingIncoming()
             sendingChanges = core.isSendingChanges()
             PatchworkWeb.coreServerPort = core.localServerPort()
-            NativeWebStorage.shared.core = core
+            Task.detached {
+                let fm = FileManager.default
+                guard let container = fm.urls(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask
+                ).first else { return }
+                let entries = (try? fm.contentsOfDirectory(
+                    at: container,
+                    includingPropertiesForKeys: nil
+                )) ?? []
+                for entry in entries where entry.lastPathComponent.hasPrefix("LushWebStorage") {
+                    try? fm.removeItem(at: entry)
+                }
+            }
             Task { [semanticSearch] in await semanticSearch.attach(core) }
             presence.model = self
             presence.setEnabled(sharingPresence, url: nil)

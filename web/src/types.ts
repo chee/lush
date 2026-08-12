@@ -57,7 +57,6 @@ declare global {
         };
         lush?: { postMessage: (message: unknown) => void };
         lusherror?: { postMessage: (message: unknown) => void };
-        lushstorage?: { postMessage: (message: unknown) => Promise<unknown> };
       };
     };
     __patchworkFlush?: (timeoutMs?: number) => Promise<boolean>;
