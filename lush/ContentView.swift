@@ -4314,7 +4314,7 @@ struct NoteDetail: View {
                 }
                 Divider()
                 CopyUrlMenu(url: noteUrl)
-                if model.patchworkDocUrls.contains(noteUrl) || node.isPatchworkDoc {
+                if node.isNote || node.isPatchworkDoc || model.patchworkDocUrls.contains(noteUrl) {
                     Button {
                         model.openInPatchwork(noteUrl)
                     } label: {

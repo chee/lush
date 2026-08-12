@@ -27,14 +27,16 @@ struct NoteContextMenu: View {
     }
 
     @ViewBuilder
-    private var content: some View {
-        if isPatchworkDoc {
-            Button {
-                model.openInPatchwork(node.url)
-            } label: {
-                OpenInPatchworkLabel()
-            }
+    private var openInPatchwork: some View {
+        Button {
+            model.openInPatchwork(node.url)
+        } label: {
+            OpenInPatchworkLabel()
         }
+    }
+
+    @ViewBuilder
+    private var content: some View {
         if node.kind == "lush" || node.kind == "rich" {
             #if os(macOS)
             Button {
@@ -42,8 +44,9 @@ struct NoteContextMenu: View {
             } label: {
                 Label("Open in New Window", systemImage: "macwindow.badge.plus")
             }
-            Divider()
             #endif
+            openInPatchwork
+            Divider()
             Button {
                 model.togglePin(node.url)
             } label: {
@@ -65,6 +68,8 @@ struct NoteContextMenu: View {
                     Label("Show in Folder", systemImage: "folder")
                 }
             }
+        } else if isPatchworkDoc {
+            openInPatchwork
         }
         Divider()
         if let rename {
