@@ -124,6 +124,14 @@ struct AgendaScreen: View {
         }
         .onAppear { scroller = proxy }
         .onChange(of: agenda.focusDay, initial: true) { focusChanged() }
+        .toolbar {
+            ToolbarItem {
+                Button("Today") {
+                    agenda.restoreDay = nil
+                    agenda.focusDay = Calendar.current.startOfDay(for: Date())
+                }
+            }
+        }
     }
 
     /// Every landing — cold open, coming back, a link, the today button —
