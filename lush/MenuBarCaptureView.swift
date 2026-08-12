@@ -145,7 +145,6 @@ struct MenuBarCaptureView: View {
                 menuAction("Record", systemImage: recorder.isRecording ? "stop.circle" : "waveform.circle") {
                     toggleRecording()
                 }
-                .disabled(recorder.recordingTooLarge)
             }
             GridRow {
                 menuAction("Search", systemImage: "magnifyingglass") {
@@ -208,12 +207,10 @@ struct MenuBarCaptureView: View {
                         pendingTranscript = nil
                         status = "Recording cancelled"
                     }
-                    if !recorder.recordingTooLarge {
-                        Button("Retry") {
-                            finishRecording()
-                        }
-                        .buttonStyle(.borderedProminent)
+                    Button("Retry") {
+                        finishRecording()
                     }
+                    .buttonStyle(.borderedProminent)
                 } else if recorder.permissionDenied {
                     Text("Microphone access denied")
                         .uiFont(.caption)
@@ -299,7 +296,6 @@ struct MenuBarCaptureView: View {
 
     private func toggleRecording() {
         if recorder.isRecording || recorder.saveFailed {
-            guard !recorder.recordingTooLarge else { return }
             finishRecording()
             return
         }
@@ -316,7 +312,7 @@ struct MenuBarCaptureView: View {
     }
 
     private func finishRecording() {
-        guard !isTranscribing, !recorder.recordingTooLarge else { return }
+        guard !isTranscribing else { return }
         guard recorder.saveState != nil
             || recorder.captureSaveState(recordingState(accountUrl: model.accountConfigUrl))
         else { return }

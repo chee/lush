@@ -27,16 +27,11 @@ private struct RecordingRecovery: Codable {
 
 @MainActor @Observable
 final class AudioRecorder {
-    nonisolated static let maximumRecordingBytes = 33_554_432
-    nonisolated private static let automaticStopBytes = 31_457_280
-    nonisolated private static let maximumRecordingDuration: TimeInterval = 2_200
-
     var isRecording = false
     var elapsed: TimeInterval = 0
     var level: Float = 0
     var permissionDenied = false
     var saveFailed = false
-    var recordingTooLarge = false
     var saveError: String?
 
     @ObservationIgnored private var recorder: AVAudioRecorder?
@@ -54,7 +49,6 @@ final class AudioRecorder {
         recoveryKey = key
         saveState = nil
         saveFailed = false
-        recordingTooLarge = false
         saveError = nil
         guard let urls = recoveryURLs() else { return }
         let recovery: RecordingRecovery? = {
@@ -81,16 +75,9 @@ final class AudioRecorder {
             return
         }
         fileURL = urls.audio
-        if let values = try? urls.audio.resourceValues(forKeys: [.fileSizeKey]),
-           let size = values.fileSize,
-           size > Self.maximumRecordingBytes {
-            recordingTooLarge = true
-        }
         saveState = recovery?.state
         saveFailed = true
-        saveError = recordingTooLarge
-            ? "This recording is larger than the 32 MB save limit."
-            : "A recording is waiting to be saved."
+        saveError = "A recording is waiting to be saved."
     }
 
     func start() async {
@@ -105,7 +92,6 @@ final class AudioRecorder {
             }
         }
         saveFailed = false
-        recordingTooLarge = false
         saveError = nil
         let gen = generation
         let granted = await AVAudioApplication.requestRecordPermission()
@@ -136,7 +122,7 @@ final class AudioRecorder {
             return
         }
         recorder.isMeteringEnabled = true
-        guard recorder.record(forDuration: Self.maximumRecordingDuration) else {
+        guard recorder.record() else {
             try? FileManager.default.removeItem(at: url)
             #if os(iOS)
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -148,7 +134,6 @@ final class AudioRecorder {
         elapsed = 0
         isRecording = true
         ticker = Task { [weak self] in
-            var nextSizeCheck: TimeInterval = 1
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard let self, let recorder = self.recorder else { return }
@@ -163,17 +148,6 @@ final class AudioRecorder {
                 self.elapsed = recorder.currentTime
                 // -60dB..0dB -> 0..1
                 self.level = max(0, min(1, (recorder.averagePower(forChannel: 0) + 60) / 60))
-                if recorder.currentTime >= nextSizeCheck {
-                    nextSizeCheck = recorder.currentTime + 1
-                    if let size = try? recorder.url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-                       size >= Self.automaticStopBytes {
-                        self.finishRecorder()
-                        self.saveFailed = true
-                        self.saveError = "Recording stopped at the size limit."
-                        self.persistRecovery()
-                        return
-                    }
-                }
             }
         }
     }
@@ -186,7 +160,6 @@ final class AudioRecorder {
     func cancel() {
         finishRecorder()
         saveFailed = false
-        recordingTooLarge = false
         saveError = nil
         saveState = nil
         let stateURL = recoveryURLs()?.state
@@ -224,21 +197,11 @@ final class AudioRecorder {
             saveError = "Couldn't read this recording."
             return nil
         }
-        let result = await Task.detached { () -> (Data?, Bool) in
-            let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey])
-            guard let size = values?.fileSize else { return (nil, false) }
-            guard size <= Self.maximumRecordingBytes else { return (nil, true) }
-            guard
-                  let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
-                  data.count <= Self.maximumRecordingBytes else { return (nil, false) }
-            return (data, false)
+        let data = await Task.detached {
+            try? Data(contentsOf: fileURL, options: .mappedIfSafe)
         }.value
-        let data = result.0
         saveFailed = true
-        recordingTooLarge = result.1
-        saveError = recordingTooLarge
-            ? "This recording is larger than the 32 MB save limit."
-            : data == nil ? "Couldn't read this recording." : nil
+        saveError = data == nil ? "Couldn't read this recording." : nil
         persistRecovery()
         return data
     }
@@ -246,7 +209,6 @@ final class AudioRecorder {
     func retainSaveState(_ state: RecordingSaveState?) {
         saveState = state
         saveFailed = true
-        recordingTooLarge = false
         saveError = "Couldn't save this recording. It is still available to retry."
         persistRecovery()
     }
@@ -266,7 +228,6 @@ final class AudioRecorder {
     func completeSave(_ state: RecordingSaveState? = nil) {
         if let state { saveState = state }
         saveFailed = false
-        recordingTooLarge = false
         saveError = nil
         defer {
             saveState = nil
@@ -392,11 +353,7 @@ struct RecorderBar: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(
-                isStopping
-                    || recorder.recordingTooLarge
-                    || (!recorder.isRecording && !recorder.saveFailed)
-            )
+            .disabled(isStopping || (!recorder.isRecording && !recorder.saveFailed))
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
