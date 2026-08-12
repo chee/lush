@@ -11,6 +11,8 @@ struct AgendaScreen: View {
     @State private var dayGroups: [DayGroup] = []
     @State private var highlighted: String?
     @State private var highlightTask: Task<Void, Never>?
+    @State private var ready = false
+    @State private var extendingBack = false
 
     var body: some View {
         Group {
@@ -47,8 +49,11 @@ struct AgendaScreen: View {
     }
 
     private func regroup() {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let first = calendar.date(byAdding: .day, value: -agenda.backHorizon, to: today) ?? today
         dayGroups = Agenda
-            .days(agenda.items, from: Calendar.current.startOfDay(for: Date()), count: agenda.horizon)
+            .days(agenda.items, from: first, count: agenda.backHorizon + agenda.horizon)
             .map(DayGroup.init)
     }
 
@@ -59,6 +64,14 @@ struct AgendaScreen: View {
                 // through those, and a loose header plus a nested ForEach left
                 // it dropping rows until they were scrolled well past.
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    // Reaching the top of the list loads the previous
+                    // fortnight. Keying the sentinel to the horizon makes each
+                    // extension a fresh view, so its onAppear fires again when
+                    // she scrolls up to the new top.
+                    Color.clear
+                        .frame(height: 1)
+                        .id("back-\(agenda.backHorizon)")
+                        .onAppear { extendBack(proxy) }
                     ForEach(dayGroups) { group in
                         Section {
                             // An event running over several days appears in
@@ -86,10 +99,8 @@ struct AgendaScreen: View {
                 .frame(maxWidth: 720)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
-            .onAppear {
-                guard agenda.focusDay == nil, let day = agenda.restoreDay else { return }
-                proxy.scrollTo(day, anchor: .top)
-            }
+            .onAppear { settle(proxy) }
+            .onChange(of: dayGroups.isEmpty) { settle(proxy) }
             .onChange(of: agenda.focusDay, initial: true) {
                 guard let day = agenda.focusDay else { return }
                 withAnimation { proxy.scrollTo(day, anchor: .top) }
@@ -107,6 +118,32 @@ struct AgendaScreen: View {
         }
     }
 
+
+    /// The list now opens with a fortnight of the past above today, so today
+    /// has to be scrolled to rather than simply being the top. Until that
+    /// scroll has landed the back sentinel is ignored — it is visible at first
+    /// layout, and extending then would drag the view into the past.
+    private func settle(_ proxy: ScrollViewProxy) {
+        guard !ready, !dayGroups.isEmpty else { return }
+        if agenda.focusDay == nil {
+            proxy.scrollTo(agenda.restoreDay ?? Calendar.current.startOfDay(for: Date()), anchor: .top)
+        }
+        Task { ready = true }
+    }
+
+    /// The day that was first stays put: it was at the top of the viewport
+    /// when the sentinel appeared, and pinning it back there after the prepend
+    /// is what keeps the list from jumping.
+    private func extendBack(_ proxy: ScrollViewProxy) {
+        guard ready, !extendingBack, let anchor = dayGroups.first?.day else { return }
+        extendingBack = true
+        Task {
+            await agenda.extendBack()
+            regroup()
+            proxy.scrollTo(anchor, anchor: .top)
+            extendingBack = false
+        }
+    }
 
     private func header(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {

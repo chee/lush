@@ -439,7 +439,8 @@ final class NoteChatSession {
                 return "Lush does not have calendar access."
             }
             let horizon = Date().addingTimeInterval(TimeInterval(max(days, 1)) * 86_400)
-            let items = store.items.filter { $0.start <= horizon }
+            let today = Calendar.current.startOfDay(for: Date())
+            let items = store.items.filter { $0.start <= horizon && ($0.end ?? $0.start) >= today }
             guard !items.isEmpty else { return "Nothing scheduled in the next \(days) days." }
             return items.prefix(40).map {
                 "\($0.id) — \($0.title) — \($0.start.formatted(date: .abbreviated, time: .shortened)) — \($0.listName)"

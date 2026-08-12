@@ -105,6 +105,9 @@ enum Agenda {
     /// How far scrolling will run on before it stops. Further than she means
     /// to look, not forever.
     static let horizonLimit = 730
+    /// EventKit quietly truncates an event predicate to four years, so a long
+    /// window is fetched in slices no wider than this.
+    static let predicateSpanDays = 1095
 
     #if os(macOS)
     private static func fourCharCode(_ text: String) -> FourCharCode {
@@ -312,6 +315,10 @@ final class AgendaStore {
     /// How many days the list currently reaches. Grows as she scrolls rather
     /// than fetching a year nobody asked for.
     private(set) var horizon = Agenda.horizonDays
+    /// How many days before today the list reaches. Starts one page back so
+    /// there is somewhere to scroll up to, and grows without limit — the past
+    /// runs as far as her calendar does.
+    private(set) var backHorizon = Agenda.horizonDays
     /// Where she was when she last left the calendar, so coming back lands
     /// there instead of at today.
     var restoreDay: Date?
@@ -460,8 +467,9 @@ final class AgendaStore {
 
     private func reload() async {
         let calendar = Calendar.current
-        let from = calendar.startOfDay(for: Date())
-        let to = calendar.date(byAdding: .day, value: horizon, to: from) ?? from
+        let today = calendar.startOfDay(for: Date())
+        let from = calendar.date(byAdding: .day, value: -backHorizon, to: today) ?? today
+        let to = calendar.date(byAdding: .day, value: horizon, to: today) ?? today
         items = await fetch(from: from, to: to)
     }
 
@@ -472,6 +480,21 @@ final class AgendaStore {
         await reload()
     }
 
+    /// Another fortnight of the past, each time the top of the list comes into
+    /// view. Only the new slice is fetched; an item spanning the seam arrives
+    /// twice and is dropped by its row key.
+    func extendBack() async {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        guard let to = calendar.date(byAdding: .day, value: -backHorizon, to: today),
+              let from = calendar.date(byAdding: .day, value: -(backHorizon + Agenda.horizonDays), to: today)
+        else { return }
+        backHorizon += Agenda.horizonDays
+        let older = await fetch(from: from, to: to)
+        let known = Set(items.map(\.rowKey))
+        items = (older.filter { !known.contains($0.rowKey) } + items).sorted { $0.start < $1.start }
+    }
+
     private func fetch(from: Date, to: Date) async -> [AgendaItem] {
         let shownIds = Set(NotesModel.shared.focus.state?.shownCalendarIds ?? [])
         var next: [AgendaItem] = []
@@ -479,16 +502,23 @@ final class AgendaStore {
             let ekCalendars: [EKCalendar]? = shownIds.isEmpty
                 ? nil
                 : store.calendars(for: .event).filter { shownIds.contains($0.calendarIdentifier) }
-            let predicate = store.predicateForEvents(withStart: from, end: to, calendars: ekCalendars)
             let store = self.store
-            next += await Task.detached {
-                store.events(matching: predicate).compactMap(AgendaItem.init)
-            }.value
+            let calendar = Calendar.current
+            var sliceFrom = from
+            while sliceFrom < to {
+                let sliceTo = min(calendar.date(byAdding: .day, value: Agenda.predicateSpanDays, to: sliceFrom) ?? to, to)
+                let predicate = store.predicateForEvents(withStart: sliceFrom, end: sliceTo, calendars: ekCalendars)
+                next += await Task.detached {
+                    store.events(matching: predicate).compactMap(AgendaItem.init)
+                }.value
+                sliceFrom = sliceTo
+            }
         }
         if reminderAccess == .fullAccess {
             next += await reminders(from: from, to: to, shownIds: shownIds)
         }
-        return next.sorted { $0.start < $1.start }
+        var seen = Set<String>()
+        return next.filter { seen.insert($0.rowKey).inserted }.sorted { $0.start < $1.start }
     }
 
     private func reminders(from: Date, to: Date, shownIds: Set<String>) async -> [AgendaItem] {
