@@ -596,6 +596,11 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * already holds. That folder goes to the top of the account's root folder
      * and is appended to the lush config's `.folders`. Returns the merged
      * folder list.
+     *
+     * Idempotent: anything already reachable from the account's folder tree
+     * is skipped, an adopted folder from an earlier run is reused instead of
+     * making another, and duplicate adopted folders left by earlier runs are
+     * merged into the first.
      */
     func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String]) async throws  -> [String]
     
@@ -1196,6 +1201,11 @@ open func addIrohPeer(code: String)throws   {try rustCallWithError(FfiConverterT
      * already holds. That folder goes to the top of the account's root folder
      * and is appended to the lush config's `.folders`. Returns the merged
      * folder list.
+     *
+     * Idempotent: anything already reachable from the account's folder tree
+     * is skipped, an adopted folder from an earlier run is reused instead of
+     * making another, and duplicate adopted folders left by earlier runs are
+     * merged into the first.
      */
 open func adoptLocalDocs(accountUrl: String, folderUrls: [String], docUrls: [String])async throws  -> [String]  {
     return
@@ -6788,7 +6798,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_add_iroh_peer() != 44741) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 39538) {
+    if (uniffi_lush_core_checksum_method_core_adopt_local_docs() != 39107) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_apply_note_mark() != 29508) {
