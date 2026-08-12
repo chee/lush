@@ -352,8 +352,10 @@ final class AgendaStore {
         await reload()
     }
     /// Where she was when she last left the calendar, so coming back lands
-    /// there instead of at today.
-    var restoreDay: Date?
+    /// there instead of at today. Ignored by observation: it is written on
+    /// every scroll tick, and observed writes at that rate invalidate the
+    /// view mid-gesture. It is only ever read at screen creation.
+    @ObservationIgnored var restoreDay: Date?
     /// Set by a link into the Calendar view: the day to scroll to, and the
     /// item to pick out when it gets there.
     var focusDay: Date?

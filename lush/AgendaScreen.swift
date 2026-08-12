@@ -11,12 +11,15 @@ struct AgendaScreen: View {
     @State private var dayGroups: [DayGroup] = []
     @State private var highlighted: String?
     @State private var highlightTask: Task<Void, Never>?
-    @State private var position = ScrollPosition(
-        id: AgendaStore.shared.restoreDay ?? Calendar.current.startOfDay(for: Date()),
-        anchor: .top
-    )
+    @State private var pendingAnchor: Date? = AgendaStore.shared.focusDay == nil
+        ? AgendaStore.shared.restoreDay ?? Calendar.current.startOfDay(for: Date())
+        : nil
     @State private var settled = false
     @State private var extending = false
+    @State private var assertedSize: CGFloat?
+    @State private var assertedAt = Date.distantPast
+    @State private var scroller: ScrollViewProxy?
+    @State private var visibleDays: Set<Date> = []
 
     var body: some View {
         Group {
@@ -59,12 +62,21 @@ struct AgendaScreen: View {
     }
 
     private var list: some View {
+        ScrollViewReader { proxy in
+            scrollView(proxy)
+        }
+    }
+
+    private func scrollView(_ proxy: ScrollViewProxy) -> some View {
         ScrollView {
-            // Each day is one child of the lazy stack — a loose header plus a
-            // nested ForEach left it dropping rows until they were scrolled
-            // well past, and a single view per day also gives the scroll
-            // target layout one date to anchor by.
-            LazyVStack(alignment: .leading, spacing: 0) {
+            // A plain stack, deliberately: the window never exceeds
+            // Agenda.windowLimit days, so laziness buys nothing — and it cost
+            // a lot. Lazily-built cells re-estimate their heights as they
+            // come and go, which made the content size churn under the
+            // scroll, and a day that wasn't built yet was a day the proxy
+            // silently couldn't scroll to. Fully materialized, every anchor
+            // resolves and the geometry stays put.
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(dayGroups) { group in
                     VStack(alignment: .leading, spacing: 0) {
                         header(group.day)
@@ -76,47 +88,58 @@ struct AgendaScreen: View {
                             row(entry.item)
                         }
                     }
+                    .id(group.day)
+                    // The topmost day actually on screen is where she is —
+                    // kept in the store so leaving and coming back returns
+                    // here rather than to today.
+                    .onScrollVisibilityChange(threshold: 0.05) { visible in
+                        if visible { visibleDays.insert(group.day) }
+                        else { visibleDays.remove(group.day) }
+                    }
                 }
             }
-            .scrollTargetLayout()
             .padding(.horizontal, 28)
             .padding(.bottom, 40)
             .frame(maxWidth: 720)
             .frame(maxWidth: .infinity, alignment: .center)
         }
-        .scrollPosition($position, anchor: .top)
-        // The toolbar floats over the top of the scroll content, so a day
-        // anchored to the bare container edge lands tucked underneath it.
-        // A top content margin moves the resting edge down for every anchor —
-        // the seeded open, the settle assert, a focus jump — while costing
-        // nothing mid-scroll: it is the container's edge, not the cells'.
-        .contentMargins(.top, 40, for: .scrollContent)
+        .contentMargins(.top, 12, for: .scrollContent)
         .scrollIndicators(.hidden)
-        // The scroll geometry drives the sliding window: nearing either end
-        // extends it, and the position binding keeps the day she is looking
-        // at where it is while days are spliced in and out of the far ends —
-        // no sentinel views, nothing to get stuck on at the very top.
+        // The scroll geometry drives the sliding window: crossing into either
+        // end extends it, and the anchor machinery pins the day she was on
+        // while days are spliced in — no sentinel views, nothing to get
+        // stuck on at the very top.
         .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { old, new in
             slide(from: old, to: new)
         }
-        .onChange(of: dayGroups.isEmpty, initial: true) { settle() }
+        .onAppear { scroller = proxy }
         .onChange(of: agenda.focusDay, initial: true) { focusChanged() }
     }
 
-    /// Opens anchored on today — or, coming back, on the day she left at,
-    /// which the store remembers along with the loaded window. The position
-    /// is seeded before anything renders and asserted again in the update the
-    /// first day groups land — the binding resolves a day id through the
-    /// target layout without the day having to be built, so there is no race
-    /// against lazy layout.
+    /// Every landing — cold open, coming back, a link, the today button —
+    /// funnels through here so they cannot drift apart. The scroll is asked
+    /// for straight away, then re-asserted from the geometry callback each
+    /// time layout changes underneath it, because a scroll-to issued in the
+    /// same update as the content it targets is dropped. Once the offset
+    /// moves without the layout changing it has landed — or she has taken
+    /// over, which is just as final — and the window is free to slide.
     private func settle() {
-        guard !settled, !dayGroups.isEmpty else { return }
+        pendingAnchor = nil
         settled = true
-        guard agenda.focusDay == nil else { return }
-        position.scrollTo(
-            id: agenda.restoreDay ?? Calendar.current.startOfDay(for: Date()),
-            anchor: .top
-        )
+        if let top = visibleDays.min() {
+            agenda.restoreDay = top
+        }
+    }
+
+    private func anchor(_ day: Date, animated: Bool = false) {
+        pendingAnchor = day
+        settled = false
+        assertedSize = nil
+        if animated {
+            withAnimation { scroller?.scrollTo(day, anchor: .top) }
+        } else {
+            scroller?.scrollTo(day, anchor: .top)
+        }
     }
 
     private func focusChanged() {
@@ -127,7 +150,7 @@ struct AgendaScreen: View {
         Task {
             await agenda.ensureWindow(around: day)
             regroup()
-            withAnimation { position.scrollTo(id: day, anchor: .top) }
+            anchor(day, animated: true)
             guard let item else { return }
             withAnimation { highlighted = item }
             highlightTask?.cancel()
@@ -145,22 +168,55 @@ struct AgendaScreen: View {
     /// geometry, not a view that has to reappear. The forward edge also
     /// extends when new content still doesn't fill the viewport.
     private func slide(from old: ScrollGeometry, to new: ScrollGeometry) {
+        guard new.containerSize.height > 100 else { return }
+        if let day = pendingAnchor {
+            if abs(new.contentOffset.y - old.contentOffset.y) > 8,
+               new.contentSize.height == old.contentSize.height,
+               Date.now.timeIntervalSince(assertedAt) > 0.6 {
+                settle()
+            } else if assertedSize != new.contentSize.height,
+                      dayGroups.contains(where: { $0.day == day }) {
+                assertedSize = new.contentSize.height
+                assertedAt = Date.now
+                Task { @MainActor in
+                    guard pendingAnchor == day else { return }
+                    scroller?.scrollTo(day, anchor: .top)
+                    try? await Task.sleep(for: .seconds(1))
+                    guard pendingAnchor == day,
+                          Date.now.timeIntervalSince(assertedAt) >= 0.9 else { return }
+                    settle()
+                }
+            }
+            return
+        }
         guard settled, !extending, !dayGroups.isEmpty else { return }
-        // The day at the top of the viewport, straight from the position
-        // binding, is where she is — kept in the store so leaving and coming
-        // back returns here rather than to today.
-        if let day = position.viewID(type: Date.self) {
-            agenda.restoreDay = day
+        // The topmost day on screen is where she is — recorded only on real
+        // scroll ticks, so the teardown of a navigation pop can't smear it.
+        if let top = visibleDays.min() {
+            agenda.restoreDay = top
         }
         let margin = new.containerSize.height * 2
         let top = new.contentOffset.y + new.contentInsets.top
         let oldTop = old.contentOffset.y + old.contentInsets.top
         let bottom = new.contentSize.height - new.containerSize.height - new.contentOffset.y
         let oldBottom = old.contentSize.height - old.containerSize.height - old.contentOffset.y
-        if top < margin, top < oldTop {
-            extend { await agenda.extendBack() }
-        } else if bottom < margin, bottom < oldBottom || new.contentSize.height != old.contentSize.height {
-            extend { await agenda.extendHorizon() }
+        if (top < margin && oldTop >= margin) || (top < oldTop - 2 && top <= 0 && oldTop >= -1) {
+            let first = dayGroups.first?.day
+            extend {
+                await agenda.extendBack()
+                regroup()
+                if let first { anchor(first) }
+            }
+        } else if (bottom < margin && oldBottom >= margin) || (bottom < oldBottom - 2 && bottom <= 0 && oldBottom >= -1) {
+            extend {
+                await agenda.extendHorizon()
+                regroup()
+            }
+        } else if new.contentSize.height <= new.containerSize.height, new.contentSize.height != old.contentSize.height {
+            extend {
+                await agenda.extendHorizon()
+                regroup()
+            }
         }
     }
 
@@ -168,7 +224,6 @@ struct AgendaScreen: View {
         extending = true
         Task {
             await work()
-            regroup()
             extending = false
         }
     }
