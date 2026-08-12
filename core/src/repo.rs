@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -100,6 +100,11 @@ const LOCAL_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 /// so a burst of writes back-pressures the writer instead of piling cloned
 /// blobs up in memory.
 const OBSERVER_QUEUE: usize = 64;
+const EVICT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const EVICT_IDLE: Duration = Duration::from_secs(300);
+/// Above this many resident docs the sweep keeps evicting oldest-first even
+/// before they reach the idle threshold.
+const MAX_RESIDENT_DOCS: usize = 48;
 
 /// Requests reaching the loopback sync server must come from the app's own
 /// webview, which loads under the custom `lushweb://` scheme. Native peers send
@@ -692,6 +697,8 @@ pub struct Repo {
     /// decoding blobs into one doc or building fragments for it does not stall
     /// reads of every other doc — which is what the UI does on every keystroke.
     docs: Mutex<HashMap<DocId, Arc<Mutex<DocState>>>>,
+    last_touched: std::sync::Mutex<HashMap<DocId, Instant>>,
+    pins: std::sync::Mutex<HashMap<DocId, u32>>,
     syncs: Mutex<HashMap<DocId, SyncSlot>>,
     pending_saves: Mutex<HashMap<DocId, PendingSave>>,
     last_server_heads: Mutex<HashMap<DocId, BTreeSet<CommitId>>>,
@@ -1563,6 +1570,8 @@ impl Repo {
             server_url,
             outbox_dir,
             docs: Mutex::new(HashMap::new()),
+            last_touched: std::sync::Mutex::new(HashMap::new()),
+            pins: std::sync::Mutex::new(HashMap::new()),
             syncs: Mutex::new(HashMap::new()),
             pending_saves: Mutex::new(HashMap::new()),
             last_server_heads: Mutex::new(HashMap::new()),
@@ -1664,6 +1673,15 @@ impl Repo {
             tokio::spawn(async move {
                 while let Some((sid, heads)) = heads_rx.recv().await {
                     repo.on_remote_heads(sid, heads).await;
+                }
+            });
+        }
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(EVICT_SWEEP_INTERVAL).await;
+                    repo.sweep_idle_docs(EVICT_IDLE).await;
                 }
             });
         }
@@ -1925,10 +1943,40 @@ impl Repo {
             return;
         }
         let id = DocId::from_sedimentree_id(sid);
+        let heads_set: BTreeSet<CommitId> = heads.iter().cloned().collect();
         if self.docs.lock().await.get(&id).is_none() {
+            // An evicted (or never-opened) doc still gets its announced changes
+            // pulled into storage. No materialization: the blobs land on disk,
+            // the stored-batch loop emits DocChanged, and whoever cares reads
+            // the doc back on demand.
+            {
+                let mut last = self.last_server_heads.lock().await;
+                if last.get(&id) == Some(&heads_set) {
+                    return;
+                }
+                last.insert(id, heads_set.clone());
+            }
+            let repo = self.clone();
+            tokio::spawn(async move {
+                let outcome = repo
+                    .core
+                    .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                    .await
+                    .map(|peers| {
+                        classify_sync(peers.values().map(|(succeeded, stats, _)| {
+                            (*succeeded, stats.total_received() > 0)
+                        }))
+                    });
+                if !matches!(outcome, Ok(SyncOutcome::Succeeded { .. })) {
+                    // Forget the heads so the server's next announcement retries.
+                    let mut last = repo.last_server_heads.lock().await;
+                    if last.get(&id) == Some(&heads_set) {
+                        last.remove(&id);
+                    }
+                }
+            });
             return;
         }
-        let heads_set: BTreeSet<CommitId> = heads.iter().cloned().collect();
         if self.last_server_heads.lock().await.get(&id) == Some(&heads_set) {
             return;
         }
@@ -2157,6 +2205,12 @@ impl Repo {
         let sid = batch.sedimentree_id;
         let (advanced, failed) = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+                // Untracked doc: the blobs are on disk but nothing in memory
+                // advanced. Announce the change anyway so the search index and
+                // sidebar re-read the doc — that read re-materializes it.
+                if count > 0 {
+                    let _ = self.events.send(RepoEvent::DocChanged(id));
+                }
                 return Ok(false);
             };
             let mut state = state.lock().await;
@@ -2371,6 +2425,7 @@ impl Repo {
         let mut doc = Automerge::new();
         catching(|| init(&mut doc))?;
         self.docs.lock().await.insert(id, DocState::shared(doc));
+        self.touch(id);
         self.ephemeral
             .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
             .await;
@@ -2503,12 +2558,39 @@ impl Repo {
 
     /// The lock for one doc, without holding the map lock while it is used.
     async fn doc_state(&self, id: DocId) -> Result<Arc<Mutex<DocState>>> {
-        self.docs
+        let state = self
+            .docs
             .lock()
             .await
             .get(&id)
             .cloned()
-            .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))
+            .ok_or_else(|| anyhow!("unknown doc {}", id.to_url()))?;
+        self.touch(id);
+        Ok(state)
+    }
+
+    fn touch(&self, id: DocId) {
+        self.last_touched.lock().unwrap().insert(id, Instant::now());
+    }
+
+    /// Keep a doc resident: a pinned doc is never swept by idle eviction.
+    /// Pins are counted, so nested opens need matching unpins.
+    pub fn pin_doc(&self, id: DocId) {
+        *self.pins.lock().unwrap().entry(id).or_insert(0) += 1;
+    }
+
+    pub fn unpin_doc(&self, id: DocId) {
+        let mut pins = self.pins.lock().unwrap();
+        if let Some(count) = pins.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pins.remove(&id);
+            }
+        }
+    }
+
+    fn is_pinned(&self, id: DocId) -> bool {
+        self.pins.lock().unwrap().contains_key(&id)
     }
 
     /// Track a doc and populate it from local storage. The fresh doc's lock is
@@ -2522,6 +2604,7 @@ impl Repo {
             }
             let state = DocState::shared(Automerge::new());
             docs.insert(id, state.clone());
+            self.touch(id);
             state.try_lock_owned().expect("fresh doc lock")
         };
         self.ephemeral
@@ -2578,12 +2661,131 @@ impl Repo {
             }
         }
         self.docs.lock().await.remove(&id);
+        self.last_touched.lock().unwrap().remove(&id);
         self.syncs.lock().await.remove(&id);
         self.last_server_heads.lock().await.remove(&id);
         self.last_synced_local_heads.lock().await.remove(&id);
         self.ephemeral
             .unsubscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
             .await;
+    }
+
+    /// Drop an idle doc's in-memory state, strictly: only when nothing is in
+    /// flight for it and its exact heads are provably rebuildable from the
+    /// sedimentree plus the outbox file. Anything doubtful skips — the doc
+    /// just stays resident until the next sweep.
+    pub async fn evict_doc(&self, id: DocId) -> bool {
+        if self.is_pinned(id)
+            || self.pending_saves.lock().await.contains_key(&id)
+            || self.deferred_applies.lock().await.contains(&id)
+            || self.deferred_sends.lock().await.contains(&id)
+        {
+            return false;
+        }
+        {
+            let syncs = self.syncs.lock().await;
+            if syncs.get(&id).is_some_and(|slot| slot.running || slot.again) {
+                return false;
+            }
+        }
+        if self.docs.lock().await.get(&id).is_none() {
+            return false;
+        }
+        if let Err(e) = self.save_doc_now(id).await {
+            tracing::warn!(doc = %id.to_url(), error = %e, "flush before evict failed");
+            if let Err(e) = self.stage_doc(id).await {
+                tracing::warn!(doc = %id.to_url(), error = %e, "staging before evict failed; keeping doc resident");
+                return false;
+            }
+        }
+        let heads = {
+            let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+                return false;
+            };
+            let heads = state.lock().await.doc.get_heads();
+            heads
+        };
+        let rebuildable = {
+            let Ok(mut rebuilt) = self.stored_doc(id).await else {
+                return false;
+            };
+            let outbox = cpu_heavy(|| std::fs::read(self.outbox_path(id)).ok());
+            if let Some(bytes) = outbox {
+                match Automerge::load(&bytes) {
+                    Ok(mut staged) => {
+                        if rebuilt.merge(&mut staged).is_err() {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+            heads
+                .iter()
+                .all(|head| rebuilt.get_change_by_hash(head).is_some())
+        };
+        if !rebuildable {
+            tracing::warn!(doc = %id.to_url(), "doc not reconstructable from disk; keeping it resident");
+            return false;
+        }
+        {
+            let mut docs = self.docs.lock().await;
+            let Some(state) = docs.get(&id).cloned() else {
+                return false;
+            };
+            let Ok(guard) = state.try_lock() else {
+                return false;
+            };
+            if guard.doc.get_heads() != heads || self.is_pinned(id) {
+                return false;
+            }
+            drop(guard);
+            docs.remove(&id);
+        }
+        self.last_touched.lock().unwrap().remove(&id);
+        self.syncs.lock().await.remove(&id);
+        self.last_server_heads.lock().await.remove(&id);
+        self.last_synced_local_heads.lock().await.remove(&id);
+        self.ephemeral
+            .unsubscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
+            .await;
+        tracing::debug!(doc = %id.to_url(), "evicted idle doc");
+        true
+    }
+
+    /// Evict every unpinned doc idle longer than `idle`, oldest first, then
+    /// keep going past the threshold while more than MAX_RESIDENT_DOCS remain.
+    /// `Duration::ZERO` is the memory-pressure sweep: everything evictable goes.
+    pub async fn sweep_idle_docs(&self, idle: Duration) -> usize {
+        let now = Instant::now();
+        let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
+        let mut candidates: Vec<(Duration, DocId)> = {
+            let touched = self.last_touched.lock().unwrap();
+            ids.into_iter()
+                .map(|id| {
+                    let age = touched
+                        .get(&id)
+                        .map_or(Duration::MAX, |t| now.duration_since(*t));
+                    (age, id)
+                })
+                .collect()
+        };
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut resident = candidates.len();
+        let mut evicted = 0;
+        for (age, id) in candidates {
+            if age < idle && resident <= MAX_RESIDENT_DOCS {
+                break;
+            }
+            if self.evict_doc(id).await {
+                evicted += 1;
+                resident -= 1;
+            }
+        }
+        if evicted > 0 {
+            tracing::info!(evicted, resident, "idle sweep");
+        }
+        evicted
     }
 
     /// Sign and fan out an opaque ephemeral payload on the doc's topic.
@@ -3343,6 +3545,328 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn connected_pair() -> (TempDir, Arc<Repo>, TempDir, Arc<Repo>) {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = Repo::start(dir_a.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        let port = a.local_server_port().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = Repo::start(
+            dir_b.path().to_path_buf(),
+            format!("ws://127.0.0.1:{port}"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(b.wait_connected(Duration::from_secs(10)).await);
+        (dir_a, a, dir_b, b)
+    }
+
+    async fn evict_when_settled(repo: &Arc<Repo>, id: DocId) {
+        timeout(Duration::from_secs(10), async {
+            while !repo.evict_doc(id).await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("doc should become evictable");
+        assert!(repo.docs.lock().await.get(&id).is_none());
+    }
+
+    /// The chain push-notification and rule evaluation hang off: a change made
+    /// on another device reaches this one while the doc is evicted. The blobs
+    /// land in storage over a real loopback sync, DocChanged fires with nothing
+    /// resident, and reading the doc rebuilds it with the new content.
+    #[tokio::test]
+    async fn remote_changes_wake_an_evicted_doc_end_to_end() {
+        let (_da, a, _db, b) = connected_pair().await;
+        let id = a
+            .create_doc(|doc| {
+                put(doc, "value", "first");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        b.ensure_doc(id).await.unwrap();
+        assert!(b.wait_for_doc(id, Duration::from_secs(10)).await);
+        evict_when_settled(&b, id).await;
+
+        let mut events = b.subscribe();
+        a.change_doc(id, |doc| {
+            put(doc, "remote", "waiting");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = a.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        // The announcement a sync server would push for a doc b no longer
+        // tracks: b must pull the blobs into storage without materializing.
+        let announced: Vec<CommitId> = expected.iter().map(|h| CommitId::new(h.0)).collect();
+        b.on_remote_heads(id.sedimentree_id(), announced).await;
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    RepoEvent::DocChanged(changed) if changed == id => {
+                        let (heads, has_remote) = b
+                            .read_doc(id, |doc| {
+                                Ok((doc.get_heads(), doc.get(ROOT, "remote")?.is_some()))
+                            })
+                            .await
+                            .unwrap();
+                        if has_remote {
+                            assert_eq!(heads, expected);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("evicted doc should wake on a remote change");
+    }
+
+    /// Same chain without the network: blobs stored for an untracked doc emit
+    /// DocChanged so the index and sidebar re-read, and the read rebuilds the
+    /// doc with the stored content.
+    #[tokio::test]
+    async fn stored_blobs_for_an_untracked_doc_emit_doc_changed() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "first");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut remote = repo.read_doc(id, |doc| Ok(doc.fork())).await.unwrap();
+        remote.set_actor(ActorId::from([21; 16].as_slice()));
+        put(&mut remote, "remote", "arrived");
+        let expected = remote.get_heads();
+        evict_when_settled(&repo, id).await;
+
+        let mut events = repo.subscribe();
+        let ingested = ingest(
+            &remote,
+            id.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+        repo.core
+            .store_built_batch(id.sedimentree_id(), ingested.commits, ingested.fragments)
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    RepoEvent::DocChanged(changed) if changed == id => {
+                        let (heads, has_remote) = repo
+                            .read_doc(id, |doc| {
+                                Ok((doc.get_heads(), doc.get(ROOT, "remote")?.is_some()))
+                            })
+                            .await
+                            .unwrap();
+                        if has_remote {
+                            assert_eq!(heads, expected);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("stored blobs for an untracked doc should announce themselves");
+    }
+
+    #[tokio::test]
+    async fn evicted_docs_reopen_with_the_same_heads() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.change_doc(id, |doc| {
+            put(doc, "second", "also saved");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+
+        evict_when_settled(&repo, id).await;
+        let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
+    }
+
+    #[tokio::test]
+    async fn eviction_skips_a_pending_deferred_save_then_keeps_the_edit() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_save(id, heads, |doc| {
+            put(doc, "second", "deferred");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+
+        assert!(!repo.evict_doc(id).await);
+        assert!(repo.docs.lock().await.get(&id).is_some());
+
+        evict_when_settled(&repo, id).await;
+        let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
+    }
+
+    #[tokio::test]
+    async fn pinned_docs_are_never_swept() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "pinned");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.pin_doc(id);
+        repo.pin_doc(id);
+        repo.sweep_idle_docs(Duration::ZERO).await;
+        assert!(repo.docs.lock().await.get(&id).is_some());
+
+        repo.unpin_doc(id);
+        repo.sweep_idle_docs(Duration::ZERO).await;
+        assert!(
+            repo.docs.lock().await.get(&id).is_some(),
+            "one of two pins released should still hold the doc"
+        );
+
+        repo.unpin_doc(id);
+        timeout(Duration::from_secs(10), async {
+            loop {
+                repo.sweep_idle_docs(Duration::ZERO).await;
+                if repo.docs.lock().await.get(&id).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("unpinned doc should be swept");
+    }
+
+    #[tokio::test]
+    async fn moon_deferred_docs_are_never_swept() {
+        let (_dir, repo) = test_repo().await;
+        let sending = repo
+            .create_doc(|doc| {
+                put(doc, "value", "before");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let applying = repo
+            .create_doc(|doc| {
+                put(doc, "value", "before");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        repo.set_send_changes(false).await;
+        repo.change_doc(sending, |doc| {
+            put(doc, "value", "after");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(repo.deferred_sends.lock().await.contains(&sending));
+
+        repo.set_apply_incoming(false).await;
+        let mut remote = repo
+            .read_doc(applying, |doc| Ok(doc.fork()))
+            .await
+            .unwrap();
+        remote.set_actor(ActorId::from([22; 16].as_slice()));
+        put(&mut remote, "remote", "waiting");
+        let ingested = ingest(
+            &remote,
+            applying.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+        repo.core
+            .store_built_batch(
+                applying.sedimentree_id(),
+                ingested.commits,
+                ingested.fragments,
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !repo.deferred_applies.lock().await.contains(&applying) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        repo.sweep_idle_docs(Duration::ZERO).await;
+        assert!(repo.docs.lock().await.get(&sending).is_some());
+        assert!(repo.docs.lock().await.get(&applying).is_some());
+    }
+
+    #[tokio::test]
+    async fn sweep_only_takes_idle_docs_unless_over_the_resident_cap() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "fresh");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(repo.sweep_idle_docs(EVICT_IDLE).await, 0);
+        assert!(repo.docs.lock().await.get(&id).is_some());
+
+        for n in 0..MAX_RESIDENT_DOCS + 5 {
+            repo.create_doc(|doc| {
+                put(doc, "n", n as i64);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        }
+        timeout(Duration::from_secs(20), async {
+            loop {
+                repo.sweep_idle_docs(EVICT_IDLE).await;
+                if repo.docs.lock().await.len() <= MAX_RESIDENT_DOCS {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("sweep should trim residents down to the cap");
     }
 
     #[tokio::test]
