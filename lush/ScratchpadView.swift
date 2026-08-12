@@ -840,7 +840,7 @@ private struct PadCardView: View {
 
     private var picture: some View {
         Group {
-            if let image = store.cache.images[item.data] {
+            if let image = store.cache.displayImage(for: item.data) ?? store.cache.images[item.data] {
                 #if os(macOS)
                 Image(nsImage: image).resizable()
                 #else

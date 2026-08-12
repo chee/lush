@@ -495,7 +495,6 @@ final class BlockBox: NSObject {
 @MainActor
 final class AssetCache {
     var images: [String: PImage] = [:]
-    var displayImages: [String: PImage] = [:]
     var names: [String: String] = [:]
     var fileURLs: [String: URL] = [:]
     var videoThumbs: [String: PImage] = [:]
@@ -507,9 +506,34 @@ final class AssetCache {
     static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
     static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
 
+    private static let displayImages: NSCache<NSString, PImage> = {
+        let cache = NSCache<NSString, PImage>()
+        cache.totalCostLimit = 384 << 20
+        return cache
+    }()
+
+    func displayImage(for url: String) -> PImage? {
+        Self.displayImages.object(forKey: url as NSString)
+    }
+
     @discardableResult
     func storeImage(_ data: Data, for url: String) -> PImage? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard let image = PImage(data: data) else { return nil }
+        images[url] = image
+        let key = url as NSString
+        if Self.displayImages.object(forKey: key) == nil,
+           let display = Self.decodeDisplay(data) {
+            Self.displayImages.setObject(display.image, forKey: key, cost: display.cost)
+        }
+        return image
+    }
+
+    private static func decodeDisplay(_ data: Data) -> (image: PImage, cost: Int)? {
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithData(
+            data as CFData,
+            sourceOptions as CFDictionary
+        ) else { return nil }
         #if os(macOS)
         let scale: CGFloat = 2
         #else
@@ -531,9 +555,7 @@ final class AssetCache {
         #else
         let image = UIImage(cgImage: thumbnail, scale: scale, orientation: .up)
         #endif
-        images[url] = image
-        displayImages[url] = image
-        return image
+        return (image, thumbnail.bytesPerRow * thumbnail.height)
     }
 
     static func kind(forName name: String) -> String {
@@ -1471,7 +1493,7 @@ enum RichText {
         } else if let url, let image = cache.images[url] {
             let size = Self.fitted(image.size)
             attachment = imageBox(
-                cache.displayImages[url] ?? image,
+                cache.displayImage(for: url) ?? image,
                 bounds: CGRect(origin: .zero, size: size),
                 ideal: size
             )
