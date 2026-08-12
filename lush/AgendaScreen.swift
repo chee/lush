@@ -11,7 +11,10 @@ struct AgendaScreen: View {
     @State private var dayGroups: [DayGroup] = []
     @State private var highlighted: String?
     @State private var highlightTask: Task<Void, Never>?
-    @State private var position = ScrollPosition(id: Calendar.current.startOfDay(for: Date()), anchor: .top)
+    @State private var position = ScrollPosition(
+        id: AgendaStore.shared.restoreDay ?? Calendar.current.startOfDay(for: Date()),
+        anchor: .top
+    )
     @State private var settled = false
     @State private var extending = false
 
@@ -73,10 +76,6 @@ struct AgendaScreen: View {
                             row(entry.item)
                         }
                     }
-                    // The last day to come into view is where she was; a lazy
-                    // stack only builds them as they arrive, which is the
-                    // signal.
-                    .onAppear { agenda.restoreDay = group.day }
                 }
             }
             .scrollTargetLayout()
@@ -98,11 +97,12 @@ struct AgendaScreen: View {
         .onChange(of: agenda.focusDay, initial: true) { focusChanged() }
     }
 
-    /// Opens anchored on today, with yesterday loaded above for the scroll
-    /// up. The position is seeded with today before anything renders and
-    /// asserted again in the update the first day groups land — the binding
-    /// resolves a day id through the target layout without the day having to
-    /// be built, so there is no race against lazy layout.
+    /// Opens anchored on today — or, coming back, on the day she left at,
+    /// which the store remembers along with the loaded window. The position
+    /// is seeded before anything renders and asserted again in the update the
+    /// first day groups land — the binding resolves a day id through the
+    /// target layout without the day having to be built, so there is no race
+    /// against lazy layout.
     private func settle() {
         guard !settled, !dayGroups.isEmpty else { return }
         settled = true
@@ -140,6 +140,12 @@ struct AgendaScreen: View {
     /// extends when new content still doesn't fill the viewport.
     private func slide(from old: ScrollGeometry, to new: ScrollGeometry) {
         guard settled, !extending, !dayGroups.isEmpty else { return }
+        // The day at the top of the viewport, straight from the position
+        // binding, is where she is — kept in the store so leaving and coming
+        // back returns here rather than to today.
+        if let day = position.viewID(type: Date.self) {
+            agenda.restoreDay = day
+        }
         let margin = new.containerSize.height * 2
         let top = new.contentOffset.y + new.contentInsets.top
         let oldTop = old.contentOffset.y + old.contentInsets.top
