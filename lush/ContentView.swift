@@ -441,16 +441,6 @@ struct ContentView: View {
                 }
             }
         }
-        .overlay(alignment: .bottomTrailing) {
-            if model.focusModeEnabled {
-                FocusModeControl(model: model)
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.circle)
-                    .tint(.purple)
-                    .padding()
-            }
-        }
         .onOpenURL { url in
             if url.scheme == "lush" || url.scheme == "automerge" {
                 router.handle(url)
@@ -2685,10 +2675,8 @@ struct FolderScreen: View {
                         Label("Settings", systemImage: "gearshape")
                     }
                 }
-                if !model.focusModeEnabled {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        FocusModeControl(model: model)
-                    }
+                ToolbarItem(placement: .topBarTrailing) {
+                    FocusModeControl(model: model)
                 }
             }
             ToolbarItem {
@@ -4250,10 +4238,8 @@ struct NoteDetail: View {
             }
             .disabled(editor.undoManager?.canRedo != true && !model.undoManager.canRedo)
         }
-        if !model.focusModeEnabled {
-            ToolbarItem(placement: .primaryAction) {
-                FocusModeControl(model: model)
-            }
+        ToolbarItem(placement: .primaryAction) {
+            FocusModeControl(model: model)
         }
         ToolbarItem(placement: .primaryAction) {
             Button {
@@ -4601,86 +4587,28 @@ struct NoteDetail: View {
 
 private struct FocusModeControl: View {
     @Bindable var model: NotesModel
-    @State private var showingOptions = false
 
     private var engaged: Bool {
-        model.focusModeEnabled || !model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence
+        !model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence
     }
 
     var body: some View {
-        HStack(spacing: 2) {
-            Button {
-                model.setFocusMode(!model.focusModeEnabled)
-            } label: {
-                Label {
-                    Text("Moon Mode")
-                } icon: {
-                    if model.focusModeEnabled {
-                        Image(systemName: "moon.fill")
-                            .foregroundStyle(Color.purple)
-                    } else {
-                        Image(systemName: "moon")
-                            .overlay {
-                                if engaged {
-                                    Image(systemName: "moon.fill")
-                                        .foregroundStyle(Color.purple)
-                                        .mask(alignment: .leading) {
-                                            Rectangle().scaleEffect(x: 0.5, anchor: .leading)
-                                        }
-                                }
-                            }
-                    }
-                }
-                .overlay {
-                    if engaged {
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .strokeBorder(Color.purple.opacity(0.6), lineWidth: 1)
-                            .padding(-4)
-                    }
+        Button {
+            model.setFocusMode(!engaged)
+        } label: {
+            Label {
+                Text("Moon Mode")
+            } icon: {
+                if engaged {
+                    Image(systemName: "moon.fill")
+                        .foregroundStyle(Color.purple)
+                } else {
+                    Image(systemName: "moon")
                 }
             }
-            .disabled(model.changingIncomingChanges || model.changingSendingChanges)
-            .help(model.focusModeEnabled ? "Leave Moon Mode" : "Enter Moon Mode")
-            Button {
-                showingOptions = true
-            } label: {
-                Label("Moon Mode Options", systemImage: "chevron.down")
-                    .imageScale(.small)
-            }
-            .help("Moon Mode Options")
-            .popover(isPresented: $showingOptions, arrowEdge: .bottom) {
-                FocusModeOptions(model: model)
-            }
         }
-    }
-}
-
-private struct FocusModeOptions: View {
-    @Bindable var model: NotesModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle("Apply incoming changes", isOn: Binding(
-                get: { model.applyingIncomingChanges },
-                set: model.setApplyingIncomingChanges
-            ))
-            .disabled(model.changingIncomingChanges)
-            Toggle("Send my changes", isOn: Binding(
-                get: { model.sendingChanges },
-                set: model.setSendingChanges
-            ))
-            .disabled(model.changingSendingChanges)
-            Toggle("Share presence", isOn: Binding(
-                get: { model.sharingPresence },
-                set: model.setSharingPresence
-            ))
-        }
-        .toggleStyle(.switch)
-        .padding(10)
-        .frame(width: 220)
-        #if os(iOS)
-        .presentationCompactAdaptation(.popover)
-        #endif
+        .disabled(model.changingIncomingChanges || model.changingSendingChanges)
+        .help(engaged ? "Leave Moon Mode" : "Enter Moon Mode")
     }
 }
 
