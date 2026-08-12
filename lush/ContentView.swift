@@ -5059,7 +5059,7 @@ enum SidebarDrag {
     static func ended() {
         kind = nil
         payload = nil
-        SidebarDropHighlight.shared.clear()
+        SidebarDropHighlight.shared.dropCompleted()
     }
 }
 
@@ -5078,16 +5078,36 @@ final class SidebarDropHighlight {
 
     private var row: String?
     private var mark: DropMark?
+    private var sweep: Task<Void, Never>?
 
     func show(_ row: String, _ mark: DropMark) {
         self.row = row
         self.mark = mark
+        armSweep(after: .seconds(4))
     }
 
     func clear(_ row: String? = nil) {
         guard row == nil || row == self.row else { return }
         self.row = nil
         self.mark = nil
+        sweep?.cancel()
+        sweep = nil
+    }
+
+    func dropCompleted() {
+        clear()
+        armSweep(after: .milliseconds(250))
+    }
+
+    private func armSweep(after delay: Duration) {
+        sweep?.cancel()
+        sweep = Task {
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            row = nil
+            mark = nil
+            sweep = nil
+        }
     }
 
     func mark(for row: String) -> DropMark? {
@@ -5201,7 +5221,7 @@ private struct SidebarReorderDrop: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         let after = landing(info) == .after
         if isFileDrop(info) {
-            SidebarDropHighlight.shared.clear()
+            SidebarDropHighlight.shared.dropCompleted()
             let fileHandle = fileHandle
             loadFileURLs(info.itemProviders(for: [UTType.fileURL.identifier])) { fileHandle($0, after) }
             return true
@@ -5241,6 +5261,7 @@ struct SidebarDropCleanup: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         let providers = info.itemProviders(for: [UTType.fileURL.identifier])
         if !providers.isEmpty {
+            SidebarDropHighlight.shared.dropCompleted()
             loadFileURLs(providers) { model.prepareFileImport($0, into: folderUrl) }
             return true
         }
@@ -5421,7 +5442,7 @@ private struct FolderDrop: DropDelegate {
     func performDrop(info: DropInfo) -> Bool {
         let providers = info.itemProviders(for: [UTType.fileURL.identifier])
         if !providers.isEmpty {
-            SidebarDropHighlight.shared.clear()
+            SidebarDropHighlight.shared.dropCompleted()
             loadFileURLs(providers) { model.prepareFileImport($0, into: node.url) }
             return true
         }
