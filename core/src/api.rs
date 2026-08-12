@@ -442,8 +442,17 @@ fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<Index
 /// runtime workers waiting for it.
 async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
     let url = id.to_url();
+    let known_created = {
+        let index = index.clone();
+        let url = url.clone();
+        tokio::task::spawn_blocking(move || index.stored_created(&url))
+            .await
+            .unwrap_or(None)
+    };
     let indexed = match repo
-        .read_doc(id, |doc| Ok(search::indexed_doc(url.clone(), doc)))
+        .read_doc(id, |doc| {
+            Ok(search::indexed_doc(url.clone(), doc, known_created))
+        })
         .await
     {
         Ok(doc) => doc,
@@ -607,7 +616,7 @@ impl Core {
         self.runtime
             .block_on(
                 self.repo
-                    .read_doc(id, |doc| Ok(doc.get_changes(&[]).len() as u32)),
+                    .read_doc(id, |doc| Ok(doc.get_changes_meta(&[]).len() as u32)),
             )
             .unwrap_or(0)
     }

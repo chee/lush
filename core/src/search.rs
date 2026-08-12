@@ -225,6 +225,22 @@ impl SearchIndex {
         })
     }
 
+    /// The `created` already stored for a doc, if any. Creation time is
+    /// immutable, so a nonzero stored value spares the indexer walking the
+    /// doc's whole change history again.
+    pub fn stored_created(&self, url: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT created FROM search_docs WHERE url = ?1",
+            params![url],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|created| *created > 0)
+    }
+
     pub fn upsert(&self, doc: IndexedDoc) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         if !doc.heads.is_empty() {
@@ -654,7 +670,11 @@ impl SearchIndex {
     }
 }
 
-pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
+pub fn indexed_doc(
+    url: String,
+    doc: &automerge::Automerge,
+    known_created: Option<i64>,
+) -> IndexedDoc {
     let kind = shapes::doc_kind(doc);
     let title = shapes::doc_title(doc);
     let body = match kind.as_str() {
@@ -677,7 +697,9 @@ pub fn indexed_doc(url: String, doc: &automerge::Automerge) -> IndexedDoc {
         body,
         links,
         modified: shapes::doc_modified(doc),
-        created: shapes::doc_created(doc),
+        created: known_created
+            .filter(|stamp| *stamp > 0)
+            .unwrap_or_else(|| shapes::doc_created(doc)),
         has_vision,
         tags: shapes::doc_tags(doc),
         weather: shapes::context_values(doc, "weather"),
@@ -985,6 +1007,38 @@ mod tests {
             urls(index.search("cake", &SearchFilter::default()).unwrap()),
             ["note"]
         );
+    }
+
+    #[test]
+    fn stored_created_returns_only_nonzero_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "lush-search-created-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let index = SearchIndex::open(&dir).unwrap();
+        assert_eq!(index.stored_created("missing"), None);
+        index.upsert(indexed("dateless", "cake", &[], "")).unwrap();
+        assert_eq!(index.stored_created("dateless"), None);
+        let mut doc = indexed("note", "cake", &[], "");
+        doc.created = 123;
+        index.upsert(doc).unwrap();
+        assert_eq!(index.stored_created("note"), Some(123));
+    }
+
+    #[test]
+    fn indexed_doc_reuses_a_known_created() {
+        use automerge::transaction::{CommitOptions, Transactable};
+        let mut doc = automerge::Automerge::new();
+        doc.transact_with(
+            |_| CommitOptions::default().with_time(111),
+            |t| t.put(automerge::ROOT, "title", "hi"),
+        )
+        .unwrap();
+        assert_eq!(indexed_doc("u".into(), &doc, None).created, 111);
+        assert_eq!(indexed_doc("u".into(), &doc, Some(42)).created, 42);
+        assert_eq!(indexed_doc("u".into(), &doc, Some(0)).created, 111);
     }
 
     #[test]

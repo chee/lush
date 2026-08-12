@@ -1037,11 +1037,11 @@ pub fn doc_modified(doc: &Automerge) -> i64 {
 
 /// Unix seconds of the first change. A doc with no timestamped history — an
 /// import that carries none — reports 0, which reads as "unknown" rather than
-/// as 1970.
+/// as 1970. Reads change metadata only, so no op history is materialized.
 pub fn doc_created(doc: &Automerge) -> i64 {
-    doc.get_changes(&[])
+    doc.get_changes_meta(&[])
         .into_iter()
-        .map(|change| change.timestamp())
+        .map(|change| change.timestamp)
         .find(|stamp| *stamp > 0)
         .unwrap_or(0)
 }
@@ -1878,6 +1878,23 @@ mod tests {
             doc.get(obj, key).unwrap(),
             Some((automerge::Value::Object(ObjType::Text), _))
         )
+    }
+
+    #[test]
+    fn created_is_first_timestamp_and_modified_is_last() {
+        let mut doc = Automerge::new();
+        doc.transact_with(
+            |_| CommitOptions::default().with_time(111),
+            |t| t.put(ROOT, "a", 1),
+        )
+        .unwrap();
+        doc.transact_with(
+            |_| CommitOptions::default().with_time(222),
+            |t| t.put(ROOT, "a", 2),
+        )
+        .unwrap();
+        assert_eq!(doc_created(&doc), 111);
+        assert_eq!(doc_modified(&doc), 222);
     }
 
     #[test]
