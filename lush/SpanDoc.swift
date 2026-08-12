@@ -399,6 +399,11 @@ final class TableBox: NSObject {
 /// (belt and braces — TextKit caches attachment metrics aggressively).
 final class FittingImageAttachment: NSTextAttachment {
     var idealSize: CGSize = .zero
+    /// Set for asset-backed images: `image` starts as the compressed-backed
+    /// original and the bounded display bitmap is decoded on demand, the first
+    /// time layout asks for this attachment.
+    var assetUrl: String?
+    var assetCache: AssetCache?
 
     private func fitted(to lineFrag: CGRect, padding: CGFloat) -> CGRect {
         var size = bounds.size
@@ -408,6 +413,27 @@ final class FittingImageAttachment: NSTextAttachment {
             size = CGSize(width: available, height: size.height * scale)
         }
         return CGRect(origin: bounds.origin, size: size)
+    }
+
+    /// The decoded bitmap matches the compressed original's aspect and the
+    /// bounds are already set, so landing a decode never moves layout — the
+    /// refresh only redraws the attachment's fragment.
+    private func resolveDisplayImage(refresh: @escaping @MainActor () -> Void) -> PImage? {
+        var resolved = image
+        guard let url = assetUrl else { return resolved }
+        MainActor.assumeIsolated {
+            guard let cache = assetCache else { return }
+            if let display = cache.displayImage(for: url) {
+                resolved = display
+                return
+            }
+            cache.ensureDisplayImage(for: url) { [weak self] display in
+                guard let self, let display else { return }
+                self.image = display
+                refresh()
+            }
+        }
+        return resolved
     }
 
     override func attachmentBounds(
@@ -427,6 +453,49 @@ final class FittingImageAttachment: NSTextAttachment {
         position: CGPoint
     ) -> CGRect {
         fitted(to: proposedLineFragment, padding: textContainer?.lineFragmentPadding ?? 5)
+    }
+
+    override func image(
+        forBounds imageBounds: CGRect,
+        textContainer: NSTextContainer?,
+        characterIndex charIndex: Int
+    ) -> PImage? {
+        guard assetUrl != nil else {
+            return super.image(
+                forBounds: imageBounds,
+                textContainer: textContainer,
+                characterIndex: charIndex
+            )
+        }
+        return resolveDisplayImage { [weak textContainer] in
+            textContainer?.layoutManager?.invalidateDisplay(
+                forCharacterRange: NSRange(location: charIndex, length: 1)
+            )
+        }
+    }
+
+    override func image(
+        for bounds: CGRect,
+        attributes: [NSAttributedString.Key: Any],
+        location: NSTextLocation,
+        textContainer: NSTextContainer?
+    ) -> PImage? {
+        guard assetUrl != nil else {
+            return super.image(
+                for: bounds,
+                attributes: attributes,
+                location: location,
+                textContainer: textContainer
+            )
+        }
+        return resolveDisplayImage { [weak textContainer] in
+            guard let layoutManager = textContainer?.textLayoutManager,
+                  let contentManager = layoutManager.textContentManager,
+                  let end = contentManager.location(location, offsetBy: 1),
+                  let range = NSTextRange(location: location, end: end)
+            else { return }
+            layoutManager.invalidateLayout(for: range)
+        }
     }
 }
 
@@ -495,6 +564,7 @@ final class BlockBox: NSObject {
 @MainActor
 final class AssetCache {
     var images: [String: PImage] = [:]
+    var imageData: [String: Data] = [:]
     var names: [String: String] = [:]
     var fileURLs: [String: URL] = [:]
     var videoThumbs: [String: PImage] = [:]
@@ -512,6 +582,8 @@ final class AssetCache {
         return cache
     }()
 
+    private static var decodesInFlight: [String: [@MainActor (PImage?) -> Void]] = [:]
+
     func displayImage(for url: String) -> PImage? {
         Self.displayImages.object(forKey: url as NSString)
     }
@@ -520,15 +592,56 @@ final class AssetCache {
     func storeImage(_ data: Data, for url: String) -> PImage? {
         guard let image = PImage(data: data) else { return nil }
         images[url] = image
-        let key = url as NSString
-        if Self.displayImages.object(forKey: key) == nil,
-           let display = Self.decodeDisplay(data) {
-            Self.displayImages.setObject(display.image, forKey: key, cost: display.cost)
-        }
+        imageData[url] = data
         return image
     }
 
-    private static func decodeDisplay(_ data: Data) -> (image: PImage, cost: Int)? {
+    /// Decode the bounded display bitmap off the main thread, once per url no
+    /// matter how many fragments ask while it's in flight. `onReady` runs on
+    /// the main actor with nil when there's nothing to decode.
+    func ensureDisplayImage(for url: String, onReady: @escaping @MainActor (PImage?) -> Void) {
+        if let display = displayImage(for: url) {
+            onReady(display)
+            return
+        }
+        guard let data = imageData[url] else {
+            onReady(nil)
+            return
+        }
+        if Self.decodesInFlight[url] != nil {
+            Self.decodesInFlight[url]?.append(onReady)
+            return
+        }
+        Self.decodesInFlight[url] = [onReady]
+        Task.detached(priority: .userInitiated) {
+            let display = Self.decodeDisplay(data)
+            await MainActor.run { [weak self] in
+                if let display {
+                    Self.displayImages.setObject(
+                        display.image,
+                        forKey: url as NSString,
+                        cost: display.cost
+                    )
+                    #if os(macOS)
+                    // drop any full-size rep the compressed-backed original
+                    // cached while it stood in for the thumbnail
+                    self?.images[url]?.recache()
+                    #endif
+                }
+                for waiter in Self.decodesInFlight.removeValue(forKey: url) ?? [] {
+                    waiter(display?.image)
+                }
+            }
+        }
+    }
+
+    func displayImage(ensureFor url: String) async -> PImage? {
+        await withCheckedContinuation { continuation in
+            ensureDisplayImage(for: url) { continuation.resume(returning: $0) }
+        }
+    }
+
+    nonisolated private static func decodeDisplay(_ data: Data) -> (image: PImage, cost: Int)? {
         let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let source = CGImageSourceCreateWithData(
             data as CFData,
@@ -1492,11 +1605,14 @@ enum RichText {
             attachment = liveBox(width: 460, height: 300)
         } else if let url, let image = cache.images[url] {
             let size = Self.fitted(image.size)
-            attachment = imageBox(
+            let fitting = imageBox(
                 cache.displayImage(for: url) ?? image,
                 bounds: CGRect(origin: .zero, size: size),
                 ideal: size
             )
+            fitting.assetUrl = url
+            fitting.assetCache = cache
+            attachment = fitting
         } else if let url, let thumbnail = cache.videoThumbs[url] {
             // the live VideoInlineView plays in place of the poster
             let size = Self.fitted(thumbnail.size)

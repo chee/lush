@@ -684,6 +684,7 @@ private struct PadCardView: View {
     @State private var resize: CGSize = .zero
     @State private var editing = false
     @State private var attributed = NSAttributedString()
+    @State private var display: PImage?
 
     private var store: PadStore { model.pads }
 
@@ -840,7 +841,7 @@ private struct PadCardView: View {
 
     private var picture: some View {
         Group {
-            if let image = store.cache.displayImage(for: item.data) ?? store.cache.images[item.data] {
+            if let image = store.cache.displayImage(for: item.data) ?? display {
                 #if os(macOS)
                 Image(nsImage: image).resizable()
                 #else
@@ -854,6 +855,10 @@ private struct PadCardView: View {
         }
         .scaledToFit()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task(id: "\(item.data)#\(store.version)") {
+            display = await store.cache.displayImage(ensureFor: item.data)
+                ?? store.cache.images[item.data]
+        }
     }
 
     private var text: some View {
