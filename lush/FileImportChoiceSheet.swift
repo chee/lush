@@ -4,6 +4,7 @@ struct FileImportRequest: Identifiable {
     let id = UUID()
     let urls: [URL]
     let folderUrl: String?
+    var place: (@MainActor ([String]) -> Void)? = nil
 }
 
 struct FileImportChoiceSheet: View {
@@ -47,7 +48,12 @@ struct FileImportChoiceSheet: View {
     }
 
     private func finish(asNotes: Bool) {
-        Task { await model.importFiles(request.urls, into: request.folderUrl, asNotes: asNotes) }
+        let request = request
+        let model = model
+        Task {
+            let imported = await model.importFiles(request.urls, into: request.folderUrl, asNotes: asNotes)
+            request.place?(imported)
+        }
         dismiss()
     }
 }

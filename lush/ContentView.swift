@@ -742,7 +742,7 @@ struct ContentView: View {
                 }
                 Color.clear
                     .frame(height: 28)
-                    .modifier(SectionTailDrop(order: $sectionOrder))
+                    .modifier(SectionTailDrop(order: $sectionOrder, model: model))
                     .listRowInsets(sidebarRowInsets(depth: 0))
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -5103,6 +5103,7 @@ private struct SidebarReorderTarget: ViewModifier {
     var pinnedMark: DropMark?
     var movesLive = true
     var liveHandle: (@MainActor @Sendable (String, Bool) -> Void)?
+    var fileHandle: (@MainActor @Sendable ([URL], Bool) -> Void)?
     let handle: @MainActor @Sendable (String, Bool) -> Void
 
     @State private var height: CGFloat = 0
@@ -5118,7 +5119,9 @@ private struct SidebarReorderTarget: ViewModifier {
                 }
             }
             .onDrop(
-                of: [UTType.plainText.identifier],
+                of: fileHandle == nil
+                    ? [UTType.plainText.identifier]
+                    : [UTType.plainText.identifier, UTType.fileURL.identifier],
                 delegate: SidebarReorderDrop(
                     row: row,
                     kind: kind,
@@ -5129,6 +5132,8 @@ private struct SidebarReorderTarget: ViewModifier {
                     liveHandle: { payload, after in
                         liveHandle?(payload, after)
                     },
+                    hasFileHandle: fileHandle != nil,
+                    fileHandle: { urls, after in fileHandle?(urls, after) },
                     handle: { payload, after in handle(payload, after) }
                 )
             )
@@ -5144,10 +5149,16 @@ private struct SidebarReorderDrop: DropDelegate {
     let movesLive: Bool
     let hasLiveHandle: Bool
     let liveHandle: @MainActor @Sendable (String, Bool) -> Void
+    let hasFileHandle: Bool
+    let fileHandle: @MainActor @Sendable ([URL], Bool) -> Void
     let handle: @MainActor @Sendable (String, Bool) -> Void
 
     private func landing(_ info: DropInfo) -> DropMark {
         pinnedMark ?? (info.location.y > height / 2 ? .after : .before)
+    }
+
+    private func isFileDrop(_ info: DropInfo) -> Bool {
+        hasFileHandle && info.hasItemsConforming(to: [UTType.fileURL.identifier])
     }
 
     private func moveLive(_ info: DropInfo) {
@@ -5162,7 +5173,8 @@ private struct SidebarReorderDrop: DropDelegate {
     }
 
     func validateDrop(info: DropInfo) -> Bool {
-        SidebarDrag.kind == kind && info.hasItemsConforming(to: [UTType.plainText.identifier])
+        if isFileDrop(info) { return true }
+        return SidebarDrag.kind == kind && info.hasItemsConforming(to: [UTType.plainText.identifier])
     }
 
     func dropEntered(info: DropInfo) {
@@ -5183,11 +5195,17 @@ private struct SidebarReorderDrop: DropDelegate {
         let previous = SidebarDropHighlight.shared.mark(for: row)
         SidebarDropHighlight.shared.show(row, landed)
         if previous != landed { moveLive(info) }
-        return DropProposal(operation: .move)
+        return DropProposal(operation: isFileDrop(info) ? .copy : .move)
     }
 
     func performDrop(info: DropInfo) -> Bool {
         let after = landing(info) == .after
+        if isFileDrop(info) {
+            SidebarDropHighlight.shared.clear()
+            let fileHandle = fileHandle
+            loadFileURLs(info.itemProviders(for: [UTType.fileURL.identifier])) { fileHandle($0, after) }
+            return true
+        }
         SidebarDrag.ended()
         guard let provider = info.itemProviders(for: [UTType.plainText.identifier]).first else {
             return false
@@ -5259,10 +5277,16 @@ private struct SectionDragReorder: ViewModifier {
 
 private struct SectionTailDrop: ViewModifier {
     @Binding var order: [SidebarSection]
+    let model: NotesModel
 
     func body(content: Content) -> some View {
         content.modifier(
-            SidebarReorderTarget(row: "section:tail", kind: .section, pinnedMark: .before) { payload, _ in
+            SidebarReorderTarget(
+                row: "section:tail",
+                kind: .section,
+                pinnedMark: .before,
+                fileHandle: { urls, _ in model.prepareFileImport(urls, into: model.folderUrl) }
+            ) { payload, _ in
                 guard let dragged = SidebarSection(rawValue: payload), order.last != dragged else { return }
                 var next = order
                 next.removeAll { $0 == dragged }
@@ -5435,6 +5459,13 @@ private struct NoteReorderDropTarget: ViewModifier {
                     where model.node(for: url)?.parentUrl == node.parentUrl {
                         model.reorderChild(url, adjacentTo: node.url, after: after)
                     }
+                },
+                fileHandle: { urls, after in
+                    let folderUrl = node.parentUrl
+                    importDroppedFiles(urls, model: model, into: folderUrl) { imported in
+                        guard let folderUrl else { return }
+                        placeImported(imported, model: model, in: folderUrl, adjacentTo: node.url, after: after)
+                    }
                 }
             ) { payload, after in
                 for url in payload.components(separatedBy: "\n") where url.hasPrefix("automerge:") {
@@ -5447,6 +5478,39 @@ private struct NoteReorderDropTarget: ViewModifier {
             }
         )
     }
+}
+
+@MainActor
+private func importDroppedFiles(
+    _ urls: [URL],
+    model: NotesModel,
+    into folderUrl: String?,
+    place: @escaping @MainActor ([String]) -> Void
+) {
+    guard !urls.isEmpty else { return }
+    if urls.contains(where: NotesModel.canImportAsNote) {
+        model.fileImportRequest = FileImportRequest(urls: urls, folderUrl: folderUrl, place: place)
+    } else {
+        Task { place(await model.importFiles(urls, into: folderUrl, asNotes: false)) }
+    }
+}
+
+@MainActor
+private func placeImported(
+    _ imported: [String],
+    model: NotesModel,
+    in folderUrl: String,
+    adjacentTo target: String,
+    after: Bool
+) {
+    guard !imported.isEmpty else { return }
+    var order = model.orderedChildren(model.node(for: folderUrl)?.children ?? [], in: folderUrl)
+        .filter { $0.kind != "folder" }
+        .map(\.url)
+    order.removeAll { imported.contains($0) }
+    let index = order.firstIndex(of: target).map { after ? $0 + 1 : $0 } ?? order.count
+    order.insert(contentsOf: imported, at: index)
+    model.childOrder[folderUrl] = order
 }
 
 private func loadPayload(_ provider: NSItemProvider, handle: @escaping @MainActor (String) -> Void) {
