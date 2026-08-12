@@ -677,28 +677,31 @@ struct ContentView: View {
 
     @ViewBuilder
     private func mobileDestination(_ route: NavRoute) -> some View {
-        switch route {
-        case .folder(let url):
-            FolderScreen(folderUrl: url, push: openMobile)
-        case .note(let url):
-            NoteDetail(noteUrl: model.resolvedNoteUrl(url))
-                .onAppear { model.selectedNoteUrl = url }
-        case .patchwork(let url):
-            PatchworkDetail(docUrl: url)
-        case .script(let url):
-            ScriptEditorView(url: url)
-                .environment(model)
-        case .recents:
-            RecentsScreen(push: openMobile)
-        case .smart(let id):
-            SmartNotebookScreen(smartNotebookId: id, push: openMobile)
-        case .calendar:
-            AgendaScreen { openMobile(.note($0)) }
-        case .meetingNotes:
-            MeetingNotesScreen { openMobile(.note($0)) }
-        case .shortcutsHelp:
-            ShortcutsHelpView()
+        Group {
+            switch route {
+            case .folder(let url):
+                FolderScreen(folderUrl: url, push: openMobile)
+            case .note(let url):
+                NoteDetail(noteUrl: model.resolvedNoteUrl(url))
+                    .onAppear { model.selectedNoteUrl = url }
+            case .patchwork(let url):
+                PatchworkDetail(docUrl: url)
+            case .script(let url):
+                ScriptEditorView(url: url)
+                    .environment(model)
+            case .recents:
+                RecentsScreen(push: openMobile)
+            case .smart(let id):
+                SmartNotebookScreen(smartNotebookId: id, push: openMobile)
+            case .calendar:
+                AgendaScreen { openMobile(.note($0)) }
+            case .meetingNotes:
+                MeetingNotesScreen { openMobile(.note($0)) }
+            case .shortcutsHelp:
+                ShortcutsHelpView()
+            }
         }
+        .moonToolbar(model)
     }
     #endif
 
@@ -2668,14 +2671,12 @@ struct FolderScreen: View {
         }
         .toolbar {
             if folderUrl == nil {
-                ToolbarItem(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
                         showingSettings = true
                     } label: {
                         Label("Settings", systemImage: "gearshape")
                     }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
                     FocusModeControl(model: model)
                 }
             }
@@ -4239,9 +4240,6 @@ struct NoteDetail: View {
             .disabled(editor.undoManager?.canRedo != true && !model.undoManager.canRedo)
         }
         ToolbarItem(placement: .primaryAction) {
-            FocusModeControl(model: model)
-        }
-        ToolbarItem(placement: .primaryAction) {
             Button {
                 showingInspector = true
             } label: {
@@ -4611,6 +4609,26 @@ private struct FocusModeControl: View {
         .help(engaged ? "Leave Moon Mode" : "Enter Moon Mode")
     }
 }
+
+#if os(iOS)
+private struct MoonToolbar: ViewModifier {
+    let model: NotesModel
+
+    func body(content: Content) -> some View {
+        content.toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                FocusModeControl(model: model)
+            }
+        }
+    }
+}
+
+extension View {
+    fileprivate func moonToolbar(_ model: NotesModel) -> some View {
+        modifier(MoonToolbar(model: model))
+    }
+}
+#endif
 
 /// The Notes-style treatment behind the floating toolbar: the editor extends
 /// under it, and only content that scrolls into that strip frosts and fades.
