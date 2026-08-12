@@ -102,9 +102,6 @@ enum Agenda {
     static let reminderPrefix = "reminder:"
     static let dayInIconKey = "calendarIconShowsDay"
     static let horizonDays = 14
-    /// How far scrolling will run on before it stops. Further than she means
-    /// to look, not forever.
-    static let horizonLimit = 730
     /// EventKit quietly truncates an event predicate to four years, so a long
     /// window is fetched in slices no wider than this.
     static let predicateSpanDays = 1095
@@ -473,11 +470,19 @@ final class AgendaStore {
         items = await fetch(from: from, to: to)
     }
 
-    /// Another fortnight, each time the end of the list comes into view.
+    /// Another fortnight, each time the end of the list comes into view. Like
+    /// the past, the future has no cap: only the new slice is fetched, and an
+    /// item spanning the seam is dropped by its row key.
     func extendHorizon() async {
-        guard horizon < Agenda.horizonLimit else { return }
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        guard let from = calendar.date(byAdding: .day, value: horizon, to: today),
+              let to = calendar.date(byAdding: .day, value: horizon + Agenda.horizonDays, to: today)
+        else { return }
         horizon += Agenda.horizonDays
-        await reload()
+        let newer = await fetch(from: from, to: to)
+        let known = Set(items.map(\.rowKey))
+        items = (items + newer.filter { !known.contains($0.rowKey) }).sorted { $0.start < $1.start }
     }
 
     /// Another fortnight of the past, each time the top of the list comes into

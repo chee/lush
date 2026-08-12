@@ -92,6 +92,7 @@ struct AgendaScreen: View {
                     }
                     Color.clear
                         .frame(height: 1)
+                        .id("forward-\(agenda.horizon)")
                         .onAppear { Task { await agenda.extendHorizon() } }
                 }
                 .padding(.horizontal, 28)
@@ -99,6 +100,7 @@ struct AgendaScreen: View {
                 .frame(maxWidth: 720)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
+            .scrollIndicators(.hidden)
             .onAppear { settle(proxy) }
             .onChange(of: dayGroups.isEmpty) { settle(proxy) }
             .onChange(of: agenda.focusDay, initial: true) {
