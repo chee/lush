@@ -16,6 +16,8 @@ const importmapped = [
 
 export default defineConfig({
   build: {
+	 minify: true,
+	 sourcemap: false,
     outDir: "../PatchworkWeb.bundle",
     emptyOutDir: false,
     target: "esnext",
