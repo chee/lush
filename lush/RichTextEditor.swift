@@ -700,9 +700,11 @@ final class EditorCore: LiveWriter {
     // MARK: loading
 
     func switchTo(_ url: String) {
+        NotesModel.selectBegin(url, "editor switchTo begin")
         cancelLiveTranscription()
         rememberCaretNow()
         pushNow()
+        NotesModel.selectLog("previous note flushed")
         remoteReloadTask?.cancel()
         textSpliceFlushTask?.cancel()
         caretBroadcastTask?.cancel()
@@ -732,6 +734,7 @@ final class EditorCore: LiveWriter {
         attachViewToSharedStorage()
         autoLoglineCheckedNoteUrl = nil
         load()
+        NotesModel.selectLog("editor switchTo end")
     }
 
     /// The storage TextKit actually lays out for this view.
@@ -761,6 +764,8 @@ final class EditorCore: LiveWriter {
 
     func attachViewToSharedStorage() {
         guard let contentStorage = noteView?.pContentStorage else { return }
+        NotesModel.selectLog("attach begin")
+        defer { NotesModel.selectLog("attach end") }
         EditorCore.presenceOwners[noteUrl] = ObjectIdentifier(self)
         #if !os(macOS)
         observeStorageEdits()
@@ -1196,9 +1201,12 @@ final class EditorCore: LiveWriter {
             if session.loaded {
                 // The session survives across visits but this editor's asset
                 // cache does not; reconcile text first, then reclassify embeds.
+                NotesModel.selectLog("load session-cached")
                 let spans = SpanNode.decodeList(session.lastKnownJSON)
                 guard self.noteUrl == url, self.session === session else { return }
                 self.syncFromSession()
+                NotesModel.selectLog("syncFromSession done")
+                NotesModel.selectFirstFrame()
                 #if !os(macOS)
                 // No storage was swapped in (see layoutStorage), so the
                 // incoming note's text has to be filled in before the awaits
@@ -1231,12 +1239,15 @@ final class EditorCore: LiveWriter {
             let task: Task<NoteSpansSnapshot?, Never>
             if let loadTask = session.loadTask {
                 task = loadTask
+                NotesModel.selectLog("spansSnapshot joined in-flight")
             } else {
                 task = Task { [model] in await model.spansSnapshot(for: url) }
                 session.loadTask = task
+                NotesModel.selectLog("spansSnapshot requested")
             }
             let snapshot = await task.value
             session.loadTask = nil
+            NotesModel.selectLog("spansSnapshot ready")
             guard self.noteUrl == url, self.session === session else { return }
             guard let snapshot else {
                 #if !os(macOS)
@@ -1252,6 +1263,7 @@ final class EditorCore: LiveWriter {
             let shouldFocus = self.model.pendingFocusUrl == url
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
+            NotesModel.selectFirstFrame()
             self.restoreRememberedCaret()
             self.syncLoglines(in: spans)
             guard await self.fetchMissingAssets(in: spans),
@@ -1575,6 +1587,8 @@ final class EditorCore: LiveWriter {
 
     private func apply(spans: [SpanNode], focus: Bool = false) {
         guard let view = noteView, view.pStorage != nil else { return }
+        NotesModel.selectLog("apply begin spans=\(spans.count)")
+        defer { NotesModel.selectLog("apply end") }
         // write out queued typing before it's discarded — the flush's write
         // merges with whatever this apply brings in
         if queuedTextSplice != nil {

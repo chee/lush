@@ -643,6 +643,42 @@ final class NotesModel {
         }
     }
 
+    /// Latency waterfall for one note selection. The zero resets when a new
+    /// url enters the path, so the stamps from click to first frame read as
+    /// one block and consecutive clicks stay separable.
+    nonisolated static func selectBegin(_ url: String, _ stage: String) {
+        selectLock.lock()
+        if selectUrl != url {
+            selectUrl = url
+            selectZero = DispatchTime.now()
+            selectFramed = false
+        }
+        selectLock.unlock()
+        selectLog(stage)
+    }
+
+    nonisolated static func selectLog(_ stage: String) {
+        selectLock.lock()
+        let zero = selectZero
+        selectLock.unlock()
+        let ns = DispatchTime.now().uptimeNanoseconds &- zero.uptimeNanoseconds
+        NSLog("lush select +%.1fms %@", Double(ns) / 1_000_000, stage)
+    }
+
+    nonisolated static func selectFirstFrame() {
+        selectLock.lock()
+        let already = selectFramed
+        selectFramed = true
+        selectLock.unlock()
+        guard !already else { return }
+        DispatchQueue.main.async { selectLog("first frame") }
+    }
+
+    nonisolated private static let selectLock = NSLock()
+    nonisolated(unsafe) private static var selectZero = DispatchTime.now()
+    nonisolated(unsafe) private static var selectUrl = ""
+    nonisolated(unsafe) private static var selectFramed = false
+
     nonisolated private static let bootTraceLock = NSLock()
     nonisolated private static let bootTraceQueue = DispatchQueue(
         label: "party.chee.lush.boot-trace",
@@ -2563,15 +2599,20 @@ final class NotesModel {
         guard let core else { return nil }
         defer { openBackfillGate() }
         let start = Date()
+        Self.selectLog("core snapshot begin")
         try? await core.openNote(url: url)
         defer { try? core.closeNote(url: url) }
         guard let snapshot = try? await core.noteSpansSnapshot(url: url),
               !snapshot.heads.isEmpty
         else {
-            Self.bootLog("note snapshot empty ms=\(Int(Date().timeIntervalSince(start) * 1000))")
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            Self.bootLog("note snapshot empty ms=\(ms)")
+            Self.selectLog("core snapshot empty ms=\(ms)")
             return nil
         }
-        Self.bootLog("note snapshot loaded from core ms=\(Int(Date().timeIntervalSince(start) * 1000))")
+        let ms = Int(Date().timeIntervalSince(start) * 1000)
+        Self.bootLog("note snapshot loaded from core ms=\(ms)")
+        Self.selectLog("core snapshot end ms=\(ms)")
         return snapshot
     }
 

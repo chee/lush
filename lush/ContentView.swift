@@ -346,6 +346,7 @@ struct ContentView: View {
             else { return }
             guard !initialSelection else { return }
             let delay = deferred == tag ? 80 : 0
+            NotesModel.selectBegin(Self.sidebarUrl(tag), "selection observed delay=\(delay)ms")
             scheduleSidebarSelection(Self.sidebarUrl(tag), delay: delay)
         }
         .onChange(of: model.activeEditor?.padded) { _, padded in
@@ -641,6 +642,7 @@ struct ContentView: View {
     }
 
     private func open(_ url: String) {
+        NotesModel.selectBegin(url, "open")
         #if os(macOS)
         selectedDocumentUrl = url
         model.selectedNoteUrl = url
@@ -651,12 +653,14 @@ struct ContentView: View {
     }
 
     private func openDispatched(_ url: String) async {
+        NotesModel.selectBegin(url, "openDispatched")
         let kind: String?
         if let known = model.node(for: url)?.kind {
             kind = known
         } else {
             kind = await model.documentKind(for: url)
         }
+        NotesModel.selectLog("kind resolved \(kind ?? "nil")")
         switch kind {
         case "folder":
             await model.selectFolder(url)
@@ -992,11 +996,13 @@ struct ContentView: View {
         sidebarSelectionTask = Task {
             if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
             guard !Task.isCancelled else { return }
+            NotesModel.selectLog("sidebar selection task begin")
             if let node = model.node(for: url), node.kind == "folder" {
                 await model.selectFolder(url)
             } else {
                 await model.selectItem(url)
             }
+            NotesModel.selectLog("model selectItem done")
         }
     }
 
