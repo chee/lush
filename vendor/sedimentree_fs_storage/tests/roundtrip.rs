@@ -1236,3 +1236,79 @@ async fn sweep_removes_stale_temps_and_spares_committed_pairs() -> testresult::T
     );
     Ok(())
 }
+
+/// A commit directory holding staging litter from a crashed writer — too
+/// young for the age-based sweep — still deletes cleanly, directory and all.
+#[tokio::test]
+async fn delete_loose_commit_clears_staging_litter() -> testresult::TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = FsStorage::new(dir.path().to_path_buf())?;
+    let signer = test_signer();
+    let id = make_sedimentree_id(0x6C);
+
+    let head = CommitId::new([0x6C; 32]);
+    let verified: VerifiedMeta<LooseCommit> = VerifiedMeta::seal::<Sendable, _>(
+        &signer,
+        (id, head, BTreeSet::new()),
+        VerifiedBlobMeta::new(Blob::new(vec![9, 9, 9])),
+    )
+    .await;
+    Storage::<Sendable>::save_loose_commit(&storage, id, verified).await?;
+
+    let commits_dir = tree_path(dir.path(), id).join("commits");
+    let id_dir = std::fs::read_dir(&commits_dir)?
+        .flatten()
+        .find(|entry| entry.path().is_dir())
+        .expect("commit dir")
+        .path();
+    for name in ["beef.0.blob.tmp", "beef.0.meta.tmp", "f00d.7.blob.tmp"] {
+        std::fs::write(id_dir.join(name), b"litter")?;
+    }
+
+    Storage::<Sendable>::delete_loose_commit(&storage, id, head).await?;
+
+    assert!(!id_dir.exists(), "the commit dir must be gone, litter and all");
+    assert!(
+        Storage::<Sendable>::load_loose_commits(&storage, id)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// Deleting a commit while writers stage into the same directory must not
+/// leave the directory behind: `remove_dir_all`'s final `rmdir` sees the
+/// staged `.tmp` files and reports `ENOTEMPTY`, which the retry absorbs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_loose_commit_survives_concurrent_saves() -> testresult::TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = FsStorage::new(dir.path().to_path_buf())?;
+    let signer = test_signer();
+    let id = make_sedimentree_id(0x6D);
+    let head = CommitId::new([0x6D; 32]);
+
+    let seal = async || -> VerifiedMeta<LooseCommit> {
+        VerifiedMeta::seal::<Sendable, _>(
+            &signer,
+            (id, head, BTreeSet::new()),
+            VerifiedBlobMeta::new(Blob::new(vec![3; 128])),
+        )
+        .await
+    };
+
+    for _ in 0..24 {
+        let verified = seal().await;
+        Storage::<Sendable>::save_loose_commit(&storage, id, verified).await?;
+        let writer = {
+            let storage = storage.clone();
+            let verified = seal().await;
+            tokio::spawn(async move {
+                let _ = Storage::<Sendable>::save_loose_commit(&storage, id, verified).await;
+            })
+        };
+        Storage::<Sendable>::delete_loose_commit(&storage, id, head).await?;
+        writer.await?;
+        Storage::<Sendable>::delete_loose_commit(&storage, id, head).await?;
+    }
+    Ok(())
+}

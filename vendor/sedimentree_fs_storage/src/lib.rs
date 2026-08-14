@@ -228,8 +228,17 @@ pub fn sweep_stale_temp_files(trees_root: &Path) -> u64 {
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(STALE_TMP_AGE) else {
         return 0;
     };
+    remove_temp_files(trees_root, Some(cutoff))
+}
+
+/// Remove staging `.tmp` files under `root`, returning how many were deleted.
+/// With a `cutoff`, only files last modified before it go — the age-based
+/// sweep. Without one, every staging file goes, which is only safe where the
+/// directory is being torn down anyway. Committed `.blob`/`.meta` pairs are
+/// never touched either way.
+fn remove_temp_files(root: &Path, cutoff: Option<std::time::SystemTime>) -> u64 {
     let mut removed = 0;
-    let mut stack = vec![trees_root.to_path_buf()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -244,16 +253,50 @@ pub fn sweep_stale_temp_files(trees_root: &Path) -> u64 {
                 continue;
             }
             let stale = path.extension().is_some_and(|ext| ext == "tmp")
-                && entry
-                    .metadata()
-                    .and_then(|meta| meta.modified())
-                    .is_ok_and(|modified| modified < cutoff);
+                && cutoff.is_none_or(|cutoff| {
+                    entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .is_ok_and(|modified| modified < cutoff)
+                });
             if stale && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
         }
     }
     removed
+}
+
+/// How many times a directory removal may lose the race with a writer
+/// staging into it before the error is reported.
+const REMOVE_DIR_ATTEMPTS: u32 = 3;
+
+/// Remove one storage directory and everything under it.
+///
+/// `remove_dir_all` lists the directory, unlinks what it saw, then `rmdir`s
+/// it — so a writer staging `.tmp` files into the same directory in between
+/// leaves the final `rmdir` with `ENOTEMPTY`, and the item stays on disk
+/// forever because reclaim never revisits it. Clear the staging files by
+/// hand and try again; only `*.tmp` is removed that way, and a committed
+/// `.blob`/`.meta` pair is left to `remove_dir_all` itself.
+async fn remove_dir_tree(dir: &Path) -> Result<(), FsStorageError> {
+    let mut attempt = 1;
+    loop {
+        match tokio::fs::remove_dir_all(dir).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && attempt < REMOVE_DIR_ATTEMPTS =>
+            {
+                tracing::debug!(dir = %dir.display(), attempt, "clearing staging litter to remove item dir");
+                let owned = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || remove_temp_files(&owned, None)).await?;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Fsync `path`'s contents. Opening a fresh read handle is sufficient:
@@ -1050,11 +1093,7 @@ impl Storage<Sendable> for FsStorage {
             self.with_ids(|ids| ids.remove(&sedimentree_id)).await?;
 
             let tree_dir = self.tree_path(sedimentree_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&tree_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e.into());
-            }
+            remove_dir_tree(&tree_dir).await?;
 
             Ok(())
         })
@@ -1171,14 +1210,7 @@ impl Storage<Sendable> for FsStorage {
                 "FsStorage::delete_loose_commit"
             );
 
-            let id_dir = self.commit_id_dir(sedimentree_id, commit_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&id_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e.into());
-            }
-
-            Ok(())
+            remove_dir_tree(&self.commit_id_dir(sedimentree_id, commit_id)).await
         })
     }
 
@@ -1246,11 +1278,7 @@ impl Storage<Sendable> for FsStorage {
             tracing::trace!(?sedimentree_id, "FsStorage::delete_loose_commits");
 
             let commits_dir = self.commits_dir(sedimentree_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&commits_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e.into());
-            }
+            remove_dir_tree(&commits_dir).await?;
 
             // Recreate the empty directory
             tokio::fs::create_dir_all(&commits_dir).await?;
@@ -1409,14 +1437,7 @@ impl Storage<Sendable> for FsStorage {
                 "FsStorage::delete_fragment"
             );
 
-            let id_dir = self.fragment_id_dir(sedimentree_id, fragment_head);
-            if let Err(e) = tokio::fs::remove_dir_all(&id_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e.into());
-            }
-
-            Ok(())
+            remove_dir_tree(&self.fragment_id_dir(sedimentree_id, fragment_head)).await
         })
     }
 
@@ -1428,11 +1449,7 @@ impl Storage<Sendable> for FsStorage {
             tracing::trace!(?sedimentree_id, "FsStorage::delete_fragments");
 
             let fragments_dir = self.fragments_dir(sedimentree_id);
-            if let Err(e) = tokio::fs::remove_dir_all(&fragments_dir).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e.into());
-            }
+            remove_dir_tree(&fragments_dir).await?;
 
             // Recreate the empty directory
             tokio::fs::create_dir_all(&fragments_dir).await?;
@@ -1735,3 +1752,4 @@ impl Storage<Local> for FsStorage {
         ))
     }
 }
+
