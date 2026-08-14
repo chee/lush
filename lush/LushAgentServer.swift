@@ -265,21 +265,19 @@ final class LushAgentServer {
 
     private nonisolated static func connectionFileDirectories() -> [URL] {
         let fm = FileManager.default
-        let home: URL
-        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
-            home = URL(fileURLWithPath: String(cString: dir), isDirectory: true)
-        } else {
-            home = fm.homeDirectoryForCurrentUser
-        }
-        var directories = [
-            home.appendingPathComponent(
-                "Library/Containers/party.chee.patchwork.lush/Data/Library/Application Support/Lush",
-                isDirectory: true
-            ),
-            home.appendingPathComponent("Library/Application Support/Lush", isDirectory: true),
-        ]
+        var directories: [URL] = []
         if let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             directories.append(support.appendingPathComponent("Lush", isDirectory: true))
+        }
+        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
+            let real = URL(fileURLWithPath: String(cString: dir), isDirectory: true)
+            let containerized = real.standardizedFileURL.path
+                != fm.homeDirectoryForCurrentUser.standardizedFileURL.path
+            if !containerized {
+                directories.append(
+                    real.appendingPathComponent("Library/Application Support/Lush", isDirectory: true)
+                )
+            }
         }
         var seen = Set<String>()
         return directories.filter { seen.insert($0.standardizedFileURL.path).inserted }
