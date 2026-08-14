@@ -1312,3 +1312,56 @@ async fn delete_loose_commit_survives_concurrent_saves() -> testresult::TestResu
     }
     Ok(())
 }
+
+/// Staging names carry the writing process's pid, so leftovers from several
+/// processes coexist in one commit dir. The sweep clears all of them, plus
+/// bare-counter names staged before the pid tag existed.
+#[tokio::test]
+async fn sweep_clears_leftovers_from_every_writer() -> testresult::TestResult {
+    let dir = tempfile::tempdir()?;
+    let storage = FsStorage::new(dir.path().to_path_buf())?;
+    let signer = test_signer();
+    let id = make_sedimentree_id(0x7E);
+
+    let head = CommitId::new([0x7E; 32]);
+    let verified: VerifiedMeta<LooseCommit> = VerifiedMeta::seal::<Sendable, _>(
+        &signer,
+        (id, head, BTreeSet::new()),
+        VerifiedBlobMeta::new(Blob::new(vec![4, 4])),
+    )
+    .await;
+    Storage::<Sendable>::save_loose_commit(&storage, id, verified).await?;
+
+    let id_dir = std::fs::read_dir(tree_path(dir.path(), id).join("commits"))?
+        .flatten()
+        .find(|entry| entry.path().is_dir())
+        .expect("commit dir")
+        .path();
+    let leftovers: Vec<_> = [
+        "deadbeef.0.blob.tmp",
+        "deadbeef.111-0.blob.tmp",
+        "deadbeef.222-0.blob.tmp",
+        "deadbeef.222-1.meta.tmp",
+    ]
+    .iter()
+    .map(|name| id_dir.join(name))
+    .collect();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 60 * 60);
+    for path in &leftovers {
+        std::fs::write(path, b"junk")?;
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.set_times(std::fs::FileTimes::new().set_modified(long_ago))?;
+    }
+
+    let removed = sedimentree_fs_storage::sweep_stale_temp_files(&dir.path().join("trees"));
+    assert_eq!(removed, leftovers.len() as u64, "every writer's litter goes");
+    assert!(leftovers.iter().all(|path| !path.exists()));
+    assert_eq!(
+        Storage::<Sendable>::load_loose_commits(&storage, id)
+            .await?
+            .len(),
+        1,
+        "the committed pair must survive the sweep"
+    );
+    Ok(())
+}

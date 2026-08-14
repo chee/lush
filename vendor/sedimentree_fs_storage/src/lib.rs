@@ -70,6 +70,19 @@ use thiserror::Error;
 /// the same content-addressed path.
 static TMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// A name component unique to one staging write, process included: the store
+/// is shared with helpers and app extensions, and a bare counter starts at
+/// zero in every one of them, so two processes saving the same commit would
+/// otherwise stage to the same `.tmp` path and clobber each other's bytes
+/// mid-write.
+fn staging_nonce() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        TMP_NONCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// One compound item (meta + blob) to persist, with its target paths already
 /// resolved. Carried into a blocking closure so the whole write sequence runs
 /// in a single `spawn_blocking` hop.
@@ -199,7 +212,7 @@ fn stage_compound_write_sync(
 
     create_dir_all_durable(&item.id_dir)?;
 
-    let nonce = TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let nonce = staging_nonce();
     // The guard exists before the first byte is written, so a failed or
     // partial `write` (ENOSPC, IO error) still drops through the cleanup —
     // returning early here would otherwise strand whatever made it to disk.
@@ -1753,3 +1766,35 @@ impl Storage<Local> for FsStorage {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_nonces_are_process_tagged_and_never_repeat() {
+        let first = staging_nonce();
+        let second = staging_nonce();
+        let prefix = format!("{}-", std::process::id());
+        assert!(first.starts_with(&prefix), "{first} lacks the pid tag");
+        assert!(second.starts_with(&prefix), "{second} lacks the pid tag");
+        assert_ne!(first, second);
+    }
+
+    /// Writers in different processes stage the same item to different
+    /// names, even though every process's counter starts at zero — and both
+    /// names still read as staging files.
+    #[test]
+    fn staging_names_from_two_pids_coexist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stem = dir.path().join("deadbeef");
+        let one = stem.with_extension("111-0.blob.tmp");
+        let two = stem.with_extension("222-0.blob.tmp");
+        assert_ne!(one, two);
+        std::fs::write(&one, b"a").expect("write");
+        std::fs::write(&two, b"b").expect("write");
+        assert!(one.exists() && two.exists());
+
+        assert_eq!(remove_temp_files(dir.path(), None), 2);
+        assert!(!one.exists() && !two.exists());
+    }
+}
