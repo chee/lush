@@ -20,17 +20,19 @@ jobs:
             | sh -s -- -y --default-toolchain stable \
               --target aarch64-apple-ios --target aarch64-apple-ios-sim --target x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            core
-            server-rs
-
       - name: Build Rust core and bindings
         run: ./core/build-bindings.sh
 
       - name: Build PatchworkServer xcframework and bindings
         run: ./server-rs/build-xcframework.sh
+
+      - uses: Swatinem/rust-cache@v2
+        env:
+          CACHE_ON_FAILURE: true
+        with:
+          workspaces: |
+            core
+            server-rs
 
       - name: Build web bundle
         run: |
