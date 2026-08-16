@@ -64,6 +64,16 @@ jobs:
           mkdir -p "$HOME/private_keys"
           printf '%s' "$API_KEY_CONTENT" > "$HOME/private_keys/AuthKey_$API_KEY_ID.p8"
 
+      - name: Download provisioning profiles
+        env:
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          xcodebuild -downloadAllProvisioningProfiles \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
+            -authenticationKeyID "$API_KEY_ID" \
+            -authenticationKeyIssuerID "$API_ISSUER"
+
       - name: Archive
         env:
           API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
@@ -88,7 +98,6 @@ jobs:
             -archivePath "$RUNNER_TEMP/Lush.xcarchive" \
             -exportOptionsPlist .github/ExportOptions.plist \
             -exportPath "$RUNNER_TEMP/export" \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
             -authenticationKeyIssuerID "$API_ISSUER"
