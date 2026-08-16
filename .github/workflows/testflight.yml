@@ -22,7 +22,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: core
+          workspaces: |
+            core
+            server-rs
 
       - name: Build Rust core and bindings
         run: ./core/build-bindings.sh
