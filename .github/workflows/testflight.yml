@@ -35,6 +35,13 @@ jobs:
       - name: Build Rust core and bindings
         run: ./core/build-bindings.sh
 
+      - name: Build web bundle
+        run: |
+          cd web
+          npm install -g pnpm
+          pnpm install
+          pnpm build
+
       - name: Import signing certificate
         env:
           CERT_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
@@ -64,10 +71,10 @@ jobs:
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           xcodebuild archive \
-            -project richtext.xcodeproj \
-            -scheme richtext \
+            -project Lush.xcodeproj \
+            -scheme Lush \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/richtext.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Lush.xcarchive" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
@@ -79,7 +86,7 @@ jobs:
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/richtext.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Lush.xcarchive" \
             -exportOptionsPlist .github/ExportOptions.plist \
             -exportPath "$RUNNER_TEMP/export" \
             -allowProvisioningUpdates \
