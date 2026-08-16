@@ -10,6 +10,8 @@
 	<string>R2MP6EU7T3</string>
 	<key>signingStyle</key>
 	<string>automatic</string>
+	<key>signingCertificate</key>
+	<string>Apple Distribution</string>
 	<key>uploadSymbols</key>
 	<true/>
 	<key>manageAppVersionAndBuildNumber</key>
