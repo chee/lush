@@ -9,16 +9,7 @@
 	<key>teamID</key>
 	<string>R2MP6EU7T3</string>
 	<key>signingStyle</key>
-	<string>manual</string>
-	<key>signingCertificate</key>
-	<string>Apple Distribution</string>
-	<key>provisioningProfiles</key>
-	<dict>
-		<key>party.chee.patchwork.lush</key>
-		<string>iOS Team Store Provisioning Profile: party.chee.patchwork.lush</string>
-		<key>party.chee.patchwork.lush.LushWidget</key>
-		<string>iOS Team Store Provisioning Profile: party.chee.patchwork.lush.LushWidget</string>
-	</dict>
+	<string>automatic</string>
 	<key>uploadSymbols</key>
 	<true/>
 	<key>manageAppVersionAndBuildNumber</key>
