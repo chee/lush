@@ -614,6 +614,12 @@ struct LoglineSettingsPane: View {
         }
         .formStyle(.grouped)
         .navigationTitle("Logline")
+        .task {
+            // the context is only collected when a logline asks for it, and
+            // this pane is asking: "Where I Am Now" needs a fix to offer
+            guard ContextTracker.stampsContext else { return }
+            await contextTracker.refresh()
+        }
         .sheet(isPresented: $namingHere) {
             AddItemSheet(
                 title: "Add Place",

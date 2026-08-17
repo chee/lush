@@ -111,7 +111,9 @@ extension BlockValue {
     static func contextBlock(from snap: ContextSnapshot, pending: Bool = false) -> BlockValue {
         var attrs: [String: JSONValue] = [:]
         let fmt = ISO8601DateFormatter()
-        attrs["ts"] = .string(fmt.string(from: snap.timestamp))
+        // when the logline was stamped, which is now — the snapshot's own
+        // timestamp says how fresh its readings are, a different question
+        attrs["ts"] = .string(fmt.string(from: Date()))
         if let loc = snap.locationName { attrs["location"] = .string(loc) }
         if let lat = snap.latitude { attrs["lat"] = .number(lat) }
         if let lon = snap.longitude { attrs["lon"] = .number(lon) }
@@ -234,125 +236,101 @@ final class ContextTracker {
     /// keeps whatever it already knew.
     static let refreshTimeout: TimeInterval = 3
 
-    /// Extra logline sources. Each tick asks every provider for a value; the
+    /// Extra logline sources. Each stamp asks every provider for a value; the
     /// key becomes the context block's attribute name.
     var providers: [String: @MainActor () -> String?] = [:]
 
     private let locationDelegate = _LocationDelegate()
     private var locationManager: CLLocationManager?
-    private var monitorTask: Task<Void, Never>?
     private var lastWeatherFetch: Date = .distantPast
-    private var lastWeatherAttempt: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
-    private var weatherFetchInProgress = false
-    private var pendingWeatherLocation: CLLocation?
-    private var weatherGeneration = 0
     private var lastLocation: CLLocation?
-    private var locationNameGeneration = 0
-    private var locationRequestInFlight = false
     private var lastLocationFix: Date = .distantPast
+    private var lastPlaceName: String?
+    private var lastNamedLocation: CLLocation?
+    private var locationRequestInFlight = false
+    private var lastAuthorization: CLAuthorizationStatus?
     private var fixWaiters: [UUID: CheckedContinuation<CLLocation?, Never>] = [:]
     private var refreshTask: Task<Void, Never>?
-    /// A note is stamped with the place it was written in, and the snapshot's
-    /// own substantial-change threshold is 500m, so a fix from a few minutes
-    /// ago is as good as one taken now.
-    private static let locationRefresh: TimeInterval = 300
+
+    /// Nothing here is collected on a timer: a logline asks, and only then does
+    /// the radio wake. These are how much of the last answer a stamp will take
+    /// rather than ask again — a note records a place, not a pace, and the
+    /// snapshot's own substantial-change threshold is 500m.
+    private static let fixReuse: TimeInterval = 60
+    /// The open check only wants to know whether the place changed since the
+    /// last logline, so it settles for what the old minute-by-minute poll used
+    /// to guarantee anyway.
+    static let openCheckFixReuse: TimeInterval = 300
+    private static let weatherReuse: TimeInterval = 900
+    /// About a kilometre in degrees — closer than that is the same weather.
+    private static let weatherReuseDegrees = 0.01
+    private static let placeReuseDistance: CLLocationDistance = 50
 
     init() {
         locationDelegate.owner = self
     }
 
+    /// Readies the radio without waking it. Authorization is asked for at the
+    /// first stamp that needs it, not here.
     func start() {
-        if monitorTask == nil {
-            tick()
-            monitorTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    await AppActivity.waitUntilActive()
-                    guard !Task.isCancelled else { break }
-                    try? await Task.sleep(for: .seconds(60))
-                    guard !Task.isCancelled else { break }
-                    self?.tick()
-                }
-            }
-        }
-        guard SavedPlaces.enabled || Self.weatherEnabled else { return }
-        // one window per scene calls this; monitors must not accumulate
-        guard locationManager == nil else {
-            requestLocation()
-            return
-        }
+        guard Self.stampsContext, locationManager == nil else { return }
         let mgr = CLLocationManager()
         mgr.delegate = locationDelegate
         // accuracy stays where it was: saved places are 150m wide and the POI
-        // lookup gates on 150m, so a coarser fix would cost naming precision.
-        // The saving comes from asking once instead of streaming, below.
+        // lookup gates on 150m, so a coarser fix would cost naming precision
         mgr.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
         locationManager = mgr
-        requestLocation()
     }
 
     func setPlacesEnabled(_ enabled: Bool) {
         SavedPlaces.setEnabled(enabled)
-        locationNameGeneration &+= 1
-        if enabled || Self.weatherEnabled {
-            start()
-        } else {
-            // stopping cancels a one-shot request without any delegate call
-            // back, so the in-flight flag has to be released by hand
-            locationManager?.stopUpdatingLocation()
-            locationManager = nil
-            locationRequestInFlight = false
-            lastLocation = nil
-            deliverFix(nil)
-        }
+        forgetPlaceName()
         if enabled {
-            if let lastLocation { didUpdateLocation(lastLocation, fresh: false) }
-            requestLocation(force: true)
+            start()
+            Task { await refresh() }
             return
         }
         snapshot.locationName = nil
         snapshot.latitude = nil
         snapshot.longitude = nil
+        if !Self.weatherEnabled { stopTracking() }
     }
 
     func setWeatherEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: Self.weatherEnabledKey)
-        weatherGeneration &+= 1
         lastWeatherFetch = .distantPast
-        lastWeatherAttempt = .distantPast
         lastWeatherLocation = nil
-        if enabled || SavedPlaces.enabled {
+        if enabled {
             start()
-        } else {
-            // stopping cancels a one-shot request without any delegate call
-            // back, so the in-flight flag has to be released by hand
-            locationManager?.stopUpdatingLocation()
-            locationManager = nil
-            locationRequestInFlight = false
-            lastLocation = nil
-            deliverFix(nil)
+            Task { await refresh() }
+            return
         }
-        if !enabled { snapshot.weatherDescription = nil }
-        if enabled, let location = lastLocation {
-            Task {
-                await fetchWeather(lat: location.coordinate.latitude, lon: location.coordinate.longitude)
-            }
-        } else if enabled {
-            requestLocation(force: true)
-        }
+        snapshot.weatherDescription = nil
+        if !SavedPlaces.enabled { stopTracking() }
     }
 
-    /// One fix, then the radio goes back to sleep. Streaming updates kept the
-    /// location hardware warm for the whole session — every window appearing
-    /// called `start()` — to serve a snapshot only read when a note is stamped.
-    func requestLocation(force: Bool = false) {
-        guard SavedPlaces.enabled || Self.weatherEnabled, let mgr = locationManager else { return }
+    private func stopTracking() {
+        // stopping cancels a one-shot request without any delegate call back,
+        // so the in-flight flag has to be released by hand
+        locationManager?.stopUpdatingLocation()
+        locationManager = nil
+        locationRequestInFlight = false
+        lastAuthorization = nil
+        lastLocation = nil
+        deliverFix(nil)
+    }
+
+    /// One fix, then the radio goes back to sleep.
+    private func requestFix() {
+        guard Self.stampsContext, let mgr = locationManager else { return }
         switch mgr.authorizationStatus {
         case .notDetermined:
+            // the answer arrives too late for the stamp that asked; the
+            // authorization callback refreshes the snapshot for the next one
             mgr.requestWhenInUseAuthorization()
         case .authorizedWhenInUse, .authorizedAlways:
             guard !locationRequestInFlight else { return }
-            guard force || Date().timeIntervalSince(lastLocationFix) > Self.locationRefresh else { return }
             locationRequestInFlight = true
             mgr.requestLocation()
         default:
@@ -360,18 +338,28 @@ final class ContextTracker {
         }
     }
 
-    /// The freshest fix and weather that `timeout` seconds can buy. Loglines
-    /// stamped in the same moment share the one refresh; what doesn't arrive in
-    /// time keeps arriving in the background, it just misses this stamp.
+    /// The context as of now: providers, then the freshest fix and weather that
+    /// `timeout` seconds can buy. Nothing collects any of this in the
+    /// background, so every reader of `snapshot` comes through here first.
+    ///
+    /// `maxAge` is how old a fix may be before the radio is woken for a new
+    /// one — a stamp wants a recent one, the open check will take the last few
+    /// minutes. Loglines stamped in the same moment share the one refresh; what
+    /// misses the deadline still lands in the snapshot, just not in that stamp.
     @discardableResult
-    func refresh(timeout: TimeInterval = ContextTracker.refreshTimeout) async -> ContextSnapshot {
+    func refresh(
+        maxAge: TimeInterval = ContextTracker.fixReuse,
+        timeout: TimeInterval = ContextTracker.refreshTimeout
+    ) async -> ContextSnapshot {
+        collectProviders()
+        snapshot.timestamp = Date()
         if let refreshTask {
             await refreshTask.value
             return snapshot
         }
         let work: Task<Void, Never> = Task { [weak self] in
             guard let self else { return }
-            await self.performRefresh(timeout: timeout)
+            await self.performRefresh(maxAge: maxAge, timeout: timeout)
         }
         refreshTask = work
         // the fix has its own deadline; this one stops a slow geocode or a
@@ -386,10 +374,19 @@ final class ContextTracker {
         return snapshot
     }
 
-    private func performRefresh(timeout: TimeInterval) async {
+    private func collectProviders() {
+        guard !providers.isEmpty else { return }
+        var extras: [String: String] = [:]
+        for (key, provide) in providers {
+            if let value = provide() { extras[key] = value }
+        }
+        snapshot.extras = extras
+    }
+
+    private func performRefresh(maxAge: TimeInterval, timeout: TimeInterval) async {
         guard Self.stampsContext else { return }
         start()
-        guard let loc = await nextFix(timeout: timeout), !Task.isCancelled else { return }
+        guard let loc = await nextFix(maxAge: maxAge, timeout: timeout), !Task.isCancelled else { return }
         lastLocation = loc
         let lat = loc.coordinate.latitude
         let lon = loc.coordinate.longitude
@@ -400,37 +397,54 @@ final class ContextTracker {
         if SavedPlaces.enabled {
             snapshot.latitude = lat
             snapshot.longitude = lon
-            if let name {
-                // the fix that got us here started its own naming task; this
-                // one is newer, so retire that one rather than race it
-                locationNameGeneration &+= 1
-                snapshot.locationName = name
-            }
+            if let name { snapshot.locationName = name }
         }
         if Self.weatherEnabled, let weather {
             snapshot.weatherDescription = weather
-            lastWeatherFetch = Date()
-            lastWeatherAttempt = Date()
-            lastWeatherLocation = (lat, lon)
         }
         snapshot.timestamp = Date()
     }
 
+    /// The name already found for this spot, or a fresh lookup. A reused fix
+    /// would otherwise be geocoded again for the same answer.
     private func refreshedPlaceName(at loc: CLLocation) async -> String? {
         guard SavedPlaces.enabled else { return nil }
-        return await placeName(at: loc)
+        if let name = lastPlaceName, let named = lastNamedLocation,
+           loc.distance(from: named) < Self.placeReuseDistance {
+            return name
+        }
+        guard let name = await placeName(at: loc) else { return nil }
+        lastPlaceName = name
+        lastNamedLocation = loc
+        return name
+    }
+
+    private func forgetPlaceName() {
+        lastPlaceName = nil
+        lastNamedLocation = nil
     }
 
     private func refreshedWeather(lat: Double, lon: Double) async -> String? {
         guard Self.weatherEnabled else { return nil }
-        return await weatherText(lat: lat, lon: lon)
+        if let current = snapshot.weatherDescription, let last = lastWeatherLocation,
+           Date().timeIntervalSince(lastWeatherFetch) < Self.weatherReuse,
+           sqrt(pow(lat - last.0, 2) + pow(lon - last.1, 2)) < Self.weatherReuseDegrees {
+            return current
+        }
+        guard let text = await weatherText(lat: lat, lon: lon) else { return nil }
+        lastWeatherFetch = Date()
+        lastWeatherLocation = (lat, lon)
+        return text
     }
 
-    /// The fix the radio is about to hand over, or the last one when there is
-    /// nothing in flight to wait for. The deadline is what guarantees the wait
-    /// ends — a one-shot request that never answers has no delegate call back.
-    private func nextFix(timeout: TimeInterval) async -> CLLocation? {
-        requestLocation(force: true)
+    /// The last fix while it's younger than `maxAge`, else the one the radio is
+    /// about to hand over. The deadline is what guarantees the wait ends — a
+    /// one-shot request that never answers has no delegate call back.
+    private func nextFix(maxAge: TimeInterval, timeout: TimeInterval) async -> CLLocation? {
+        if let lastLocation, Date().timeIntervalSince(lastLocationFix) < maxAge {
+            return lastLocation
+        }
+        requestFix()
         guard locationRequestInFlight else { return lastLocation }
         let id = UUID()
         let deadline = Task { [weak self] in
@@ -457,56 +471,21 @@ final class ContextTracker {
         }
     }
 
-    private func tick() {
-        var extras: [String: String] = [:]
-        for (key, provide) in providers {
-            if let value = provide() { extras[key] = value }
-        }
-        snapshot.extras = extras
-        snapshot.timestamp = Date()
-        requestLocation()
-    }
-
-    /// `fresh` marks a fix the radio just produced; replaying a cached one must
-    /// not push the throttle forward or the snapshot could go stale unnoticed.
-    func didUpdateLocation(_ loc: CLLocation, fresh: Bool = true) {
-        if fresh {
-            locationRequestInFlight = false
-            lastLocationFix = Date()
-            deliverFix(loc)
-        }
-        guard SavedPlaces.enabled || Self.weatherEnabled else { return }
+    /// Only a refresh asks for a fix now, so this hands the fix to whoever is
+    /// waiting on it and does nothing else — naming it and reading its weather
+    /// belong to the refresh that wanted it.
+    func didUpdateLocation(_ loc: CLLocation) {
+        locationRequestInFlight = false
+        lastLocationFix = Date()
         lastLocation = loc
-        snapshot.timestamp = Date()
-        if SavedPlaces.enabled {
-            locationNameGeneration &+= 1
-            let generation = locationNameGeneration
-            snapshot.latitude = loc.coordinate.latitude
-            snapshot.longitude = loc.coordinate.longitude
-            snapshot.locationName = nil
-            Task {
-                let name = await placeName(at: loc)
-                guard SavedPlaces.enabled, locationNameGeneration == generation else { return }
-                snapshot.locationName = name
-            }
-        }
-        if Self.weatherEnabled {
-            Task {
-                await fetchWeather(lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
-            }
-        }
+        deliverFix(loc)
     }
 
+    /// The saved places changed, so the name found for this spot may have too.
     func refreshPlaceName() {
-        guard SavedPlaces.enabled, let loc = lastLocation else { return }
-        locationNameGeneration &+= 1
-        let generation = locationNameGeneration
-        snapshot.locationName = nil
-        Task {
-            let name = await placeName(at: loc)
-            guard SavedPlaces.enabled, locationNameGeneration == generation else { return }
-            snapshot.locationName = name
-        }
+        forgetPlaceName()
+        guard SavedPlaces.enabled else { return }
+        Task { await refresh() }
     }
 
     /// The most specific name for the spot — a saved place, a nearby business
@@ -550,49 +529,25 @@ final class ContextTracker {
         deliverFix(nil)
     }
 
+    /// The stamp that triggered the permission prompt is long gone by the time
+    /// it's answered; fill the snapshot in so the next one has something.
     func didChangeAuthorization() {
-        requestLocation(force: true)
+        guard let mgr = locationManager else { return }
+        let status = mgr.authorizationStatus
+        let previous = lastAuthorization
+        lastAuthorization = status
+        // the delegate reports the state as it stands the moment it's set, and
+        // that report is not a decision anyone just made
+        guard let previous, previous != status, Self.stampsContext else { return }
+        switch status {
+        case .authorizedWhenInUse, .authorizedAlways:
+            Task { await refresh(maxAge: 0) }
+        default:
+            deliverFix(nil)
+        }
     }
 
-    private func fetchWeather(lat: Double, lon: Double, retrying: Bool = false) async {
-        guard Self.weatherEnabled else { return }
-        let generation = weatherGeneration
-        let now = Date()
-        guard !weatherFetchInProgress else {
-            pendingWeatherLocation = CLLocation(latitude: lat, longitude: lon)
-            return
-        }
-        if !retrying, let last = lastWeatherLocation {
-            let moved = sqrt(pow(lat - last.0, 2) + pow(lon - last.1, 2)) > 0.01
-            let stale = now.timeIntervalSince(lastWeatherFetch) > 1800
-            guard moved || stale else { return }
-        }
-        guard retrying || now.timeIntervalSince(lastWeatherAttempt) > 60 else { return }
-        lastWeatherAttempt = now
-        weatherFetchInProgress = true
-        defer {
-            weatherFetchInProgress = false
-            let pending = pendingWeatherLocation
-            pendingWeatherLocation = nil
-            if Self.weatherEnabled,
-               let location = pending ?? (weatherGeneration != generation ? lastLocation : nil) {
-                Task {
-                    await fetchWeather(
-                        lat: location.coordinate.latitude,
-                        lon: location.coordinate.longitude,
-                        retrying: true
-                    )
-                }
-            }
-        }
-        guard let text = await weatherText(lat: lat, lon: lon) else { return }
-        guard Self.weatherEnabled, weatherGeneration == generation else { return }
-        snapshot.weatherDescription = text
-        lastWeatherFetch = now
-        lastWeatherLocation = (lat, lon)
-    }
-
-    /// WeatherKit when it answers, open-meteo when it doesn't. No throttling and
+    /// WeatherKit when it answers, open-meteo when it doesn't. No caching and
     /// no snapshot writes — the caller owns both.
     private func weatherText(lat: Double, lon: Double) async -> String? {
         let location = CLLocation(latitude: lat, longitude: lon)

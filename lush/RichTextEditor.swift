@@ -737,19 +737,41 @@ final class EditorCore {
         resolvePendingLogline()
     }
 
+    /// Nothing tracks the context in the background any more, so the snapshot
+    /// this compares against is asked for here — and since it arrives before
+    /// the block is written, this logline needs no spinner.
     private func checkContextChangeOnOpen(in spans: [SpanNode], force: Bool = false) {
         guard force || autoLoglineCheckedNoteUrl != noteUrl else { return }
         autoLoglineCheckedNoteUrl = noteUrl
-        guard EditorSettings.autoInsertLogline else { return }
-        guard let tracker = contextTracker else { return }
-        let snap = tracker.snapshot
-        guard let previous = spans.reversed().compactMap({ node -> ContextSnapshot? in
+        guard EditorSettings.autoInsertLogline, let tracker = contextTracker else { return }
+        // a logline already waiting on a refresh is this open's logline
+        guard !hasPendingLogline(in: spans), lastContextSnapshot(in: spans) != nil else { return }
+        let url = noteUrl
+        Task { [weak self] in
+            let snap = await tracker.refresh(maxAge: ContextTracker.openCheckFixReuse)
+            // read the note again: the refresh this waited on may have been the
+            // one that spliced a fresher place into the logline it compares to
+            guard let self, self.noteUrl == url, self.session.loaded,
+                  let previous = self.lastContextSnapshot(in: SpanNode.decodeList(self.session.lastKnownJSON)),
+                  snap.hasSubstantialChange(from: previous)
+            else { return }
+            self.insertContextBlockAtEnd(.contextBlock(from: snap))
+            self.pushNow()
+        }
+    }
+
+    private func lastContextSnapshot(in spans: [SpanNode]) -> ContextSnapshot? {
+        spans.reversed().compactMap { node -> ContextSnapshot? in
             guard case .block(let block) = node else { return nil }
             return ContextSnapshot(block: block)
-        }).first else { return }
-        guard snap.hasSubstantialChange(from: previous) else { return }
-        insertContextBlockAtEnd(BlockValue.contextBlock(from: snap, pending: ContextTracker.stampsContext))
-        pushNow()
+        }.first
+    }
+
+    private func hasPendingLogline(in spans: [SpanNode]) -> Bool {
+        spans.contains { node in
+            guard case .block(let block) = node else { return false }
+            return block.isPendingContext
+        }
     }
 
     func checkContextChangeAfterReactivation() {
@@ -758,7 +780,7 @@ final class EditorCore {
     }
 
     func insertLogline() {
-        let snap = contextTracker?.snapshot ?? ContextSnapshot(timestamp: Date())
+        let snap = contextTracker?.snapshot ?? ContextSnapshot()
         // only the note's own text gets a spinner: the refresh splices into
         // that storage, and a pad card's copy isn't it
         let pending = contextTracker != nil && ContextTracker.stampsContext && view === noteView
