@@ -250,4 +250,60 @@ extension View {
     }
 }
 
+/// A gate repeating work parks on so a phone in a pocket isn't kept awake by
+/// timers that only ever feed the visible UI. On macOS an app that isn't
+/// frontmost is still expected to keep working, so the gate is always open.
+@MainActor
+enum AppActivity {
+    #if os(macOS)
+    static var isActive: Bool { true }
+    static func watch() {}
+    static func waitUntilActive() async {}
+    #else
+    private(set) static var isActive = true
+    private static var observers: [NSObjectProtocol] = []
+    private static var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    static func watch() {
+        guard observers.isEmpty else { return }
+        isActive = UIApplication.shared.applicationState == .active
+        func observe(_ name: Notification.Name, active: Bool) -> NSObjectProtocol {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { AppActivity.setActive(active) }
+            }
+        }
+        observers = [
+            observe(UIApplication.didBecomeActiveNotification, active: true),
+            observe(UIApplication.willResignActiveNotification, active: false),
+        ]
+    }
+
+    private static func setActive(_ active: Bool) {
+        guard isActive != active else { return }
+        isActive = active
+        guard active else { return }
+        let resuming = waiters
+        waiters = [:]
+        for waiter in resuming.values { waiter.resume() }
+    }
+
+    /// Suspends until the app is frontmost, returning straight away when it is.
+    static func waitUntilActive() async {
+        guard !isActive else { return }
+        let id = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if isActive || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    waiters[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in AppActivity.waiters.removeValue(forKey: id)?.resume() }
+        }
+    }
+    #endif
+}
+
 import SwiftUI

@@ -83,10 +83,16 @@ final class FocusModes {
     /// Needs the focus-status entitlement authorized; without it `isFocused` is
     /// nil and this settles into a no-op, leaving the reconcile on activation
     /// to do the work.
+    ///
+    /// A backgrounded iOS app is suspended, so there the poll can't do what it
+    /// is for and only burns battery in the foreground; it parks and lets the
+    /// reconcile on activation cover the gap. On macOS the gate is always open.
     func watchSystemFocus() {
         guard watcher == nil else { return }
         watcher = Task { [weak self] in
             while !Task.isCancelled {
+                await AppActivity.waitUntilActive()
+                guard !Task.isCancelled else { break }
                 try? await Task.sleep(for: .seconds(20))
                 guard let self else { return }
                 let isFocused = INFocusStatusCenter.default.focusStatus.isFocused
