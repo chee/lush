@@ -552,9 +552,19 @@ impl Core {
                 .try_init();
         });
         tracing::info!("lush-core built {}", env!("LUSH_BUILD_TS"));
-        let runtime = Runtime::new().map_err(|e| CoreError::General {
-            msg: format!("tokio runtime: {e}"),
-        })?;
+        // The default blocking pool is sized for a server: 512 threads at 2MiB
+        // of stack each is more address space than an iOS app gets. `cpu_heavy`
+        // hands work to this pool on every file read and every automerge save,
+        // and a burst can grow it faster than the keep-alive reaps it — one
+        // crash report came back with 501 live blocking threads. Cap it.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .max_blocking_threads(32)
+            .thread_keep_alive(Duration::from_secs(5))
+            .build()
+            .map_err(|e| CoreError::General {
+                msg: format!("tokio runtime: {e}"),
+            })?;
         tracing::info!(
             elapsed_ms = boot.elapsed().as_millis(),
             "core runtime ready"

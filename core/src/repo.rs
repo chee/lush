@@ -716,6 +716,10 @@ pub struct Repo {
     iroh_endpoint: std::sync::Mutex<Option<Arc<iroh::Endpoint>>>,
     /// Serializes enable/disable so a bind and a close can't interleave.
     iroh_lifecycle: Mutex<()>,
+    /// Held for the duration of an idle sweep. Memory pressure arrives as a
+    /// repeating signal, so without this every warning stacks another sweep on
+    /// top of the ones already rebuilding docs from disk.
+    sweep_lock: Mutex<()>,
     peers_path: PathBuf,
     peers: std::sync::Mutex<Peers>,
 }
@@ -1105,7 +1109,15 @@ fn load_blob_batch(
     }
     let mut digests = Vec::new();
     let mut seen = HashSet::new();
-    let mut bytes = Vec::new();
+    // Sized up front: growing by doubling means a moment where the old buffer
+    // and the new one are both live, and this runs while the device is already
+    // out of memory.
+    let total: usize = commits
+        .iter()
+        .map(|record| record.blob.as_slice().len())
+        .chain(fragments.iter().map(|record| record.blob.as_slice().len()))
+        .sum();
+    let mut bytes = Vec::with_capacity(total);
     for blob in commits
         .iter()
         .map(|record| &record.blob)
@@ -1588,6 +1600,7 @@ impl Repo {
             iroh_key_path,
             iroh_endpoint: std::sync::Mutex::new(None),
             iroh_lifecycle: Mutex::new(()),
+            sweep_lock: Mutex::new(()),
             peers: std::sync::Mutex::new(load_peers(&peers_path)),
             peers_path,
         });
@@ -2756,7 +2769,18 @@ impl Repo {
     /// Evict every unpinned doc idle longer than `idle`, oldest first, then
     /// keep going past the threshold while more than MAX_RESIDENT_DOCS remain.
     /// `Duration::ZERO` is the memory-pressure sweep: everything evictable goes.
+    ///
+    /// One at a time. Evicting rebuilds each doc from disk to check it, which
+    /// costs a whole extra copy of the doc, and the memory-pressure signal
+    /// repeats for as long as the pressure lasts — running a sweep per warning
+    /// spends memory faster than the sweep reclaims it. A sweep already in
+    /// flight is doing this one's work, so drop it and let the next signal
+    /// through once that finishes.
     pub async fn sweep_idle_docs(&self, idle: Duration) -> usize {
+        let Ok(_sweeping) = self.sweep_lock.try_lock() else {
+            tracing::debug!("idle sweep already running; skipping");
+            return 0;
+        };
         let now = Instant::now();
         let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
         let mut candidates: Vec<(Duration, DocId)> = {
@@ -3833,6 +3857,41 @@ mod tests {
         repo.sweep_idle_docs(Duration::ZERO).await;
         assert!(repo.docs.lock().await.get(&sending).is_some());
         assert!(repo.docs.lock().await.get(&applying).is_some());
+    }
+
+    /// Memory pressure repeats, and each warning used to spawn another sweep
+    /// that rebuilt every doc from disk alongside the ones already doing it.
+    #[tokio::test]
+    async fn a_sweep_in_flight_turns_the_next_one_away() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "resident");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.unpin_doc(id);
+
+        let in_flight = repo.sweep_lock.lock().await;
+        assert_eq!(repo.sweep_idle_docs(Duration::ZERO).await, 0);
+        assert!(
+            repo.docs.lock().await.get(&id).is_some(),
+            "the turned-away sweep should not have touched anything"
+        );
+        drop(in_flight);
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                repo.sweep_idle_docs(Duration::ZERO).await;
+                if repo.docs.lock().await.get(&id).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("once the lock is free the sweep should run again");
     }
 
     #[tokio::test]
