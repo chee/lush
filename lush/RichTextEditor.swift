@@ -722,13 +722,19 @@ final class EditorCore {
 
     private weak var contextTracker: ContextTracker?
     private var autoLoglineCheckedNoteUrl: String?
+    private var loglineRefresh: Task<Void, Never>?
 
     func startContext(_ tracker: ContextTracker) {
         contextTracker = tracker
         tracker.start()
         if session.loaded {
-            checkContextChangeOnOpen(in: SpanNode.decodeList(session.lastKnownJSON))
+            syncLoglines(in: SpanNode.decodeList(session.lastKnownJSON))
         }
+    }
+
+    private func syncLoglines(in spans: [SpanNode], force: Bool = false) {
+        checkContextChangeOnOpen(in: spans, force: force)
+        resolvePendingLogline()
     }
 
     private func checkContextChangeOnOpen(in spans: [SpanNode], force: Bool = false) {
@@ -742,18 +748,114 @@ final class EditorCore {
             return ContextSnapshot(block: block)
         }).first else { return }
         guard snap.hasSubstantialChange(from: previous) else { return }
-        insertContextBlockAtEnd(BlockValue.contextBlock(from: snap))
+        insertContextBlockAtEnd(BlockValue.contextBlock(from: snap, pending: ContextTracker.stampsContext))
         pushNow()
     }
 
     func checkContextChangeAfterReactivation() {
         guard session.loaded else { return }
-        checkContextChangeOnOpen(in: SpanNode.decodeList(session.lastKnownJSON), force: true)
+        syncLoglines(in: SpanNode.decodeList(session.lastKnownJSON), force: true)
     }
 
     func insertLogline() {
         let snap = contextTracker?.snapshot ?? ContextSnapshot(timestamp: Date())
-        insertBlockAttachment(RichText.contextLine(for: BlockValue.contextBlock(from: snap)))
+        // only the note's own text gets a spinner: the refresh splices into
+        // that storage, and a pad card's copy isn't it
+        let pending = contextTracker != nil && ContextTracker.stampsContext && view === noteView
+        insertBlockAttachment(RichText.contextLine(for: .contextBlock(from: snap, pending: pending)))
+        if pending { resolvePendingLogline() }
+    }
+
+    /// A logline is on screen wearing a spinner: chase a fresher fix and
+    /// weather, splice whatever comes back in, and take the spinner off either
+    /// way. Loglines stamped elsewhere — a note made from the sidebar, say —
+    /// arrive already flagged and get picked up when the note opens.
+    private func resolvePendingLogline() {
+        guard loglineRefresh == nil,
+              let storage = noteView?.pStorage,
+              let pending = pendingLogline(in: storage)
+        else { return }
+        // a flag left behind by a session that quit mid-refresh: take the
+        // spinner off, but don't go asking the radio where an old note was
+        guard Self.isRecentLogline(pending.block) else {
+            applyLoglineRefresh(nil)
+            return
+        }
+        let url = noteUrl
+        loglineRefresh = Task { [weak self] in
+            guard let self else { return }
+            let snap = await self.contextTracker?.refresh()
+            if self.noteUrl == url { self.applyLoglineRefresh(snap) }
+            self.loglineRefresh = nil
+        }
+    }
+
+    private func applyLoglineRefresh(_ snap: ContextSnapshot?) {
+        guard let view = noteView else { return }
+        var spliced = false
+        // a note made and then a logline typed into it before the fix landed
+        // leaves two of them waiting; the bound is only there so a line that
+        // somehow refuses the splice can't spin the main thread
+        for _ in 0..<8 {
+            guard let storage = view.pStorage, let pending = pendingLogline(in: storage) else { break }
+            let fresher = Self.isRecentLogline(pending.block) ? snap : nil
+            let line = RichText.contextLine(for: pending.block.resolvingContext(with: fresher))
+            let box = line.length > 0 ? line.attribute(.amBlock, at: 0, effectiveRange: nil) : nil
+            let selection = view.pSelectedRange
+            view.pPerformStorageEdit { storage in
+                storage.replaceCharacters(in: pending.range, with: line)
+                // the paragraph break carries the block too, and the spans
+                // encoder isn't the only reader of it
+                let end = pending.range.location + line.length
+                if let box, end < storage.length,
+                   (storage.string as NSString).character(at: end) == 0x0A {
+                    storage.addAttribute(.amBlock, value: box, range: NSRange(location: end, length: 1))
+                }
+            }
+            if selection.location >= NSMaxRange(pending.range) {
+                view.pSelectedRange = NSRange(
+                    location: max(0, selection.location + line.length - pending.range.length),
+                    length: selection.length
+                )
+            } else if NSIntersectionRange(selection, pending.range).length > 0 {
+                view.pSelectedRange = NSRange(location: pending.range.location + line.length, length: 0)
+            }
+            spliced = true
+        }
+        if spliced { pushNow() }
+    }
+
+    /// Stamped recently enough that where the reader is standing now is still
+    /// where the logline was written.
+    private static func isRecentLogline(_ block: BlockValue) -> Bool {
+        guard let stamp = block.contextStamp else { return false }
+        return Date().timeIntervalSince(stamp) < 300
+    }
+
+    /// The line of the first logline still waiting on a refresh, without its
+    /// paragraph break.
+    private func pendingLogline(in storage: NSTextStorage) -> (range: NSRange, block: BlockValue)? {
+        var found: (range: NSRange, block: BlockValue)?
+        let str = storage.string as NSString
+        storage.enumerateAttribute(
+            .amBlock,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, range, stop in
+            guard let box = value as? BlockBox, box.value.isPendingContext else { return }
+            var line = str.paragraphRange(for: NSRange(location: range.location, length: 0))
+            if line.length > 0, str.character(at: NSMaxRange(line) - 1) == 0x0A {
+                line.length -= 1
+            }
+            // a run can be nothing but the paragraph break of a logline already
+            // spliced; the head of the line is what says whether it's waiting
+            guard line.length > 0,
+                  let head = storage.attribute(.amBlock, at: line.location, effectiveRange: nil) as? BlockBox,
+                  head.value.isPendingContext
+            else { return }
+            found = (line, head.value)
+            stop.pointee = true
+        }
+        return found
     }
 
     private func insertContextBlockAtEnd(_ block: BlockValue) {
@@ -782,7 +884,7 @@ final class EditorCore {
                 // below — otherwise the previous note stays on screen.
                 self.apply(spans: spans)
                 #endif
-                self.checkContextChangeOnOpen(in: spans)
+                self.syncLoglines(in: spans)
                 let populated = await self.fetchMissingAssets(in: spans)
                 guard self.noteUrl == url,
                       self.session === session,
@@ -828,7 +930,7 @@ final class EditorCore {
             let shouldFocus = self.model.pendingFocusUrl == url
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
-            self.checkContextChangeOnOpen(in: spans)
+            self.syncLoglines(in: spans)
             guard await self.fetchMissingAssets(in: spans),
                   self.noteUrl == url,
                   self.session === session,

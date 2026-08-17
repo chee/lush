@@ -1698,10 +1698,14 @@ final class NotesModel {
             return await createNote(inFolder: folderUrl, snap: snap)
         }
         guard let core else { return nil }
+        let pending = snap != nil && ContextTracker.stampsContext
         do {
-            let url = try await Task.detached { [core, snap] () -> String in
+            let url = try await Task.detached { [core, snap, pending] () -> String in
                 let url = try core.createNoteDoc(title: "")
-                let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
+                let initial: [SpanNode] = [
+                    .block(.creationBlock(snap: snap, pending: pending)),
+                    .block(.heading(level: 1)),
+                ]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
                 try await core.linkNoteToFolder(noteUrl: url, title: "")
                 return url
@@ -1719,10 +1723,14 @@ final class NotesModel {
     @discardableResult
     func createNote(inFolder folderUrl: String, snap: ContextSnapshot? = nil) async -> String? {
         guard let core else { return nil }
+        let pending = snap != nil && ContextTracker.stampsContext
         do {
-            let url = try await Task.detached { [core, folderUrl, snap] () -> String in
+            let url = try await Task.detached { [core, folderUrl, snap, pending] () -> String in
                 let url = try core.createNoteIn(folderUrl: folderUrl, title: "")
-                let initial: [SpanNode] = [.block(.creationBlock(snap: snap)), .block(.heading(level: 1))]
+                let initial: [SpanNode] = [
+                    .block(.creationBlock(snap: snap, pending: pending)),
+                    .block(.heading(level: 1)),
+                ]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
                 return url
             }.value

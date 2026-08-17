@@ -96,7 +96,7 @@ struct ContextSnapshot: Equatable {
         longitude = block.attrs["lon"]?.doubleValue
         weatherDescription = block.attrs["weather"]?.stringValue
         extras = block.attrs.reduce(into: [:]) { result, pair in
-            let reserved = ["created", "ts", "location", "lat", "lon", "weather"]
+            let reserved = ["created", "ts", "location", "lat", "lon", "weather", "pending"]
             guard !reserved.contains(pair.key), let value = pair.value.stringValue else { return }
             result[pair.key] = value
         }
@@ -104,7 +104,11 @@ struct ContextSnapshot: Equatable {
 }
 
 extension BlockValue {
-    static func contextBlock(from snap: ContextSnapshot) -> BlockValue {
+    /// A logline stamped from a snapshot that a refresh is still chasing. It
+    /// draws a spinner until `resolvingContext` folds the fresher reading in.
+    static let contextPendingKey = "pending"
+
+    static func contextBlock(from snap: ContextSnapshot, pending: Bool = false) -> BlockValue {
         var attrs: [String: JSONValue] = [:]
         let fmt = ISO8601DateFormatter()
         attrs["ts"] = .string(fmt.string(from: snap.timestamp))
@@ -113,10 +117,11 @@ extension BlockValue {
         if let lon = snap.longitude { attrs["lon"] = .number(lon) }
         if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
         for (key, value) in snap.extras { attrs[key] = .string(value) }
+        if pending { attrs[contextPendingKey] = .bool(true) }
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
     }
 
-    static func creationBlock(snap: ContextSnapshot? = nil) -> BlockValue {
+    static func creationBlock(snap: ContextSnapshot? = nil, pending: Bool = false) -> BlockValue {
         var attrs: [String: JSONValue] = [:]
         let fmt = ISO8601DateFormatter()
         attrs["created"] = .string(fmt.string(from: Date()))
@@ -126,8 +131,33 @@ extension BlockValue {
             if let lon = snap.longitude { attrs["lon"] = .number(lon) }
             if let w = snap.weatherDescription { attrs["weather"] = .string(w) }
                 for (key, value) in snap.extras { attrs[key] = .string(value) }
+            if pending { attrs[contextPendingKey] = .bool(true) }
         }
         return BlockValue(type: "context", attrs: attrs, isEmbed: true)
+    }
+
+    var isPendingContext: Bool {
+        type == "context" && attrs[Self.contextPendingKey] != nil
+    }
+
+    /// When the logline was written, however long ago the doc has been sitting
+    /// around with the flag still on it.
+    var contextStamp: Date? {
+        guard let raw = (attrs["created"] ?? attrs["ts"])?.stringValue else { return nil }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+
+    /// Stops the spinner, keeping whatever the refresh didn't improve on.
+    func resolvingContext(with snap: ContextSnapshot?) -> BlockValue {
+        var out = self
+        out.attrs.removeValue(forKey: Self.contextPendingKey)
+        guard let snap else { return out }
+        if let loc = snap.locationName { out.attrs["location"] = .string(loc) }
+        if let lat = snap.latitude { out.attrs["lat"] = .number(lat) }
+        if let lon = snap.longitude { out.attrs["lon"] = .number(lon) }
+        if let w = snap.weatherDescription { out.attrs["weather"] = .string(w) }
+        for (key, value) in snap.extras { out.attrs[key] = .string(value) }
+        return out
     }
 }
 
@@ -173,6 +203,9 @@ struct ContextInlineView: View {
                     Label(loc, systemImage: "location")
                 }
             }
+            if block.isPendingContext {
+                ProgressView().controlSize(.mini)
+            }
             Spacer(minLength: 0)
         }
         .labelStyle(.titleAndIcon)
@@ -192,6 +225,15 @@ final class ContextTracker {
         UserDefaults.standard.bool(forKey: weatherEnabledKey)
     }
 
+    /// Whether a logline has anything to go and fetch.
+    static var stampsContext: Bool {
+        SavedPlaces.enabled || weatherEnabled
+    }
+
+    /// A logline holds a spinner open while this runs, so it gives up fast and
+    /// keeps whatever it already knew.
+    static let refreshTimeout: TimeInterval = 3
+
     /// Extra logline sources. Each tick asks every provider for a value; the
     /// key becomes the context block's attribute name.
     var providers: [String: @MainActor () -> String?] = [:]
@@ -209,6 +251,8 @@ final class ContextTracker {
     private var locationNameGeneration = 0
     private var locationRequestInFlight = false
     private var lastLocationFix: Date = .distantPast
+    private var fixWaiters: [UUID: CheckedContinuation<CLLocation?, Never>] = [:]
+    private var refreshTask: Task<Void, Never>?
     /// A note is stamped with the place it was written in, and the snapshot's
     /// own substantial-change threshold is 500m, so a fix from a few minutes
     /// ago is as good as one taken now.
@@ -259,6 +303,7 @@ final class ContextTracker {
             locationManager = nil
             locationRequestInFlight = false
             lastLocation = nil
+            deliverFix(nil)
         }
         if enabled {
             if let lastLocation { didUpdateLocation(lastLocation, fresh: false) }
@@ -285,6 +330,7 @@ final class ContextTracker {
             locationManager = nil
             locationRequestInFlight = false
             lastLocation = nil
+            deliverFix(nil)
         }
         if !enabled { snapshot.weatherDescription = nil }
         if enabled, let location = lastLocation {
@@ -314,6 +360,103 @@ final class ContextTracker {
         }
     }
 
+    /// The freshest fix and weather that `timeout` seconds can buy. Loglines
+    /// stamped in the same moment share the one refresh; what doesn't arrive in
+    /// time keeps arriving in the background, it just misses this stamp.
+    @discardableResult
+    func refresh(timeout: TimeInterval = ContextTracker.refreshTimeout) async -> ContextSnapshot {
+        if let refreshTask {
+            await refreshTask.value
+            return snapshot
+        }
+        let work: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.performRefresh(timeout: timeout)
+        }
+        refreshTask = work
+        // the fix has its own deadline; this one stops a slow geocode or a
+        // stalled weather host from holding the spinner past its welcome
+        let deadline = Task {
+            try? await Task.sleep(for: .seconds(timeout))
+            work.cancel()
+        }
+        await work.value
+        deadline.cancel()
+        refreshTask = nil
+        return snapshot
+    }
+
+    private func performRefresh(timeout: TimeInterval) async {
+        guard Self.stampsContext else { return }
+        start()
+        guard let loc = await nextFix(timeout: timeout), !Task.isCancelled else { return }
+        lastLocation = loc
+        let lat = loc.coordinate.latitude
+        let lon = loc.coordinate.longitude
+        async let place = refreshedPlaceName(at: loc)
+        async let sky = refreshedWeather(lat: lat, lon: lon)
+        let (name, weather) = await (place, sky)
+        guard !Task.isCancelled else { return }
+        if SavedPlaces.enabled {
+            snapshot.latitude = lat
+            snapshot.longitude = lon
+            if let name {
+                // the fix that got us here started its own naming task; this
+                // one is newer, so retire that one rather than race it
+                locationNameGeneration &+= 1
+                snapshot.locationName = name
+            }
+        }
+        if Self.weatherEnabled, let weather {
+            snapshot.weatherDescription = weather
+            lastWeatherFetch = Date()
+            lastWeatherAttempt = Date()
+            lastWeatherLocation = (lat, lon)
+        }
+        snapshot.timestamp = Date()
+    }
+
+    private func refreshedPlaceName(at loc: CLLocation) async -> String? {
+        guard SavedPlaces.enabled else { return nil }
+        return await placeName(at: loc)
+    }
+
+    private func refreshedWeather(lat: Double, lon: Double) async -> String? {
+        guard Self.weatherEnabled else { return nil }
+        return await weatherText(lat: lat, lon: lon)
+    }
+
+    /// The fix the radio is about to hand over, or the last one when there is
+    /// nothing in flight to wait for. The deadline is what guarantees the wait
+    /// ends — a one-shot request that never answers has no delegate call back.
+    private func nextFix(timeout: TimeInterval) async -> CLLocation? {
+        requestLocation(force: true)
+        guard locationRequestInFlight else { return lastLocation }
+        let id = UUID()
+        let deadline = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(timeout))
+            self?.stopWaitingForFix(id)
+        }
+        let fix = await withCheckedContinuation { (continuation: CheckedContinuation<CLLocation?, Never>) in
+            fixWaiters[id] = continuation
+        }
+        deadline.cancel()
+        return fix
+    }
+
+    private func stopWaitingForFix(_ id: UUID) {
+        fixWaiters.removeValue(forKey: id)?.resume(returning: lastLocation)
+    }
+
+    private func deliverFix(_ loc: CLLocation?) {
+        guard !fixWaiters.isEmpty else { return }
+        let waiters = fixWaiters
+        fixWaiters.removeAll()
+        for continuation in waiters.values {
+            continuation.resume(returning: loc ?? lastLocation)
+        }
+    }
+
     private func tick() {
         var extras: [String: String] = [:]
         for (key, provide) in providers {
@@ -330,6 +473,7 @@ final class ContextTracker {
         if fresh {
             locationRequestInFlight = false
             lastLocationFix = Date()
+            deliverFix(loc)
         }
         guard SavedPlaces.enabled || Self.weatherEnabled else { return }
         lastLocation = loc
@@ -403,6 +547,7 @@ final class ContextTracker {
     /// flag has to clear here or no fix would ever be asked for again.
     func didFailToLocate() {
         locationRequestInFlight = false
+        deliverFix(nil)
     }
 
     func didChangeAuthorization() {
@@ -440,22 +585,27 @@ final class ContextTracker {
                 }
             }
         }
+        guard let text = await weatherText(lat: lat, lon: lon) else { return }
+        guard Self.weatherEnabled, weatherGeneration == generation else { return }
+        snapshot.weatherDescription = text
+        lastWeatherFetch = now
+        lastWeatherLocation = (lat, lon)
+    }
+
+    /// WeatherKit when it answers, open-meteo when it doesn't. No throttling and
+    /// no snapshot writes — the caller owns both.
+    private func weatherText(lat: Double, lon: Double) async -> String? {
         let location = CLLocation(latitude: lat, longitude: lon)
         if let current = try? await WeatherService.shared.weather(for: location, including: .current) {
-            guard Self.weatherEnabled, weatherGeneration == generation else { return }
             let formatter = MeasurementFormatter()
             formatter.unitOptions = [.naturalScale, .temperatureWithoutUnit]
             formatter.numberFormatter.maximumFractionDigits = 0
             let temp = formatter.string(from: current.temperature)
-            snapshot.weatherDescription = "\(temp) \(current.condition.description)"
-            lastWeatherFetch = now
-            lastWeatherLocation = (lat, lon)
-            return
+            return "\(temp) \(current.condition.description)"
         }
-        guard Self.weatherEnabled, weatherGeneration == generation else { return }
-        guard let url = URL(
+        guard !Task.isCancelled, let url = URL(
             string: "https://api.open-meteo.com/v1/forecast?latitude=\(lat)&longitude=\(lon)&current_weather=true"
-        ) else { return }
+        ) else { return nil }
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         guard let (data, response) = try? await URLSession.shared.data(for: request),
@@ -463,13 +613,10 @@ final class ContextTracker {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let current = json["current_weather"] as? [String: Any],
               let temperature = current["temperature"] as? Double
-        else { return }
+        else { return nil }
         let condition = weatherLabel(current["weathercode"] as? Int ?? 0)
         let temp = "\(Int(temperature.rounded()))°C"
-        guard Self.weatherEnabled, weatherGeneration == generation else { return }
-        snapshot.weatherDescription = condition.isEmpty ? temp : "\(temp) \(condition)"
-        lastWeatherFetch = now
-        lastWeatherLocation = (lat, lon)
+        return condition.isEmpty ? temp : "\(temp) \(condition)"
     }
 
     private func weatherLabel(_ code: Int) -> String {
