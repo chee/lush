@@ -655,6 +655,7 @@ final class NotesModel {
     private func startOnce() async {
         guard core == nil else { return }
         Self.bootLog("startOnce begin")
+        AppActivity.watch()
         focus.watchSystemFocus()
         Task { await focus.reconcileWithSystemFocus() }
         do {
@@ -1352,6 +1353,8 @@ final class NotesModel {
         pollTask?.cancel()
         pollTask = Task.detached { [weak self] in
             while !Task.isCancelled {
+                await AppActivity.waitUntilActive()
+                guard !Task.isCancelled else { break }
                 try? await Task.sleep(for: .seconds(120))
                 guard !Task.isCancelled else { break }
                 guard let (core, rootUrls, knownCounts) = await MainActor.run(body: { [weak self] () -> (Core, [String], [String: Int])? in
@@ -1420,6 +1423,10 @@ final class NotesModel {
         maintenanceTask?.cancel()
         maintenanceTask = Task { [weak self] in
             while !Task.isCancelled {
+                // the intake is also drained on activation, so nothing is
+                // missed by leaving this parked while backgrounded
+                await AppActivity.waitUntilActive()
+                guard !Task.isCancelled else { break }
                 try? await Task.sleep(for: .seconds(30))
                 guard let self, !Task.isCancelled else { break }
                 await self.drainSharedIntake()

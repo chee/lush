@@ -207,6 +207,12 @@ final class ContextTracker {
     private var weatherGeneration = 0
     private var lastLocation: CLLocation?
     private var locationNameGeneration = 0
+    private var locationRequestInFlight = false
+    private var lastLocationFix: Date = .distantPast
+    /// A note is stamped with the place it was written in, and the snapshot's
+    /// own substantial-change threshold is 500m, so a fix from a few minutes
+    /// ago is as good as one taken now.
+    private static let locationRefresh: TimeInterval = 300
 
     init() {
         locationDelegate.owner = self
@@ -217,6 +223,8 @@ final class ContextTracker {
             tick()
             monitorTask = Task { [weak self] in
                 while !Task.isCancelled {
+                    await AppActivity.waitUntilActive()
+                    guard !Task.isCancelled else { break }
                     try? await Task.sleep(for: .seconds(60))
                     guard !Task.isCancelled else { break }
                     self?.tick()
@@ -231,8 +239,10 @@ final class ContextTracker {
         }
         let mgr = CLLocationManager()
         mgr.delegate = locationDelegate
+        // accuracy stays where it was: saved places are 150m wide and the POI
+        // lookup gates on 150m, so a coarser fix would cost naming precision.
+        // The saving comes from asking once instead of streaming, below.
         mgr.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
-        mgr.distanceFilter = 100
         locationManager = mgr
         requestLocation()
     }
@@ -243,12 +253,16 @@ final class ContextTracker {
         if enabled || Self.weatherEnabled {
             start()
         } else {
+            // stopping cancels a one-shot request without any delegate call
+            // back, so the in-flight flag has to be released by hand
             locationManager?.stopUpdatingLocation()
             locationManager = nil
+            locationRequestInFlight = false
             lastLocation = nil
         }
         if enabled {
-            if let lastLocation { didUpdateLocation(lastLocation) }
+            if let lastLocation { didUpdateLocation(lastLocation, fresh: false) }
+            requestLocation(force: true)
             return
         }
         snapshot.locationName = nil
@@ -265,8 +279,11 @@ final class ContextTracker {
         if enabled || SavedPlaces.enabled {
             start()
         } else {
+            // stopping cancels a one-shot request without any delegate call
+            // back, so the in-flight flag has to be released by hand
             locationManager?.stopUpdatingLocation()
             locationManager = nil
+            locationRequestInFlight = false
             lastLocation = nil
         }
         if !enabled { snapshot.weatherDescription = nil }
@@ -274,16 +291,24 @@ final class ContextTracker {
             Task {
                 await fetchWeather(lat: location.coordinate.latitude, lon: location.coordinate.longitude)
             }
+        } else if enabled {
+            requestLocation(force: true)
         }
     }
 
-    func requestLocation() {
+    /// One fix, then the radio goes back to sleep. Streaming updates kept the
+    /// location hardware warm for the whole session — every window appearing
+    /// called `start()` — to serve a snapshot only read when a note is stamped.
+    func requestLocation(force: Bool = false) {
         guard SavedPlaces.enabled || Self.weatherEnabled, let mgr = locationManager else { return }
         switch mgr.authorizationStatus {
         case .notDetermined:
             mgr.requestWhenInUseAuthorization()
         case .authorizedWhenInUse, .authorizedAlways:
-            mgr.startUpdatingLocation()
+            guard !locationRequestInFlight else { return }
+            guard force || Date().timeIntervalSince(lastLocationFix) > Self.locationRefresh else { return }
+            locationRequestInFlight = true
+            mgr.requestLocation()
         default:
             break
         }
@@ -296,9 +321,16 @@ final class ContextTracker {
         }
         snapshot.extras = extras
         snapshot.timestamp = Date()
+        requestLocation()
     }
 
-    func didUpdateLocation(_ loc: CLLocation) {
+    /// `fresh` marks a fix the radio just produced; replaying a cached one must
+    /// not push the throttle forward or the snapshot could go stale unnoticed.
+    func didUpdateLocation(_ loc: CLLocation, fresh: Bool = true) {
+        if fresh {
+            locationRequestInFlight = false
+            lastLocationFix = Date()
+        }
         guard SavedPlaces.enabled || Self.weatherEnabled else { return }
         lastLocation = loc
         snapshot.timestamp = Date()
@@ -367,8 +399,14 @@ final class ContextTracker {
         return nearest?.name
     }
 
+    /// A one-shot request reports its failure and nothing else, so the in-flight
+    /// flag has to clear here or no fix would ever be asked for again.
+    func didFailToLocate() {
+        locationRequestInFlight = false
+    }
+
     func didChangeAuthorization() {
-        requestLocation()
+        requestLocation(force: true)
     }
 
     private func fetchWeather(lat: Double, lon: Double, retrying: Bool = false) async {
@@ -457,6 +495,10 @@ private final class _LocationDelegate: NSObject, CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last else { return }
         Task { @MainActor [weak owner] in owner?.didUpdateLocation(loc) }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor [weak owner] in owner?.didFailToLocate() }
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

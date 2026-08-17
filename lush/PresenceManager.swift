@@ -94,9 +94,28 @@ final class PresenceManager {
         peers = [:]
         notifyPeersChanged()
         sendSnapshot()
+        startHeartbeat()
+    }
+
+    /// Alone in a document there is nobody to keep a 2s heartbeat alive for —
+    /// peers announce themselves with a snapshot when they arrive, so being
+    /// slow to speak costs nothing until one does.
+    private var heartbeatInterval: Duration {
+        peers.isEmpty ? .seconds(30) : .seconds(2)
+    }
+
+    private func startHeartbeat() {
+        heartbeatTask?.cancel()
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                if !AppActivity.isActive {
+                    await AppActivity.waitUntilActive()
+                    guard !Task.isCancelled else { break }
+                    // peers pruned us on their ttl while we were away
+                    self?.sendSnapshot()
+                }
+                guard let interval = self?.heartbeatInterval else { break }
+                try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { break }
                 self?.heartbeatTick()
             }
@@ -234,6 +253,7 @@ final class PresenceManager {
         else { return }
         let now = Date()
         let isNew = peers[sender] == nil
+        let wasAlone = peers.isEmpty
         var peer = peers[sender] ?? Peer(senderId: sender)
         switch message["type"]?.stringValue {
         case "snapshot":
@@ -263,6 +283,10 @@ final class PresenceManager {
         }
         peers[sender] = peer
         notifyPeersChanged()
+        if wasAlone {
+            // back to a real heartbeat before their ttl prunes us
+            startHeartbeat()
+        }
         if isNew {
             // introduce ourselves to the newcomer shortly, like the JS side
             snapshotDebounce?.cancel()
