@@ -21,9 +21,8 @@ jobs:
               --target aarch64-apple-ios --target aarch64-apple-ios-sim --target x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
-        env:
-          CACHE_ON_FAILURE: true
         with:
+          cache-on-failure: true
           workspaces: |
             core
             server-rs
@@ -52,9 +51,11 @@ jobs:
           security unlock-keychain -p ci "$KEYCHAIN"
           echo "$CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
-            -P "$CERT_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -s "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Install App Store Connect API key
         env:
