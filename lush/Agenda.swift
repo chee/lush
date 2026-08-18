@@ -822,11 +822,12 @@ extension NotesModel {
             status = "Couldn't create note: no folder yet"
             return nil
         }
+        let pending = snap != nil && ContextTracker.stampsContext
         do {
-            let url = try await Task.detached { [core, folder, item, series, snap] () -> String in
+            let url = try await Task.detached { [core, folder, item, series, snap, pending] () -> String in
                 let url = try core.createNoteIn(folderUrl: folder, title: item.title)
                 let initial: [SpanNode] = [
-                    .block(.creationBlock(snap: snap)),
+                    .block(.creationBlock(snap: snap, pending: pending)),
                     .block(.calendarEventBlock(item, series: series)),
                     .block(.heading(level: 1)),
                     .text(item.title, [:]),

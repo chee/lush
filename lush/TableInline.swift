@@ -84,6 +84,7 @@ final class InlineViewManager {
         let id = ObjectIdentifier(box)
         if let hit = hosts[id], hit.box === box { return hit }
         var host: Host? = switch box {
+        case is LoglineSpinnerBox: makeLoglineSpinnerHost()
         case let transcription as LiveTranscriptionBox: makeLiveTranscriptionHost(for: transcription)
         case let table as TableBox: makeTableHost(for: table)
         case let columns as ColumnsBox: makeColumnsHost(for: columns)
@@ -93,6 +94,18 @@ final class InlineViewManager {
         host?.box = box
         hosts[id] = host
         return host
+    }
+
+    private func makeLoglineSpinnerHost() -> Host {
+        // the logline's own type size, so the line doesn't change height when
+        // the spinner comes off
+        let side = max(10, RichText.bodySize * 0.76)
+        let (view, _, retained) = makeHosting(LoglineSpinnerView(side: side))
+        return Host(
+            view: view,
+            preferredSize: { _ in CGSize(width: side, height: side) },
+            retained: retained
+        )
     }
 
     private func makeLiveTranscriptionHost(for box: LiveTranscriptionBox) -> Host {
@@ -340,6 +353,17 @@ final class InlineViewManager {
             controller
         )
         #endif
+    }
+}
+
+private struct LoglineSpinnerView: View {
+    let side: CGFloat
+
+    var body: some View {
+        ProgressView()
+            .controlSize(.mini)
+            .frame(width: side, height: side)
+            .accessibilityLabel("Refreshing logline")
     }
 }
 

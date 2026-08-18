@@ -300,6 +300,10 @@ extension NSAttributedString.Key {
     static let amFontRole = NSAttributedString.Key("io.lush.fontRole")
 }
 
+/// The spinner a logline wears while its fix and weather are being refreshed.
+/// One per rendered line — the view manager keys its host on the instance.
+final class LoglineSpinnerBox: NSObject {}
+
 final class LiveTranscriptionBox: NSObject {
     let id: String
 
@@ -1516,6 +1520,15 @@ enum RichText {
         }
         if line.length == 0 {
             line.append(NSAttributedString(string: "Logline", attributes: attrs))
+        }
+        if block.isPendingContext {
+            let attachment = EmbedAttachment(box: LoglineSpinnerBox())
+            let side = max(10, bodySize * 0.76)
+            attachment.bounds = CGRect(x: 0, y: 0, width: side, height: side)
+            let spinner = NSMutableAttributedString(attachment: attachment)
+            spinner.addAttributes(attrs, range: NSRange(location: 0, length: spinner.length))
+            line.append(NSAttributedString(string: " ", attributes: attrs))
+            line.append(spinner)
         }
         return line
     }
