@@ -65,7 +65,7 @@ jobs:
           mkdir -p "$HOME/private_keys"
           printf '%s' "$API_KEY_CONTENT" > "$HOME/private_keys/AuthKey_$API_KEY_ID.p8"
 
-      - name: Archive
+      - name: Archive (iOS)
         env:
           API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -74,21 +74,50 @@ jobs:
             -project Lush.xcodeproj \
             -scheme Lush \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/Lush.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Lush-iOS.xcarchive" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
             -authenticationKeyIssuerID "$API_ISSUER"
 
-      - name: Upload to TestFlight
+      - name: Archive (macOS)
+        env:
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          xcodebuild archive \
+            -project Lush.xcodeproj \
+            -scheme Lush \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/Lush-macOS.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
+            -authenticationKeyID "$API_KEY_ID" \
+            -authenticationKeyIssuerID "$API_ISSUER"
+
+      - name: Upload iOS to TestFlight
         env:
           API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Lush.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Lush-iOS.xcarchive" \
             -exportOptionsPlist .github/ExportOptions.plist \
-            -exportPath "$RUNNER_TEMP/export" \
+            -exportPath "$RUNNER_TEMP/export/ios" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
+            -authenticationKeyID "$API_KEY_ID" \
+            -authenticationKeyIssuerID "$API_ISSUER"
+
+      - name: Upload macOS to TestFlight
+        env:
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Lush-macOS.xcarchive" \
+            -exportOptionsPlist .github/ExportOptions.plist \
+            -exportPath "$RUNNER_TEMP/export/macos" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
