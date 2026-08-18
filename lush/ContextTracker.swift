@@ -145,8 +145,14 @@ extension BlockValue {
     /// When the logline was written, however long ago the doc has been sitting
     /// around with the flag still on it.
     var contextStamp: Date? {
-        guard let raw = (attrs["created"] ?? attrs["ts"])?.stringValue else { return nil }
+        guard let raw = contextStampText else { return nil }
         return ISO8601DateFormatter().date(from: raw)
+    }
+
+    /// The stamp as written, which is what tells one logline in a note from
+    /// another once the pending flag is off and there's nothing else to go by.
+    var contextStampText: String? {
+        (attrs["created"] ?? attrs["ts"])?.stringValue
     }
 
     /// Stops the spinner, keeping whatever the refresh didn't improve on.
@@ -244,6 +250,7 @@ final class ContextTracker {
     private var locationManager: CLLocationManager?
     private var lastWeatherFetch: Date = .distantPast
     private var lastWeatherLocation: (Double, Double)?
+    private var lastWeatherText: String?
     private var lastLocation: CLLocation?
     private var lastLocationFix: Date = .distantPast
     private var lastPlaceName: String?
@@ -262,6 +269,9 @@ final class ContextTracker {
     /// last logline, so it settles for what the old minute-by-minute poll used
     /// to guarantee anyway.
     static let openCheckFixReuse: TimeInterval = 300
+    /// The radio's own deadline, well past any spinner's — a fix that arrives
+    /// after a stamp gave up is still worth having for the next one.
+    private static let fixTimeout: TimeInterval = 15
     private static let weatherReuse: TimeInterval = 900
     /// About a kilometre in degrees — closer than that is the same weather.
     private static let weatherReuseDegrees = 0.01
@@ -301,6 +311,7 @@ final class ContextTracker {
         UserDefaults.standard.set(enabled, forKey: Self.weatherEnabledKey)
         lastWeatherFetch = .distantPast
         lastWeatherLocation = nil
+        lastWeatherText = nil
         if enabled {
             start()
             Task { await refresh() }
@@ -318,6 +329,7 @@ final class ContextTracker {
         locationRequestInFlight = false
         lastAuthorization = nil
         lastLocation = nil
+        lastWeatherText = nil
         deliverFix(nil)
     }
 
@@ -344,8 +356,10 @@ final class ContextTracker {
     ///
     /// `maxAge` is how old a fix may be before the radio is woken for a new
     /// one — a stamp wants a recent one, the open check will take the last few
-    /// minutes. Loglines stamped in the same moment share the one refresh; what
-    /// misses the deadline still lands in the snapshot, just not in that stamp.
+    /// minutes. Loglines stamped in the same moment share the one refresh, and
+    /// `timeout` is only how long *this* caller waits: the work runs on, and
+    /// each reading lands in the snapshot as it arrives, so what misses one
+    /// stamp is there for the next — or for `settled()`.
     @discardableResult
     func refresh(
         maxAge: TimeInterval = ContextTracker.fixReuse,
@@ -353,25 +367,41 @@ final class ContextTracker {
     ) async -> ContextSnapshot {
         collectProviders()
         snapshot.timestamp = Date()
-        if let refreshTask {
-            await refreshTask.value
-            return snapshot
-        }
-        let work: Task<Void, Never> = Task { [weak self] in
+        await wait(for: refreshTask ?? startRefresh(maxAge: maxAge), upTo: timeout)
+        return snapshot
+    }
+
+    /// What the refresh in flight settles on, however long it takes. A cold fix
+    /// and its weather rarely beat a spinner's deadline; this is how the
+    /// logline that gave up waiting still gets them.
+    func settled() async -> ContextSnapshot {
+        while let work = refreshTask { await work.value }
+        return snapshot
+    }
+
+    private func startRefresh(maxAge: TimeInterval) -> Task<Void, Never> {
+        let work = Task { [weak self] in
             guard let self else { return }
-            await self.performRefresh(maxAge: maxAge, timeout: timeout)
+            await self.performRefresh(maxAge: maxAge)
+            self.refreshTask = nil
         }
         refreshTask = work
-        // the fix has its own deadline; this one stops a slow geocode or a
-        // stalled weather host from holding the spinner past its welcome
+        return work
+    }
+
+    /// Waits on the refresh, but not past the deadline — a slow geocode or a
+    /// stalled weather host must not hold a spinner open. Giving up on the wait
+    /// is not giving up on the work: what it fetches is still worth having.
+    private func wait(for work: Task<Void, Never>, upTo timeout: TimeInterval) async {
         let deadline = Task {
-            try? await Task.sleep(for: .seconds(timeout))
-            work.cancel()
+            _ = try? await Task.sleep(for: .seconds(timeout))
         }
-        await work.value
-        deadline.cancel()
-        refreshTask = nil
-        return snapshot
+        let waiter = Task {
+            await work.value
+            deadline.cancel()
+        }
+        await deadline.value
+        waiter.cancel()
     }
 
     private func collectProviders() {
@@ -383,25 +413,35 @@ final class ContextTracker {
         snapshot.extras = extras
     }
 
-    private func performRefresh(maxAge: TimeInterval, timeout: TimeInterval) async {
+    private func performRefresh(maxAge: TimeInterval) async {
         guard Self.stampsContext else { return }
         start()
-        guard let loc = await nextFix(maxAge: maxAge, timeout: timeout), !Task.isCancelled else { return }
+        guard let loc = await nextFix(maxAge: maxAge) else { return }
         lastLocation = loc
         let lat = loc.coordinate.latitude
         let lon = loc.coordinate.longitude
-        async let place = refreshedPlaceName(at: loc)
-        async let sky = refreshedWeather(lat: lat, lon: lon)
-        let (name, weather) = await (place, sky)
-        guard !Task.isCancelled else { return }
         if SavedPlaces.enabled {
             snapshot.latitude = lat
             snapshot.longitude = lon
-            if let name { snapshot.locationName = name }
+            snapshot.timestamp = Date()
         }
-        if Self.weatherEnabled, let weather {
-            snapshot.weatherDescription = weather
-        }
+        // each reading is written the moment it arrives rather than all at the
+        // end: a stamp whose deadline falls between the two still keeps the
+        // first, and one that catches neither leaves both for the next stamp
+        async let place: Void = applyPlaceName(at: loc)
+        async let sky: Void = applyWeather(lat: lat, lon: lon)
+        _ = await (place, sky)
+    }
+
+    private func applyPlaceName(at loc: CLLocation) async {
+        guard let name = await refreshedPlaceName(at: loc) else { return }
+        snapshot.locationName = name
+        snapshot.timestamp = Date()
+    }
+
+    private func applyWeather(lat: Double, lon: Double) async {
+        guard let text = await refreshedWeather(lat: lat, lon: lon) else { return }
+        snapshot.weatherDescription = text
         snapshot.timestamp = Date()
     }
 
@@ -426,7 +466,7 @@ final class ContextTracker {
 
     private func refreshedWeather(lat: Double, lon: Double) async -> String? {
         guard Self.weatherEnabled else { return nil }
-        if let current = snapshot.weatherDescription, let last = lastWeatherLocation,
+        if let current = lastWeatherText, let last = lastWeatherLocation,
            Date().timeIntervalSince(lastWeatherFetch) < Self.weatherReuse,
            sqrt(pow(lat - last.0, 2) + pow(lon - last.1, 2)) < Self.weatherReuseDegrees {
             return current
@@ -434,21 +474,23 @@ final class ContextTracker {
         guard let text = await weatherText(lat: lat, lon: lon) else { return nil }
         lastWeatherFetch = Date()
         lastWeatherLocation = (lat, lon)
+        lastWeatherText = text
         return text
     }
 
     /// The last fix while it's younger than `maxAge`, else the one the radio is
     /// about to hand over. The deadline is what guarantees the wait ends — a
     /// one-shot request that never answers has no delegate call back.
-    private func nextFix(maxAge: TimeInterval, timeout: TimeInterval) async -> CLLocation? {
+    private func nextFix(maxAge: TimeInterval) async -> CLLocation? {
         if let lastLocation, Date().timeIntervalSince(lastLocationFix) < maxAge {
             return lastLocation
         }
         requestFix()
         guard locationRequestInFlight else { return lastLocation }
         let id = UUID()
+        let limit = Self.fixTimeout
         let deadline = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(timeout))
+            try? await Task.sleep(for: .seconds(limit))
             self?.stopWaitingForFix(id)
         }
         let fix = await withCheckedContinuation { (continuation: CheckedContinuation<CLLocation?, Never>) in
