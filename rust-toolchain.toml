@@ -1,0 +1,11 @@
+# core and server-rs both link into the app as static libraries, so they have to
+# be built by the same rustc: two different std builds means two definitions of
+# rust_eh_personality and the archive fails to link.
+[toolchain]
+channel = "1.94.1"
+targets = [
+  "aarch64-apple-ios",
+  "aarch64-apple-ios-sim",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
