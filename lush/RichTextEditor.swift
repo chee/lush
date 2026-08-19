@@ -423,6 +423,48 @@ private enum EditorDocumentSessions {
     }
 }
 
+/// Where the caret sat in each note last time it was open, so reopening one
+/// lands back where you left off. Local state — the offsets are into the
+/// rendered text rather than the automerge doc, so a note edited elsewhere
+/// can nudge the caret but never break it: restoring clamps to the length.
+@MainActor
+private enum CaretMemory {
+    private static let carets = "noteCaretLocations"
+    private static let recencyKey = "noteCaretRecency"
+    private static let capacity = 500
+    private static var locations = UserDefaults.standard.dictionary(forKey: carets) as? [String: Int] ?? [:]
+    private static var recency = UserDefaults.standard.stringArray(forKey: recencyKey) ?? []
+    private static var writeTask: Task<Void, Never>?
+
+    static func caret(for noteUrl: String) -> Int? {
+        locations[noteUrl]
+    }
+
+    /// Every caret move calls this, so the write to disk is left to settle.
+    static func remember(_ location: Int, for noteUrl: String) {
+        guard locations[noteUrl] != location else { return }
+        locations[noteUrl] = location
+        recency.removeAll { $0 == noteUrl }
+        recency.append(noteUrl)
+        while recency.count > capacity {
+            locations.removeValue(forKey: recency.removeFirst())
+        }
+        writeTask?.cancel()
+        writeTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            flush()
+        }
+    }
+
+    static func flush() {
+        writeTask?.cancel()
+        writeTask = nil
+        UserDefaults.standard.set(locations, forKey: carets)
+        UserDefaults.standard.set(recency, forKey: recencyKey)
+    }
+}
+
 private func embedCount(in spans: [SpanNode]) -> Int {
     spans.filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
 }
@@ -453,6 +495,9 @@ final class EditorCore {
     var noteUrl: String
     private var session: EditorDocumentSession
     var isLoaded: Bool { session.loaded }
+    /// The remembered caret is put back once per note; after that the caret
+    /// belongs to the user and every move it makes is what gets remembered.
+    private var caretRestored = false
 
     private var saveTask: Task<Void, Never>?
     private var localWriteHeadsTask: Task<[String]?, Never>?
@@ -554,6 +599,7 @@ final class EditorCore {
         model.unpinNote(noteUrl)
         model.pinNote(url)
         noteUrl = url
+        caretRestored = false
         localWriteHeadsTask = nil
         session = EditorDocumentSessions.session(for: url)
         // fold state is per-note; recompute hidden ranges for the incoming
@@ -640,6 +686,7 @@ final class EditorCore {
 
     func detachViewFromSharedStorage() {
         cancelLiveTranscription()
+        CaretMemory.flush()
         if let storageEditObserver {
             NotificationCenter.default.removeObserver(storageEditObserver)
             self.storageEditObserver = nil
@@ -957,6 +1004,7 @@ final class EditorCore {
                 // below — otherwise the previous note stays on screen.
                 self.apply(spans: spans)
                 #endif
+                self.restoreRememberedCaret()
                 self.syncLoglines(in: spans)
                 let populated = await self.fetchMissingAssets(in: spans)
                 guard self.noteUrl == url,
@@ -1003,6 +1051,7 @@ final class EditorCore {
             let shouldFocus = self.model.pendingFocusUrl == url
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
+            self.restoreRememberedCaret()
             self.syncLoglines(in: spans)
             guard await self.fetchMissingAssets(in: spans),
                   self.noteUrl == url,
@@ -1019,6 +1068,32 @@ final class EditorCore {
         let location = min(view.pSelectedRange.location, layoutStorage.length)
         view.pSelectedRange = NSRange(location: location, length: 0)
         refreshFormattingState()
+    }
+
+    /// Put the caret back where it was the last time this note was open, and
+    /// bring it into view. Runs once per note, after the text is in place.
+    private func restoreRememberedCaret() {
+        guard !caretRestored else { return }
+        caretRestored = true
+        guard let view = noteView, let storage = view.pStorage,
+              let remembered = CaretMemory.caret(for: noteUrl), remembered > 0
+        else { return }
+        view.pSelectedRange = NSRange(location: min(remembered, storage.length), length: 0)
+        view.pScrollRangeToVisible(view.pSelectedRange)
+        refreshFormattingState()
+        // the text landed a moment ago and TextKit 2 lays out lazily, so the
+        // first scroll can aim at a height the document does not have yet
+        Task { @MainActor [weak self] in
+            guard let view = self?.noteView else { return }
+            view.pScrollRangeToVisible(view.pSelectedRange)
+        }
+    }
+
+    private func rememberCaret() {
+        guard caretRestored, session.loaded, !isApplyingDocumentState,
+              let view, view === noteView, view.pSelectedRange.length == 0
+        else { return }
+        CaretMemory.remember(view.pSelectedRange.location, for: noteUrl)
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async -> Bool {
@@ -2779,6 +2854,7 @@ final class EditorCore {
         refreshTrailingMarker()
         unfoldIfCaretHidden()
         broadcastCaret()
+        rememberCaret()
         redrawCodeSelection()
     }
 
