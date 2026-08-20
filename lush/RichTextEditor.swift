@@ -466,6 +466,26 @@ private enum CaretMemory {
     }
 }
 
+/// Where a selection ends up once a range of the text is replaced.
+private func selectionAfterReplacing(
+    _ range: NSRange,
+    withLength length: Int,
+    keeping selection: NSRange
+) -> NSRange {
+    if selection.location >= NSMaxRange(range) {
+        return NSRange(
+            location: selection.location + length - range.length,
+            length: selection.length
+        )
+    }
+    if NSMaxRange(selection) <= range.location {
+        return selection
+    }
+    // it covered the text being rewritten, so there is nothing left of it to
+    // hold on to: it collapses to the end of the replacement
+    return NSRange(location: range.location + length, length: 0)
+}
+
 private func embedCount(in spans: [SpanNode]) -> Int {
     spans.filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
 }
@@ -917,7 +937,10 @@ final class EditorCore {
     private func spliceLogline(_ range: NSRange, with block: BlockValue, in view: any EditorTextViewLike) {
         let line = RichText.contextLine(for: block)
         let box = line.length > 0 ? line.attribute(.amBlock, at: 0, effectiveRange: nil) : nil
+        // this lands mid-sentence, minutes after the note was opened, so the
+        // reader's place is taken down before the edit and put back after it
         let selection = view.pSelectedRange
+        let caretOffset = caretViewportOffset(in: view)
         view.pPerformStorageEdit { storage in
             storage.replaceCharacters(in: range, with: line)
             // the paragraph break carries the block too, and the spans
@@ -928,14 +951,60 @@ final class EditorCore {
                 storage.addAttribute(.amBlock, value: box, range: NSRange(location: end, length: 1))
             }
         }
-        if selection.location >= NSMaxRange(range) {
-            view.pSelectedRange = NSRange(
-                location: max(0, selection.location + line.length - range.length),
-                length: selection.length
-            )
-        } else if NSIntersectionRange(selection, range).length > 0 {
-            view.pSelectedRange = NSRange(location: range.location + line.length, length: 0)
+        // every case, not just the ones that move: a text view left to fix up
+        // its own selection across a storage edit will drop the caret
+        view.pSelectedRange = clamped(
+            selectionAfterReplacing(range, withLength: line.length, keeping: selection),
+            in: view
+        )
+        // a logline that grew by a line pushes everything below it down, and
+        // the scroll position does not follow — the reader's line would slide
+        guard let caretOffset else { return }
+        holdCaret(atViewportOffset: caretOffset, in: view)
+    }
+
+    /// The caret's distance below the top of the viewport, when it is on
+    /// screen to begin with. Nothing to hold on to when it isn't.
+    private func caretViewportOffset(in view: any EditorTextViewLike) -> CGFloat? {
+        guard let y = caretY(in: view) else { return nil }
+        let visible = view.pVisibleRect
+        guard visible.height > 0, y >= visible.minY, y <= visible.maxY else { return nil }
+        return y - visible.minY
+    }
+
+    private func holdCaret(atViewportOffset offset: CGFloat, in view: any EditorTextViewLike) {
+        guard let y = caretY(in: view) else { return }
+        let target = y - offset
+        // a logline below the caret moves nothing; scrolling to where the
+        // view already is would only interrupt a scroll under someone's thumb
+        guard abs(target - view.pVisibleRect.minY) > 0.5 else { return }
+        view.pScrollToY(target)
+    }
+
+    private func caretY(in view: any EditorTextViewLike) -> CGFloat? {
+        guard let textLayoutManager = view.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager,
+              let range = contentManager.textRange(
+                  for: NSRange(location: view.pSelectedRange.location, length: 0)
+              )
+        else { return nil }
+        var top: CGFloat?
+        textLayoutManager.enumerateTextSegments(
+            in: range,
+            type: .selection,
+            options: [.rangeNotRequired]
+        ) { _, frame, _, _ in
+            top = frame.minY
+            return false
         }
+        guard let top else { return nil }
+        return top + view.pTextOrigin.y
+    }
+
+    private func clamped(_ range: NSRange, in view: any EditorTextViewLike) -> NSRange {
+        let length = view.pStorage?.length ?? 0
+        let location = min(max(0, range.location), length)
+        return NSRange(location: location, length: min(range.length, length - location))
     }
 
     /// Stamped recently enough that where the reader is standing now is still
@@ -987,7 +1056,8 @@ final class EditorCore {
         view.pSelectedRange = NSRange(location: max(0, storage.length - 1), length: 0)
         let line = block.type == "context" ? RichText.contextLine(for: block) : RichText.embedAttachment(for: block, cache: cache)
         insertBlockAttachment(line)
-        view.pSelectedRange = NSRange(location: min(saved.location, storage.length), length: 0)
+        // the line went in at the end, past whatever the reader had selected
+        view.pSelectedRange = clamped(saved, in: view)
     }
 
     func load() {
