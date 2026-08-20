@@ -625,11 +625,13 @@
 		};
 		F073171A30241ABC00FFA544 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
+			platformFilters = (macos, );
 			target = F073170E30241ABC00FFA544 /* LushShareExtension */;
 			targetProxy = F073171930241ABC00FFA544 /* PBXContainerItemProxy */;
 		};
 		F073173230241AD500FFA544 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
+			platformFilters = (macos, );
 			target = F073172430241AD500FFA544 /* LushFinderAction */;
 			targetProxy = F073173130241AD500FFA544 /* PBXContainerItemProxy */;
 		};

@@ -242,7 +242,7 @@ fn stored_sedimentree_records_rebuild_the_live_document() {
         }
 
         let mut loaded = Automerge::new();
-        load_blob_batch(&mut loaded, &commits, &fragments).expect("stored blobs should order");
+        load_blob_batch(&mut loaded, commits, fragments).expect("stored blobs should order");
 
         assert_eq!(loaded.get_heads(), swarm.main.get_heads(), "seed {seed}");
         assert_eq!(
