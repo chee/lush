@@ -815,6 +815,21 @@ struct Ingested {
 /// once enough accumulate; the short tail remains loose so small edits still
 /// persist immediately.
 ///
+/// # Cost
+///
+/// `fragments(0..)` is O(the note's whole history), not O(what changed):
+/// automerge exports every fragment at every level and this then skips the
+/// ones already stored. `bench_ingest_breakdown` measures it at 23ms for a
+/// note with 10k changes, and it keeps climbing.
+///
+/// Restricting the call to `0..1` costs 1.6ms at that size, because a
+/// keystroke only ever produces a loose commit. That is not a drop-in
+/// change: a change whose own `fragment_level` is >= 1 (roughly one in 256)
+/// never appears in the loose tail, so a level-0 pass can miss it — and
+/// `save_doc_now` truncates the outbox log to the heads it believes it
+/// ingested. A partial ingest must therefore not truncate, or the change is
+/// dropped from the log while it is not yet in the sedimentree.
+///
 /// `Automerge::fragments` can panic on some change graphs (an upstream bug
 /// where a level-1 change escapes the cached fragment clock). A panic means no
 /// ingest this round; the next save retries.
@@ -3014,6 +3029,146 @@ mod tests {
         assert_eq!(name("ws://example.com:80/sync"), "example.com");
     }
 
+
+
+
+    /// What one sedimentree record costs to write, and how many records a
+    /// save carries. Run with `--ignored --nocapture`.
+    ///
+    /// This is the number that decides whether a keystroke can write
+    /// straight into the sedimentree: it is flat in the note's history and
+    /// dominated by the compound write's four fsyncs, two file creates and
+    /// two renames, so it does not shrink in release and does not amortize
+    /// until several records share a batch.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_loose_commit_write() {
+        use std::time::{Duration, Instant};
+
+        for prior in [100usize, 3000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            let mut at = 0usize;
+            for _ in 0..prior {
+                type_one(&repo, id, at).await;
+                at += 1;
+            }
+            repo.save_doc_now(id).await.unwrap();
+            let sid = id.sedimentree_id();
+
+            let n = 20u32;
+            let mut store = Duration::ZERO;
+            let mut commits = 0usize;
+            let mut frags = 0usize;
+
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+                let ingested = {
+                    let state = repo.doc_state(id).await.unwrap();
+                    let g = state.lock().await;
+                    let rebundle = g.stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD;
+                    ingest(&g.doc, sid, &g.stored_commits, &g.stored_fragments, rebundle).unwrap()
+                };
+                commits += ingested.commits.len();
+                frags += ingested.fragments.len();
+                let Ingested {
+                    commits: c,
+                    fragments: f,
+                    commit_heads,
+                    fragment_heads,
+                    ..
+                } = ingested;
+                let t = Instant::now();
+                repo.core.store_built_batch(sid, c, f).await.unwrap();
+                store += t.elapsed();
+                let state = repo.doc_state(id).await.unwrap();
+                let mut g = state.lock().await;
+                g.stored_commits.extend(commit_heads);
+                g.stored_fragments.extend(fragment_heads);
+            }
+
+            println!(
+                "{prior:>5} prior: store_built_batch {:>11?} for {:.2} commits + {:.2} fragments per save",
+                store / n,
+                commits as f64 / n as f64,
+                frags as f64 / n as f64
+            );
+        }
+    }
+
+    /// Where a save's time goes, and how it scales with a note's history.
+    /// Run with `--ignored --nocapture`. Writing is roughly
+    /// `full save - ingest`, since `save_doc_now` runs its own ingest.
+    ///
+    /// `ingest` is almost entirely `fragments(0..)`, which is O(total
+    /// history): automerge exports every fragment at every level before
+    /// `ingest` gets to skip the ones already stored. The `fragments(0..1)`
+    /// column is the same call restricted to the loose tail — the only level
+    /// a keystroke can produce — and shows what an incremental ingest would
+    /// have to work with. See the note on `ingest` before using it.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_ingest_breakdown() {
+        use std::time::{Duration, Instant};
+
+        for prior in [100usize, 1000, 3000, 10000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            let mut at = 0usize;
+            for _ in 0..prior {
+                type_one(&repo, id, at).await;
+                at += 1;
+            }
+            repo.save_doc_now(id).await.unwrap();
+            let sid = id.sedimentree_id();
+
+            let n = 20u32;
+            let mut enumerate = Duration::ZERO;
+            let mut loose_only = Duration::ZERO;
+            let mut ingest_only = Duration::ZERO;
+            let mut whole = Duration::ZERO;
+
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+
+                {
+                    let state = repo.doc_state(id).await.unwrap();
+                    let g = state.lock().await;
+                    let t = Instant::now();
+                    let _ = g.doc.fragments(0..).len();
+                    enumerate += t.elapsed();
+
+                    let t = Instant::now();
+                    let _ = g.doc.fragments(0..1).len();
+                    loose_only += t.elapsed();
+
+                    let t = Instant::now();
+                    let _ = ingest(
+                        &g.doc,
+                        sid,
+                        &g.stored_commits,
+                        &g.stored_fragments,
+                        false,
+                    );
+                    ingest_only += t.elapsed();
+                }
+
+                let t = Instant::now();
+                repo.save_doc_now(id).await.unwrap();
+                whole += t.elapsed();
+            }
+
+            println!(
+                "{prior:>6} prior: fragments(0..) {:>11?} | fragments(0..1) {:>11?} | ingest {:>11?} | full save {:>11?}",
+                enumerate / n,
+                loose_only / n,
+                ingest_only / n,
+                whole / n
+            );
+        }
+    }
 
     /// Not a test — run with `--ignored --nocapture` to compare what each
     /// durability strategy costs per keystroke as a note accumulates history.
