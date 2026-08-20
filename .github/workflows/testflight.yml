@@ -18,20 +18,39 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable \
-              --target aarch64-apple-ios --target aarch64-apple-ios-sim --target x86_64-apple-darwin
+              --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
+      # Same key as CI's app job, which is the point: a push to main builds
+      # every slice and leaves this warm. Cold here has been ~47m against
+      # ~13m warm, and that gap was the whole variance in release times.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          shared-key: apple
           workspaces: |
             core
             server-rs
 
-      - name: Build Rust core and bindings
-        run: ./core/build-bindings.sh
-
-      - name: Build PatchworkServer xcframework and bindings
-        run: ./server-rs/build-xcframework.sh
+      - name: Build Rust core and PatchworkServer xcframework
+        run: |
+          set -uo pipefail
+          # Two independent workspaces writing to separate target dirs and
+          # generating different files, so they overlap cleanly. Output goes to
+          # a log each rather than interleaving into an unreadable mess.
+          ./core/build-bindings.sh > "$RUNNER_TEMP/core.log" 2>&1 &
+          core=$!
+          ./server-rs/build-xcframework.sh > "$RUNNER_TEMP/server.log" 2>&1 &
+          server=$!
+          core_rc=0; server_rc=0
+          wait $core || core_rc=$?
+          wait $server || server_rc=$?
+          echo "::group::core/build-bindings.sh (exit $core_rc)"
+          cat "$RUNNER_TEMP/core.log"
+          echo "::endgroup::"
+          echo "::group::server-rs/build-xcframework.sh (exit $server_rc)"
+          cat "$RUNNER_TEMP/server.log"
+          echo "::endgroup::"
+          if [ $core_rc -ne 0 ] || [ $server_rc -ne 0 ]; then exit 1; fi
 
       - name: Build web bundle
         run: |
