@@ -17,12 +17,22 @@ enum BackgroundSync {
     /// reading and fsyncing inside its data container is one RunningBoard
     /// kills outright (`0xdead10cc`). The core parks its opportunistic work
     /// while this is false and picks it back up when it flips.
-    private static var foreground = true
+    ///
+    /// Starts parked. A BGTask can launch the process straight into the
+    /// background, where neither `didEnterBackground` nor `willEnterForeground`
+    /// ever arrives; assuming frontmost would leave the core working through
+    /// exactly the suspension this is meant to prevent. Nothing is lost by
+    /// starting false — `syncCoreActivity` is a no-op until a core exists, and
+    /// `applyCoreActivity` reads the real state the moment one does.
+    private static var foreground = false
     private static var backgroundHolds = 0
 
     /// Push the current state onto a core that was built after the app had
-    /// already moved, and so never saw the transition.
+    /// already moved, and so never saw the transition. Reads the application
+    /// state rather than trusting the flag: on a background launch no
+    /// transition notification was ever posted for the flag to have seen.
     static func applyCoreActivity() {
+        foreground = UIApplication.shared.applicationState != .background
         syncCoreActivity()
     }
 

@@ -610,10 +610,16 @@ struct LushApp: App {
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(
-                        for: UIApplication.didBecomeActiveNotification
+                        for: UIApplication.willEnterForegroundNotification
                     )
                 ) { _ in
                     BackgroundSync.willEnterForeground()
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: UIApplication.didBecomeActiveNotification
+                    )
+                ) { _ in
                     Task { await NotesModel.shared.focus.reconcileWithSystemFocus() }
                 }
                 .onReceive(
