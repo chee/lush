@@ -1027,6 +1027,22 @@ fn concat_blob_batch(
     commits: Vec<StoredRecord<LooseCommit>>,
     fragments: Vec<StoredRecord<SedimentreeFragment>>,
 ) -> (Vec<u8>, Vec<(Digest<Blob>, std::ops::Range<usize>)>) {
+    // One blob is already its own concatenation, and taking it whole costs
+    // nothing where copying it costs all of it. automerge-repo skips the same
+    // copy at both of its load sites (`blobs.length === 1 ? blobs[0] :
+    // mergeArrays(blobs)`, src/subduction/source.ts). It is the shape a live
+    // sync delta arrives in, and the shape an asset doc — a photo, whole — is
+    // stored in.
+    if commits.len() + fragments.len() == 1 {
+        let blob = match commits.into_iter().next() {
+            Some(record) => record.blob,
+            None => fragments.into_iter().next().expect("one record").blob,
+        };
+        let digest = BlobMeta::new(&blob).digest();
+        let bytes = Vec::from(blob);
+        let len = bytes.len();
+        return (bytes, vec![(digest, 0..len)]);
+    }
     // Sized up front: growing by doubling means a moment where the old buffer
     // and the new one are both live, and this runs while the device is already
     // out of memory.
@@ -3339,6 +3355,39 @@ mod tests {
                 data_received: false
             }
         );
+    }
+
+    /// A one-record batch is taken whole rather than copied, so it skips the
+    /// concatenating loop entirely. It still has to come back with the same
+    /// digest and a range covering the blob, or the per-blob retry and the
+    /// `applied` bookkeeping downstream of it read the wrong bytes.
+    #[test]
+    fn a_single_blob_batch_is_taken_whole() {
+        let mut source = Automerge::new().with_actor(ActorId::from([9; 16].as_slice()));
+        put(&mut source, "value", "alone");
+        let ingested = ingest(
+            &source,
+            DocId([9; 16]).sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(ingested.commits.len() + ingested.fragments.len(), 1);
+        let commits: Vec<_> = ingested
+            .commits
+            .into_iter()
+            .map(|(meta, blob)| StoredRecord { meta, blob })
+            .collect();
+        let expected = BlobMeta::new(&commits[0].blob).digest();
+        let contents = commits[0].blob.as_slice().to_vec();
+
+        let (bytes, parts) = concat_blob_batch(commits, Vec::new());
+        assert_eq!(bytes, contents);
+        assert_eq!(parts, vec![(expected, 0..contents.len())]);
+
+        let mut loaded = Automerge::new();
+        loaded.load_incremental(&bytes[parts[0].1.clone()]).unwrap();
+        assert_eq!(loaded.get_heads(), source.get_heads());
     }
 
     #[test]
