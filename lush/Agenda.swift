@@ -277,12 +277,20 @@ struct CalendarSidebarLabel: View {
         return "\(Calendar.current.component(.day, from: Date())).calendar"
     }
 
+    private var tint: Color {
+        #if os(iOS)
+        .pink
+        #else
+        .red
+        #endif
+    }
+
     var body: some View {
         Label {
             Text("Calendar")
         } icon: {
             Image(systemName: symbol)
-                .foregroundStyle(.red)
+                .foregroundStyle(tint)
         }
     }
 }

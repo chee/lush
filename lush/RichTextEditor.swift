@@ -423,6 +423,69 @@ private enum EditorDocumentSessions {
     }
 }
 
+/// The offset is into the rendered text and goes back in straight away; the
+/// cursor is an automerge one, which survives edits made elsewhere but costs
+/// a doc lock to resolve, so it lands a moment later and corrects the offset
+/// if the note moved on. Notes with a table or columns above the caret get no
+/// cursor at all — index arithmetic across those layouts is wrong.
+private struct RememberedCaret: Codable {
+    var location: Int
+    var cursor: String?
+}
+
+/// Where the caret sat in each note last time it was open, so reopening one
+/// lands back where you left off. Local state, kept out of the doc.
+@MainActor
+private enum CaretMemory {
+    private static let caretsKey = "noteCarets"
+    private static let recencyKey = "noteCaretRecency"
+    private static let capacity = 500
+    private static var carets = decoded()
+    private static var recency = UserDefaults.standard.stringArray(forKey: recencyKey) ?? []
+
+    static func caret(for noteUrl: String) -> RememberedCaret? {
+        carets[noteUrl]
+    }
+
+    /// Called once the caret has settled, so writing through is cheap enough.
+    static func remember(_ caret: RememberedCaret, for noteUrl: String) {
+        carets[noteUrl] = caret
+        recency.removeAll { $0 == noteUrl }
+        recency.append(noteUrl)
+        while recency.count > capacity {
+            carets.removeValue(forKey: recency.removeFirst())
+        }
+        guard let data = try? JSONEncoder().encode(carets) else { return }
+        UserDefaults.standard.set(data, forKey: caretsKey)
+        UserDefaults.standard.set(recency, forKey: recencyKey)
+    }
+
+    private static func decoded() -> [String: RememberedCaret] {
+        guard let data = UserDefaults.standard.data(forKey: caretsKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: RememberedCaret].self, from: data)) ?? [:]
+    }
+}
+
+/// Where a selection ends up once a range of the text is replaced.
+private func selectionAfterReplacing(
+    _ range: NSRange,
+    withLength length: Int,
+    keeping selection: NSRange
+) -> NSRange {
+    if selection.location >= NSMaxRange(range) {
+        return NSRange(
+            location: selection.location + length - range.length,
+            length: selection.length
+        )
+    }
+    if NSMaxRange(selection) <= range.location {
+        return selection
+    }
+    // it covered the text being rewritten, so there is nothing left of it to
+    // hold on to: it collapses to the end of the replacement
+    return NSRange(location: range.location + length, length: 0)
+}
+
 private func embedCount(in spans: [SpanNode]) -> Int {
     spans.filter { if case .block(let b) = $0 { return b.isEmbedBlock && b.embedUrl != nil }; return false }.count
 }
@@ -453,6 +516,9 @@ final class EditorCore {
     var noteUrl: String
     private var session: EditorDocumentSession
     var isLoaded: Bool { session.loaded }
+    /// The remembered caret is put back once per note; after that the caret
+    /// belongs to the user and every move it makes is what gets remembered.
+    private var caretRestored = false
 
     private var saveTask: Task<Void, Never>?
     private var localWriteHeadsTask: Task<[String]?, Never>?
@@ -511,6 +577,7 @@ final class EditorCore {
         textSpliceFlushTask?.cancel()
         saveTask?.cancel()
         caretBroadcastTask?.cancel()
+        caretMemoryTask?.cancel()
         let identity = ObjectIdentifier(self)
         Task { @MainActor [model, noteObserverId, peersObserverId, noteUrl] in
             model.unpinNote(noteUrl)
@@ -540,6 +607,7 @@ final class EditorCore {
 
     func switchTo(_ url: String) {
         cancelLiveTranscription()
+        rememberCaretNow()
         pushNow()
         remoteReloadTask?.cancel()
         textSpliceFlushTask?.cancel()
@@ -554,6 +622,7 @@ final class EditorCore {
         model.unpinNote(noteUrl)
         model.pinNote(url)
         noteUrl = url
+        caretRestored = false
         localWriteHeadsTask = nil
         session = EditorDocumentSessions.session(for: url)
         // fold state is per-note; recompute hidden ranges for the incoming
@@ -640,6 +709,7 @@ final class EditorCore {
 
     func detachViewFromSharedStorage() {
         cancelLiveTranscription()
+        rememberCaretNow()
         if let storageEditObserver {
             NotificationCenter.default.removeObserver(storageEditObserver)
             self.storageEditObserver = nil
@@ -867,25 +937,77 @@ final class EditorCore {
     private func spliceLogline(_ range: NSRange, with block: BlockValue, in view: any EditorTextViewLike) {
         let line = RichText.contextLine(for: block)
         let box = line.length > 0 ? line.attribute(.amBlock, at: 0, effectiveRange: nil) : nil
+        // this lands mid-sentence, minutes after the note was opened, so the
+        // reader's place is taken down before the edit and put back after it
         let selection = view.pSelectedRange
+        let caretOffset = caretViewportOffset(in: view)
         view.pPerformStorageEdit { storage in
             storage.replaceCharacters(in: range, with: line)
             // the paragraph break carries the block too, and the spans
-            // encoder isn't the only reader of it
-            let end = range.location + line.length
-            if let box, end < storage.length,
-               (storage.string as NSString).character(at: end) == 0x0A {
+            // encoder isn't the only reader of it. It is not always the next
+            // character: the reader may have written on this line.
+            let str = storage.string as NSString
+            let paragraph = str.paragraphRange(for: NSRange(location: range.location, length: 0))
+            let end = NSMaxRange(paragraph) - 1
+            if let box, end >= range.location + line.length, end < storage.length,
+               str.character(at: end) == 0x0A {
                 storage.addAttribute(.amBlock, value: box, range: NSRange(location: end, length: 1))
             }
         }
-        if selection.location >= NSMaxRange(range) {
-            view.pSelectedRange = NSRange(
-                location: max(0, selection.location + line.length - range.length),
-                length: selection.length
-            )
-        } else if NSIntersectionRange(selection, range).length > 0 {
-            view.pSelectedRange = NSRange(location: range.location + line.length, length: 0)
+        // every case, not just the ones that move: a text view left to fix up
+        // its own selection across a storage edit will drop the caret
+        view.pSelectedRange = clamped(
+            selectionAfterReplacing(range, withLength: line.length, keeping: selection),
+            in: view
+        )
+        // a logline that grew by a line pushes everything below it down, and
+        // the scroll position does not follow — the reader's line would slide
+        guard let caretOffset else { return }
+        holdCaret(atViewportOffset: caretOffset, in: view)
+    }
+
+    /// The caret's distance below the top of the viewport, when it is on
+    /// screen to begin with. Nothing to hold on to when it isn't.
+    private func caretViewportOffset(in view: any EditorTextViewLike) -> CGFloat? {
+        guard let y = caretY(in: view) else { return nil }
+        let visible = view.pVisibleRect
+        guard visible.height > 0, y >= visible.minY, y <= visible.maxY else { return nil }
+        return y - visible.minY
+    }
+
+    private func holdCaret(atViewportOffset offset: CGFloat, in view: any EditorTextViewLike) {
+        guard let y = caretY(in: view) else { return }
+        let target = y - offset
+        // a logline below the caret moves nothing; scrolling to where the
+        // view already is would only interrupt a scroll under someone's thumb
+        guard abs(target - view.pVisibleRect.minY) > 0.5 else { return }
+        view.pScrollToY(target)
+    }
+
+    private func caretY(in view: any EditorTextViewLike) -> CGFloat? {
+        guard let textLayoutManager = view.pTextLayoutManager,
+              let contentManager = textLayoutManager.textContentManager,
+              let range = contentManager.textRange(
+                  for: NSRange(location: view.pSelectedRange.location, length: 0)
+              )
+        else { return nil }
+        var top: CGFloat?
+        textLayoutManager.enumerateTextSegments(
+            in: range,
+            type: .selection,
+            options: [.rangeNotRequired]
+        ) { _, frame, _, _ in
+            top = frame.minY
+            return false
         }
+        guard let top else { return nil }
+        return top + view.pTextOrigin.y
+    }
+
+    private func clamped(_ range: NSRange, in view: any EditorTextViewLike) -> NSRange {
+        let length = view.pStorage?.length ?? 0
+        let location = min(max(0, range.location), length)
+        return NSRange(location: location, length: min(range.length, length - location))
     }
 
     /// Stamped recently enough that where the reader is standing now is still
@@ -901,8 +1023,9 @@ final class EditorCore {
         logline(in: storage) { $0.isPendingContext }
     }
 
-    /// The line of the first logline the test accepts, without its paragraph
-    /// break.
+    /// What the first logline the test accepts has rendered of itself, which
+    /// is not the whole line: a reader can type onto it, and those characters
+    /// belong to them.
     private func logline(
         in storage: NSTextStorage,
         where accept: (BlockValue) -> Bool
@@ -925,10 +1048,30 @@ final class EditorCore {
                   head.value.type == "context",
                   accept(head.value)
             else { return }
-            found = (line, head.value)
+            let rendered = displayOnlyRun(from: line.location, within: line, in: storage)
+            guard rendered.length > 0 else { return }
+            found = (rendered, head.value)
             stop.pointee = true
         }
         return found
+    }
+
+    /// How far the block's own rendering reaches. It draws itself from its
+    /// attrs and marks every character it lays down display-only, so the first
+    /// character without that mark is where the reader's writing starts.
+    private func displayOnlyRun(
+        from location: Int,
+        within line: NSRange,
+        in storage: NSTextStorage
+    ) -> NSRange {
+        var end = location
+        while end < NSMaxRange(line) {
+            var effective = NSRange(location: 0, length: 0)
+            guard storage.attribute(.amDisplayOnly, at: end, effectiveRange: &effective) != nil
+            else { break }
+            end = min(NSMaxRange(effective), NSMaxRange(line))
+        }
+        return NSRange(location: location, length: end - location)
     }
 
     private func insertContextBlockAtEnd(_ block: BlockValue) {
@@ -937,7 +1080,8 @@ final class EditorCore {
         view.pSelectedRange = NSRange(location: max(0, storage.length - 1), length: 0)
         let line = block.type == "context" ? RichText.contextLine(for: block) : RichText.embedAttachment(for: block, cache: cache)
         insertBlockAttachment(line)
-        view.pSelectedRange = NSRange(location: min(saved.location, storage.length), length: 0)
+        // the line went in at the end, past whatever the reader had selected
+        view.pSelectedRange = clamped(saved, in: view)
     }
 
     func load() {
@@ -957,6 +1101,7 @@ final class EditorCore {
                 // below — otherwise the previous note stays on screen.
                 self.apply(spans: spans)
                 #endif
+                self.restoreRememberedCaret()
                 self.syncLoglines(in: spans)
                 let populated = await self.fetchMissingAssets(in: spans)
                 guard self.noteUrl == url,
@@ -1003,6 +1148,7 @@ final class EditorCore {
             let shouldFocus = self.model.pendingFocusUrl == url
             if shouldFocus { self.model.pendingFocusUrl = nil }
             self.apply(spans: spans, focus: shouldFocus)
+            self.restoreRememberedCaret()
             self.syncLoglines(in: spans)
             guard await self.fetchMissingAssets(in: spans),
                   self.noteUrl == url,
@@ -1019,6 +1165,114 @@ final class EditorCore {
         let location = min(view.pSelectedRange.location, layoutStorage.length)
         view.pSelectedRange = NSRange(location: location, length: 0)
         refreshFormattingState()
+    }
+
+    /// Put the caret back where it was the last time this note was open, and
+    /// bring it into view. Runs once per note, after the text is in place.
+    ///
+    /// The stored offset goes in immediately so there is no wait for the
+    /// common case of an unchanged note; the cursor then resolves against the
+    /// doc and corrects it if the note moved on since. The correction only
+    /// applies while the caret is still where this put it — once the reader
+    /// has moved it themselves, it is theirs.
+    private func restoreRememberedCaret() {
+        guard !caretRestored else { return }
+        caretRestored = true
+        guard let remembered = CaretMemory.caret(for: noteUrl) else { return }
+        placeCaret(at: remembered.location)
+        guard let cursor = remembered.cursor,
+              let core = model.core,
+              let placed = noteView?.pSelectedRange.location
+        else { return }
+        let url = noteUrl
+        Task { @MainActor [weak self] in
+            // cursorIndex FFI can block on the doc lock — keep it off main
+            let index = await Task.detached { try? core.cursorIndex(url: url, cursor: cursor) }.value
+            guard let index, let self, self.noteUrl == url,
+                  let view = self.noteView, let storage = view.pStorage,
+                  view.pSelectedRange == NSRange(location: placed, length: 0),
+                  !self.storageHasAtomicLayout(in: storage, before: storage.length),
+                  let offset = self.utf16Position(forAutomergeIndex: Int(index), in: storage),
+                  offset != placed
+            else { return }
+            self.placeCaret(at: offset)
+        }
+    }
+
+    private func placeCaret(at location: Int) {
+        guard let view = noteView, let storage = view.pStorage else { return }
+        view.pSelectedRange = NSRange(
+            location: min(max(0, location), storage.length),
+            length: 0
+        )
+        scrollCaretIntoView()
+        refreshFormattingState()
+    }
+
+    /// TextKit 2 lays out lazily, so a caret deep in a note that was only just
+    /// filled in has no geometry yet and the scroll would aim at a height the
+    /// document does not have. Ask for that fragment's layout first.
+    private func scrollCaretIntoView(retrying: Bool = true) {
+        guard let view = noteView else { return }
+        if let textLayoutManager = view.pTextLayoutManager,
+           let contentManager = textLayoutManager.textContentManager,
+           let range = contentManager.textRange(for: view.pSelectedRange) {
+            textLayoutManager.ensureLayout(for: range)
+        }
+        // restoring runs as soon as the text lands, which on a note opened
+        // from cache can be before the view has been given a size to scroll in
+        guard view.pVisibleRect.height > 0 else {
+            guard retrying else { return }
+            Task { @MainActor [weak self] in self?.scrollCaretIntoView(retrying: false) }
+            return
+        }
+        view.pScrollRangeToVisible(view.pSelectedRange)
+    }
+
+    private var caretMemoryTask: Task<Void, Never>?
+
+    /// Every caret move lands here, so the cursor is only minted once the
+    /// caret has sat still — an FFI call per arrow key would be absurd.
+    private func rememberCaret() {
+        guard caretRestored, session.loaded, !isApplyingDocumentState,
+              let view, view === noteView, view.pSelectedRange.length == 0
+        else { return }
+        let location = view.pSelectedRange.location
+        guard CaretMemory.caret(for: noteUrl)?.location != location else { return }
+        let url = noteUrl
+        caretMemoryTask?.cancel()
+        caretMemoryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled, let self, self.noteUrl == url,
+                  let view = self.noteView, let storage = view.pStorage,
+                  view.pSelectedRange == NSRange(location: location, length: 0)
+            else { return }
+            var cursor: String?
+            // tables and columns are one character in storage but many spans
+            // in the doc, so index arithmetic across them is wrong
+            if !self.storageHasAtomicLayout(in: storage, before: location),
+               let index = self.automergeTextPosition(in: storage, at: location),
+               let core = self.model.core {
+                cursor = await Task.detached {
+                    try? core.textCursor(url: url, index: UInt64(index))
+                }.value
+            }
+            guard !Task.isCancelled, self.noteUrl == url else { return }
+            CaretMemory.remember(.init(location: location, cursor: cursor), for: url)
+        }
+    }
+
+    /// Leaving the note beats the debounce more often than not, so bank the
+    /// offset on the way out. Only the cursor is lost, and only until the
+    /// caret next settles somewhere.
+    private func rememberCaretNow() {
+        caretMemoryTask?.cancel()
+        guard caretRestored, session.loaded,
+              let view = noteView, view.pSelectedRange.length == 0
+        else { return }
+        let location = view.pSelectedRange.location
+        guard CaretMemory.caret(for: noteUrl)?.location != location else { return }
+        CaretMemory.remember(.init(location: location, cursor: nil), for: noteUrl)
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async -> Bool {
@@ -2779,6 +3033,7 @@ final class EditorCore {
         refreshTrailingMarker()
         unfoldIfCaretHidden()
         broadcastCaret()
+        rememberCaret()
         redrawCodeSelection()
     }
 
