@@ -944,10 +944,13 @@ final class EditorCore {
         view.pPerformStorageEdit { storage in
             storage.replaceCharacters(in: range, with: line)
             // the paragraph break carries the block too, and the spans
-            // encoder isn't the only reader of it
-            let end = range.location + line.length
-            if let box, end < storage.length,
-               (storage.string as NSString).character(at: end) == 0x0A {
+            // encoder isn't the only reader of it. It is not always the next
+            // character: the reader may have written on this line.
+            let str = storage.string as NSString
+            let paragraph = str.paragraphRange(for: NSRange(location: range.location, length: 0))
+            let end = NSMaxRange(paragraph) - 1
+            if let box, end >= range.location + line.length, end < storage.length,
+               str.character(at: end) == 0x0A {
                 storage.addAttribute(.amBlock, value: box, range: NSRange(location: end, length: 1))
             }
         }
@@ -1020,8 +1023,9 @@ final class EditorCore {
         logline(in: storage) { $0.isPendingContext }
     }
 
-    /// The line of the first logline the test accepts, without its paragraph
-    /// break.
+    /// What the first logline the test accepts has rendered of itself, which
+    /// is not the whole line: a reader can type onto it, and those characters
+    /// belong to them.
     private func logline(
         in storage: NSTextStorage,
         where accept: (BlockValue) -> Bool
@@ -1044,10 +1048,30 @@ final class EditorCore {
                   head.value.type == "context",
                   accept(head.value)
             else { return }
-            found = (line, head.value)
+            let rendered = displayOnlyRun(from: line.location, within: line, in: storage)
+            guard rendered.length > 0 else { return }
+            found = (rendered, head.value)
             stop.pointee = true
         }
         return found
+    }
+
+    /// How far the block's own rendering reaches. It draws itself from its
+    /// attrs and marks every character it lays down display-only, so the first
+    /// character without that mark is where the reader's writing starts.
+    private func displayOnlyRun(
+        from location: Int,
+        within line: NSRange,
+        in storage: NSTextStorage
+    ) -> NSRange {
+        var end = location
+        while end < NSMaxRange(line) {
+            var effective = NSRange(location: 0, length: 0)
+            guard storage.attribute(.amDisplayOnly, at: end, effectiveRange: &effective) != nil
+            else { break }
+            end = min(NSMaxRange(effective), NSMaxRange(line))
+        }
+        return NSRange(location: location, length: end - location)
     }
 
     private func insertContextBlockAtEnd(_ block: BlockValue) {

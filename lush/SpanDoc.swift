@@ -1965,6 +1965,18 @@ enum RichText {
             if block.type == "context" || block.type == "calendar-event" {
                 spans.append(.block(block))
                 previousBlock = block
+                // these render themselves from their attrs, so their own
+                // characters are display-only and must not be encoded — but a
+                // reader can type onto the line, and that text is theirs.
+                // Dropping the whole paragraph here ate it on the next save.
+                let stray = strayParagraph(in: NSRange(
+                    location: range.location,
+                    length: contentLength
+                ))
+                if !stray.isEmpty {
+                    spans.append(contentsOf: stray)
+                    previousBlock = .paragraph
+                }
                 continue
             }
             if block.isEmbedBlock {
