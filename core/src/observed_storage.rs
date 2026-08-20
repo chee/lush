@@ -40,7 +40,6 @@ impl ObservedStorage {
     pub(crate) fn new(inner: FsStorage, stored: mpsc::Sender<StoredBatch>) -> Self {
         Self { inner, stored }
     }
-
 }
 
 impl Storage<Sendable> for ObservedStorage {

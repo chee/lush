@@ -544,7 +544,6 @@ impl Core {
     ) -> Result<Arc<Self>, CoreError> {
         Self::new_with_options(data_dir, server_url, enable_iroh)
     }
-
 }
 
 impl Core {

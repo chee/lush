@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use async_tungstenite::{tokio::TokioAdapter, tungstenite::protocol::WebSocketConfig};
-use automerge::{Automerge, ChangeHash, Fragment as AutomergeFragment, ReadDoc};
+use automerge::{Automerge, ChangeHash, ReadDoc};
 use future_form::Sendable;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use sedimentree_core::{
@@ -86,13 +86,6 @@ const HEAL_DELAY: Duration = Duration::from_secs(5);
 const HEAL_MAX_ATTEMPTS: u32 = 12;
 const LOCAL_SERVER_PORT: u16 = 43219;
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
-const LOOSE_FRAGMENT_BATCH_SIZE: usize = 32;
-/// Once a doc is holding this many loose commits, the next save bundles the
-/// ones already on disk too. Without this a commit written loose could never
-/// join a fragment — only commits new to a save were ever eligible — so
-/// ordinary editing, a few changes at a time, never reached the batch size and
-/// left everything loose for good.
-const REBUNDLE_LOOSE_THRESHOLD: usize = 64;
 /// How many absorbed commits to delete at once. Deleting one at a time makes a
 /// pass over a doc with thousands of them crawl; unbounded floods the disk.
 const RECLAIM_DELETE_CONCURRENCY: usize = 16;
@@ -811,24 +804,22 @@ struct Ingested {
 }
 
 /// Decompose the doc's automerge fragments into sedimentree records, skipping
-/// anything already stored. Level 0 commits are batched into fragment records
-/// once enough accumulate; the short tail remains loose so small edits still
-/// persist immediately.
+/// anything already stored. A level-0 fragment becomes a loose commit; a
+/// level-1-or-higher fragment becomes a fragment record.
 ///
-/// # Cost
+/// Automerge core owns the compaction policy. Once it forms a fragment, the
+/// commits absorbed into it stop appearing at level 0 and the fragment appears
+/// at level >= 1, so the stored shape follows automerge's own view of the doc
+/// without this function deciding anything.
+/// `bench_natural_fragment_formation` records the rate: 8000 changes of
+/// ordinary editing leave 27 fragments and a tail of 106 loose commits.
 ///
-/// `fragments(0..)` is O(the note's whole history), not O(what changed):
-/// automerge exports every fragment at every level and this then skips the
-/// ones already stored. `bench_ingest_breakdown` measures it at 23ms for a
-/// note with 10k changes, and it keeps climbing.
-///
-/// Restricting the call to `0..1` costs 1.6ms at that size, because a
-/// keystroke only ever produces a loose commit. That is not a drop-in
-/// change: a change whose own `fragment_level` is >= 1 (roughly one in 256)
-/// never appears in the loose tail, so a level-0 pass can miss it — and
-/// `save_doc_now` truncates the outbox log to the heads it believes it
-/// ingested. A partial ingest must therefore not truncate, or the change is
-/// dropped from the log while it is not yet in the sedimentree.
+/// This mirrors `@automerge/automerge-repo`'s subduction source, which reads
+/// fragment metadata, filters it against the hashes it has already stored, and
+/// bundles only what survives. Bundling is the expensive half and is O(n) per
+/// item, so it has to stay behind the filter — enumerating metadata is
+/// comparatively cheap (1.6ms for a 10k-change note; see
+/// `bench_ingest_breakdown`).
 ///
 /// `Automerge::fragments` can panic on some change graphs (an upstream bug
 /// where a level-1 change escapes the cached fragment clock). A panic means no
@@ -838,10 +829,8 @@ fn ingest(
     sid: SedimentreeId,
     stored_commits: &HashSet<ChangeHash>,
     stored_fragments: &HashSet<ChangeHash>,
-    rebundle_loose: bool,
 ) -> Option<Ingested> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let fragments = doc.fragments(0..);
         let mut out = Ingested {
             commits: Vec::new(),
             fragments: Vec::new(),
@@ -849,20 +838,15 @@ fn ingest(
             fragment_heads: Vec::new(),
             skipped: false,
         };
-        let mut pending_loose = Vec::new();
-        for f in fragments {
+        for f in doc.fragments(0..) {
             let head = f.head;
             let level = f.level;
-            if (level == 0 && !rebundle_loose && stored_commits.contains(&head))
-                || (level > 0 && stored_fragments.contains(&head))
-            {
-                continue;
-            }
-            if level == 0 {
-                pending_loose.push(f);
-                if pending_loose.len() >= LOOSE_FRAGMENT_BATCH_SIZE {
-                    ingest_loose_batch(doc, sid, &mut pending_loose, stored_fragments, &mut out);
-                }
+            let already = if level == 0 {
+                stored_commits.contains(&head)
+            } else {
+                stored_fragments.contains(&head)
+            };
+            if already {
                 continue;
             }
             let boundary: BTreeSet<CommitId> =
@@ -870,121 +854,32 @@ fn ingest(
             let checkpoints: Vec<CommitId> =
                 f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
             let Some(bytes) = doc.bundle_fragments([f]).into_iter().next() else {
-                tracing::warn!(?head, "fragment failed to bundle; retrying on next save");
+                tracing::warn!(
+                    ?head,
+                    level,
+                    "fragment failed to bundle; retrying on next save"
+                );
                 out.skipped = true;
                 continue;
             };
             let blob = Blob::new(bytes);
             let meta = BlobMeta::new(&blob);
             let id = CommitId::new(head.0);
-            out.fragments.push((
-                SedimentreeFragment::new(sid, id, boundary, &checkpoints, meta),
-                blob,
-            ));
-            out.fragment_heads.push(head);
+            if level == 0 {
+                out.commits
+                    .push((LooseCommit::new(sid, id, boundary, meta), blob));
+                out.commit_heads.push(head);
+            } else {
+                out.fragments.push((
+                    SedimentreeFragment::new(sid, id, boundary, &checkpoints, meta),
+                    blob,
+                ));
+                out.fragment_heads.push(head);
+            }
         }
-        ingest_loose_tail(doc, sid, pending_loose, stored_commits, &mut out);
         out
     }))
     .ok()
-}
-
-fn ingest_loose_batch(
-    doc: &Automerge,
-    sid: SedimentreeId,
-    pending: &mut Vec<AutomergeFragment>,
-    stored_fragments: &HashSet<ChangeHash>,
-    out: &mut Ingested,
-) {
-    let batch = std::mem::take(pending);
-    let Some(head) = batch.last().map(|fragment| fragment.head) else {
-        return;
-    };
-    if stored_fragments.contains(&head) {
-        return;
-    }
-    let members: Vec<ChangeHash> = batch.iter().map(|fragment| fragment.head).collect();
-    let covered_heads = members.clone();
-    let member_set: HashSet<ChangeHash> = members.iter().copied().collect();
-    let mut seen_boundary = HashSet::new();
-    let boundary: Vec<ChangeHash> = batch
-        .iter()
-        .flat_map(|fragment| fragment.boundary.iter().copied())
-        .filter(|hash| !member_set.contains(hash) && seen_boundary.insert(*hash))
-        .collect();
-    let checkpoints = members.clone();
-    let fragment = AutomergeFragment {
-        head,
-        level: 0,
-        boundary: boundary.clone(),
-        checkpoints: checkpoints.clone(),
-        members,
-    };
-    let Some(bytes) = doc.bundle_fragments([fragment]).into_iter().next() else {
-        tracing::warn!(
-            ?head,
-            "loose commit batch failed to bundle; retrying as loose commits"
-        );
-        out.skipped = true;
-        return;
-    };
-    let blob = Blob::new(bytes);
-    let meta = BlobMeta::new(&blob);
-    let boundary_ids: BTreeSet<CommitId> = boundary
-        .into_iter()
-        .map(|hash| CommitId::new(hash.0))
-        .collect();
-    let checkpoint_ids: Vec<CommitId> = checkpoints
-        .into_iter()
-        .map(|hash| CommitId::new(hash.0))
-        .collect();
-    out.fragments.push((
-        SedimentreeFragment::new(
-            sid,
-            CommitId::new(head.0),
-            boundary_ids,
-            &checkpoint_ids,
-            meta,
-        ),
-        blob,
-    ));
-    out.commit_heads.extend(covered_heads);
-    out.fragment_heads.push(head);
-}
-
-fn ingest_loose_tail(
-    doc: &Automerge,
-    sid: SedimentreeId,
-    pending: Vec<AutomergeFragment>,
-    stored_commits: &HashSet<ChangeHash>,
-    out: &mut Ingested,
-) {
-    for fragment in pending {
-        let head = fragment.head;
-        if stored_commits.contains(&head) {
-            continue;
-        }
-        let boundary: BTreeSet<CommitId> = fragment
-            .boundary
-            .iter()
-            .map(|h| CommitId::new(h.0))
-            .collect();
-        let Some(bytes) = doc.bundle_fragments([fragment]).into_iter().next() else {
-            tracing::warn!(
-                ?head,
-                "loose commit failed to bundle; retrying on next save"
-            );
-            out.skipped = true;
-            continue;
-        };
-        let blob = Blob::new(bytes);
-        let meta = BlobMeta::new(&blob);
-        out.commits.push((
-            LooseCommit::new(sid, CommitId::new(head.0), boundary, meta),
-            blob,
-        ));
-        out.commit_heads.push(head);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2065,15 +1960,15 @@ impl Repo {
             }
             let repo = self.clone();
             tokio::spawn(async move {
-                let outcome = repo
-                    .core
-                    .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-                    .await
-                    .map(|peers| {
-                        classify_sync(peers.values().map(|(succeeded, stats, _)| {
-                            (*succeeded, stats.total_received() > 0)
-                        }))
-                    });
+                let outcome =
+                    repo.core
+                        .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                        .await
+                        .map(|peers| {
+                            classify_sync(peers.values().map(|(succeeded, stats, _)| {
+                                (*succeeded, stats.total_received() > 0)
+                            }))
+                        });
                 if !matches!(outcome, Ok(SyncOutcome::Succeeded { .. })) {
                     // Forget the heads so the server's next announcement retries.
                     let mut last = repo.last_server_heads.lock().await;
@@ -2357,7 +2252,6 @@ impl Repo {
         }
         let (ingested, ingested_heads) = {
             let state = shared.lock().await;
-            let rebundle = state.stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD;
             let heads = state.doc.get_heads();
             let ingested = cpu_heavy(|| {
                 ingest(
@@ -2365,7 +2259,6 @@ impl Repo {
                     sid,
                     &state.stored_commits,
                     &state.stored_fragments,
-                    rebundle,
                 )
             });
             (ingested, heads)
@@ -2802,7 +2695,10 @@ impl Repo {
         }
         {
             let syncs = self.syncs.lock().await;
-            if syncs.get(&id).is_some_and(|slot| slot.running || slot.again) {
+            if syncs
+                .get(&id)
+                .is_some_and(|slot| slot.running || slot.again)
+            {
                 return false;
             }
         }
@@ -2959,7 +2855,9 @@ impl Repo {
                     dirty.insert(id);
                 }
                 Ok(false) => {}
-                Err(e) => tracing::warn!(doc = %id.to_url(), error = %e, "pending save flush failed"),
+                Err(e) => {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "pending save flush failed")
+                }
             }
         }
         dirty
@@ -3029,9 +2927,6 @@ mod tests {
         assert_eq!(name("ws://example.com:80/sync"), "example.com");
     }
 
-
-
-
     /// What one sedimentree record costs to write, and how many records a
     /// save carries. Run with `--ignored --nocapture`.
     ///
@@ -3067,8 +2962,7 @@ mod tests {
                 let ingested = {
                     let state = repo.doc_state(id).await.unwrap();
                     let g = state.lock().await;
-                    let rebundle = g.stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD;
-                    ingest(&g.doc, sid, &g.stored_commits, &g.stored_fragments, rebundle).unwrap()
+                    ingest(&g.doc, sid, &g.stored_commits, &g.stored_fragments).unwrap()
                 };
                 commits += ingested.commits.len();
                 frags += ingested.fragments.len();
@@ -3097,16 +2991,48 @@ mod tests {
         }
     }
 
+    /// Does automerge form real fragments during ordinary editing? The
+    /// synthetic loose-batching in `ingest_loose_batch` exists because
+    /// "ordinary editing never reached the batch size and left everything
+    /// loose for good". Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_natural_fragment_formation() {
+        for total in [500usize, 2000, 8000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            for at in 0..total {
+                type_one(&repo, id, at).await;
+            }
+            let state = repo.doc_state(id).await.unwrap();
+            let g = state.lock().await;
+            let mut by_level = std::collections::BTreeMap::new();
+            for f in g.doc.fragments(0..) {
+                *by_level.entry(f.level).or_insert(0usize) += 1;
+            }
+            println!("{total:>5} changes -> fragments by level: {by_level:?}");
+        }
+    }
+
     /// Where a save's time goes, and how it scales with a note's history.
-    /// Run with `--ignored --nocapture`. Writing is roughly
-    /// `full save - ingest`, since `save_doc_now` runs its own ingest.
+    /// Writing is roughly `full save - ingest`, since `save_doc_now` runs its
+    /// own ingest.
     ///
-    /// `ingest` is almost entirely `fragments(0..)`, which is O(total
-    /// history): automerge exports every fragment at every level before
-    /// `ingest` gets to skip the ones already stored. The `fragments(0..1)`
-    /// column is the same call restricted to the loose tail — the only level
-    /// a keystroke can produce — and shows what an incremental ingest would
-    /// have to work with. See the note on `ingest` before using it.
+    /// **Run this with `--release`.** A debug build inflates `fragments(0..)`
+    /// by 10-15x and makes the enumeration look like the dominant cost when it
+    /// is not. In release it is 1.5ms for a 10k-change note, which matches
+    /// what automerge-repo's subduction source assumes ("cheap: a few ms even
+    /// at 12k changes").
+    ///
+    /// `ingest` is almost entirely `fragments(0..)`. It grows with the note's
+    /// history, because automerge exports metadata for every fragment at every
+    /// level before `ingest` skips the ones already stored. The
+    /// `fragments(0..1)` column is the same call restricted to the loose tail.
+    /// Reading only that level would be cheaper, but a change whose own
+    /// `fragment_level` is >= 1 never appears there, so it would miss records
+    /// that must be stored — and at 1.5ms the enumeration is not worth
+    /// trading correctness for. Bundling is the half that has to stay behind
+    /// the already-stored filter; see `ingest`.
     #[tokio::test]
     #[ignore]
     async fn bench_ingest_breakdown() {
@@ -3145,13 +3071,7 @@ mod tests {
                     loose_only += t.elapsed();
 
                     let t = Instant::now();
-                    let _ = ingest(
-                        &g.doc,
-                        sid,
-                        &g.stored_commits,
-                        &g.stored_fragments,
-                        false,
-                    );
+                    let _ = ingest(&g.doc, sid, &g.stored_commits, &g.stored_fragments);
                     ingest_only += t.elapsed();
                 }
 
@@ -3296,9 +3216,12 @@ mod tests {
     /// Dialing by node id goes through iroh discovery, so the endpoint being
     /// dialed has to have published its address before the test can find it.
     async fn wait_until_dialable(repo: &Repo) {
-        timeout(Duration::from_secs(20), repo.iroh_endpoint().unwrap().online())
-            .await
-            .expect("iroh endpoint should come online");
+        timeout(
+            Duration::from_secs(20),
+            repo.iroh_endpoint().unwrap().online(),
+        )
+        .await
+        .expect("iroh endpoint should come online");
     }
 
     #[tokio::test]
@@ -3420,7 +3343,6 @@ mod tests {
             DocId([7; 16]).sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         let mut commits: Vec<_> = ingested
@@ -3457,7 +3379,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         assert!(!ingested.fragments.is_empty());
@@ -3480,41 +3401,125 @@ mod tests {
         );
     }
 
+    /// Every record written has to correspond to a fragment automerge itself
+    /// reports, at the matching level. A previous version of `ingest` batched
+    /// level-0 runs into hand-built `AutomergeFragment`s — a head automerge
+    /// never chose, `level: 0` stored as a fragment record, and every member
+    /// declared a checkpoint — which put our sedimentree and the server's out
+    /// of step. Automerge core owns the compaction policy.
     #[test]
-    fn ingest_batches_level_zero_runs_into_fragments() {
+    fn ingest_mirrors_automerge_fragment_levels() {
         let id = DocId([12; 16]);
         let sid = id.sedimentree_id();
         let mut source = Automerge::new().with_actor(ActorId::from([12; 16].as_slice()));
-
-        while get_level_zero_count(&source) < LOOSE_FRAGMENT_BATCH_SIZE {
+        for _ in 0..600 {
             let index = source.length(ROOT);
             put(&mut source, &format!("value-{index}"), index as i64);
         }
 
-        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new(), false).unwrap();
+        let by_head: HashMap<ChangeHash, usize> = source
+            .fragments(0..)
+            .into_iter()
+            .map(|f| (f.head, f.level))
+            .collect();
         assert!(
-            !ingested.fragments.is_empty(),
-            "level-0 changes should be batched into fragment records"
-        );
-        assert!(
-            ingested.commits.len() < LOOSE_FRAGMENT_BATCH_SIZE,
-            "only the below-threshold tail should remain loose"
+            by_head.values().any(|level| *level > 0),
+            "expected automerge to have formed at least one real fragment"
         );
 
-        let commits: Vec<_> = ingested
-            .commits
-            .into_iter()
-            .map(|(meta, blob)| StoredRecord { meta, blob })
-            .collect();
-        let fragments: Vec<_> = ingested
-            .fragments
-            .into_iter()
-            .map(|(meta, blob)| StoredRecord { meta, blob })
-            .collect();
+        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+
+        for head in &ingested.commit_heads {
+            assert_eq!(
+                by_head.get(head),
+                Some(&0),
+                "a loose commit must be a level-0 automerge fragment"
+            );
+        }
+        for head in &ingested.fragment_heads {
+            let level = by_head
+                .get(head)
+                .copied()
+                .expect("a fragment record must have a head automerge reported");
+            assert!(level > 0, "a fragment record must come from level >= 1");
+        }
+        assert_eq!(
+            ingested.commit_heads.len() + ingested.fragment_heads.len(),
+            by_head.len(),
+            "every fragment automerge reports should be stored exactly once"
+        );
+    }
+
+    /// The durability property, across the point where automerge forms a real
+    /// fragment mid-stream: saving a few changes at a time and then loading
+    /// only what was stored has to reproduce the doc.
+    #[test]
+    fn ingest_reconstructs_doc_across_fragment_formation() {
+        let id = DocId([13; 16]);
+        let sid = id.sedimentree_id();
+        let mut source = Automerge::new().with_actor(ActorId::from([13; 16].as_slice()));
+
+        let mut stored_commits = HashSet::new();
+        let mut stored_fragments = HashSet::new();
+        let mut commits = Vec::new();
+        let mut fragments = Vec::new();
+
+        for round in 0..120 {
+            for _ in 0..5 {
+                let index = source.length(ROOT);
+                put(&mut source, &format!("value-{index}"), index as i64);
+            }
+            let ingested = ingest(&source, sid, &stored_commits, &stored_fragments).unwrap();
+            assert!(!ingested.skipped, "round {round} failed to bundle");
+            stored_commits.extend(ingested.commit_heads.iter().copied());
+            stored_fragments.extend(ingested.fragment_heads.iter().copied());
+            commits.extend(
+                ingested
+                    .commits
+                    .into_iter()
+                    .map(|(meta, blob)| StoredRecord { meta, blob }),
+            );
+            fragments.extend(
+                ingested
+                    .fragments
+                    .into_iter()
+                    .map(|(meta, blob)| StoredRecord { meta, blob }),
+            );
+        }
+
+        assert!(
+            !fragments.is_empty(),
+            "600 changes should have formed at least one fragment record"
+        );
+
         let mut loaded = Automerge::new();
         load_blob_batch(&mut loaded, &commits, &fragments).unwrap();
-
         assert_eq!(loaded.get_heads(), source.get_heads());
+    }
+
+    /// Re-ingesting with everything already stored writes nothing. This is
+    /// what keeps a save O(what changed) rather than O(the note's history):
+    /// bundling is the expensive half, and it sits behind this filter.
+    #[test]
+    fn ingest_skips_records_already_stored() {
+        let id = DocId([14; 16]);
+        let sid = id.sedimentree_id();
+        let mut source = Automerge::new().with_actor(ActorId::from([14; 16].as_slice()));
+        for _ in 0..600 {
+            let index = source.length(ROOT);
+            put(&mut source, &format!("value-{index}"), index as i64);
+        }
+
+        let first = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+        let stored_commits: HashSet<_> = first.commit_heads.iter().copied().collect();
+        let stored_fragments: HashSet<_> = first.fragment_heads.iter().copied().collect();
+
+        let second = ingest(&source, sid, &stored_commits, &stored_fragments).unwrap();
+        assert!(second.commits.is_empty() && second.fragments.is_empty());
+
+        put(&mut source, "one-more", 1);
+        let third = ingest(&source, sid, &stored_commits, &stored_fragments).unwrap();
+        assert_eq!(third.commits.len() + third.fragments.len(), 1);
     }
 
     fn get_level_zero_count(doc: &Automerge) -> usize {
@@ -3538,7 +3543,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         let commit_heads = ingested.commit_heads.clone();
@@ -3573,7 +3577,6 @@ mod tests {
             sid,
             &state.stored_commits,
             &state.stored_fragments,
-            false,
         )
         .unwrap();
         assert!(repeated.commits.is_empty());
@@ -3673,7 +3676,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         repo.core
@@ -3729,7 +3731,6 @@ mod tests {
                 id.sedimentree_id(),
                 &HashSet::new(),
                 &HashSet::new(),
-                false,
             )
             .unwrap();
             repo.core
@@ -3747,10 +3748,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            *repo.deferred_applies.lock().await,
-            HashSet::from([a, b])
-        );
+        assert_eq!(*repo.deferred_applies.lock().await, HashSet::from([a, b]));
 
         repo.drop_doc(b).await;
         repo.set_apply_incoming(true).await;
@@ -3841,7 +3839,7 @@ mod tests {
         let sid = id.sedimentree_id();
         let mut source = Automerge::new().with_actor(ActorId::from([11; 16].as_slice()));
         put(&mut source, "value", "legacy");
-        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new(), false).unwrap();
+        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!(ingested.commits.len(), 1);
         assert!(ingested.fragments.is_empty());
         let (commit, blob) = ingested.commits.pop().unwrap();
@@ -4013,7 +4011,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         repo.core
@@ -4158,10 +4155,7 @@ mod tests {
         assert!(repo.deferred_sends.lock().await.contains(&sending));
 
         repo.set_apply_incoming(false).await;
-        let mut remote = repo
-            .read_doc(applying, |doc| Ok(doc.fork()))
-            .await
-            .unwrap();
+        let mut remote = repo.read_doc(applying, |doc| Ok(doc.fork())).await.unwrap();
         remote.set_actor(ActorId::from([22; 16].as_slice()));
         put(&mut remote, "remote", "waiting");
         let ingested = ingest(
@@ -4169,7 +4163,6 @@ mod tests {
             applying.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         repo.core
@@ -4286,7 +4279,6 @@ mod tests {
         let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
         assert_eq!(loaded, expected);
     }
-
 
     /// Rebuild a doc from nothing but what is on disk, the way a fresh
     /// process would: the sedimentree, then the outbox log replayed over it.
