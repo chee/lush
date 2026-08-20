@@ -2261,6 +2261,37 @@ mod embed_resize_tests {
         assert!(json.contains("automerge:abc"), "embed url vanished: {json}");
         assert!(json.contains("420"), "width attr missing: {json}");
     }
+
+    /// The splice a logline's refresh performs: attrs added to an existing
+    /// context block and its pending flag deleted, everything else untouched.
+    #[test]
+    fn context_block_takes_refreshed_attrs_and_drops_pending() {
+        let mut doc = Automerge::new();
+        let initial = spans_json(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-08-20T12:00:00Z","pending":true}}},
+              {"type":"block","value":{"type":"heading","parents":[],"isEmbed":false,"attrs":{"level":1}}},
+              {"type":"text","value":"hello"}
+            ]"#,
+        );
+        update_spans_from_json(&mut doc, &initial).unwrap();
+        let resolved = spans_json(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-08-20T12:00:00Z","location":"Home, London","lat":51.5,"lon":-0.1,"weather":"14C Clear"}}},
+              {"type":"block","value":{"type":"heading","parents":[],"isEmbed":false,"attrs":{"level":1}}},
+              {"type":"text","value":"hello"}
+            ]"#,
+        );
+        update_spans_from_json(&mut doc, &resolved).unwrap();
+        let out = spans_to_json(&doc).unwrap();
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(json.contains("Home, London"), "location attr missing: {json}");
+        assert!(json.contains("14C Clear"), "weather attr missing: {json}");
+        assert!(!json.contains("pending"), "pending flag survived the splice: {json}");
+        assert!(json.contains("hello"), "text vanished: {json}");
+    }
 }
 
 #[cfg(test)]
