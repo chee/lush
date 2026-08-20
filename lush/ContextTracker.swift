@@ -252,7 +252,6 @@ final class ContextTracker {
     private var lastWeatherLocation: (Double, Double)?
     private var lastWeatherText: String?
     private var lastLocation: CLLocation?
-    private var lastLocationFix: Date = .distantPast
     private var lastPlaceName: String?
     private var lastNamedLocation: CLLocation?
     private var locationRequestInFlight = false
@@ -272,6 +271,8 @@ final class ContextTracker {
     /// The radio's own deadline, well past any spinner's — a fix that arrives
     /// after a stamp gave up is still worth having for the next one.
     private static let fixTimeout: TimeInterval = 15
+    /// The oldest last-known fix worth stamping when the radio doesn't answer.
+    private static let staleFixCutoff: TimeInterval = 900
     private static let weatherReuse: TimeInterval = 900
     /// About a kilometre in degrees — closer than that is the same weather.
     private static let weatherReuseDegrees = 0.01
@@ -478,15 +479,28 @@ final class ContextTracker {
         return text
     }
 
-    /// The last fix while it's younger than `maxAge`, else the one the radio is
-    /// about to hand over. The deadline is what guarantees the wait ends — a
-    /// one-shot request that never answers has no delegate call back.
+    /// The freshest position anyone knows: a fix this tracker took, or the
+    /// system's last known one — often already warm from another app while a
+    /// one-shot request here would sit waiting on the radio for seconds, or
+    /// fail outright on a machine that can't place itself right now.
+    private func freshestFix() -> CLLocation? {
+        [lastLocation, locationManager?.location]
+            .compactMap { $0 }
+            .filter { Date().timeIntervalSince($0.timestamp) < Self.staleFixCutoff }
+            .max { $0.timestamp < $1.timestamp }
+    }
+
+    /// A known fix while it's younger than `maxAge`, else the one the radio is
+    /// about to hand over — settling for the last known position rather than
+    /// nothing when the radio is slow or errors out. The deadline is what
+    /// guarantees the wait ends — a one-shot request that never answers has no
+    /// delegate call back.
     private func nextFix(maxAge: TimeInterval) async -> CLLocation? {
-        if let lastLocation, Date().timeIntervalSince(lastLocationFix) < maxAge {
-            return lastLocation
+        if let fix = freshestFix(), Date().timeIntervalSince(fix.timestamp) < maxAge {
+            return fix
         }
         requestFix()
-        guard locationRequestInFlight else { return lastLocation }
+        guard locationRequestInFlight else { return freshestFix() }
         let id = UUID()
         let limit = Self.fixTimeout
         let deadline = Task { [weak self] in
@@ -501,7 +515,7 @@ final class ContextTracker {
     }
 
     private func stopWaitingForFix(_ id: UUID) {
-        fixWaiters.removeValue(forKey: id)?.resume(returning: lastLocation)
+        fixWaiters.removeValue(forKey: id)?.resume(returning: freshestFix())
     }
 
     private func deliverFix(_ loc: CLLocation?) {
@@ -509,7 +523,7 @@ final class ContextTracker {
         let waiters = fixWaiters
         fixWaiters.removeAll()
         for continuation in waiters.values {
-            continuation.resume(returning: loc ?? lastLocation)
+            continuation.resume(returning: loc ?? freshestFix())
         }
     }
 
@@ -518,7 +532,6 @@ final class ContextTracker {
     /// belong to the refresh that wanted it.
     func didUpdateLocation(_ loc: CLLocation) {
         locationRequestInFlight = false
-        lastLocationFix = Date()
         lastLocation = loc
         deliverFix(loc)
     }
