@@ -982,24 +982,22 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
         return (false, false);
     }
     let before = state.doc.get_heads();
-    match load_blob_batch(&mut state.doc, &commits, &fragments) {
-        Ok(applied) => {
-            state.applied.extend(applied);
+    let (bytes, parts) = concat_blob_batch(commits, fragments);
+    match state.doc.load_incremental(&bytes) {
+        Ok(_) => {
+            state
+                .applied
+                .extend(parts.into_iter().map(|(digest, _)| digest));
             (state.doc.get_heads() != before, false)
         }
         Err(e) => {
             tracing::warn!(doc = %id.to_url(), error = %e, "stored blob batch could not be ordered; loading in storage order");
             let mut any_failed = false;
-            let blobs = commits
-                .iter()
-                .map(|record| &record.blob)
-                .chain(fragments.iter().map(|record| &record.blob));
-            for blob in blobs {
-                let digest = BlobMeta::new(blob).digest();
+            for (digest, range) in parts {
                 if state.applied.contains(&digest) {
                     continue;
                 }
-                match catching(|| Ok(state.doc.load_incremental(blob.as_slice())?)) {
+                match catching(|| Ok(state.doc.load_incremental(&bytes[range])?)) {
                     Ok(_) => {
                         state.applied.insert(digest);
                     }
@@ -1015,19 +1013,20 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
     }
 }
 
-/// Apply stored blobs to `doc` as one concatenated load. `load_incremental`
+/// Lay a batch's stored blobs end to end for one `load_incremental`, which
 /// takes any concatenation of `save_incremental` output — loose commits and
 /// fragment bundles, in any order — and resolves the dependencies itself.
-fn load_blob_batch(
-    doc: &mut Automerge,
-    commits: &[StoredRecord<LooseCommit>],
-    fragments: &[StoredRecord<SedimentreeFragment>],
-) -> Result<Vec<Digest<Blob>>> {
-    if commits.is_empty() && fragments.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut digests = Vec::new();
-    let mut seen = HashSet::new();
+///
+/// The records are consumed as they are copied, so the concatenation replaces
+/// the blobs instead of doubling them. What is being copied here is a doc's
+/// whole stored history, and it is being copied on the path a device short of
+/// memory takes to open a note. Each blob's place in the buffer comes back
+/// alongside it, so a batch that won't load can still be retried one blob at a
+/// time without a second copy of anything.
+fn concat_blob_batch(
+    commits: Vec<StoredRecord<LooseCommit>>,
+    fragments: Vec<StoredRecord<SedimentreeFragment>>,
+) -> (Vec<u8>, Vec<(Digest<Blob>, std::ops::Range<usize>)>) {
     // Sized up front: growing by doubling means a moment where the old buffer
     // and the new one are both live, and this runs while the device is already
     // out of memory.
@@ -1037,20 +1036,37 @@ fn load_blob_batch(
         .chain(fragments.iter().map(|record| record.blob.as_slice().len()))
         .sum();
     let mut bytes = Vec::with_capacity(total);
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
     for blob in commits
-        .iter()
-        .map(|record| &record.blob)
-        .chain(fragments.iter().map(|record| &record.blob))
+        .into_iter()
+        .map(|record| record.blob)
+        .chain(fragments.into_iter().map(|record| record.blob))
     {
-        let digest = BlobMeta::new(blob).digest();
+        let digest = BlobMeta::new(&blob).digest();
         if !seen.insert(digest) {
             continue;
         }
+        let start = bytes.len();
         bytes.extend_from_slice(blob.as_slice());
-        digests.push(digest);
+        parts.push((digest, start..bytes.len()));
     }
-    doc.load_incremental(&bytes)?;
-    Ok(digests)
+    (bytes, parts)
+}
+
+/// Load a whole batch into `doc`, for callers with no use for the per-blob
+/// retry: a batch that won't order is an error to them, not something to
+/// pick apart.
+fn load_blob_batch(
+    doc: &mut Automerge,
+    commits: Vec<StoredRecord<LooseCommit>>,
+    fragments: Vec<StoredRecord<SedimentreeFragment>>,
+) -> Result<Vec<Digest<Blob>>> {
+    let (bytes, parts) = concat_blob_batch(commits, fragments);
+    if !bytes.is_empty() {
+        doc.load_incremental(&bytes)?;
+    }
+    Ok(parts.into_iter().map(|(digest, _)| digest).collect())
 }
 
 /// Fsync the directory holding `path`, so a create or a delete of the entry
@@ -1224,7 +1240,7 @@ impl Repo {
     pub async fn stored_doc(&self, id: DocId) -> Result<Automerge> {
         let batch = self.stored_batch(id).await?;
         let mut doc = Automerge::new();
-        load_blob_batch(&mut doc, &batch.commits, &batch.fragments)?;
+        load_blob_batch(&mut doc, batch.commits, batch.fragments)?;
         Ok(doc)
     }
 
@@ -2712,29 +2728,29 @@ impl Repo {
                 return false;
             }
         }
-        let heads = {
+        // `staged_heads` is the proof, and asking it costs nothing. It is only
+        // ever set to heads the disk can reproduce: by `stage_doc`, which has
+        // just written a log that replays to them, or by `truncate_outbox`,
+        // which drops the log precisely because the sedimentree already holds
+        // them. `open_local` performs that same replay, so a doc whose heads
+        // match is a doc that comes back.
+        //
+        // Rebuilding the doc from disk and asking automerge for each head's
+        // change answered the same question, but it cost a whole second copy
+        // of the doc plus a change reconstruction per head — spent by the
+        // routine whose job is to give memory back, at the moment there is
+        // none. That is what the sweep was aborting in.
+        let (heads, rebuildable) = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 return false;
             };
-            let heads = state.lock().await.doc.get_heads();
-            heads
-        };
-        let rebuildable = {
-            let Ok(mut rebuilt) = self.stored_doc(id).await else {
-                return false;
-            };
-            let outbox = cpu_heavy(|| std::fs::read(self.outbox_path(id)).ok());
-            if let Some(bytes) = outbox {
-                if merge_outbox_into(&mut rebuilt, &bytes).is_err() {
-                    return false;
-                }
-            }
-            heads
-                .iter()
-                .all(|head| rebuilt.get_change_by_hash(head).is_some())
+            let guard = state.lock().await;
+            let heads = guard.doc.get_heads();
+            let rebuildable = guard.staged_heads.as_deref() == Some(heads.as_slice());
+            (heads, rebuildable)
         };
         if !rebuildable {
-            tracing::warn!(doc = %id.to_url(), "doc not reconstructable from disk; keeping it resident");
+            tracing::debug!(doc = %id.to_url(), "doc's heads are not on disk yet; keeping it resident");
             return false;
         }
         {
@@ -2766,12 +2782,9 @@ impl Repo {
     /// keep going past the threshold while more than MAX_RESIDENT_DOCS remain.
     /// `Duration::ZERO` is the memory-pressure sweep: everything evictable goes.
     ///
-    /// One at a time. Evicting rebuilds each doc from disk to check it, which
-    /// costs a whole extra copy of the doc, and the memory-pressure signal
-    /// repeats for as long as the pressure lasts — running a sweep per warning
-    /// spends memory faster than the sweep reclaims it. A sweep already in
-    /// flight is doing this one's work, so drop it and let the next signal
-    /// through once that finishes.
+    /// One at a time. The memory-pressure signal repeats for as long as the
+    /// pressure lasts, and a sweep already in flight is doing this one's work,
+    /// so drop it and let the next signal through once that finishes.
     pub async fn sweep_idle_docs(&self, idle: Duration) -> usize {
         let Ok(_sweeping) = self.sweep_lock.try_lock() else {
             tracing::debug!("idle sweep already running; skipping");
@@ -3359,10 +3372,11 @@ mod tests {
         commits.reverse();
         fragments.reverse();
 
+        let stored = commits.len() + fragments.len();
         let mut loaded = Automerge::new();
-        let applied = load_blob_batch(&mut loaded, &commits, &fragments).unwrap();
+        let applied = load_blob_batch(&mut loaded, commits, fragments).unwrap();
 
-        assert_eq!(applied.len(), commits.len() + fragments.len());
+        assert_eq!(applied.len(), stored);
         assert_eq!(loaded.get_heads(), source.get_heads());
     }
 
@@ -3493,7 +3507,7 @@ mod tests {
         );
 
         let mut loaded = Automerge::new();
-        load_blob_batch(&mut loaded, &commits, &fragments).unwrap();
+        load_blob_batch(&mut loaded, commits, fragments).unwrap();
         assert_eq!(loaded.get_heads(), source.get_heads());
     }
 
@@ -4039,6 +4053,37 @@ mod tests {
         })
         .await
         .expect("stored blobs for an untracked doc should announce themselves");
+    }
+
+    /// What eviction now takes as its proof that a doc is on disk. A save
+    /// leaves `staged_heads` on the doc's own heads — the outbox log replays
+    /// to them, or the sedimentree already holds them and the log is gone.
+    /// Break that and eviction stops happening at all, quietly, so it is
+    /// worth a test of its own rather than a timeout in one of the sweeps.
+    #[tokio::test]
+    async fn a_save_leaves_the_staged_heads_on_the_docs_own_heads() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.change_doc(id, |doc| {
+            put(doc, "second", "also saved");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        repo.save_doc_now(id).await.unwrap();
+
+        let state = repo.docs.lock().await.get(&id).cloned().unwrap();
+        let guard = state.lock().await;
+        assert_eq!(
+            guard.staged_heads.as_deref(),
+            Some(&guard.doc.get_heads()[..])
+        );
     }
 
     #[tokio::test]
