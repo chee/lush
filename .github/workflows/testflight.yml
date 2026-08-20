@@ -20,9 +20,13 @@ jobs:
             | sh -s -- -y --default-toolchain stable \
               --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
+      # Same key as CI's app job, which is the point: a push to main builds
+      # every slice and leaves this warm. Cold here has been ~47m against
+      # ~13m warm, and that gap was the whole variance in release times.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          shared-key: apple
           workspaces: |
             core
             server-rs

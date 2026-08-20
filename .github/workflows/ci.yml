@@ -73,27 +73,34 @@ jobs:
             | sh -s -- -y --default-toolchain stable \
               --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
+      # shared-key rather than the default per-job one, so the TestFlight
+      # upload can restore what a push to main built. rust-cache keys on the
+      # job otherwise, and those two have never shared anything.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          shared-key: apple
           workspaces: |
             core
             server-rs
 
       # The lib and the generated bindings carry matching API checksums, so the
       # app can only be built from freshly generated ones — see build-bindings.sh.
-      # This job only ever runs tests on an arm64 simulator, so it builds that
-      # slice and the host one bindgen needs, and skips the device and macOS
-      # slices it would throw away.
+      #
+      # A pull request only runs tests on an arm64 simulator, so it builds that
+      # slice and the host one bindgen needs and skips the rest — 29m to 19m.
+      # A push to main builds every slice: it is what catches a device or macOS
+      # break before a release does, and it leaves a complete cache behind for
+      # TestFlight to restore.
       - name: Build Rust core and bindings
         run: ./core/build-bindings.sh
         env:
-          SIMULATOR_ONLY: 1
+          SIMULATOR_ONLY: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && '0' || '1' }}
 
       - name: Build PatchworkServer xcframework and bindings
         run: ./server-rs/build-xcframework.sh
         env:
-          SIMULATOR_ONLY: 1
+          SIMULATOR_ONLY: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && '0' || '1' }}
 
       - name: Build web bundle
         run: |
