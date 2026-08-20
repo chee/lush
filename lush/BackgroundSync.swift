@@ -11,6 +11,35 @@ enum BackgroundSync {
     private static var assertionWork: Task<Void, Never>?
     private static var assertionToken: UUID?
 
+    /// Whether the process still has permission to work: frontmost, or
+    /// holding a background assertion, or inside a BGTask. Everywhere else,
+    /// iOS can suspend us at any moment — and a suspended process still
+    /// reading and fsyncing inside its data container is one RunningBoard
+    /// kills outright (`0xdead10cc`). The core parks its opportunistic work
+    /// while this is false and picks it back up when it flips.
+    private static var foreground = true
+    private static var backgroundHolds = 0
+
+    /// Push the current state onto a core that was built after the app had
+    /// already moved, and so never saw the transition.
+    static func applyCoreActivity() {
+        syncCoreActivity()
+    }
+
+    private static func syncCoreActivity() {
+        NotesModel.shared.core?.setAppActive(foreground || backgroundHolds > 0)
+    }
+
+    private static func beginBackgroundHold() {
+        backgroundHolds += 1
+        syncCoreActivity()
+    }
+
+    private static func endBackgroundHold() {
+        backgroundHolds = max(0, backgroundHolds - 1)
+        syncCoreActivity()
+    }
+
     private final class Completion: @unchecked Sendable {
         private let task: BGTask
         private let lock = NSLock()
@@ -60,17 +89,36 @@ enum BackgroundSync {
     }
 
     static func didEnterBackground() {
+        foreground = false
         schedule()
-        guard assertion == .invalid else { return }
+        guard assertion == .invalid else {
+            syncCoreActivity()
+            return
+        }
         assertion = UIApplication.shared.beginBackgroundTask(withName: "lush.sync") {
             assertionWork?.cancel()
             assertionWork = nil
             assertionToken = nil
             endAssertion()
         }
+        // Pair the hold with a real assertion: `endAssertion` is the only
+        // release, and it no-ops when there was never one to end. Without an
+        // assertion there is no background time to protect anyway — the flush
+        // below is still worth starting, it just has to win a race.
+        if assertion != .invalid {
+            beginBackgroundHold()
+        } else {
+            syncCoreActivity()
+        }
         let token = UUID()
         assertionToken = token
         let work = Task { @MainActor in
+            // Durability first, and before the cancellation check: syncing is
+            // work we can lose and pick up next launch, but an edit still held
+            // by a debounce exists only in this process, and the system can
+            // kill it while suspended without ever sending `willTerminate`.
+            await NotesModel.shared.flushPendingWrites()
+            guard !Task.isCancelled else { return }
             await NotesModel.shared.syncNow(budget: .seconds(15))
             guard !Task.isCancelled else { return }
             await NotesModel.shared.checkSmartNotebooks()
@@ -82,16 +130,29 @@ enum BackgroundSync {
         assertionWork = work
     }
 
+    static func willEnterForeground() {
+        foreground = true
+        syncCoreActivity()
+    }
+
     private static func endAssertion() {
         guard assertion != .invalid else { return }
         UIApplication.shared.endBackgroundTask(assertion)
         assertion = .invalid
+        endBackgroundHold()
     }
 
     private static func run(_ task: BGTask, budget: Duration) async {
         schedule()
+        // A BGTask is permission to run, so the core is allowed to work for
+        // as long as it lasts — a background launch reaches this before the
+        // prefetch walk has settled, and `checkSmartNotebooks` waits on it.
+        beginBackgroundHold()
+        defer { endBackgroundHold() }
         let completion = Completion(task)
         let work = Task { @MainActor in
+            await NotesModel.shared.flushPendingWrites()
+            guard !Task.isCancelled else { return }
             await NotesModel.shared.syncNow(budget: budget)
             guard !Task.isCancelled else { return }
             await NotesModel.shared.checkSmartNotebooks()

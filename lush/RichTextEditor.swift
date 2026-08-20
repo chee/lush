@@ -1819,6 +1819,14 @@ final class EditorCore {
         localWriteHeadsTask = task
     }
 
+    /// `pushNow`, then wait for the write it started to reach the doc. The
+    /// suspend path needs the waiting part: `pushNow` only kicks off a task,
+    /// and a process killed while suspended never runs it.
+    func flushNow() async {
+        pushNow()
+        _ = await localWriteHeadsTask?.value
+    }
+
     private func automergeTextPosition(in storage: NSAttributedString, at location: Int) -> Int? {
         let string = storage.string as NSString
         guard location >= 0, location <= string.length else { return nil }

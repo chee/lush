@@ -2842,9 +2842,9 @@ impl Repo {
         }
     }
 
-    /// Flush all pending saves and do a best-effort final sync before the app
-    /// exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
-    pub async fn shutdown(self: &Arc<Self>) {
+    /// Run every pending debounced save now, and report which docs gained
+    /// data on disk. Local durability only — no network.
+    async fn drain_pending_saves(&self) -> HashSet<DocId> {
         let pending: Vec<(DocId, PendingSave)> = {
             let mut saves = self.pending_saves.lock().await;
             saves.drain().collect()
@@ -2859,9 +2859,25 @@ impl Repo {
                     dirty.insert(id);
                 }
                 Ok(false) => {}
-                Err(e) => tracing::warn!(doc = %id.to_url(), error = %e, "shutdown save failed"),
+                Err(e) => tracing::warn!(doc = %id.to_url(), error = %e, "pending save flush failed"),
             }
         }
+        dirty
+    }
+
+    /// Get every debounced edit onto disk, without the network round trip
+    /// `shutdown` waits for. This is the suspend path, not the exit path:
+    /// iOS suspends an app in the background and may kill it later without
+    /// ever sending `willTerminate`, so a change still sitting in
+    /// `pending_saves` at that moment is typed text the user never gets back.
+    pub async fn flush_pending_saves(&self) {
+        self.drain_pending_saves().await;
+    }
+
+    /// Flush all pending saves and do a best-effort final sync before the app
+    /// exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let mut dirty = self.drain_pending_saves().await;
         dirty.extend(
             self.syncs
                 .lock()
@@ -3950,6 +3966,55 @@ mod tests {
         repo.drop_doc(id).await;
         repo.ensure_doc(id).await.unwrap();
         let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
+    }
+
+    /// The suspend path: a debounced edit has to be on disk before the
+    /// process can be killed, and durable enough that a *fresh* repo over
+    /// the same directory sees it. Reloading through `drop_doc` would not
+    /// prove this — `drop_doc` flushes pending saves itself.
+    #[tokio::test]
+    async fn flush_pending_saves_persists_a_debounced_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_save(id, heads, |doc| {
+            put(doc, "second", "deferred");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert!(
+            !repo.pending_saves.lock().await.is_empty(),
+            "the change should still be held by the save debounce"
+        );
+
+        repo.flush_pending_saves().await;
+        assert!(
+            repo.pending_saves.lock().await.is_empty(),
+            "flush should leave nothing waiting on the debounce"
+        );
+
+        // Stand in for the process being killed: nothing else gets to run.
+        drop(repo);
+        let reopened = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        reopened.ensure_doc(id).await.unwrap();
+        let loaded = reopened
+            .read_doc(id, |doc| Ok(doc.get_heads()))
+            .await
+            .unwrap();
         assert_eq!(loaded, expected);
     }
 

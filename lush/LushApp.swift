@@ -613,6 +613,7 @@ struct LushApp: App {
                         for: UIApplication.didBecomeActiveNotification
                     )
                 ) { _ in
+                    BackgroundSync.willEnterForeground()
                     Task { await NotesModel.shared.focus.reconcileWithSystemFocus() }
                 }
                 .onReceive(
