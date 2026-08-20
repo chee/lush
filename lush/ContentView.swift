@@ -861,7 +861,7 @@ struct ContentView: View {
         }
         .focused($sidebarFocused)
         .foregroundStyle(Color.primary)
-        .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
+        .tint(Color.lushPink)
     }
 
     private func focusCurrentNoteSearch() {
@@ -1476,7 +1476,7 @@ struct ContentView: View {
         return routed != initialRoute?.selection && Self.sidebarUrl(routed) == url
     }
 
-    private static let selectionTint = Color(red: 1.0, green: 0.412, blue: 0.647)
+    private static let selectionTint = Color.lushPink
 
     private func expansionBinding(_ url: String) -> Binding<Bool> {
         Binding(
@@ -5619,7 +5619,7 @@ struct FolderColumnBrowser: View {
                     .buttonStyle(.plain)
                     .listRowBackground(
                         selectedPerColumn[folderUrl] == node.url
-                            ? Color(red: 1.0, green: 0.412, blue: 0.647).opacity(0.2) : Color.clear
+                            ? Color.lushPink.opacity(0.2) : Color.clear
                     )
                 }
             }

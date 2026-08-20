@@ -279,7 +279,7 @@ struct CalendarSidebarLabel: View {
 
     private var tint: Color {
         #if os(iOS)
-        .pink
+        .lushPink
         #else
         .red
         #endif

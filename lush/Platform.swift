@@ -34,6 +34,13 @@ extension Image {
     }
 }
 
+extension Color {
+    /// Lush's pink, the one in the AccentColor asset. The system's `.pink` is
+    /// a red on iOS — 255,45,85, a hair off `.red` — so anything that wants to
+    /// look pink has to name the colour itself.
+    static let lushPink = Color(red: 1.0, green: 0.412, blue: 0.647)
+}
+
 enum Clipboard {
     static func copy(_ string: String) {
         #if os(macOS)
