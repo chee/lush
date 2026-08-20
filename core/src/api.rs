@@ -2398,7 +2398,7 @@ impl Core {
             let heads = decode_heads(heads)?;
             let current_heads = self.runtime.block_on(async move {
                 let id = DocId::from_url(&url)?;
-                repo.change_doc_at_deferred_save(id, heads, |doc| {
+                repo.change_doc_at_deferred_ingest(id, heads, |doc| {
                     shapes::splice_note_text(doc, index as usize, delete_count, &insert, &title)?;
                     Ok(())
                 })
@@ -2429,7 +2429,7 @@ impl Core {
                 let value = value_json
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?;
-                repo.change_doc_at_deferred_save(id, heads, |doc| {
+                repo.change_doc_at_deferred_ingest(id, heads, |doc| {
                     shapes::apply_note_mark(
                         doc,
                         start as usize,

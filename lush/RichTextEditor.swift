@@ -1712,10 +1712,16 @@ final class EditorCore {
         scheduleQueuedTextSpliceFlush()
     }
 
+    /// Hand the splice to the document on the next turn rather than after a
+    /// delay. Text that has not reached the document exists only in the text
+    /// view, where nothing downstream can persist it, so the only coalescing
+    /// worth keeping is what arrives in the same turn — key repeat,
+    /// autocorrect, a paste — which costs nothing to wait for. The turn's
+    /// worth of slack also keeps the whole-note walk in `flushQueuedTextSplice`
+    /// out of the text view's own callback.
     private func scheduleQueuedTextSpliceFlush() {
         textSpliceFlushTask?.cancel()
         textSpliceFlushTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             self?.flushQueuedTextSplice()
         }
@@ -1762,12 +1768,16 @@ final class EditorCore {
         localWriteHeadsTask = task
     }
 
+    /// The structural path — formatting, blocks, embeds, and any edit the
+    /// splice path can't express — on the same next-turn schedule as a
+    /// splice, so a command's several `scheduleSave` calls still collapse
+    /// into one push without leaving the edit unwritten for a third of a
+    /// second.
     func scheduleSave() {
         guard session.loaded, !isApplyingDocumentState, !session.isApplyingDocumentState else { return }
         flushQueuedTextSplice()
         saveTask?.cancel()
         saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             self?.pushNow()
         }
