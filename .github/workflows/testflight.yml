@@ -98,8 +98,7 @@ jobs:
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
             -authenticationKeyIssuerID "$API_ISSUER" \
-            CODE_SIGN_STYLE=Automatic \
-            CODE_SIGN_IDENTITY="Apple Distribution"
+            CODE_SIGN_STYLE=Automatic
 
       - name: Archive (macOS)
         env:
@@ -115,8 +114,7 @@ jobs:
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
             -authenticationKeyIssuerID "$API_ISSUER" \
-            CODE_SIGN_STYLE=Automatic \
-            CODE_SIGN_IDENTITY="Apple Distribution"
+            CODE_SIGN_STYLE=Automatic
 
       - name: Upload iOS to TestFlight
         env:
