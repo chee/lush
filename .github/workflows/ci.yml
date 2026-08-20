@@ -56,7 +56,8 @@ jobs:
 
   app:
     name: app (iOS simulator)
-    runs-on: macos-26
+    # 6 cores rather than 3. This job is ~70% rustc and scales with them.
+    runs-on: macos-26-xlarge
     steps:
       - uses: actions/checkout@v4
 
@@ -67,7 +68,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable \
-              --target aarch64-apple-ios --target aarch64-apple-ios-sim --target x86_64-apple-darwin
+              --target aarch64-apple-ios --target aarch64-apple-ios-sim
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -78,11 +79,18 @@ jobs:
 
       # The lib and the generated bindings carry matching API checksums, so the
       # app can only be built from freshly generated ones — see build-bindings.sh.
+      # This job only ever runs tests on an arm64 simulator, so it builds that
+      # slice and the host one bindgen needs, and skips the device and macOS
+      # slices it would throw away.
       - name: Build Rust core and bindings
         run: ./core/build-bindings.sh
+        env:
+          SIMULATOR_ONLY: 1
 
       - name: Build PatchworkServer xcframework and bindings
         run: ./server-rs/build-xcframework.sh
+        env:
+          SIMULATOR_ONLY: 1
 
       - name: Build web bundle
         run: |
