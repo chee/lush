@@ -5337,9 +5337,29 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         )
     }
 
+    /// The last line of a long note sits at the bottom edge of the phone,
+    /// which is the worst place to read or type on. A note taller than the
+    /// view gets a screenful of room under it so its end can be scrolled up
+    /// to where the eyes are; the tail keeps a few lines on screen once the
+    /// scroll is all the way down.
+    private static let scrollPastEndTail: CGFloat = 120
+
+    func pApplyScrollPastEnd() {
+        let viewport = bounds.height - safeAreaInsets.top - safeAreaInsets.bottom
+        guard viewport > 0 else { return }
+        // measured against the text alone: adding the room doesn't grow
+        // contentSize, so this can't talk itself into another pass
+        let room = contentSize.height > viewport
+            ? max(0, viewport - Self.scrollPastEndTail)
+            : 0
+        guard abs(contentInset.bottom - room) > 0.5 else { return }
+        contentInset.bottom = room
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         pApplyMaxWidth()
+        pApplyScrollPastEnd()
     }
 
     var pVisibleRect: CGRect {
@@ -5348,8 +5368,8 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     var pUndoManager: UndoManager? { undoManager }
 
     func pScrollToY(_ y: CGFloat) {
-        let visibleHeight = bounds.height - adjustedContentInset.top - adjustedContentInset.bottom
-        guard visibleHeight > 0 else { return }
+        guard bounds.height - adjustedContentInset.top - adjustedContentInset.bottom > 0
+        else { return }
         // contentSize lags the edit that moved the caret; the layout
         // manager's usage bounds are current
         var contentHeight = contentSize.height
@@ -5361,7 +5381,9 @@ final class EditorTextView: UITextView, EditorTextViewLike {
             )
         }
         let minY = -adjustedContentInset.top
-        let maxY = max(minY, contentHeight - visibleHeight + adjustedContentInset.bottom)
+        // the bottom inset is a screenful of scroll-past-the-end room, so the
+        // furthest the view goes is the content plus that, less its own height
+        let maxY = max(minY, contentHeight + adjustedContentInset.bottom - bounds.height)
         let target = min(max(y, minY), maxY)
         setContentOffset(CGPoint(x: contentOffset.x, y: target), animated: false)
     }
@@ -5709,6 +5731,9 @@ struct RichTextEditor: UIViewRepresentable {
 
         func textViewDidChange(_ textView: UITextView) {
             core.textDidChange()
+            // a note that just grew past the height of the view earns its
+            // scroll-past-the-end room without waiting for the next layout
+            (textView as? EditorTextView)?.pApplyScrollPastEnd()
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
