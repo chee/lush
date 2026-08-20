@@ -56,8 +56,11 @@ jobs:
 
   app:
     name: app (iOS simulator)
-    # 6 cores rather than 3. This job is ~70% rustc and scales with them.
-    runs-on: macos-26-xlarge
+    # Would be worth ~2x here — the job is ~70% rustc — but macos-26-xlarge
+    # is not available to this account: the job is handed no runner and fails
+    # in two seconds with no steps and no log. Needs larger runners enabling
+    # on the plan first, then this is a one-line change.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
