@@ -742,6 +742,15 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func ensurePocketPad(configUrl: String) throws  -> String
     
     /**
+     * Persist every debounced edit, without `shutdown`'s final network sync.
+     * Call this on the way to the background: iOS suspends the process and
+     * can kill it later without sending `willTerminate`, so anything still
+     * waiting on the save debounce at that point is lost text. Async so the
+     * caller can await it on the main actor instead of blocking on it.
+     */
+    func flushPendingSaves() async 
+    
+    /**
      * Entries of any folder doc we hold locally (no waiting, no network).
      */
     func folderEntriesOf(url: String) async  -> [NoteInfo]
@@ -941,6 +950,20 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Notes whose closest passage is nearest `vector`, best first.
      */
     func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], filter: SearchFilter?)  -> [SearchHit]
+    
+    /**
+     * Tell the core whether the app may still do work — frontmost, or
+     * holding a background assertion, or inside a BGTask.
+     *
+     * The prefetch walk is the app's longest-running background job: up to
+     * `PREFETCH_MAX_DOCS` docs, each one a load, a normalizing write and an
+     * FTS index update. Nothing used to stop it when the app went away, so
+     * it kept reading, renaming and fsyncing inside the data container long
+     * after iOS suspended the process — which is what RunningBoard kills an
+     * app for (`0xdead10cc`, "held a file lock while suspended"). Parking
+     * the walk lets the process go quiet, and it resumes where it stopped.
+     */
+    func setAppActive(active: Bool) 
     
     /**
      * Both of these walk every tracked doc, applying or publishing changes as
@@ -1584,6 +1607,31 @@ open func ensurePocketPad(configUrl: String)throws  -> String  {
 }
     
     /**
+     * Persist every debounced edit, without `shutdown`'s final network sync.
+     * Call this on the way to the background: iOS suspends the process and
+     * can kill it later without sending `willTerminate`, so anything still
+     * waiting on the save debounce at that point is lost text. Async so the
+     * caller can await it on the main actor instead of blocking on it.
+     */
+open func flushPendingSaves()async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_flush_pending_saves(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_void,
+            completeFunc: ffi_lush_core_rust_future_complete_void,
+            freeFunc: ffi_lush_core_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
      * Entries of any folder doc we hold locally (no waiting, no network).
      */
 open func folderEntriesOf(url: String)async  -> [NoteInfo]  {
@@ -2224,6 +2272,25 @@ open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], fi
         FfiConverterOptionTypeSearchFilter.lower(filter),$0
     )
 })
+}
+    
+    /**
+     * Tell the core whether the app may still do work — frontmost, or
+     * holding a background assertion, or inside a BGTask.
+     *
+     * The prefetch walk is the app's longest-running background job: up to
+     * `PREFETCH_MAX_DOCS` docs, each one a load, a normalizing write and an
+     * FTS index update. Nothing used to stop it when the app went away, so
+     * it kept reading, renaming and fsyncing inside the data container long
+     * after iOS suspended the process — which is what RunningBoard kills an
+     * app for (`0xdead10cc`, "held a file lock while suspended"). Parking
+     * the walk lets the process go quiet, and it resumes where it stopped.
+     */
+open func setAppActive(active: Bool)  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_set_app_active(self.uniffiClonePointer(),
+        FfiConverterBool.lower(active),$0
+    )
+}
 }
     
     /**
@@ -6050,6 +6117,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_ensure_pocket_pad() != 52874) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_flush_pending_saves() != 45884) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_folder_entries_of() != 11978) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6204,6 +6274,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_semantic_search() != 33300) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_app_active() != 48668) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_apply_incoming() != 5016) {

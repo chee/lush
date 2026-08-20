@@ -226,15 +226,8 @@ fn stored_sedimentree_records_rebuild_the_live_document() {
             if step + 1 < STEPS && !rng.chance(SAVE_CHANCE) {
                 continue;
             }
-            let rebundle = stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD && rng.chance(20);
-            let ingested = ingest(
-                &swarm.main,
-                sid,
-                &stored_commits,
-                &stored_fragments,
-                rebundle,
-            )
-            .expect("ingest should not panic");
+            let ingested = ingest(&swarm.main, sid, &stored_commits, &stored_fragments)
+                .expect("ingest should not panic");
             stored_commits.extend(ingested.commit_heads.iter().copied());
             stored_fragments.extend(ingested.fragment_heads.iter().copied());
             let (new_commits, new_fragments) = stored_records(ingested);
@@ -277,7 +270,7 @@ fn out_of_order_blob_batches_converge() {
             if step + 1 < STEPS && !rng.chance(SAVE_CHANCE) {
                 continue;
             }
-            let ingested = ingest(&swarm.main, sid, &stored_commits, &stored_fragments, false)
+            let ingested = ingest(&swarm.main, sid, &stored_commits, &stored_fragments)
                 .expect("ingest should not panic");
             stored_commits.extend(ingested.commit_heads.iter().copied());
             stored_fragments.extend(ingested.fragment_heads.iter().copied());
@@ -371,14 +364,8 @@ async fn repo_reopen_matches_the_in_memory_document() {
             for _ in 0..=rng.below(3) {
                 edit(peer, &mut rng);
             }
-            let ingested = ingest(
-                peer,
-                id.sedimentree_id(),
-                &HashSet::new(),
-                &HashSet::new(),
-                false,
-            )
-            .unwrap();
+            let ingested =
+                ingest(peer, id.sedimentree_id(), &HashSet::new(), &HashSet::new()).unwrap();
             let mut merged = repo.read_doc(id, |doc| Ok(doc.fork())).await.unwrap();
             merged.merge(&mut peer.clone()).unwrap();
             drain(&mut events).await;

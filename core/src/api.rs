@@ -273,6 +273,9 @@ pub struct Core {
     index_slots: Arc<IndexSlots>,
     folder: std::sync::Mutex<Option<DocId>>,
     history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
+    /// Whether the app still has permission to run. Opportunistic background
+    /// work watches this and parks while it is false — see `set_app_active`.
+    app_active: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -281,6 +284,18 @@ struct CachedDocHistory {
     frontier: HashSet<ChangeHash>,
     known_hashes: HashSet<ChangeHash>,
     entries: Vec<DocHistoryEntry>,
+}
+
+/// Park until the app may run again. Returns `Err` only when the `Core` that
+/// owns the channel is gone, which means the caller should stop for good.
+async fn wait_for_active(
+    mut active: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    if *active.borrow_and_update() {
+        return Ok(());
+    }
+    active.wait_for(|active| *active).await?;
+    Ok(())
 }
 
 fn normalized_heads(mut heads: Vec<ChangeHash>) -> Vec<ChangeHash> {
@@ -529,7 +544,6 @@ impl Core {
     ) -> Result<Arc<Self>, CoreError> {
         Self::new_with_options(data_dir, server_url, enable_iroh)
     }
-
 }
 
 impl Core {
@@ -585,6 +599,7 @@ impl Core {
             index_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             folder: std::sync::Mutex::new(None),
             history_cache: std::sync::Mutex::new(HashMap::new()),
+            app_active: tokio::sync::watch::channel(true).0,
         });
         core.start_index_updates();
         tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "core constructed");
@@ -1991,6 +2006,20 @@ impl Core {
         Ok(kind)
     }
 
+    /// Tell the core whether the app may still do work — frontmost, or
+    /// holding a background assertion, or inside a BGTask.
+    ///
+    /// The prefetch walk is the app's longest-running background job: up to
+    /// `PREFETCH_MAX_DOCS` docs, each one a load, a normalizing write and an
+    /// FTS index update. Nothing used to stop it when the app went away, so
+    /// it kept reading, renaming and fsyncing inside the data container long
+    /// after iOS suspended the process — which is what RunningBoard kills an
+    /// app for (`0xdead10cc`, "held a file lock while suspended"). Parking
+    /// the walk lets the process go quiet, and it resumes where it stopped.
+    pub fn set_app_active(&self, active: bool) {
+        let _ = self.app_active.send(active);
+    }
+
     /// Start tracking + syncing docs without waiting for them to arrive,
     /// recursing into subfolders. Once a doc lands, its legacy scalar
     /// strings are normalized to Text.
@@ -2000,6 +2029,7 @@ impl Core {
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let active = self.app_active.subscribe();
         self.runtime.spawn(async move {
             let mut visited = HashSet::new();
             let mut level: Vec<DocId> = urls
@@ -2008,13 +2038,20 @@ impl Core {
                 .filter(|id| visited.insert(*id))
                 .collect();
             while !level.is_empty() {
+                if wait_for_active(active.clone()).await.is_err() {
+                    return;
+                }
                 for id in &level {
                     let _ = repo.ensure_doc(*id).await;
                 }
                 let found = futures::stream::iter(level.drain(..).map(|id| {
                     let repo = repo.clone();
                     let index = index.clone();
+                    let active = active.clone();
                     async move {
+                        if wait_for_active(active).await.is_err() {
+                            return Vec::new();
+                        }
                         if !repo.wait_for_doc(id, PREFETCH_TIMEOUT).await {
                             return Vec::new();
                         }
@@ -2360,7 +2397,7 @@ impl Core {
             let heads = decode_heads(heads)?;
             let current_heads = self.runtime.block_on(async move {
                 let id = DocId::from_url(&url)?;
-                repo.change_doc_at_deferred_save(id, heads, |doc| {
+                repo.change_doc_at_deferred_ingest(id, heads, |doc| {
                     shapes::splice_note_text(doc, index as usize, delete_count, &insert, &title)?;
                     Ok(())
                 })
@@ -2391,7 +2428,7 @@ impl Core {
                 let value = value_json
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?;
-                repo.change_doc_at_deferred_save(id, heads, |doc| {
+                repo.change_doc_at_deferred_ingest(id, heads, |doc| {
                     shapes::apply_note_mark(
                         doc,
                         start as usize,
@@ -2639,6 +2676,18 @@ impl Core {
             self.reindex_doc(DocId::from_url(&url)?);
             Ok(url)
         })
+    }
+
+    /// Persist every debounced edit, without `shutdown`'s final network sync.
+    /// Call this on the way to the background: iOS suspends the process and
+    /// can kill it later without sending `willTerminate`, so anything still
+    /// waiting on the save debounce at that point is lost text. Async so the
+    /// caller can await it on the main actor instead of blocking on it.
+    pub async fn flush_pending_saves(&self) {
+        let repo = self.repo.clone();
+        let _ = self
+            .run(async move { repo.flush_pending_saves().await })
+            .await;
     }
 
     /// Flush all pending saves and do a best-effort final sync before the app

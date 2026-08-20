@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use async_tungstenite::{tokio::TokioAdapter, tungstenite::protocol::WebSocketConfig};
-use automerge::{Automerge, ChangeHash, Fragment as AutomergeFragment, ReadDoc};
+use automerge::{Automerge, ChangeHash, ReadDoc};
 use future_form::Sendable;
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use sedimentree_core::{
@@ -78,18 +78,14 @@ pub const DEFAULT_SERVER: &str = "wss://subduction.sync.inkandswitch.com";
 
 const SYNC_TIMEOUT: CallTimeout = CallTimeout::TimeoutMillis(30_000);
 const SHUTDOWN_SYNC_TIMEOUT: CallTimeout = CallTimeout::TimeoutMillis(5_000);
+/// How long an edit waits to be folded into the sedimentree. Not a
+/// durability window: `change_doc_at_deferred_ingest` has already logged the
+/// edit by the time this starts, and the log is replayed on load.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(90);
 const HEAL_DELAY: Duration = Duration::from_secs(5);
 const HEAL_MAX_ATTEMPTS: u32 = 12;
 const LOCAL_SERVER_PORT: u16 = 43219;
 const HANDSHAKE_MAX_DRIFT: Duration = Duration::from_secs(600);
-const LOOSE_FRAGMENT_BATCH_SIZE: usize = 32;
-/// Once a doc is holding this many loose commits, the next save bundles the
-/// ones already on disk too. Without this a commit written loose could never
-/// join a fragment — only commits new to a save were ever eligible — so
-/// ordinary editing, a few changes at a time, never reached the batch size and
-/// left everything loose for good.
-const REBUNDLE_LOOSE_THRESHOLD: usize = 64;
 /// How many absorbed commits to delete at once. Deleting one at a time makes a
 /// pass over a doc with thousands of them crawl; unbounded floods the disk.
 const RECLAIM_DELETE_CONCURRENCY: usize = 16;
@@ -716,6 +712,12 @@ pub struct Repo {
     iroh_endpoint: std::sync::Mutex<Option<Arc<iroh::Endpoint>>>,
     /// Serializes enable/disable so a bind and a close can't interleave.
     iroh_lifecycle: Mutex<()>,
+    /// One lock per doc around its outbox file. Appending to the log and
+    /// truncating it after an ingest both mutate the same file plus the same
+    /// `staged_heads`, and a keystroke can land while a debounced save is
+    /// still running — interleaving them would strand changes in neither
+    /// place. Not the doc lock: the append fsyncs, and reads shouldn't wait.
+    outbox_locks: std::sync::Mutex<HashMap<DocId, Arc<Mutex<()>>>>,
     /// Held for the duration of an idle sweep. Memory pressure arrives as a
     /// repeating signal, so without this every warning stacks another sweep on
     /// top of the ones already rebuilding docs from disk.
@@ -802,9 +804,22 @@ struct Ingested {
 }
 
 /// Decompose the doc's automerge fragments into sedimentree records, skipping
-/// anything already stored. Level 0 commits are batched into fragment records
-/// once enough accumulate; the short tail remains loose so small edits still
-/// persist immediately.
+/// anything already stored. A level-0 fragment becomes a loose commit; a
+/// level-1-or-higher fragment becomes a fragment record.
+///
+/// Automerge core owns the compaction policy. Once it forms a fragment, the
+/// commits absorbed into it stop appearing at level 0 and the fragment appears
+/// at level >= 1, so the stored shape follows automerge's own view of the doc
+/// without this function deciding anything.
+/// `bench_natural_fragment_formation` records the rate: 8000 changes of
+/// ordinary editing leave 27 fragments and a tail of 106 loose commits.
+///
+/// This mirrors `@automerge/automerge-repo`'s subduction source, which reads
+/// fragment metadata, filters it against the hashes it has already stored, and
+/// bundles only what survives. Bundling is the expensive half and is O(n) per
+/// item, so it has to stay behind the filter — enumerating metadata is
+/// comparatively cheap (1.6ms for a 10k-change note; see
+/// `bench_ingest_breakdown`).
 ///
 /// `Automerge::fragments` can panic on some change graphs (an upstream bug
 /// where a level-1 change escapes the cached fragment clock). A panic means no
@@ -814,10 +829,8 @@ fn ingest(
     sid: SedimentreeId,
     stored_commits: &HashSet<ChangeHash>,
     stored_fragments: &HashSet<ChangeHash>,
-    rebundle_loose: bool,
 ) -> Option<Ingested> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let fragments = doc.fragments(0..);
         let mut out = Ingested {
             commits: Vec::new(),
             fragments: Vec::new(),
@@ -825,20 +838,15 @@ fn ingest(
             fragment_heads: Vec::new(),
             skipped: false,
         };
-        let mut pending_loose = Vec::new();
-        for f in fragments {
+        for f in doc.fragments(0..) {
             let head = f.head;
             let level = f.level;
-            if (level == 0 && !rebundle_loose && stored_commits.contains(&head))
-                || (level > 0 && stored_fragments.contains(&head))
-            {
-                continue;
-            }
-            if level == 0 {
-                pending_loose.push(f);
-                if pending_loose.len() >= LOOSE_FRAGMENT_BATCH_SIZE {
-                    ingest_loose_batch(doc, sid, &mut pending_loose, stored_fragments, &mut out);
-                }
+            let already = if level == 0 {
+                stored_commits.contains(&head)
+            } else {
+                stored_fragments.contains(&head)
+            };
+            if already {
                 continue;
             }
             let boundary: BTreeSet<CommitId> =
@@ -846,121 +854,32 @@ fn ingest(
             let checkpoints: Vec<CommitId> =
                 f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
             let Some(bytes) = doc.bundle_fragments([f]).into_iter().next() else {
-                tracing::warn!(?head, "fragment failed to bundle; retrying on next save");
+                tracing::warn!(
+                    ?head,
+                    level,
+                    "fragment failed to bundle; retrying on next save"
+                );
                 out.skipped = true;
                 continue;
             };
             let blob = Blob::new(bytes);
             let meta = BlobMeta::new(&blob);
             let id = CommitId::new(head.0);
-            out.fragments.push((
-                SedimentreeFragment::new(sid, id, boundary, &checkpoints, meta),
-                blob,
-            ));
-            out.fragment_heads.push(head);
+            if level == 0 {
+                out.commits
+                    .push((LooseCommit::new(sid, id, boundary, meta), blob));
+                out.commit_heads.push(head);
+            } else {
+                out.fragments.push((
+                    SedimentreeFragment::new(sid, id, boundary, &checkpoints, meta),
+                    blob,
+                ));
+                out.fragment_heads.push(head);
+            }
         }
-        ingest_loose_tail(doc, sid, pending_loose, stored_commits, &mut out);
         out
     }))
     .ok()
-}
-
-fn ingest_loose_batch(
-    doc: &Automerge,
-    sid: SedimentreeId,
-    pending: &mut Vec<AutomergeFragment>,
-    stored_fragments: &HashSet<ChangeHash>,
-    out: &mut Ingested,
-) {
-    let batch = std::mem::take(pending);
-    let Some(head) = batch.last().map(|fragment| fragment.head) else {
-        return;
-    };
-    if stored_fragments.contains(&head) {
-        return;
-    }
-    let members: Vec<ChangeHash> = batch.iter().map(|fragment| fragment.head).collect();
-    let covered_heads = members.clone();
-    let member_set: HashSet<ChangeHash> = members.iter().copied().collect();
-    let mut seen_boundary = HashSet::new();
-    let boundary: Vec<ChangeHash> = batch
-        .iter()
-        .flat_map(|fragment| fragment.boundary.iter().copied())
-        .filter(|hash| !member_set.contains(hash) && seen_boundary.insert(*hash))
-        .collect();
-    let checkpoints = members.clone();
-    let fragment = AutomergeFragment {
-        head,
-        level: 0,
-        boundary: boundary.clone(),
-        checkpoints: checkpoints.clone(),
-        members,
-    };
-    let Some(bytes) = doc.bundle_fragments([fragment]).into_iter().next() else {
-        tracing::warn!(
-            ?head,
-            "loose commit batch failed to bundle; retrying as loose commits"
-        );
-        out.skipped = true;
-        return;
-    };
-    let blob = Blob::new(bytes);
-    let meta = BlobMeta::new(&blob);
-    let boundary_ids: BTreeSet<CommitId> = boundary
-        .into_iter()
-        .map(|hash| CommitId::new(hash.0))
-        .collect();
-    let checkpoint_ids: Vec<CommitId> = checkpoints
-        .into_iter()
-        .map(|hash| CommitId::new(hash.0))
-        .collect();
-    out.fragments.push((
-        SedimentreeFragment::new(
-            sid,
-            CommitId::new(head.0),
-            boundary_ids,
-            &checkpoint_ids,
-            meta,
-        ),
-        blob,
-    ));
-    out.commit_heads.extend(covered_heads);
-    out.fragment_heads.push(head);
-}
-
-fn ingest_loose_tail(
-    doc: &Automerge,
-    sid: SedimentreeId,
-    pending: Vec<AutomergeFragment>,
-    stored_commits: &HashSet<ChangeHash>,
-    out: &mut Ingested,
-) {
-    for fragment in pending {
-        let head = fragment.head;
-        if stored_commits.contains(&head) {
-            continue;
-        }
-        let boundary: BTreeSet<CommitId> = fragment
-            .boundary
-            .iter()
-            .map(|h| CommitId::new(h.0))
-            .collect();
-        let Some(bytes) = doc.bundle_fragments([fragment]).into_iter().next() else {
-            tracing::warn!(
-                ?head,
-                "loose commit failed to bundle; retrying on next save"
-            );
-            out.skipped = true;
-            continue;
-        };
-        let blob = Blob::new(bytes);
-        let meta = BlobMeta::new(&blob);
-        out.commits.push((
-            LooseCommit::new(sid, CommitId::new(head.0), boundary, meta),
-            blob,
-        ));
-        out.commit_heads.push(head);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1134,17 +1053,64 @@ fn load_blob_batch(
     Ok(digests)
 }
 
+/// Fsync the directory holding `path`, so a create or a delete of the entry
+/// itself survives, not just the file contents.
+fn sync_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+/// Replay an outbox log onto a doc already carrying everything the
+/// sedimentree holds. The log is a compacted document followed by appended
+/// change chunks, and `load_incremental` takes both — importantly including
+/// a log that starts mid-history, which is what one looks like after
+/// `truncate_outbox` restarts it from the last ingested heads.
+fn merge_outbox_into(doc: &mut Automerge, bytes: &[u8]) -> Result<()> {
+    match doc.load_incremental(bytes) {
+        Ok(_) => Ok(()),
+        // Logs written before the format carried deltas across an ingest are
+        // whole documents; those still merge the old way.
+        Err(e) => {
+            let mut staged = Automerge::load(bytes).map_err(|_| anyhow!("{e}"))?;
+            doc.merge(&mut staged)?;
+            Ok(())
+        }
+    }
+}
+
 impl Repo {
     fn outbox_path(&self, id: DocId) -> PathBuf {
         self.outbox_dir
             .join(format!("{}.automerge", hex::encode(id.0)))
     }
 
-    /// Mirror the in-memory doc into the outbox file. The first stage writes a
-    /// compacted document; later ones append only the changes since, so a
-    /// keystroke's debounced save costs a change chunk rather than a full
-    /// rewrite of the note.
+    fn outbox_lock(&self, id: DocId) -> Arc<Mutex<()>> {
+        self.outbox_locks
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Mirror the in-memory doc into the outbox file, and don't come back
+    /// until it is on the disk.
+    ///
+    /// This is the commit point for an edit. Building sedimentree fragments
+    /// costs tens of milliseconds and climbs with the note's history, so the
+    /// editor's keystroke path can't wait for it — but it can wait for this,
+    /// which appends only the changes since the last stage. `open_local`
+    /// replays the log over the sedimentree, so an edit that got this far is
+    /// recoverable even if the process is killed a moment later.
+    ///
+    /// The first stage after a truncation writes a compacted document; every
+    /// stage after it appends.
     async fn stage_doc(&self, id: DocId) -> Result<()> {
+        let outbox = self.outbox_lock(id);
+        let _outbox = outbox.lock().await;
         let state = self.doc_state(id).await?;
         let (bytes, heads, append) = {
             let guard = state.lock().await;
@@ -1164,10 +1130,17 @@ impl Repo {
                     .open(&path)
                     .context("opening staged doc")?;
                 file.write_all(&bytes).context("appending staged doc")?;
+                // A kill leaves written-but-unflushed bytes intact, but a
+                // panic or a flat battery does not, and this is the only
+                // copy of the edit until the next ingest.
+                file.sync_all().context("flushing staged doc")?;
             } else {
                 let pending = path.with_extension("pending");
                 std::fs::write(&pending, &bytes).context("writing staged doc")?;
+                let file = std::fs::File::open(&pending).context("reopening staged doc")?;
+                file.sync_all().context("flushing staged doc")?;
                 std::fs::rename(&pending, &path).context("committing staged doc")?;
+                sync_dir(&path);
             }
             Ok(())
         })?;
@@ -1175,13 +1148,28 @@ impl Repo {
         Ok(())
     }
 
-    /// Drop the outbox file once its contents are safely in the sedimentree.
-    async fn clear_outbox(&self, id: DocId) {
-        let path = self.outbox_path(id);
-        cpu_heavy(|| std::fs::remove_file(path)).ok();
-        if let Ok(state) = self.doc_state(id).await {
-            state.lock().await.staged_heads = None;
+    /// Start the outbox log over from `durable`, the heads the sedimentree
+    /// now holds. The file goes away, but `staged_heads` stays set to that
+    /// point, so the next stage appends the changes since it rather than
+    /// rewriting the whole note — which is what the next keystroke after
+    /// every save would otherwise cost, growing with the note.
+    ///
+    /// Skips when the doc has moved past `durable`: those newer changes are
+    /// in the log and nowhere else yet, so the log has to stay.
+    async fn truncate_outbox(&self, id: DocId, durable: &[ChangeHash]) {
+        let outbox = self.outbox_lock(id);
+        let _outbox = outbox.lock().await;
+        let Ok(state) = self.doc_state(id).await else {
+            return;
+        };
+        let mut guard = state.lock().await;
+        if guard.doc.get_heads() != durable {
+            return;
         }
+        let path = self.outbox_path(id);
+        cpu_heavy(|| std::fs::remove_file(&path)).ok();
+        sync_dir(&path);
+        guard.staged_heads = Some(durable.to_vec());
     }
 
     pub async fn set_apply_incoming(self: &Arc<Self>, enabled: bool) {
@@ -1590,6 +1578,7 @@ impl Repo {
             last_synced_local_heads: Mutex::new(HashMap::new()),
             deferred_applies: Mutex::new(HashSet::new()),
             deferred_sends: Mutex::new(HashSet::new()),
+            outbox_locks: std::sync::Mutex::new(HashMap::new()),
             next_save: AtomicU64::new(0),
             events,
             connected: AtomicBool::new(false),
@@ -1971,15 +1960,15 @@ impl Repo {
             }
             let repo = self.clone();
             tokio::spawn(async move {
-                let outcome = repo
-                    .core
-                    .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
-                    .await
-                    .map(|peers| {
-                        classify_sync(peers.values().map(|(succeeded, stats, _)| {
-                            (*succeeded, stats.total_received() > 0)
-                        }))
-                    });
+                let outcome =
+                    repo.core
+                        .sync_with_all_peers(id.sedimentree_id(), true, SYNC_TIMEOUT)
+                        .await
+                        .map(|peers| {
+                            classify_sync(peers.values().map(|(succeeded, stats, _)| {
+                                (*succeeded, stats.total_received() > 0)
+                            }))
+                        });
                 if !matches!(outcome, Ok(SyncOutcome::Succeeded { .. })) {
                     // Forget the heads so the server's next announcement retries.
                     let mut last = repo.last_server_heads.lock().await;
@@ -2261,18 +2250,18 @@ impl Repo {
                 return Ok(false);
             }
         }
-        let ingested = {
+        let (ingested, ingested_heads) = {
             let state = shared.lock().await;
-            let rebundle = state.stored_commits.len() >= REBUNDLE_LOOSE_THRESHOLD;
-            cpu_heavy(|| {
+            let heads = state.doc.get_heads();
+            let ingested = cpu_heavy(|| {
                 ingest(
                     &state.doc,
                     sid,
                     &state.stored_commits,
                     &state.stored_fragments,
-                    rebundle,
                 )
-            })
+            });
+            (ingested, heads)
         };
         let Some(ingested) = ingested else {
             tracing::warn!(doc = %id.to_url(), "fragment ingest failed; staging to outbox");
@@ -2283,7 +2272,7 @@ impl Repo {
         };
         if ingested.commits.is_empty() && ingested.fragments.is_empty() {
             if !ingested.skipped && !muted {
-                self.clear_outbox(id).await;
+                self.truncate_outbox(id, &ingested_heads).await;
             }
             return Ok(false);
         }
@@ -2310,7 +2299,7 @@ impl Repo {
             self.stage_doc(id).await?;
             self.deferred_sends.lock().await.insert(id);
         } else if !skipped {
-            self.clear_outbox(id).await;
+            self.truncate_outbox(id, &ingested_heads).await;
         }
         if wrote_fragments {
             self.reclaim_doc(id).await;
@@ -2509,10 +2498,13 @@ impl Repo {
         Ok(value)
     }
 
-    /// Like `change_doc_at`, but persistence is debounced. This is for editor
-    /// keystroke patches where the in-memory doc must advance immediately but
-    /// sedimentree fragment building should not block every character.
-    pub async fn change_doc_at_deferred_save<F, T>(
+    /// Like `change_doc_at`, but only the sedimentree ingest is debounced.
+    ///
+    /// The edit is durable before this returns — it goes into the outbox log
+    /// on the way through. What gets deferred is building fragments, which
+    /// costs tens of milliseconds and climbs with the note's history, so it
+    /// can't sit in front of every character.
+    pub async fn change_doc_at_deferred_ingest<F, T>(
         self: &Arc<Self>,
         id: DocId,
         heads: Vec<ChangeHash>,
@@ -2538,6 +2530,11 @@ impl Repo {
                 }
             })?
         };
+        // Durability is not what's deferred here — only the sedimentree
+        // ingest is. The edit goes to the outbox log before this returns, so
+        // there is no window where the caller has been told the change
+        // landed while it lives only in memory.
+        self.stage_doc(id).await?;
         self.schedule_save_doc(id).await;
         Ok(value)
     }
@@ -2638,21 +2635,22 @@ impl Repo {
             let Ok(bytes) = std::fs::read(self.outbox_path(id)) else {
                 return false;
             };
-            match Automerge::load(&bytes) {
-                Ok(mut staged) => {
-                    if let Err(e) = guard.doc.merge(&mut staged) {
-                        tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to merge");
-                        false
-                    } else {
-                        true
-                    }
-                }
+            match merge_outbox_into(&mut guard.doc, &bytes) {
+                Ok(()) => true,
                 Err(e) => {
-                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to load");
+                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to replay");
                     false
                 }
             }
         });
+        if merged_staged {
+            // The log on disk covers everything the doc now holds that the
+            // sedimentree doesn't, so record that as the baseline: without
+            // it the first keystroke after opening a note rewrites the whole
+            // thing instead of appending one change.
+            let heads = guard.doc.get_heads();
+            guard.staged_heads = Some(heads);
+        }
         drop(guard);
         self.emit_batch_events(id, count, advanced, failed);
         if merged_staged {
@@ -2697,7 +2695,10 @@ impl Repo {
         }
         {
             let syncs = self.syncs.lock().await;
-            if syncs.get(&id).is_some_and(|slot| slot.running || slot.again) {
+            if syncs
+                .get(&id)
+                .is_some_and(|slot| slot.running || slot.again)
+            {
                 return false;
             }
         }
@@ -2724,13 +2725,8 @@ impl Repo {
             };
             let outbox = cpu_heavy(|| std::fs::read(self.outbox_path(id)).ok());
             if let Some(bytes) = outbox {
-                match Automerge::load(&bytes) {
-                    Ok(mut staged) => {
-                        if rebuilt.merge(&mut staged).is_err() {
-                            return false;
-                        }
-                    }
-                    Err(_) => return false,
+                if merge_outbox_into(&mut rebuilt, &bytes).is_err() {
+                    return false;
                 }
             }
             heads
@@ -2842,9 +2838,9 @@ impl Repo {
         }
     }
 
-    /// Flush all pending saves and do a best-effort final sync before the app
-    /// exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
-    pub async fn shutdown(self: &Arc<Self>) {
+    /// Run every pending debounced save now, and report which docs gained
+    /// data on disk. Local durability only — no network.
+    async fn drain_pending_saves(&self) -> HashSet<DocId> {
         let pending: Vec<(DocId, PendingSave)> = {
             let mut saves = self.pending_saves.lock().await;
             saves.drain().collect()
@@ -2859,9 +2855,27 @@ impl Repo {
                     dirty.insert(id);
                 }
                 Ok(false) => {}
-                Err(e) => tracing::warn!(doc = %id.to_url(), error = %e, "shutdown save failed"),
+                Err(e) => {
+                    tracing::warn!(doc = %id.to_url(), error = %e, "pending save flush failed")
+                }
             }
         }
+        dirty
+    }
+
+    /// Get every debounced edit onto disk, without the network round trip
+    /// `shutdown` waits for. This is the suspend path, not the exit path:
+    /// iOS suspends an app in the background and may kill it later without
+    /// ever sending `willTerminate`, so a change still sitting in
+    /// `pending_saves` at that moment is typed text the user never gets back.
+    pub async fn flush_pending_saves(&self) {
+        self.drain_pending_saves().await;
+    }
+
+    /// Flush all pending saves and do a best-effort final sync before the app
+    /// exits. Should be called from applicationWillTerminate / sceneDidDisconnect.
+    pub async fn shutdown(self: &Arc<Self>) {
+        let mut dirty = self.drain_pending_saves().await;
         dirty.extend(
             self.syncs
                 .lock()
@@ -2913,6 +2927,246 @@ mod tests {
         assert_eq!(name("ws://example.com:80/sync"), "example.com");
     }
 
+    /// What one sedimentree record costs to write, and how many records a
+    /// save carries. Run with `--ignored --nocapture`.
+    ///
+    /// This is the number that decides whether a keystroke can write
+    /// straight into the sedimentree: it is flat in the note's history and
+    /// dominated by the compound write's four fsyncs, two file creates and
+    /// two renames, so it does not shrink in release and does not amortize
+    /// until several records share a batch.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_loose_commit_write() {
+        use std::time::{Duration, Instant};
+
+        for prior in [100usize, 3000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            let mut at = 0usize;
+            for _ in 0..prior {
+                type_one(&repo, id, at).await;
+                at += 1;
+            }
+            repo.save_doc_now(id).await.unwrap();
+            let sid = id.sedimentree_id();
+
+            let n = 20u32;
+            let mut store = Duration::ZERO;
+            let mut commits = 0usize;
+            let mut frags = 0usize;
+
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+                let ingested = {
+                    let state = repo.doc_state(id).await.unwrap();
+                    let g = state.lock().await;
+                    ingest(&g.doc, sid, &g.stored_commits, &g.stored_fragments).unwrap()
+                };
+                commits += ingested.commits.len();
+                frags += ingested.fragments.len();
+                let Ingested {
+                    commits: c,
+                    fragments: f,
+                    commit_heads,
+                    fragment_heads,
+                    ..
+                } = ingested;
+                let t = Instant::now();
+                repo.core.store_built_batch(sid, c, f).await.unwrap();
+                store += t.elapsed();
+                let state = repo.doc_state(id).await.unwrap();
+                let mut g = state.lock().await;
+                g.stored_commits.extend(commit_heads);
+                g.stored_fragments.extend(fragment_heads);
+            }
+
+            println!(
+                "{prior:>5} prior: store_built_batch {:>11?} for {:.2} commits + {:.2} fragments per save",
+                store / n,
+                commits as f64 / n as f64,
+                frags as f64 / n as f64
+            );
+        }
+    }
+
+    /// Does automerge form real fragments during ordinary editing? The
+    /// synthetic loose-batching in `ingest_loose_batch` exists because
+    /// "ordinary editing never reached the batch size and left everything
+    /// loose for good". Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_natural_fragment_formation() {
+        for total in [500usize, 2000, 8000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            for at in 0..total {
+                type_one(&repo, id, at).await;
+            }
+            let state = repo.doc_state(id).await.unwrap();
+            let g = state.lock().await;
+            let mut by_level = std::collections::BTreeMap::new();
+            for f in g.doc.fragments(0..) {
+                *by_level.entry(f.level).or_insert(0usize) += 1;
+            }
+            println!("{total:>5} changes -> fragments by level: {by_level:?}");
+        }
+    }
+
+    /// Where a save's time goes, and how it scales with a note's history.
+    /// Writing is roughly `full save - ingest`, since `save_doc_now` runs its
+    /// own ingest.
+    ///
+    /// **Run this with `--release`.** A debug build inflates `fragments(0..)`
+    /// by 10-15x and makes the enumeration look like the dominant cost when it
+    /// is not. In release it is 1.5ms for a 10k-change note, which matches
+    /// what automerge-repo's subduction source assumes ("cheap: a few ms even
+    /// at 12k changes").
+    ///
+    /// `ingest` is almost entirely `fragments(0..)`. It grows with the note's
+    /// history, because automerge exports metadata for every fragment at every
+    /// level before `ingest` skips the ones already stored. The
+    /// `fragments(0..1)` column is the same call restricted to the loose tail.
+    /// Reading only that level would be cheaper, but a change whose own
+    /// `fragment_level` is >= 1 never appears there, so it would miss records
+    /// that must be stored — and at 1.5ms the enumeration is not worth
+    /// trading correctness for. Bundling is the half that has to stay behind
+    /// the already-stored filter; see `ingest`.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_ingest_breakdown() {
+        use std::time::{Duration, Instant};
+
+        for prior in [100usize, 1000, 3000, 10000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            let mut at = 0usize;
+            for _ in 0..prior {
+                type_one(&repo, id, at).await;
+                at += 1;
+            }
+            repo.save_doc_now(id).await.unwrap();
+            let sid = id.sedimentree_id();
+
+            let n = 20u32;
+            let mut enumerate = Duration::ZERO;
+            let mut loose_only = Duration::ZERO;
+            let mut ingest_only = Duration::ZERO;
+            let mut whole = Duration::ZERO;
+
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+
+                {
+                    let state = repo.doc_state(id).await.unwrap();
+                    let g = state.lock().await;
+                    let t = Instant::now();
+                    let _ = g.doc.fragments(0..).len();
+                    enumerate += t.elapsed();
+
+                    let t = Instant::now();
+                    let _ = g.doc.fragments(0..1).len();
+                    loose_only += t.elapsed();
+
+                    let t = Instant::now();
+                    let _ = ingest(&g.doc, sid, &g.stored_commits, &g.stored_fragments);
+                    ingest_only += t.elapsed();
+                }
+
+                let t = Instant::now();
+                repo.save_doc_now(id).await.unwrap();
+                whole += t.elapsed();
+            }
+
+            println!(
+                "{prior:>6} prior: fragments(0..) {:>11?} | fragments(0..1) {:>11?} | ingest {:>11?} | full save {:>11?}",
+                enumerate / n,
+                loose_only / n,
+                ingest_only / n,
+                whole / n
+            );
+        }
+    }
+
+    /// Not a test — run with `--ignored --nocapture` to compare what each
+    /// durability strategy costs per keystroke as a note accumulates history.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_write_paths() {
+        use std::time::Instant;
+
+        for prior in [100usize, 1000, 3000] {
+            let (_dir, repo) = test_repo().await;
+            let id = repo.create_doc(|_| Ok(())).await.unwrap();
+            let mut at = 0usize;
+            for _ in 0..prior {
+                type_one(&repo, id, at).await;
+                at += 1;
+            }
+            repo.save_doc_now(id).await.unwrap();
+            drop_outbox_baseline(&repo, id).await;
+
+            let n = 30u32;
+
+            let t = Instant::now();
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+                repo.save_doc_now(id).await.unwrap();
+            }
+            let save = t.elapsed() / n;
+
+            repo.stage_doc(id).await.unwrap();
+            let t = Instant::now();
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+                repo.stage_doc(id).await.unwrap();
+            }
+            let append = t.elapsed() / n;
+
+            let t = Instant::now();
+            for _ in 0..n {
+                type_one(&repo, id, at).await;
+                at += 1;
+                drop_outbox_baseline(&repo, id).await;
+                repo.stage_doc(id).await.unwrap();
+            }
+            let restage = t.elapsed() / n;
+
+            println!(
+                "{prior:>5} prior changes: sedimentree save {save:>12?} | outbox append {append:>12?} | outbox re-stage {restage:>12?}"
+            );
+        }
+    }
+
+    /// Force the outbox back to having no baseline, so the benchmark can
+    /// price a full rewrite against an append.
+    async fn drop_outbox_baseline(repo: &Arc<Repo>, id: DocId) {
+        std::fs::remove_file(repo.outbox_path(id)).ok();
+        if let Ok(state) = repo.doc_state(id).await {
+            state.lock().await.staged_heads = None;
+        }
+    }
+
+    /// Mutate the in-memory doc only, no persistence, so a benchmark can time
+    /// one storage strategy without another one inside the measurement.
+    async fn type_one(repo: &Arc<Repo>, id: DocId, at: usize) {
+        let state = repo.doc_state(id).await.unwrap();
+        let mut state = state.lock().await;
+        let mut tx = state.doc.transaction();
+        let obj = match tx.get(ROOT, "text").unwrap() {
+            Some((_, o)) => o,
+            None => tx
+                .put_object(ROOT, "text", automerge::ObjType::Text)
+                .unwrap(),
+        };
+        tx.splice_text(&obj, at, 0, "x").unwrap();
+        tx.commit();
+    }
+
     fn put(doc: &mut Automerge, key: &str, value: impl Into<automerge::ScalarValue>) {
         let mut tx = doc.transaction();
         tx.put(ROOT, key, value).unwrap();
@@ -2962,9 +3216,12 @@ mod tests {
     /// Dialing by node id goes through iroh discovery, so the endpoint being
     /// dialed has to have published its address before the test can find it.
     async fn wait_until_dialable(repo: &Repo) {
-        timeout(Duration::from_secs(20), repo.iroh_endpoint().unwrap().online())
-            .await
-            .expect("iroh endpoint should come online");
+        timeout(
+            Duration::from_secs(20),
+            repo.iroh_endpoint().unwrap().online(),
+        )
+        .await
+        .expect("iroh endpoint should come online");
     }
 
     #[tokio::test]
@@ -3086,7 +3343,6 @@ mod tests {
             DocId([7; 16]).sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         let mut commits: Vec<_> = ingested
@@ -3123,7 +3379,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         assert!(!ingested.fragments.is_empty());
@@ -3146,41 +3401,125 @@ mod tests {
         );
     }
 
+    /// Every record written has to correspond to a fragment automerge itself
+    /// reports, at the matching level. A previous version of `ingest` batched
+    /// level-0 runs into hand-built `AutomergeFragment`s — a head automerge
+    /// never chose, `level: 0` stored as a fragment record, and every member
+    /// declared a checkpoint — which put our sedimentree and the server's out
+    /// of step. Automerge core owns the compaction policy.
     #[test]
-    fn ingest_batches_level_zero_runs_into_fragments() {
+    fn ingest_mirrors_automerge_fragment_levels() {
         let id = DocId([12; 16]);
         let sid = id.sedimentree_id();
         let mut source = Automerge::new().with_actor(ActorId::from([12; 16].as_slice()));
-
-        while get_level_zero_count(&source) < LOOSE_FRAGMENT_BATCH_SIZE {
+        for _ in 0..600 {
             let index = source.length(ROOT);
             put(&mut source, &format!("value-{index}"), index as i64);
         }
 
-        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new(), false).unwrap();
+        let by_head: HashMap<ChangeHash, usize> = source
+            .fragments(0..)
+            .into_iter()
+            .map(|f| (f.head, f.level))
+            .collect();
         assert!(
-            !ingested.fragments.is_empty(),
-            "level-0 changes should be batched into fragment records"
-        );
-        assert!(
-            ingested.commits.len() < LOOSE_FRAGMENT_BATCH_SIZE,
-            "only the below-threshold tail should remain loose"
+            by_head.values().any(|level| *level > 0),
+            "expected automerge to have formed at least one real fragment"
         );
 
-        let commits: Vec<_> = ingested
-            .commits
-            .into_iter()
-            .map(|(meta, blob)| StoredRecord { meta, blob })
-            .collect();
-        let fragments: Vec<_> = ingested
-            .fragments
-            .into_iter()
-            .map(|(meta, blob)| StoredRecord { meta, blob })
-            .collect();
+        let ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+
+        for head in &ingested.commit_heads {
+            assert_eq!(
+                by_head.get(head),
+                Some(&0),
+                "a loose commit must be a level-0 automerge fragment"
+            );
+        }
+        for head in &ingested.fragment_heads {
+            let level = by_head
+                .get(head)
+                .copied()
+                .expect("a fragment record must have a head automerge reported");
+            assert!(level > 0, "a fragment record must come from level >= 1");
+        }
+        assert_eq!(
+            ingested.commit_heads.len() + ingested.fragment_heads.len(),
+            by_head.len(),
+            "every fragment automerge reports should be stored exactly once"
+        );
+    }
+
+    /// The durability property, across the point where automerge forms a real
+    /// fragment mid-stream: saving a few changes at a time and then loading
+    /// only what was stored has to reproduce the doc.
+    #[test]
+    fn ingest_reconstructs_doc_across_fragment_formation() {
+        let id = DocId([13; 16]);
+        let sid = id.sedimentree_id();
+        let mut source = Automerge::new().with_actor(ActorId::from([13; 16].as_slice()));
+
+        let mut stored_commits = HashSet::new();
+        let mut stored_fragments = HashSet::new();
+        let mut commits = Vec::new();
+        let mut fragments = Vec::new();
+
+        for round in 0..120 {
+            for _ in 0..5 {
+                let index = source.length(ROOT);
+                put(&mut source, &format!("value-{index}"), index as i64);
+            }
+            let ingested = ingest(&source, sid, &stored_commits, &stored_fragments).unwrap();
+            assert!(!ingested.skipped, "round {round} failed to bundle");
+            stored_commits.extend(ingested.commit_heads.iter().copied());
+            stored_fragments.extend(ingested.fragment_heads.iter().copied());
+            commits.extend(
+                ingested
+                    .commits
+                    .into_iter()
+                    .map(|(meta, blob)| StoredRecord { meta, blob }),
+            );
+            fragments.extend(
+                ingested
+                    .fragments
+                    .into_iter()
+                    .map(|(meta, blob)| StoredRecord { meta, blob }),
+            );
+        }
+
+        assert!(
+            !fragments.is_empty(),
+            "600 changes should have formed at least one fragment record"
+        );
+
         let mut loaded = Automerge::new();
         load_blob_batch(&mut loaded, &commits, &fragments).unwrap();
-
         assert_eq!(loaded.get_heads(), source.get_heads());
+    }
+
+    /// Re-ingesting with everything already stored writes nothing. This is
+    /// what keeps a save O(what changed) rather than O(the note's history):
+    /// bundling is the expensive half, and it sits behind this filter.
+    #[test]
+    fn ingest_skips_records_already_stored() {
+        let id = DocId([14; 16]);
+        let sid = id.sedimentree_id();
+        let mut source = Automerge::new().with_actor(ActorId::from([14; 16].as_slice()));
+        for _ in 0..600 {
+            let index = source.length(ROOT);
+            put(&mut source, &format!("value-{index}"), index as i64);
+        }
+
+        let first = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
+        let stored_commits: HashSet<_> = first.commit_heads.iter().copied().collect();
+        let stored_fragments: HashSet<_> = first.fragment_heads.iter().copied().collect();
+
+        let second = ingest(&source, sid, &stored_commits, &stored_fragments).unwrap();
+        assert!(second.commits.is_empty() && second.fragments.is_empty());
+
+        put(&mut source, "one-more", 1);
+        let third = ingest(&source, sid, &stored_commits, &stored_fragments).unwrap();
+        assert_eq!(third.commits.len() + third.fragments.len(), 1);
     }
 
     fn get_level_zero_count(doc: &Automerge) -> usize {
@@ -3204,7 +3543,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         let commit_heads = ingested.commit_heads.clone();
@@ -3239,7 +3577,6 @@ mod tests {
             sid,
             &state.stored_commits,
             &state.stored_fragments,
-            false,
         )
         .unwrap();
         assert!(repeated.commits.is_empty());
@@ -3261,7 +3598,7 @@ mod tests {
 
         repo.set_send_changes(false).await;
         let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-        repo.change_doc_at_deferred_save(id, heads, |doc| {
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
             put(doc, "value", "after");
             Ok(())
         })
@@ -3339,7 +3676,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         repo.core
@@ -3395,7 +3731,6 @@ mod tests {
                 id.sedimentree_id(),
                 &HashSet::new(),
                 &HashSet::new(),
-                false,
             )
             .unwrap();
             repo.core
@@ -3413,10 +3748,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            *repo.deferred_applies.lock().await,
-            HashSet::from([a, b])
-        );
+        assert_eq!(*repo.deferred_applies.lock().await, HashSet::from([a, b]));
 
         repo.drop_doc(b).await;
         repo.set_apply_incoming(true).await;
@@ -3467,7 +3799,7 @@ mod tests {
         repo.set_send_changes(false).await;
         for id in [a, b] {
             let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-            repo.change_doc_at_deferred_save(id, heads, |doc| {
+            repo.change_doc_at_deferred_ingest(id, heads, |doc| {
                 put(doc, "value", "after");
                 Ok(())
             })
@@ -3507,7 +3839,7 @@ mod tests {
         let sid = id.sedimentree_id();
         let mut source = Automerge::new().with_actor(ActorId::from([11; 16].as_slice()));
         put(&mut source, "value", "legacy");
-        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new(), false).unwrap();
+        let mut ingested = ingest(&source, sid, &HashSet::new(), &HashSet::new()).unwrap();
         assert_eq!(ingested.commits.len(), 1);
         assert!(ingested.fragments.is_empty());
         let (commit, blob) = ingested.commits.pop().unwrap();
@@ -3679,7 +4011,6 @@ mod tests {
             id.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         repo.core
@@ -3744,7 +4075,7 @@ mod tests {
             .await
             .unwrap();
         let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-        repo.change_doc_at_deferred_save(id, heads, |doc| {
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
             put(doc, "second", "deferred");
             Ok(())
         })
@@ -3824,10 +4155,7 @@ mod tests {
         assert!(repo.deferred_sends.lock().await.contains(&sending));
 
         repo.set_apply_incoming(false).await;
-        let mut remote = repo
-            .read_doc(applying, |doc| Ok(doc.fork()))
-            .await
-            .unwrap();
+        let mut remote = repo.read_doc(applying, |doc| Ok(doc.fork())).await.unwrap();
         remote.set_actor(ActorId::from([22; 16].as_slice()));
         put(&mut remote, "remote", "waiting");
         let ingested = ingest(
@@ -3835,7 +4163,6 @@ mod tests {
             applying.sedimentree_id(),
             &HashSet::new(),
             &HashSet::new(),
-            false,
         )
         .unwrap();
         repo.core
@@ -3939,7 +4266,7 @@ mod tests {
             .await
             .unwrap();
         let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-        repo.change_doc_at_deferred_save(id, heads, |doc| {
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
             put(doc, "second", "deferred");
             Ok(())
         })
@@ -3950,6 +4277,204 @@ mod tests {
         repo.drop_doc(id).await;
         repo.ensure_doc(id).await.unwrap();
         let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(loaded, expected);
+    }
+
+    /// Rebuild a doc from nothing but what is on disk, the way a fresh
+    /// process would: the sedimentree, then the outbox log replayed over it.
+    async fn rebuild_from_disk(repo: &Arc<Repo>, id: DocId) -> Automerge {
+        let mut doc = repo.stored_doc(id).await.unwrap();
+        if let Ok(bytes) = std::fs::read(repo.outbox_path(id)) {
+            merge_outbox_into(&mut doc, &bytes).unwrap();
+        }
+        doc
+    }
+
+    /// Throw away the scheduled ingest without running it, the way a kill
+    /// throws away everything the process was about to do.
+    async fn abandon_pending_saves(repo: &Arc<Repo>) {
+        for (_, pending) in repo.pending_saves.lock().await.drain() {
+            pending.handle.abort();
+        }
+    }
+
+    /// The guarantee: an editor keystroke is on disk by the time the call
+    /// returns — no debounce elapsed, no flush, no clean shutdown.
+    #[tokio::test]
+    async fn a_keystroke_is_durable_before_the_call_returns() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+            put(doc, "second", "typed");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+
+        // The ingest is still only scheduled — this is the window the crash
+        // reports died in.
+        assert!(
+            !repo.pending_saves.lock().await.is_empty(),
+            "the sedimentree ingest should still be pending"
+        );
+        abandon_pending_saves(&repo).await;
+
+        assert_eq!(
+            rebuild_from_disk(&repo, id).await.get_heads(),
+            expected,
+            "the keystroke should already be reconstructable from disk"
+        );
+    }
+
+    /// Same guarantee across a burst long enough that the debounce fires
+    /// partway through, so the log gets restarted mid-burst and later
+    /// keystrokes append to a log that begins mid-history.
+    #[tokio::test]
+    async fn every_keystroke_in_a_burst_survives() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo.create_doc(|_| Ok(())).await.unwrap();
+        for i in 0..40i64 {
+            let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+            repo.change_doc_at_deferred_ingest(id, heads, move |doc| {
+                put(doc, "n", i);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            if i % 7 == 0 {
+                tokio::time::sleep(SAVE_DEBOUNCE * 2).await;
+            }
+        }
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        abandon_pending_saves(&repo).await;
+
+        assert_eq!(
+            rebuild_from_disk(&repo, id).await.get_heads(),
+            expected,
+            "every keystroke in the burst should be on disk"
+        );
+    }
+
+    /// After an ingest the log restarts from the heads the sedimentree took,
+    /// rather than losing its baseline — which would make the next keystroke
+    /// rewrite the whole note instead of appending one change to it.
+    #[tokio::test]
+    async fn the_log_restarts_from_the_ingested_heads() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "a", "1");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+            put(doc, "b", "2");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(repo.outbox_path(id).exists(), "the keystroke is logged");
+
+        repo.flush_pending_saves().await;
+        assert!(!repo.outbox_path(id).exists(), "an ingested log is dropped");
+
+        let now = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        let state = repo.doc_state(id).await.unwrap();
+        let staged = state.lock().await.staged_heads.clone();
+        assert_eq!(
+            staged,
+            Some(now),
+            "the next keystroke should append from here, not rewrite"
+        );
+    }
+
+    /// An ingest that finishes after the next keystroke must leave the log
+    /// alone: the newer change is in it and nowhere else yet.
+    #[tokio::test]
+    async fn truncating_skips_a_log_that_moved_on() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "a", "1");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let stale = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, stale.clone(), |doc| {
+            put(doc, "b", "2");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        abandon_pending_saves(&repo).await;
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+
+        repo.truncate_outbox(id, &stale).await;
+
+        assert!(
+            repo.outbox_path(id).exists(),
+            "the log still holds a change the sedimentree never took"
+        );
+        assert_eq!(rebuild_from_disk(&repo, id).await.get_heads(), expected);
+    }
+
+    /// The suspend path: a debounced edit has to be on disk before the
+    /// process can be killed, and durable enough that a *fresh* repo over
+    /// the same directory sees it. Reloading through `drop_doc` would not
+    /// prove this — `drop_doc` flushes pending saves itself.
+    #[tokio::test]
+    async fn flush_pending_saves_persists_a_debounced_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "first", "saved");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+            put(doc, "second", "deferred");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert!(
+            !repo.pending_saves.lock().await.is_empty(),
+            "the change should still be held by the save debounce"
+        );
+
+        repo.flush_pending_saves().await;
+        assert!(
+            repo.pending_saves.lock().await.is_empty(),
+            "flush should leave nothing waiting on the debounce"
+        );
+
+        // Stand in for the process being killed: nothing else gets to run.
+        drop(repo);
+        let reopened = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        reopened.ensure_doc(id).await.unwrap();
+        let loaded = reopened
+            .read_doc(id, |doc| Ok(doc.get_heads()))
+            .await
+            .unwrap();
         assert_eq!(loaded, expected);
     }
 
@@ -3964,7 +4489,7 @@ mod tests {
             .await
             .unwrap();
         let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-        repo.change_doc_at_deferred_save(id, heads, |doc| {
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
             put(doc, "second", "deferred");
             Ok(())
         })

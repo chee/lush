@@ -668,6 +668,11 @@ final class NotesModel {
             }
             Self.bootLog("Core adopted")
             self.core = core
+            #if os(iOS) || os(visionOS)
+            // A core built while the app is already in the background starts
+            // out thinking it may work freely; tell it where we actually are.
+            BackgroundSync.applyCoreActivity()
+            #endif
             watchMemoryPressure()
             LushAgentServer.shared.start(model: self)
             applyingIncomingChanges = core.isApplyingIncoming()
@@ -1313,6 +1318,23 @@ final class NotesModel {
                 appendSyncEvent("  post-sync \(url.suffix(12)): \(entries) entries, \(changes) changes")
             }
         }
+    }
+
+    /// Get everything typed but not yet durable onto disk.
+    ///
+    /// This is the suspend path, and on iOS it is the last moment the app
+    /// reliably runs code: the system suspends a backgrounded app and can
+    /// kill it later without ever sending `willTerminate`, which is the only
+    /// place `shutdown()` was wired up. Until this runs, a recent edit exists
+    /// only in memory — behind the editor's 300ms push debounce, then behind
+    /// the core's save debounce — and a kill in that window loses it.
+    func flushPendingWrites() async {
+        await activeEditor?.core?.flushNow()
+        for task in Array(noteWriteTasks.values) {
+            _ = await task.value
+        }
+        guard let core else { return }
+        await core.flushPendingSaves()
     }
 
     func syncNow(budget: Duration) async {

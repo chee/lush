@@ -610,6 +610,13 @@ struct LushApp: App {
                 }
                 .onReceive(
                     NotificationCenter.default.publisher(
+                        for: UIApplication.willEnterForegroundNotification
+                    )
+                ) { _ in
+                    BackgroundSync.willEnterForeground()
+                }
+                .onReceive(
+                    NotificationCenter.default.publisher(
                         for: UIApplication.didBecomeActiveNotification
                     )
                 ) { _ in
