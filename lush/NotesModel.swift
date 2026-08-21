@@ -1591,12 +1591,12 @@ final class NotesModel {
 
     /// Every logline that carries a fix. The indexer reads each note as it
     /// lands and keeps its placed loglines, so this is one query against the
-    /// index rather than a walk of the whole collection — and it waits for the
-    /// startup crawl, since an early answer would be a short one.
+    /// index rather than a walk of the whole collection. It answers with
+    /// whatever has been indexed so far; whoever asks before the startup crawl
+    /// has landed decides what to do about that.
     func noteLocations() async -> [NoteLocation] {
         if core == nil { await start() }
         guard let core else { return [] }
-        _ = await waitForStartup()
         let places = await Task.detached { NoteLocation.from(core.notePlaces()) }.value
         return places.filter { node(for: $0.noteUrl) != nil }
     }

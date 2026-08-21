@@ -337,14 +337,28 @@ struct NotesMapScreen: View {
             .compactMap { model.node(for: $0.key) }
     }
 
+    /// The startup crawl is what fills the index, so a map opened while Lush is
+    /// still coming up is only as complete as what has been read so far. Draw
+    /// that, then draw again when the rest lands — the spinner is only held
+    /// while there is nothing to show, so it never claims there is nowhere.
     private func reload() async {
         loading = true
+        await draw()
+        if !model.startupSettled {
+            loading = places.isEmpty
+            await model.awaitStartup()
+            guard !Task.isCancelled else { return }
+            await draw()
+        }
+        loading = false
+    }
+
+    private func draw() async {
         let locations = await model.noteLocations()
         let clustered = await Task.detached { MapPlace.cluster(locations) }.value
         guard !Task.isCancelled else { return }
         let isFirstLoad = places.isEmpty
         places = clustered
-        loading = false
         if selected != nil, !clustered.contains(where: { $0.id == selected }) { selected = nil }
         if isFirstLoad, let region = MapPlace.region(covering: clustered) {
             camera = .region(region)

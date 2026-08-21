@@ -2137,28 +2137,6 @@ pub fn full_text(doc: &Automerge) -> String {
     out
 }
 
-pub fn context_values(doc: &Automerge, key: &str) -> Vec<String> {
-    let Ok(spans) = spans_to_json(doc) else {
-        return Vec::new();
-    };
-    spans
-        .into_iter()
-        .filter_map(|span| match span {
-            SpanJson::Block { value }
-                if value.get("type").and_then(Json::as_str) == Some("context") =>
-            {
-                value
-                    .get("attrs")
-                    .and_then(Json::as_object)
-                    .and_then(|attrs| attrs.get(key))
-                    .and_then(Json::as_str)
-                    .map(str::to_string)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
 /// A logline that carried a fix. The stamp stays the string the block was
 /// written with — whoever reads it back knows the format it went in as.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2173,46 +2151,67 @@ pub struct ContextPlace {
     pub ts: String,
 }
 
-/// Every logline in the doc that knows where it was stamped. A logline without
-/// a fix is nowhere on a map, so it is left out here rather than downstream.
-pub fn context_places(doc: &Automerge) -> Vec<ContextPlace> {
+/// What the index keeps from a doc's loglines. Hydrating the spans of a note
+/// with a long history is the expensive part, so all three are read in one
+/// pass rather than one walk each.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ContextIndex {
+    pub weather: Vec<String>,
+    pub locations: Vec<String>,
+    /// Only the loglines that know where they were stamped: one without a fix
+    /// is nowhere on a map, so it is left out here rather than downstream.
+    pub places: Vec<ContextPlace>,
+}
+
+pub fn context_index(doc: &Automerge) -> ContextIndex {
+    let mut found = ContextIndex::default();
     let Ok(spans) = spans_to_json(doc) else {
-        return Vec::new();
+        return found;
     };
-    spans
-        .into_iter()
-        .filter_map(|span| {
-            let SpanJson::Block { value } = span else {
-                return None;
-            };
-            if value.get("type").and_then(Json::as_str) != Some("context") {
-                return None;
-            }
-            let attrs = value.get("attrs").and_then(Json::as_object)?;
-            let text = |key: &str| {
-                attrs
-                    .get(key)
-                    .and_then(Json::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            let created = text("created");
-            let lat = attrs.get("lat").and_then(Json::as_f64)?;
-            let lon = attrs.get("lon").and_then(Json::as_f64)?;
-            // a doc can arrive from anywhere, and two numbers are not yet a
-            // place: what is not on the globe never becomes a pin
-            if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-                return None;
-            }
-            Some(ContextPlace {
-                lat,
-                lon,
-                name: text("location"),
-                weather: text("weather"),
-                ts: if created.is_empty() { text("ts") } else { created },
-            })
-        })
-        .collect()
+    for span in spans {
+        let SpanJson::Block { value } = span else {
+            continue;
+        };
+        if value.get("type").and_then(Json::as_str) != Some("context") {
+            continue;
+        }
+        let Some(attrs) = value.get("attrs").and_then(Json::as_object) else {
+            continue;
+        };
+        let text = |key: &str| {
+            attrs
+                .get(key)
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        if let Some(weather) = attrs.get("weather").and_then(Json::as_str) {
+            found.weather.push(weather.to_string());
+        }
+        if let Some(location) = attrs.get("location").and_then(Json::as_str) {
+            found.locations.push(location.to_string());
+        }
+        let (Some(lat), Some(lon)) = (
+            attrs.get("lat").and_then(Json::as_f64),
+            attrs.get("lon").and_then(Json::as_f64),
+        ) else {
+            continue;
+        };
+        // a doc can arrive from anywhere, and two numbers are not yet a place:
+        // what is not on the globe never becomes a pin
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            continue;
+        }
+        let created = text("created");
+        found.places.push(ContextPlace {
+            lat,
+            lon,
+            name: text("location"),
+            weather: text("weather"),
+            ts: if created.is_empty() { text("ts") } else { created },
+        });
+    }
+    found
 }
 
 pub fn doc_facets(doc: &Automerge) -> Vec<String> {
@@ -2306,7 +2305,7 @@ mod context_place_tests {
                          "lat":51.5072,"lon":-0.1276}}}
             ]"#,
         );
-        let places = context_places(&doc);
+        let places = context_index(&doc).places;
         assert_eq!(places.len(), 2);
         assert_eq!(places[0].name, "Glasgow");
         assert_eq!(places[0].weather, "Rain");
@@ -2329,7 +2328,25 @@ mod context_place_tests {
               {"type":"text","value":"words"}
             ]"#,
         );
-        assert!(context_places(&doc).is_empty());
+        assert!(context_index(&doc).places.is_empty());
+    }
+
+    /// A logline with no fix still says what the weather was and what the place
+    /// was called; only the map has no use for it.
+    #[test]
+    fn a_logline_without_a_fix_still_counts_as_weather_and_a_name() {
+        let context = context_index(&doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"location":"Somewhere","weather":"Fog"}}},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"location":"Glasgow","weather":"Rain","lat":55.8642,"lon":-4.2518}}}
+            ]"#,
+        ));
+        assert_eq!(context.locations, vec!["Somewhere", "Glasgow"]);
+        assert_eq!(context.weather, vec!["Fog", "Rain"]);
+        assert_eq!(context.places.len(), 1);
+        assert_eq!(context.places[0].name, "Glasgow");
     }
 
     #[test]
@@ -2342,7 +2359,7 @@ mod context_place_tests {
                 "attrs":{"lat":55.8642,"lon":181.5}}}
             ]"#,
         );
-        assert!(context_places(&doc).is_empty());
+        assert!(context_index(&doc).places.is_empty());
     }
 
     #[test]
@@ -2353,7 +2370,7 @@ mod context_place_tests {
                 "attrs":{"lat":55,"lon":-4}}}
             ]"#,
         );
-        let places = context_places(&doc);
+        let places = context_index(&doc).places;
         assert_eq!(places.len(), 1);
         assert_eq!(places[0].lat, 55.0);
         assert_eq!(places[0].lon, -4.0);

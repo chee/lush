@@ -745,6 +745,7 @@ pub fn indexed_doc(
         Vec::new()
     };
     let has_vision = kind == "file" && shapes::asset_vision(doc).is_some();
+    let context = shapes::context_index(doc);
     let mut heads: Vec<String> = doc.get_heads().iter().map(ToString::to_string).collect();
     heads.sort();
     IndexedDoc {
@@ -759,9 +760,9 @@ pub fn indexed_doc(
             .unwrap_or_else(|| shapes::doc_created(doc)),
         has_vision,
         tags: shapes::doc_tags(doc),
-        weather: shapes::context_values(doc, "weather"),
-        locations: shapes::context_values(doc, "location"),
-        places: shapes::context_places(doc),
+        weather: context.weather,
+        locations: context.locations,
+        places: context.places,
         facets: shapes::doc_facets(doc),
         when: shapes::doc_when(doc),
         heads: heads.join(","),
