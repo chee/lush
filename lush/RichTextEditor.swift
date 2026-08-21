@@ -1276,13 +1276,18 @@ final class EditorCore {
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async -> Bool {
+        // one entry per asset, in the order the note uses them: the same
+        // picture placed twice would otherwise be fetched twice and spend two
+        // of the warm slots below on one decode
+        var seen: Set<String> = []
         let urls: [String] = spans.compactMap { node -> String? in
             guard case .block(let block) = node,
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
                   !cache.isImage(url), cache.names[url] == nil,
-                  !cache.patchworkDocs.contains(url)
+                  !cache.patchworkDocs.contains(url),
+                  seen.insert(url).inserted
             else { return nil }
             return url
         }

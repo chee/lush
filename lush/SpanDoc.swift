@@ -412,6 +412,14 @@ final class FittingImageAttachment: NSTextAttachment {
     var assetUrl: String?
     var assetCache: AssetCache?
 
+    /// The redraw to run when the in-flight decode lands. TextKit asks for the
+    /// image on every frame that draws this fragment, so without somewhere to
+    /// collapse them each of those frames queues its own waiter and the decode
+    /// arrives as a burst of identical redraws — in the middle of the scroll
+    /// this exists to smooth. The newest requester wins: it is the one whose
+    /// viewport is on screen.
+    private var pendingRefresh: (@MainActor () -> Void)?
+
     /// One pixel of the colour a picture's slot shows before its bitmap
     /// arrives. Stretched to the attachment's bounds, it reads as a flat
     /// placeholder block and costs nothing to draw. An asset-backed
@@ -459,9 +467,15 @@ final class FittingImageAttachment: NSTextAttachment {
                 return
             }
             resolved = Self.placeholder
-            cache.ensureDisplayImage(for: url) { display in
+            let alreadyWaiting = pendingRefresh != nil
+            pendingRefresh = refresh
+            guard !alreadyWaiting else { return }
+            cache.ensureDisplayImage(for: url) { [weak self] display in
+                guard let self else { return }
+                let pending = self.pendingRefresh
+                self.pendingRefresh = nil
                 guard display != nil else { return }
-                refresh()
+                pending?()
             }
         }
         return resolved
@@ -620,7 +634,10 @@ final class AssetCache {
     #if os(macOS)
     nonisolated static let displayMaxPixels = 420 * 2
     #else
-    nonisolated static let displayMaxPixels = 340 * 3
+    /// The cap is in pixels, so the UIImage carries the matching scale —
+    /// without it the picture measures three times its point size.
+    nonisolated static let displayScale: CGFloat = 3
+    nonisolated static let displayMaxPixels = Int(340 * displayScale)
     #endif
 
     private static let displayImages: NSCache<NSString, PImage> = {
@@ -709,11 +726,6 @@ final class AssetCache {
             data as CFData,
             sourceOptions as CFDictionary
         ) else { return nil }
-        #if os(macOS)
-        let scale: CGFloat = 2
-        #else
-        let scale: CGFloat = 3
-        #endif
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -728,7 +740,7 @@ final class AssetCache {
         #if os(macOS)
         let image = NSImage(cgImage: thumbnail, size: .zero)
         #else
-        let image = UIImage(cgImage: thumbnail, scale: scale, orientation: .up)
+        let image = UIImage(cgImage: thumbnail, scale: displayScale, orientation: .up)
         #endif
         return (image, thumbnail.bytesPerRow * thumbnail.height)
     }
