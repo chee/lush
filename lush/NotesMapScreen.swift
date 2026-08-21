@@ -24,11 +24,18 @@ struct NoteLocation: Identifiable, Hashable, Sendable {
     }
 
     /// The whole batch at once: one date formatter does for all of them, and
-    /// the index hands them over in one go anyway.
+    /// the index hands them over in one go anyway. A logline can come from an
+    /// imported doc, so two numbers are not yet a place — anything off the
+    /// globe is dropped rather than handed to MapKit.
     static func from(_ places: [NotePlace]) -> [NoteLocation] {
         let fmt = ISO8601DateFormatter()
-        return places.map { place in
-            NoteLocation(
+        return places.compactMap { place in
+            let coordinate = CLLocationCoordinate2D(
+                latitude: place.latitude,
+                longitude: place.longitude
+            )
+            guard CLLocationCoordinate2DIsValid(coordinate) else { return nil }
+            return NoteLocation(
                 noteUrl: place.url,
                 ordinal: Int(place.ordinal),
                 name: place.name.isEmpty ? nil : place.name,
@@ -75,10 +82,11 @@ struct MapPlace: Identifiable, Sendable {
             if let index = groups.firstIndex(where: { $0.centre.distance(from: point) <= metres }) {
                 groups[index].members.append(location)
                 let count = Double(groups[index].members.count)
-                let latitude = groups[index].centre.coordinate.latitude
-                    + (location.latitude - groups[index].centre.coordinate.latitude) / count
-                let longitude = groups[index].centre.coordinate.longitude
-                    + (location.longitude - groups[index].centre.coordinate.longitude) / count
+                let centre = groups[index].centre.coordinate
+                let latitude = centre.latitude + (location.latitude - centre.latitude) / count
+                let longitude = wrappedLongitude(
+                    centre.longitude + wrappedLongitude(location.longitude - centre.longitude) / count
+                )
                 groups[index].centre = CLLocation(latitude: latitude, longitude: longitude)
             } else {
                 groups.append((centre: point, members: [location]))
@@ -107,17 +115,30 @@ struct MapPlace: Identifiable, Sendable {
         }?.key
     }
 
+    /// A longitude, or a difference between two, taken the short way round the
+    /// globe. Two fixes either side of the antimeridian are a few metres apart,
+    /// and averaging them arithmetically would put their pin in the Gulf of
+    /// Guinea instead.
+    static func wrappedLongitude(_ degrees: Double) -> Double {
+        let turned = (degrees + 180).truncatingRemainder(dividingBy: 360)
+        return turned < 0 ? turned + 180 : turned - 180
+    }
+
     static func region(covering places: [MapPlace]) -> MKCoordinateRegion? {
-        guard !places.isEmpty else { return nil }
+        guard let first = places.first else { return nil }
         let latitudes = places.map(\.latitude)
-        let longitudes = places.map(\.longitude)
+        // measured from the first place rather than from zero, so a set lying
+        // either side of the antimeridian frames across the line
+        let longitudes = places.map {
+            first.longitude + wrappedLongitude($0.longitude - first.longitude)
+        }
         guard let minLatitude = latitudes.min(), let maxLatitude = latitudes.max(),
               let minLongitude = longitudes.min(), let maxLongitude = longitudes.max()
         else { return nil }
         return MKCoordinateRegion(
             center: CLLocationCoordinate2D(
                 latitude: (minLatitude + maxLatitude) / 2,
-                longitude: (minLongitude + maxLongitude) / 2
+                longitude: wrappedLongitude((minLongitude + maxLongitude) / 2)
             ),
             span: MKCoordinateSpan(
                 latitudeDelta: max((maxLatitude - minLatitude) * 1.4, 0.01),

@@ -36,6 +36,30 @@ final class NotesMapTests: XCTestCase {
         XCTAssertNil(found.last?.stamped)
     }
 
+    func testAFixOffTheGlobeNeverBecomesALocation() {
+        let found = NoteLocation.from([
+            NotePlace(url: "a", ordinal: 0, latitude: 100, longitude: -4.2518, name: "", weather: "", stamped: ""),
+            NotePlace(url: "a", ordinal: 1, latitude: 55.8642, longitude: 181.5, name: "", weather: "", stamped: ""),
+            NotePlace(url: "a", ordinal: 2, latitude: 55.8642, longitude: -4.2518, name: "", weather: "", stamped: ""),
+        ])
+
+        XCTAssertEqual(found.map(\.id), ["a#2"])
+    }
+
+    func testAPlaceOnTheAntimeridianKeepsItsPinThere() {
+        let places = MapPlace.cluster([
+            NoteLocation(noteUrl: "a", ordinal: 0, name: "Taveuni", latitude: -16.8, longitude: 179.9995, weather: nil, stamped: Date(timeIntervalSince1970: 1)),
+            NoteLocation(noteUrl: "b", ordinal: 0, name: "Taveuni", latitude: -16.8, longitude: -179.9995, weather: nil, stamped: Date(timeIntervalSince1970: 2)),
+        ])
+
+        XCTAssertEqual(places.count, 1)
+        XCTAssertEqual(abs(places[0].longitude), 180, accuracy: 0.001)
+
+        let region = MapPlace.region(covering: places)
+        XCTAssertEqual(abs(region?.center.longitude ?? 0), 180, accuracy: 0.001)
+        XCTAssertLessThan(region?.span.longitudeDelta ?? 360, 1)
+    }
+
     func testTheSameDeskDoesNotScatterIntoSeveralPins() {
         let places = MapPlace.cluster([
             NoteLocation(noteUrl: "a", ordinal: 0, name: "Home", latitude: 55.8642, longitude: -4.2518, weather: nil, stamped: Date(timeIntervalSince1970: 1)),

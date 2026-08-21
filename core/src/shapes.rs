@@ -2197,9 +2197,16 @@ pub fn context_places(doc: &Automerge) -> Vec<ContextPlace> {
                     .to_string()
             };
             let created = text("created");
+            let lat = attrs.get("lat").and_then(Json::as_f64)?;
+            let lon = attrs.get("lon").and_then(Json::as_f64)?;
+            // a doc can arrive from anywhere, and two numbers are not yet a
+            // place: what is not on the globe never becomes a pin
+            if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+                return None;
+            }
             Some(ContextPlace {
-                lat: attrs.get("lat").and_then(Json::as_f64)?,
-                lon: attrs.get("lon").and_then(Json::as_f64)?,
+                lat,
+                lon,
                 name: text("location"),
                 weather: text("weather"),
                 ts: if created.is_empty() { text("ts") } else { created },
@@ -2320,6 +2327,19 @@ mod context_place_tests {
                 "attrs":{"created":"2026-03-04T10:00:00Z","lat":55.8642}}},
               {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
               {"type":"text","value":"words"}
+            ]"#,
+        );
+        assert!(context_places(&doc).is_empty());
+    }
+
+    #[test]
+    fn a_fix_off_the_globe_is_not_a_place() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":100.0,"lon":-4.2518}}},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":55.8642,"lon":181.5}}}
             ]"#,
         );
         assert!(context_places(&doc).is_empty());
