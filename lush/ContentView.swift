@@ -418,6 +418,7 @@ struct ContentView: View {
             FileImportChoiceSheet(request: request)
                 .environment(model)
         }
+        .statusNotice()
         #else
         Group {
             if usesWideLayout {
@@ -492,6 +493,7 @@ struct ContentView: View {
         .sheet(item: $patchworkCreateRequest) { request in
             patchworkCreateSheet(request)
         }
+        .statusNotice()
         #endif
     }
 
@@ -2340,7 +2342,8 @@ struct SearchSyntaxPills: View {
                         HStack(spacing: 5) {
                             Text(clause.label)
                             Image(systemName: "xmark")
-                                .font(.system(size: 8, weight: .bold))
+                                .font(.caption2.weight(.bold))
+                                .imageScale(.small)
                         }
                         .font(.caption.weight(.medium))
                         .padding(.horizontal, 9)
@@ -2392,7 +2395,6 @@ struct FolderScreen: View {
     @State private var searchHits: [SearchHit] = []
     @State private var searchTask: Task<Void, Never>?
     @State private var showingSettings = false
-    @State private var showingNewPatchwork = false
     @State private var renameTarget: FolderNode?
     @State private var renameText = ""
     @State private var moveTarget: MoveTarget?
@@ -2731,19 +2733,16 @@ struct FolderScreen: View {
                 }
                 .disabled(!model.undoManager.canRedo)
             }
-            ToolbarItem {
-                Menu {
-                    NewItemMenuItems(
-                        model: model,
-                        folderUrl: folderUrl,
-                        onNewSmartNotebook: { smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true) }
-                    ) { push(.note($0)) }
-                } label: {
-                    Label("New", systemImage: "square.and.pencil")
-                }
-                .disabled(model.folderUrl == nil)
+            DefaultToolbarItem(kind: .search, placement: .bottomBar)
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) {
+                newMenu
             }
         }
+        .searchable(
+            text: $searchText,
+            prompt: folderUrl == nil ? "Search notes" : "Search \(title)"
+        )
         .sheet(item: $smartEditor) { edit in
             SmartNotebookEditor(existing: edit.folder, isNew: edit.isNew)
                 .environment(model)
@@ -2759,71 +2758,10 @@ struct FolderScreen: View {
             .environment(model)
         }
         .safeAreaInset(edge: .bottom) {
-            VStack(spacing: 0) {
+            if !searchText.isEmpty {
                 SearchSyntaxSuggestions(text: $searchText)
-                HStack(spacing: 12) {
-                    HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                        .font(.system(size: 15))
-                    TextField(folderUrl == nil ? "Search notes" : "Search \(title)", text: $searchText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    if !searchText.isEmpty {
-                        Button { searchText = "" } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 10))
-
-                    Menu {
-                    Button {
-                        Task {
-                            contextTracker.start()
-                            if let url = await model.createNote(snap: contextTracker.snapshot) {
-                                push(.note(url))
-                            }
-                        }
-                    } label: {
-                        Label("Note", systemImage: "square.and.pencil")
-                    }
-                    if PatchworkWeb.available {
-                        Button {
-                            showingNewPatchwork = true
-                        } label: {
-                            Label("Patchwork Doc…", systemImage: "shippingbox")
-                        }
-                    }
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                        .font(.title2)
-                } primaryAction: {
-                    Task {
-                        contextTracker.start()
-                        if let url = await model.createNote(snap: contextTracker.snapshot) {
-                            push(.note(url))
-                        }
-                    }
-                }
-                    .accessibilityLabel("New")
-                    .disabled(model.folderUrl == nil)
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 10)
+                    .padding(.bottom, 8)
             }
-            .background(.bar)
-        }
-        .sheet(isPresented: $showingNewPatchwork) {
-            NewPatchworkDocSheet { url, _ in
-                model.addDocToCurrentFolder(url: url)
-                push(.patchwork(url))
-            }
-            .environment(model)
         }
         .sheet(isPresented: $showingSettings) {
             NavigationStack {
@@ -2938,6 +2876,30 @@ struct FolderScreen: View {
                 }
             )
         }
+    }
+
+    private var newMenu: some View {
+        Menu {
+            NewItemMenuItems(
+                model: model,
+                folderUrl: folderUrl,
+                onNewSmartNotebook: { smartEditor = SmartNotebookEdit(folder: newSmartNotebook(), isNew: true) }
+            ) { push(.note($0)) }
+        } label: {
+            Label("New", systemImage: "square.and.pencil")
+        } primaryAction: {
+            Task {
+                contextTracker.start()
+                let url: String?
+                if let folderUrl {
+                    url = await model.createNote(inFolder: folderUrl, snap: contextTracker.snapshot)
+                } else {
+                    url = await model.createNote(snap: contextTracker.snapshot)
+                }
+                if let url { push(.note(url)) }
+            }
+        }
+        .disabled(model.folderUrl == nil)
     }
 
     private var pinnedExpansionBinding: Binding<Bool> {
@@ -3213,7 +3175,7 @@ struct RightSidebarView: View {
                     selectedTab = tab
                 } label: {
                     Image(systemName: tab.icon)
-                        .font(.system(size: 20, weight: .medium))
+                        .font(.title3.weight(.medium))
                         .frame(maxWidth: .infinity)
                         .frame(height: 44)
                         .foregroundStyle(isActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
@@ -3401,6 +3363,8 @@ private struct DraftCardView: View {
     @State private var renameText = ""
     @State private var expanded = false
     @State private var revertingHash: String?
+    @ScaledMetric(relativeTo: .caption) private var badgeSize: CGFloat = InspectorMetrics.badgeSize
+    @ScaledMetric(relativeTo: .subheadline) private var chevronSize: CGFloat = InspectorMetrics.chevronSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -3418,7 +3382,7 @@ private struct DraftCardView: View {
                             Spacer()
                             if isCheckedOut {
                                 Text("checked out")
-                                    .font(.system(size: InspectorMetrics.badgeSize, weight: .medium, design: .monospaced))
+                                    .font(.system(size: badgeSize, weight: .medium, design: .monospaced))
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
                                     .background(.tint.opacity(0.16), in: Capsule())
@@ -3431,15 +3395,15 @@ private struct DraftCardView: View {
                     .padding(9)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Clear Search")
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(isCheckedOut ? "" : "Checks out this draft")
 
                 Button {
                     withAnimation(.easeOut(duration: 0.15)) { expanded.toggle() }
                 } label: {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: InspectorMetrics.chevronSize, weight: .semibold))
+                        .font(.system(size: chevronSize, weight: .semibold))
                         .foregroundStyle(.secondary)
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                         .padding(10)
@@ -3603,6 +3567,8 @@ private struct HistoryCurrentRow: View {
     let action: () -> Void
     var isExpanded: Bool? = nil
     var onToggle: (() -> Void)? = nil
+    @ScaledMetric(relativeTo: .caption) private var badgeSize: CGFloat = InspectorMetrics.badgeSize
+    @ScaledMetric(relativeTo: .subheadline) private var chevronSize: CGFloat = InspectorMetrics.chevronSize
 
     var body: some View {
         HStack(spacing: 0) {
@@ -3613,7 +3579,7 @@ private struct HistoryCurrentRow: View {
                             .uiFont(.body, weight: .semibold)
                         Spacer()
                         Text("live")
-                            .font(.system(size: InspectorMetrics.badgeSize, weight: .medium, design: .monospaced))
+                            .font(.system(size: badgeSize, weight: .medium, design: .monospaced))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(.tint.opacity(0.16), in: Capsule())
@@ -3636,7 +3602,7 @@ private struct HistoryCurrentRow: View {
             if let isExpanded, let onToggle {
                 Button(action: onToggle) {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: InspectorMetrics.chevronSize, weight: .semibold))
+                        .font(.system(size: chevronSize, weight: .semibold))
                         .foregroundStyle(.secondary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .padding(10)
@@ -3805,7 +3771,7 @@ private struct ChangesListView: View {
     private func sticker(for head: DocHistoryEntry) -> some View {
         HStack(spacing: 5) {
             Text(head.date, format: .dateTime.hour().minute().second())
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.secondary)
             if let onRevert {
                 Button {
@@ -3816,7 +3782,7 @@ private struct ChangesListView: View {
                             .controlSize(.mini)
                     } else {
                         Image(systemName: "arrow.uturn.backward.circle")
-                            .font(.system(size: 11))
+                            .font(.caption)
                     }
                 }
                 .buttonStyle(.borderless)
@@ -3865,6 +3831,7 @@ private struct ChangesListView: View {
 /// Deduped author dots, newest contributor first, patchwork-style overlap.
 private struct ActorDots: View {
     let actors: [String]
+    @ScaledMetric(relativeTo: .caption2) private var overflowSize: CGFloat = 9
 
     var body: some View {
         HStack(spacing: -4) {
@@ -3877,7 +3844,7 @@ private struct ActorDots: View {
             }
             if actors.count > 3 {
                 Text("+\(actors.count - 3)")
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: overflowSize, weight: .medium))
                     .foregroundStyle(.secondary)
                     .padding(.leading, 6)
             }
@@ -4350,6 +4317,11 @@ struct NoteDetail: View {
                         OpenInPatchworkLabel()
                     }
                 }
+                Menu {
+                    NoteShareLinks(note: ShareableNote(url: noteUrl, title: node.name))
+                } label: {
+                    Label("Share As", systemImage: "square.and.arrow.up")
+                }
                 #if os(macOS)
                 Menu {
                     Button("Export as HTML…") {
@@ -4363,7 +4335,7 @@ struct NoteDetail: View {
                         }
                     }
                 } label: {
-                    Label("Export", systemImage: "square.and.arrow.up")
+                    Label("Export", systemImage: "arrow.up.doc")
                 }
                 #endif
                 if node.parentUrl != nil {

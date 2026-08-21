@@ -17,7 +17,9 @@ enum InterfaceFont {
         let size = size(style) * adjustment.scale
         var font: Font
         if family == EditorSettings.systemFontFamily {
-            font = adjustment.scale == 1 ? .system(style) : .system(size: size)
+            font = adjustment.scale == 1
+                ? .system(style)
+                : .system(size: scaled(size, relativeTo: style))
         } else {
             EditorSettings.registerBundledFonts()
             font = .custom(family, size: size, relativeTo: style)
@@ -63,6 +65,32 @@ enum InterfaceFont {
         }
         #endif
     }
+
+    static func scaled(_ size: CGFloat, relativeTo style: Font.TextStyle) -> CGFloat {
+        #if os(iOS)
+        UIFontMetrics(forTextStyle: uiTextStyle(style)).scaledValue(for: size)
+        #else
+        size
+        #endif
+    }
+
+    #if os(iOS)
+    private static func uiTextStyle(_ style: Font.TextStyle) -> UIFont.TextStyle {
+        switch style {
+        case .largeTitle: .largeTitle
+        case .title: .title1
+        case .title2: .title2
+        case .title3: .title3
+        case .headline: .headline
+        case .callout: .callout
+        case .subheadline: .subheadline
+        case .footnote: .footnote
+        case .caption: .caption1
+        case .caption2: .caption2
+        default: .body
+        }
+    }
+    #endif
 
     static func platformFont(ofSize size: CGFloat, weight: PFont.Weight, family: String) -> PFont {
         EditorSettings.font(
@@ -110,11 +138,13 @@ extension EnvironmentValues {
 
 private struct InterfaceFontModifier: ViewModifier {
     @Environment(\.interfaceFontFamily) private var family
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let style: Font.TextStyle
     let weight: Font.Weight?
 
     func body(content: Content) -> some View {
-        content.font(InterfaceFont.font(style, family: family, weight: weight))
+        _ = dynamicTypeSize
+        return content.font(InterfaceFont.font(style, family: family, weight: weight))
     }
 }
 

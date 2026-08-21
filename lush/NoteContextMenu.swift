@@ -84,6 +84,13 @@ struct NoteContextMenu: View {
         }
         Divider()
         CopyUrlMenu(url: node.url)
+        if node.kind == "lush" || node.kind == "rich" {
+            Menu {
+                NoteShareLinks(note: ShareableNote(url: node.url, title: node.name))
+            } label: {
+                Label("Share As", systemImage: "square.and.arrow.up")
+            }
+        }
         if node.parentUrl != nil {
             Divider()
             Button(role: .destructive) {

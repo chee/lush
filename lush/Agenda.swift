@@ -626,6 +626,10 @@ enum CalendarLinks {
         map.compactMap { $0.value.contains(itemId) ? $0.key : nil }
     }
 
+    static func itemIds(for noteUrl: String) -> [String] {
+        map[noteUrl] ?? []
+    }
+
     /// A note pinned to this occurrence wins; a note kept for the whole series
     /// stands in when the occurrence has none of its own.
     static func notes(for item: AgendaItem) -> [String] {

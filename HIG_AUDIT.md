@@ -14,6 +14,42 @@ that breaks a core platform contract, an error channel that no view renders,
 one permanent delete that skips both confirmation and undo, and a large
 amount of fixed-size type that defeats Dynamic Type on iOS.
 
+## Decisions and fixes (2026-08-21)
+
+- **#1 (⌘Q hides instead of quitting): intentional.** The author breaks from
+  the HIG here on purpose; the app keeps syncing in the background and real
+  Quit lives in the menu-bar extra. Recorded as a deliberate divergence, not
+  a defect.
+- **#2 fixed** — `NotesModel.status` now renders as a notice overlay
+  (`lush/StatusNotice.swift`) in the main windows on both platforms; errors
+  are announced to VoiceOver, stay up longer, and can be dismissed.
+- **#3 fixed** — the agenda's Delete Note routes through the undoable
+  `removeEntry` when the note is in a folder (calendar links now travel
+  through the undo cycle too, which also fixes stale links on sidebar
+  deletes), and falls back to a confirmation dialog for the rare parentless
+  note.
+- **#4 fixed** — fixed-size fonts in iOS-reachable UI (agenda headers and
+  rows, inspector badges/chevrons/tab bar, history sticker, actor dots,
+  search pills, media play buttons, HTML editor) now scale via text styles
+  or `@ScaledMetric`; `InterfaceFont` scales adjusted system-family sizes
+  through `UIFontMetrics` and re-resolves on Dynamic Type changes.
+  macOS-only surfaces keep their fixed metrics (no Dynamic Type there).
+- **#5 partly fixed** — "Share As" (Markdown, HTML, Rich Text, Plain Text,
+  PDF) added to the note's More menu and note context menus via the system
+  share sheet (`lush/NoteShare.swift`). Printing remains open.
+- **#6 fixed** — macOS format popover controls carry labels and selected
+  traits (mirroring the iOS panel); agenda rows are buttons to VoiceOver
+  with a named "Open in Calendar/Reminders" action; a mislabeled draft-card
+  button ("Clear Search") corrected along the way.
+- **#10 fixed** — iOS uses `.searchable` with the system bottom-bar search
+  field; the New button sits beside it in the bottom toolbar
+  (`DefaultToolbarItem(kind: .search)`), syntax-suggestion chips float above
+  the keyboard, and the duplicate top-bar New button is gone (also trims
+  #17's toolbar crowding).
+- **#14 partly fixed** — Export no longer wears the Share glyph.
+- **#8 (haptics): open question** — candidate moments listed with the
+  finding; nothing implemented yet.
+
 ---
 
 ## High

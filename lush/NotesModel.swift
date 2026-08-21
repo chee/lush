@@ -815,6 +815,7 @@ final class NotesModel {
     }
 
     private func removeEntry(core: Core, parent: String, url: String, title: String) {
+        let linkedItems = CalendarLinks.itemIds(for: url)
         Task.detached { [core, weak self, parent, url, title] in
             do {
                 try core.removeEntry(folderUrl: parent, url: url)
@@ -826,8 +827,9 @@ final class NotesModel {
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                CalendarLinks.set([], for: url)
                 self.undoManager.registerUndo(withTarget: self) { model in
-                    model.restoreEntry(parent: parent, url: url, title: title)
+                    model.restoreEntry(parent: parent, url: url, title: title, linkedItems: linkedItems)
                 }
                 self.undoManager.setActionName("Remove Note")
                 self.refreshNotes()
@@ -835,7 +837,7 @@ final class NotesModel {
         }
     }
 
-    private func restoreEntry(parent: String, url: String, title: String) {
+    private func restoreEntry(parent: String, url: String, title: String, linkedItems: [String] = []) {
         guard let core else { return }
         undoManager.registerUndo(withTarget: self) { model in
             model.removeEntry(core: core, parent: parent, url: url, title: title)
@@ -850,7 +852,10 @@ final class NotesModel {
                 }
                 return
             }
-            await MainActor.run { [weak self] in self?.refreshNotes() }
+            await MainActor.run { [weak self] in
+                if !linkedItems.isEmpty { CalendarLinks.set(linkedItems, for: url) }
+                self?.refreshNotes()
+            }
         }
     }
 

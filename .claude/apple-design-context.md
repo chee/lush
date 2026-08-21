@@ -35,6 +35,10 @@
 - **Target Level**: Baseline (inferred — ~36 accessibility modifiers across ~53k lines of Swift)
 - **Key Considerations**: Custom text editor and custom-drawn controls need VoiceOver attention
 
+## Intentional HIG divergences
+- **⌘Q hides, not quits (macOS)**: deliberate. The app keeps syncing in the
+  background; real Quit lives in the menu-bar extra. Don't re-flag.
+
 ## Users
 - **Primary Persona**: The author (personal tool, `party.chee.lush`) and similar power users who live in notes + calendar and script their tools (inferred)
 - **Key Use Cases**: Daily notes and agenda at a desk (macOS), quick capture from menu bar/share sheet, reading and capture on the go (iOS), AI-assisted writing and querying
