@@ -4,8 +4,32 @@ import UniformTypeIdentifiers
 import AVFoundation
 #if os(macOS)
 import AppKit
+import QuickLookUI
 #else
 import UIKit
+import QuickLook
+#endif
+
+/// The picture Quick Look is showing. Both preview APIs hold their source
+/// weakly and ask for the item after they are on screen, so something has to
+/// keep the file alive for as long as the panel is up.
+final class PictureQuickLook: NSObject {
+    let file: URL
+
+    init(file: URL) { self.file = file }
+}
+
+#if os(iOS)
+extension PictureQuickLook: QLPreviewControllerDataSource {
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+    func previewController(
+        _ controller: QLPreviewController,
+        previewItemAt index: Int
+    ) -> any QLPreviewItem {
+        file as NSURL
+    }
+}
 #endif
 
 struct HtmlBlockHandle: Identifiable {
@@ -1574,6 +1598,16 @@ final class EditorCore {
                 try? await Task.sleep(for: .milliseconds(400))
                 guard !Task.isCancelled, self.noteUrl == url,
                       self.remoteReloadGeneration == generation else { return }
+            }
+            // The write-in-flight check in remoteChanged was made before the
+            // sleep and the read above; a local write that started since has
+            // not reached the doc, so this snapshot is older than what is on
+            // screen and applying it would undo the write. That is what put a
+            // logline's weather back to what it said before the refresh landed.
+            // finishLocalWrite comes back for the reload once the write is in.
+            guard self.localWritesInFlight == 0 else {
+                self.pendingRemoteReload = true
+                return
             }
             let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
@@ -4644,6 +4678,10 @@ class EditorTextView: NSTextView, EditorTextViewLike {
     /// view to hang its popover off.
     private var contextPoint: CGPoint = .zero
 
+    /// The picture the shared Quick Look panel is showing on this view's
+    /// behalf. Nil is what tells the panel this view has nothing to preview.
+    fileprivate var quickLook: PictureQuickLook?
+
     private var windowKeyObserver: (any NSObjectProtocol)?
 
     override func viewDidMoveToWindow() {
@@ -5116,6 +5154,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let menu = standard ?? NSMenu()
         var index = 0
         for (title, action) in [
+            ("Quick Look", #selector(quickLookPicture(_:))),
             ("Get Info", #selector(showAttachmentInfo(_:))),
             ("Copy Image", #selector(copyPicture(_:))),
             ("Save Image As…", #selector(savePictureAs(_:))),
@@ -5148,6 +5187,23 @@ class EditorTextView: NSTextView, EditorTextViewLike {
     @objc private func showAttachmentInfo(_ sender: NSMenuItem) {
         guard let charIndex = sender.representedObject as? Int else { return }
         core?.openAttachment(at: charIndex)
+    }
+
+    @objc private func quickLookPicture(_ sender: NSMenuItem) {
+        guard let charIndex = sender.representedObject as? Int,
+              let picture = core?.picture(at: charIndex),
+              let file = picture.file()
+        else { return }
+        quickLook = PictureQuickLook(file: file)
+        guard let panel = QLPreviewPanel.shared() else { return }
+        // the panel finds its controller by walking the responder chain, so it
+        // has to be this view that is first responder when it comes up
+        window?.makeFirstResponder(self)
+        if panel.isVisible {
+            panel.reloadData()
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
     }
 
     @objc private func copyPicture(_ sender: NSMenuItem) {
@@ -5278,6 +5334,34 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             return core.incomingData(data, fileExtension: "jpg", suggestedName: nil)
         }
         return false
+    }
+
+    // MARK: quick look
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        quickLook != nil
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = self
+        panel.delegate = self
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = nil
+        panel.delegate = nil
+        quickLook = nil
+    }
+}
+
+extension EditorTextView: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        quickLook == nil ? 0 : 1
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
+        guard let quickLook else { return nil }
+        return quickLook.file as NSURL
     }
 }
 
@@ -6032,6 +6116,15 @@ struct RichTextEditor: UIViewRepresentable {
             from point: CGPoint
         ) -> UIMenu {
             UIMenu(children: [
+                UIAction(title: "Quick Look", image: UIImage(systemName: "eye")) {
+                    [weak self, weak textView] _ in
+                    guard let self, let textView, let file = picture.file() else { return }
+                    let source = PictureQuickLook(file: file)
+                    self.quickLook = source
+                    let preview = QLPreviewController()
+                    preview.dataSource = source
+                    Self.present(preview, from: textView)
+                },
                 UIAction(title: "Copy Image", image: UIImage(systemName: "doc.on.doc")) { _ in
                     UIPasteboard.general.setItems([[picture.type.identifier: picture.data]])
                 },
@@ -6045,11 +6138,7 @@ struct RichTextEditor: UIViewRepresentable {
                     share.popoverPresentationController?.sourceView = textView
                     share.popoverPresentationController?.sourceRect =
                         CGRect(origin: point, size: .zero)
-                    // the deepest thing presented, not the root: a note read
-                    // from inside a sheet is presenting from that sheet
-                    var presenter = textView.window?.rootViewController
-                    while let next = presenter?.presentedViewController { presenter = next }
-                    presenter?.present(share, animated: true)
+                    Self.present(share, from: textView)
                 },
                 UIAction(title: "Get Info", image: UIImage(systemName: "info.circle")) {
                     [core] _ in core.openAttachment(at: charIndex)
@@ -6057,8 +6146,19 @@ struct RichTextEditor: UIViewRepresentable {
             ])
         }
 
+        /// The deepest thing presented, not the root: a note read from inside
+        /// a sheet is presenting from that sheet.
+        private static func present(_ controller: UIViewController, from view: UIView) {
+            var presenter = view.window?.rootViewController
+            while let next = presenter?.presentedViewController { presenter = next }
+            presenter?.present(controller, animated: true)
+        }
+
         var accessory: UIHostingController<FormatAccessoryBar>?
         private var lastScenePhase: ScenePhase?
+        /// Held while Quick Look is up — QLPreviewController's data source is
+        /// a weak reference.
+        private var quickLook: PictureQuickLook?
 
         init(core: EditorCore) {
             self.core = core

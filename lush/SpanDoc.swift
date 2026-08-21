@@ -482,13 +482,31 @@ final class FittingImageAttachment: NSTextAttachment {
         return resolved
     }
 
+    /// Start the decode while the fragment is being laid out, which TextKit
+    /// does ahead of drawing it — and ahead of the viewport, for the rows it
+    /// is scrolling towards. A bitmap that lands before the first draw costs
+    /// nothing. One that lands after costs a placeholder frame and a layout
+    /// invalidation to replace it, and a scroll through a note of photos is
+    /// one of those per picture.
+    private func warmDisplayImage() {
+        guard let url = assetUrl else { return }
+        MainActor.assumeIsolated {
+            guard let cache = assetCache,
+                  cache.decodeBacklog < 4,
+                  cache.displayImage(for: url) == nil
+            else { return }
+            cache.ensureDisplayImage(for: url) { _ in }
+        }
+    }
+
     override func attachmentBounds(
         for textContainer: NSTextContainer?,
         proposedLineFragment lineFrag: CGRect,
         glyphPosition position: CGPoint,
         characterIndex charIndex: Int
     ) -> CGRect {
-        fitted(to: lineFrag, padding: textContainer?.lineFragmentPadding ?? 5)
+        warmDisplayImage()
+        return fitted(to: lineFrag, padding: textContainer?.lineFragmentPadding ?? 5)
     }
 
     override func attachmentBounds(
@@ -498,7 +516,8 @@ final class FittingImageAttachment: NSTextAttachment {
         proposedLineFragment: CGRect,
         position: CGPoint
     ) -> CGRect {
-        fitted(to: proposedLineFragment, padding: textContainer?.lineFragmentPadding ?? 5)
+        warmDisplayImage()
+        return fitted(to: proposedLineFragment, padding: textContainer?.lineFragmentPadding ?? 5)
     }
 
     override func image(
@@ -688,6 +707,11 @@ final class AssetCache {
         Self.displayImages.object(forKey: url as NSString)
     }
 
+    /// How many bounded bitmaps are being decoded right now. One layout pass
+    /// can reach every picture in a long note, and the read-ahead uses this to
+    /// stay a few pictures wide rather than starting all of them at once.
+    var decodeBacklog: Int { Self.decodesInFlight.count }
+
     /// Whether this url is an image we can still produce. The size alone is not
     /// enough: bytes are evictable, so an entry whose spill never landed can
     /// lose them for good. Saying no here sends it back through
@@ -789,17 +813,47 @@ final class AssetCache {
             kCGImageSourceThumbnailMaxPixelSize: displayMaxPixels,
             kCGImageSourceShouldCacheImmediately: true,
         ]
-        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+        guard let raw = CGImageSourceCreateThumbnailAtIndex(
             source,
             0,
             options as CFDictionary
         ) else { return nil }
+        let thumbnail = displayReady(raw) ?? raw
         #if os(macOS)
         let image = NSImage(cgImage: thumbnail, size: .zero)
         #else
         let image = UIImage(cgImage: thumbnail, scale: displayScale, orientation: .up)
         #endif
         return (image, thumbnail.bytesPerRow * thumbnail.height)
+    }
+
+    /// The thumbnail in the pixel format the screen is in: 32-bit
+    /// premultiplied sRGB. A CGImage handed back by the image source keeps the
+    /// picture's own colour space and alpha layout — a wide-gamut photo, a
+    /// non-premultiplied PNG — and every draw of it then pays for the
+    /// conversion. TextKit redraws a fragment each time it re-enters the
+    /// viewport, so on a note of photos that conversion is the scroll.
+    /// Paying it once, here, off the main thread, makes each draw a blit.
+    nonisolated private static func displayReady(_ image: CGImage) -> CGImage? {
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+        let opaque = switch image.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: true
+        default: false
+        }
+        let alpha: CGImageAlphaInfo = opaque ? .noneSkipFirst : .premultipliedFirst
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | alpha.rawValue
+        ) else { return nil }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()
     }
 
     /// The picture's own file type, read from its own bytes. An image is
