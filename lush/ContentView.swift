@@ -1789,7 +1789,7 @@ struct ContentView: View {
               tag != Agenda.meetingNotesTag
         else { return nil }
         let url = Self.sidebarUrl(tag)
-        guard url.hasPrefix("automerge:"), model.node(for: url)?.kind != "folder" else { return nil }
+        guard url.hasPrefix("automerge:") else { return nil }
         return url
     }
 
@@ -1962,6 +1962,16 @@ struct ContentView: View {
     @ViewBuilder
     private func detailContent(for url: String) -> some View {
         let node = model.node(for: url)
+        if node?.kind == "folder" {
+            FolderDetail(folderUrl: url)
+                .id(url)
+        } else {
+            detailContentNonFolder(for: url, node: node)
+        }
+    }
+
+    @ViewBuilder
+    private func detailContentNonFolder(for url: String, node: FolderNode?) -> some View {
         let isPatchwork = model.patchworkDocUrls.contains(url)
         // Checked-out drafts redirect the editor to the draft's clone; the
         // sidebar, node and title all keep speaking about the origin url.
@@ -6046,3 +6056,151 @@ struct CameraPicker: UIViewControllerRepresentable {
     }
 }
 #endif
+
+enum FolderViewMode: String, CaseIterable {
+    case document = "Document"
+    case canvas = "Canvas"
+    case outline = "Outline"
+}
+
+struct FolderDetail: View {
+    let folderUrl: String
+    @Environment(NotesModel.self) private var model
+    @State private var viewMode: FolderViewMode = .document
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Label(model.node(for: folderUrl)?.displayName ?? "Folder", systemImage: "folder")
+                    .font(.title3.bold())
+                Spacer()
+                Picker("View as", selection: $viewMode) {
+                    ForEach(FolderViewMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 250)
+            }
+            .padding()
+            Divider()
+            
+            // Content
+            Group {
+                switch viewMode {
+                case .document:
+                    FolderDocumentView(folderUrl: folderUrl)
+                case .canvas:
+                    FolderCanvasView(folderUrl: folderUrl)
+                case .outline:
+                    FolderOutlineView(folderUrl: folderUrl)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        #if os(macOS)
+        .background(Color(nsColor: .textBackgroundColor))
+        #else
+        .background(Color(.systemBackground))
+        #endif
+    }
+}
+
+struct FolderDocumentView: View {
+    let folderUrl: String
+    @Environment(NotesModel.self) private var model
+
+    private var noteUrls: [String] {
+        model.node(for: folderUrl)?.children?.filter({ $0.isNote }).map(\.url) ?? []
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 20) {
+                ForEach(noteUrls, id: \.self) { url in
+                    VStack(alignment: .leading, spacing: 0) {
+                        if let node = model.node(for: url) {
+                            Text(node.displayName)
+                                .font(.headline)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal)
+                                .padding(.top, 12)
+                        }
+                        NoteDetail(noteUrl: url)
+                            .frame(minHeight: 200)
+                            .padding()
+                    }
+                    #if os(macOS)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    #else
+                    .background(Color(.secondarySystemBackground))
+                    #endif
+                    .cornerRadius(12)
+                    .shadow(color: .black.opacity(0.1), radius: 3, y: 1)
+                }
+            }
+            .padding()
+        }
+    }
+}
+
+struct FolderCanvasView: View {
+    let folderUrl: String
+    @Environment(NotesModel.self) private var model
+
+    private var noteUrls: [String] {
+        model.node(for: folderUrl)?.children?.filter({ $0.isNote }).map(\.url) ?? []
+    }
+
+    let columns = [GridItem(.adaptive(minimum: 250, maximum: 350), spacing: 20)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 20) {
+                ForEach(noteUrls, id: \.self) { url in
+                    VStack(alignment: .leading, spacing: 0) {
+                        if let node = model.node(for: url) {
+                            Text(node.displayName)
+                                .font(.headline)
+                                .foregroundStyle(.secondary)
+                                .padding([.horizontal, .top], 12)
+                        }
+                        NoteDetail(noteUrl: url)
+                            .frame(height: 250)
+                            .padding()
+                            .allowsHitTesting(false)
+                    }
+                    #if os(macOS)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    #else
+                    .background(Color(.secondarySystemBackground))
+                    #endif
+                    .cornerRadius(12)
+                    .shadow(color: .black.opacity(0.1), radius: 3, y: 1)
+                }
+            }
+            .padding()
+        }
+    }
+}
+
+struct FolderOutlineView: View {
+    let folderUrl: String
+    @Environment(NotesModel.self) private var model
+
+    private var nodes: [FolderNode] {
+        model.node(for: folderUrl)?.children ?? []
+    }
+
+    var body: some View {
+        List(nodes) { node in
+            if node.kind == "folder" {
+                Label(node.displayName, systemImage: "folder")
+            } else {
+                NoteRowView(node: node)
+            }
+        }
+        .listStyle(.inset)
+    }
+}
