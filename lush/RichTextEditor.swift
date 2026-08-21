@@ -4,8 +4,32 @@ import UniformTypeIdentifiers
 import AVFoundation
 #if os(macOS)
 import AppKit
+import QuickLookUI
 #else
 import UIKit
+import QuickLook
+#endif
+
+/// The picture Quick Look is showing. Both preview APIs hold their source
+/// weakly and ask for the item after they are on screen, so something has to
+/// keep the file alive for as long as the panel is up.
+final class PictureQuickLook: NSObject {
+    let file: URL
+
+    init(file: URL) { self.file = file }
+}
+
+#if os(iOS)
+extension PictureQuickLook: QLPreviewControllerDataSource {
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+    func previewController(
+        _ controller: QLPreviewController,
+        previewItemAt index: Int
+    ) -> any QLPreviewItem {
+        file as NSURL
+    }
+}
 #endif
 
 struct HtmlBlockHandle: Identifiable {
@@ -1574,6 +1598,16 @@ final class EditorCore {
                 try? await Task.sleep(for: .milliseconds(400))
                 guard !Task.isCancelled, self.noteUrl == url,
                       self.remoteReloadGeneration == generation else { return }
+            }
+            // The write-in-flight check in remoteChanged was made before the
+            // sleep and the read above; a local write that started since has
+            // not reached the doc, so this snapshot is older than what is on
+            // screen and applying it would undo the write. That is what put a
+            // logline's weather back to what it said before the refresh landed.
+            // finishLocalWrite comes back for the reload once the write is in.
+            guard self.localWritesInFlight == 0 else {
+                self.pendingRemoteReload = true
+                return
             }
             let json = snapshot.spansJson
             let spans = SpanNode.decodeList(json)
@@ -3932,6 +3966,47 @@ final class EditorCore {
         return cache.isImage(url)
     }
 
+    /// What a picture needs to leave the note as a picture: its own bytes
+    /// under its own type, and a name to travel under. Nothing here decodes
+    /// the full-resolution photo — the bytes go out as they came in.
+    ///
+    /// An image is stored with no name — nothing records one — so a drag, a
+    /// save or a share would otherwise hand the receiving app an
+    /// extensionless blob to guess at.
+    struct Picture {
+        let assetUrl: String
+        let name: String
+        let type: UTType
+        let data: Data
+
+        /// The picture on disk, for the apps that take a file rather than
+        /// bytes. Written when it is asked for, not when the picture is looked
+        /// up: most lookups are answering a question about the selection and
+        /// never leave the app. The spill file the cache maps has no
+        /// extension, so this is a named copy beside it.
+        func file() -> URL? {
+            AssetCache.mediaFile(for: assetUrl, name: name, data: data)
+        }
+    }
+
+    func picture(at charIndex: Int) -> Picture? {
+        guard let storage = view?.pStorage, charIndex < storage.length,
+              let box = storage.attributes(at: charIndex, effectiveRange: nil)[.amBlock] as? BlockBox,
+              box.value.isEmbedBlock,
+              let url = box.value.embedUrl,
+              cache.isImage(url),
+              let data = cache.bytes(for: url)
+        else { return nil }
+        let type = AssetCache.imageType(of: data) ?? .png
+        let stored = (cache.names[url] ?? "").replacingOccurrences(of: "/", with: "-")
+        return Picture(
+            assetUrl: url,
+            name: stored.isEmpty ? "Image.\(type.preferredFilenameExtension ?? "png")" : stored,
+            type: type,
+            data: data
+        )
+    }
+
     @discardableResult
     func openAttachment(at charIndex: Int, includeImages: Bool = true) -> Bool {
         guard let storage = view?.pStorage, charIndex < storage.length else { return false }
@@ -4599,6 +4674,14 @@ func editorCopyRange(
 class EditorTextView: NSTextView, EditorTextViewLike {
     weak var core: EditorCore?
 
+    /// Where the last context menu was opened, so Share has somewhere in the
+    /// view to hang its popover off.
+    private var contextPoint: CGPoint = .zero
+
+    /// The picture the shared Quick Look panel is showing on this view's
+    /// behalf. Nil is what tells the panel this view has nothing to preview.
+    fileprivate var quickLook: PictureQuickLook?
+
     private var windowKeyObserver: (any NSObjectProtocol)?
 
     override func viewDidMoveToWindow() {
@@ -5003,9 +5086,17 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             if event.clickCount == 1, core.calendarEmbedHit(at: containerPoint) {
                 return
             }
-            if let charIndex = core.attachmentIndex(at: containerPoint),
-               core.openAttachment(at: charIndex, includeImages: event.clickCount == 2) {
-                return
+            if let charIndex = core.attachmentIndex(at: containerPoint) {
+                // select the picture on the way down: NSTextView only starts a
+                // drag from a press that lands inside the selection, and
+                // without this a picture takes a click to select and a second
+                // press to drag anywhere
+                if event.clickCount == 1, core.isImageAttachment(at: charIndex) {
+                    setSelectedRange(NSRange(location: charIndex, length: 1))
+                }
+                if core.openAttachment(at: charIndex, includeImages: event.clickCount == 2) {
+                    return
+                }
             }
         }
         super.mouseDown(with: event)
@@ -5056,17 +5147,27 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         guard let charIndex = core.attachmentIndex(at: containerPoint),
               core.isImageAttachment(at: charIndex)
         else { return standard }
+        // a picture's menu is a picture's menu: copy it, save it, send it
+        // somewhere. The text menu stays underneath for the caret that is
+        // still sitting next to it.
+        contextPoint = point
         let menu = standard ?? NSMenu()
-        let item = NSMenuItem(
-            title: "Get Info",
-            action: #selector(showAttachmentInfo(_:)),
-            keyEquivalent: ""
-        )
-        item.target = self
-        item.representedObject = charIndex
-        menu.insertItem(item, at: 0)
+        var index = 0
+        for (title, action) in [
+            ("Quick Look", #selector(quickLookPicture(_:))),
+            ("Get Info", #selector(showAttachmentInfo(_:))),
+            ("Copy Image", #selector(copyPicture(_:))),
+            ("Save Image As…", #selector(savePictureAs(_:))),
+            ("Share…", #selector(sharePicture(_:))),
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = charIndex
+            menu.insertItem(item, at: index)
+            index += 1
+        }
         if standard != nil {
-            menu.insertItem(.separator(), at: 1)
+            menu.insertItem(.separator(), at: index)
         }
         return menu
     }
@@ -5086,6 +5187,116 @@ class EditorTextView: NSTextView, EditorTextViewLike {
     @objc private func showAttachmentInfo(_ sender: NSMenuItem) {
         guard let charIndex = sender.representedObject as? Int else { return }
         core?.openAttachment(at: charIndex)
+    }
+
+    @objc private func quickLookPicture(_ sender: NSMenuItem) {
+        guard let charIndex = sender.representedObject as? Int,
+              let picture = core?.picture(at: charIndex),
+              let file = picture.file()
+        else { return }
+        quickLook = PictureQuickLook(file: file)
+        guard let panel = QLPreviewPanel.shared() else { return }
+        // the panel finds its controller by walking the responder chain, so it
+        // has to be this view that is first responder when it comes up
+        window?.makeFirstResponder(self)
+        if panel.isVisible {
+            panel.reloadData()
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc private func copyPicture(_ sender: NSMenuItem) {
+        guard let charIndex = sender.representedObject as? Int,
+              let picture = core?.picture(at: charIndex)
+        else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([Self.pasteboardItem(for: picture)])
+    }
+
+    @objc private func savePictureAs(_ sender: NSMenuItem) {
+        guard let charIndex = sender.representedObject as? Int,
+              let picture = core?.picture(at: charIndex),
+              let window
+        else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = picture.name
+        panel.allowedContentTypes = [picture.type]
+        let data = picture.data
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK, let destination = panel.url else { return }
+            try? data.write(to: destination)
+        }
+    }
+
+    @objc private func sharePicture(_ sender: NSMenuItem) {
+        guard let charIndex = sender.representedObject as? Int,
+              let picture = core?.picture(at: charIndex),
+              let file = picture.file()
+        else { return }
+        NSSharingServicePicker(items: [file]).show(
+            relativeTo: CGRect(origin: contextPoint, size: .zero),
+            of: self,
+            preferredEdge: .minY
+        )
+    }
+
+    /// A picture on the pasteboard the way every other mac app puts one there:
+    /// a named file first, so Finder and Mail take it as a picture with a
+    /// name; then the original bytes under their own type; then PNG, for
+    /// whatever cannot read HEIC.
+    private static func pasteboardItem(for picture: EditorCore.Picture) -> NSPasteboardItem {
+        let item = NSPasteboardItem()
+        if let file = picture.file() {
+            item.setString(file.absoluteString, forType: .fileURL)
+        }
+        item.setData(picture.data, forType: .init(picture.type.identifier))
+        if picture.type != .png,
+           let full = NSImage(data: picture.data),
+           let png = pngData(full) {
+            item.setData(png, forType: .png)
+        }
+        return item
+    }
+
+    /// The picture the selection is, when it is exactly one and nothing else.
+    /// Dragging a selection out of an NSTextView writes it through the two
+    /// methods below, so this is where a dragged picture becomes a picture
+    /// rather than a scrap of rich text with a hole in it.
+    private var selectedPicture: EditorCore.Picture? {
+        let range = selectedRange()
+        guard range.length == 1, let core else { return nil }
+        return core.picture(at: range.location)
+    }
+
+    override var writablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        guard let picture = selectedPicture else { return super.writablePasteboardTypes }
+        var types: [NSPasteboard.PasteboardType] = [.fileURL, .init(picture.type.identifier)]
+        if picture.type != .png { types.append(.png) }
+        return types + super.writablePasteboardTypes
+    }
+
+    override func writeSelection(
+        to pboard: NSPasteboard,
+        type: NSPasteboard.PasteboardType
+    ) -> Bool {
+        guard let picture = selectedPicture else {
+            return super.writeSelection(to: pboard, type: type)
+        }
+        if type == .fileURL {
+            guard let file = picture.file() else { return false }
+            return pboard.setString(file.absoluteString, forType: type)
+        }
+        if type.rawValue == picture.type.identifier {
+            return pboard.setData(picture.data, forType: type)
+        }
+        if type == .png {
+            guard let full = NSImage(data: picture.data), let png = Self.pngData(full)
+            else { return false }
+            return pboard.setData(png, forType: type)
+        }
+        return super.writeSelection(to: pboard, type: type)
     }
 
     /// Files and images win over the stray strings browsers put alongside
@@ -5123,6 +5334,34 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             return core.incomingData(data, fileExtension: "jpg", suggestedName: nil)
         }
         return false
+    }
+
+    // MARK: quick look
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        quickLook != nil
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = self
+        panel.delegate = self
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        panel.dataSource = nil
+        panel.delegate = nil
+        quickLook = nil
+    }
+}
+
+extension EditorTextView: QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        quickLook == nil ? 0 : 1
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
+        guard let quickLook else { return nil }
+        return quickLook.file as NSURL
     }
 }
 
@@ -5718,6 +5957,7 @@ struct RichTextEditor: UIViewRepresentable {
             .underlineStyle: NSUnderlineStyle.single.rawValue,
         ]
         textView.delegate = context.coordinator
+        textView.textDragDelegate = context.coordinator
         textView.core = context.coordinator.core
         textView.alwaysBounceVertical = true
         context.coordinator.markers.driveTypingAttributes(from: textView)
@@ -5768,9 +6008,33 @@ struct RichTextEditor: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate, UITextDragDelegate {
         let core: EditorCore
         let markers = ListMarkerLayoutDelegate()
+
+        /// A picture dragged out of a note is a picture: hand the receiving
+        /// app the file itself rather than the scrap of rich text UITextView
+        /// would otherwise offer, so it lands in Photos or Mail as an image.
+        func textDraggableView(
+            _ textDraggableView: any UIView & UITextDraggable,
+            itemsForDrag dragRequest: any UITextDragRequest
+        ) -> [UIDragItem] {
+            guard let textView = textDraggableView as? UITextView else {
+                return dragRequest.suggestedItems
+            }
+            let range = dragRequest.dragRange
+            let start = textView.offset(from: textView.beginningOfDocument, to: range.start)
+            let length = textView.offset(from: range.start, to: range.end)
+            guard length == 1,
+                  let picture = core.picture(at: start),
+                  let file = picture.file(),
+                  let provider = NSItemProvider(contentsOf: file)
+            else { return dragRequest.suggestedItems }
+            provider.suggestedName = picture.name
+            let item = UIDragItem(itemProvider: provider)
+            item.localObject = picture.assetUrl
+            return [item]
+        }
 
         func gestureRecognizer(
             _ gestureRecognizer: UIGestureRecognizer,
@@ -5821,6 +6085,14 @@ struct RichTextEditor: UIViewRepresentable {
                 )
                 return
             }
+            if let charIndex = core.attachmentIndex(at: containerPoint),
+               let picture = core.picture(at: charIndex) {
+                textView.showBlockMenu(
+                    pictureMenu(picture, at: charIndex, in: textView, from: point),
+                    at: point
+                )
+                return
+            }
             guard let todo = core.todoBoxHit(at: containerPoint),
                   let state = core.todoState(at: todo)
             else { return }
@@ -5835,8 +6107,58 @@ struct RichTextEditor: UIViewRepresentable {
             textView.showBlockMenu(menu, at: point)
         }
 
+        /// What a held picture offers: the same three things any picture in
+        /// any iOS app offers, plus the note's own info sheet.
+        private func pictureMenu(
+            _ picture: EditorCore.Picture,
+            at charIndex: Int,
+            in textView: UITextView,
+            from point: CGPoint
+        ) -> UIMenu {
+            UIMenu(children: [
+                UIAction(title: "Quick Look", image: UIImage(systemName: "eye")) {
+                    [weak self, weak textView] _ in
+                    guard let self, let textView, let file = picture.file() else { return }
+                    let source = PictureQuickLook(file: file)
+                    self.quickLook = source
+                    let preview = QLPreviewController()
+                    preview.dataSource = source
+                    Self.present(preview, from: textView)
+                },
+                UIAction(title: "Copy Image", image: UIImage(systemName: "doc.on.doc")) { _ in
+                    UIPasteboard.general.setItems([[picture.type.identifier: picture.data]])
+                },
+                UIAction(title: "Share…", image: UIImage(systemName: "square.and.arrow.up")) {
+                    [weak textView] _ in
+                    guard let textView, let file = picture.file() else { return }
+                    let share = UIActivityViewController(
+                        activityItems: [file],
+                        applicationActivities: nil
+                    )
+                    share.popoverPresentationController?.sourceView = textView
+                    share.popoverPresentationController?.sourceRect =
+                        CGRect(origin: point, size: .zero)
+                    Self.present(share, from: textView)
+                },
+                UIAction(title: "Get Info", image: UIImage(systemName: "info.circle")) {
+                    [core] _ in core.openAttachment(at: charIndex)
+                },
+            ])
+        }
+
+        /// The deepest thing presented, not the root: a note read from inside
+        /// a sheet is presenting from that sheet.
+        private static func present(_ controller: UIViewController, from view: UIView) {
+            var presenter = view.window?.rootViewController
+            while let next = presenter?.presentedViewController { presenter = next }
+            presenter?.present(controller, animated: true)
+        }
+
         var accessory: UIHostingController<FormatAccessoryBar>?
         private var lastScenePhase: ScenePhase?
+        /// Held while Quick Look is up — QLPreviewController's data source is
+        /// a weak reference.
+        private var quickLook: PictureQuickLook?
 
         init(core: EditorCore) {
             self.core = core
