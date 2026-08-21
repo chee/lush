@@ -6,8 +6,28 @@ on:
     tags: ["v*"]
 
 jobs:
+  # One job per platform rather than one job doing both. Two runners means the
+  # archives genuinely overlap instead of contending for three cores, and each
+  # gets its own keychain and DerivedData — running two xcodebuild archives
+  # against one project on one machine is a known source of flakes. The Rust
+  # build is repeated in both, which costs runner minutes (free on a public
+  # repo) but no wall time, and restores from the shared cache anyway.
+  #
+  # fail-fast is off deliberately: if one platform fails there is no benefit to
+  # cancelling the other mid-upload, and a half-finished upload is worse than a
+  # finished one. Note a partial release — one platform up, the other failed —
+  # was already possible when these ran in sequence.
   upload:
+    name: upload (${{ matrix.platform }})
     runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: iOS
+            destination: "generic/platform=iOS"
+          - platform: macOS
+            destination: "generic/platform=macOS"
     steps:
       - uses: actions/checkout@v4
 
@@ -84,7 +104,7 @@ jobs:
           mkdir -p "$HOME/private_keys"
           printf '%s' "$API_KEY_CONTENT" > "$HOME/private_keys/AuthKey_$API_KEY_ID.p8"
 
-      - name: Archive (iOS)
+      - name: Archive
         env:
           API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -92,53 +112,23 @@ jobs:
           xcodebuild archive \
             -project Lush.xcodeproj \
             -scheme Lush \
-            -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/Lush-iOS.xcarchive" \
+            -destination '${{ matrix.destination }}' \
+            -archivePath "$RUNNER_TEMP/Lush-${{ matrix.platform }}.xcarchive" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \
             -authenticationKeyIssuerID "$API_ISSUER" \
             CODE_SIGN_STYLE=Automatic
 
-      - name: Archive (macOS)
-        env:
-          API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
-          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: |
-          xcodebuild archive \
-            -project Lush.xcodeproj \
-            -scheme Lush \
-            -destination 'generic/platform=macOS' \
-            -archivePath "$RUNNER_TEMP/Lush-macOS.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
-            -authenticationKeyID "$API_KEY_ID" \
-            -authenticationKeyIssuerID "$API_ISSUER" \
-            CODE_SIGN_STYLE=Automatic
-
-      - name: Upload iOS to TestFlight
+      - name: Upload to TestFlight
         env:
           API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
           API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Lush-iOS.xcarchive" \
+            -archivePath "$RUNNER_TEMP/Lush-${{ matrix.platform }}.xcarchive" \
             -exportOptionsPlist .github/ExportOptions.plist \
-            -exportPath "$RUNNER_TEMP/export/ios" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
-            -authenticationKeyID "$API_KEY_ID" \
-            -authenticationKeyIssuerID "$API_ISSUER"
-
-      - name: Upload macOS to TestFlight
-        env:
-          API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
-          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: |
-          xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Lush-macOS.xcarchive" \
-            -exportOptionsPlist .github/ExportOptions.plist \
-            -exportPath "$RUNNER_TEMP/export/macos" \
+            -exportPath "$RUNNER_TEMP/export/${{ matrix.platform }}" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$HOME/private_keys/AuthKey_$API_KEY_ID.p8" \
             -authenticationKeyID "$API_KEY_ID" \

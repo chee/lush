@@ -65,7 +65,7 @@ use subduction_websocket::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, mpsc, watch, Mutex},
     task::JoinHandle,
 };
 
@@ -758,6 +758,11 @@ pub struct Repo {
     /// Held for the duration of an idle sweep, so the repeating memory-pressure
     /// signal runs one sweep rather than one per warning.
     sweep_lock: Mutex<()>,
+    /// Whether the app may still touch the disk — frontmost, or holding a
+    /// background assertion, or inside a BGTask. Opportunistic work parks
+    /// while this is false; see `Core::set_app_active`. Defaults to true, so
+    /// a platform that never reports (macOS) works as it always has.
+    app_active: watch::Sender<bool>,
     peers_path: PathBuf,
     peers: std::sync::Mutex<Peers>,
 }
@@ -962,6 +967,18 @@ where
     } else {
         SyncOutcome::Failed { data_received }
     }
+}
+
+/// Park until the app may work again. Returns `Err` only when the sender is
+/// gone, which means the caller should stop for good.
+pub(crate) async fn wait_for_active(
+    mut active: watch::Receiver<bool>,
+) -> Result<(), watch::error::RecvError> {
+    if *active.borrow_and_update() {
+        return Ok(());
+    }
+    active.wait_for(|active| *active).await?;
+    Ok(())
 }
 
 /// Run CPU-heavy automerge work without starving the runtime's worker
@@ -1659,6 +1676,7 @@ impl Repo {
             iroh_endpoint: std::sync::Mutex::new(None),
             iroh_lifecycle: Mutex::new(()),
             sweep_lock: Mutex::new(()),
+            app_active: watch::channel(true).0,
             peers: std::sync::Mutex::new(load_peers(&peers_path)),
             peers_path,
         });
@@ -1752,7 +1770,33 @@ impl Repo {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(EVICT_SWEEP_INTERVAL).await;
+                    // the sweep stages and fsyncs on its way out; a tick that
+                    // lands after the app is suspended is disk work iOS kills
+                    // the process for
+                    if wait_for_active(repo.app_active()).await.is_err() {
+                        return;
+                    }
                     repo.sweep_idle_docs(EVICT_IDLE).await;
+                }
+            });
+        }
+        {
+            let repo = repo.clone();
+            let mut active = repo.app_active();
+            tokio::spawn(async move {
+                loop {
+                    // announcements that arrived while the app was away were
+                    // dropped, so coming back is the moment to ask again
+                    if active.changed().await.is_err() {
+                        return;
+                    }
+                    if !*active.borrow_and_update() {
+                        continue;
+                    }
+                    let ids: Vec<DocId> = repo.docs.lock().await.keys().copied().collect();
+                    for id in ids {
+                        repo.request_sync_forced(id).await;
+                    }
                 }
             });
         }
@@ -2013,6 +2057,13 @@ impl Repo {
         if sid.as_bytes()[16..].iter().any(|byte| *byte != 0) {
             return;
         }
+        // dropped rather than queued, and deliberately before
+        // `last_server_heads` is touched: the announcement is only worth
+        // acting on as a sync, and the resync when the app comes back covers
+        // everything missed while it was away
+        if !self.is_app_active() {
+            return;
+        }
         let id = DocId::from_sedimentree_id(sid);
         let heads_set: BTreeSet<CommitId> = heads.iter().cloned().collect();
         if self.docs.lock().await.get(&id).is_none() {
@@ -2128,6 +2179,13 @@ impl Repo {
 
     async fn request_sync_inner(self: &Arc<Self>, id: DocId, force: bool) {
         if !self.is_connected() {
+            return;
+        }
+        // A sync round enumerates the doc's commit and fragment directories
+        // and writes whatever it pulls. None of that may happen while the
+        // process has no permission to run; the round is picked back up when
+        // the app returns or takes a background assertion.
+        if !self.is_app_active() {
             return;
         }
         if !self.send_changes.load(Ordering::Relaxed) && self.outbox_path(id).exists() {
@@ -2650,6 +2708,23 @@ impl Repo {
 
     fn touch(&self, id: DocId) {
         self.last_touched.lock().unwrap().insert(id, Instant::now());
+    }
+
+    /// Tell the repo whether the app may still do work. Everything
+    /// opportunistic — the idle sweep, sync rounds, the announcements that
+    /// start them — parks while this is false, so a suspended process goes
+    /// quiet instead of being killed for reading and fsyncing inside its own
+    /// container (`0xdead10cc`).
+    pub fn set_app_active(&self, active: bool) {
+        let _ = self.app_active.send(active);
+    }
+
+    pub(crate) fn app_active(&self) -> watch::Receiver<bool> {
+        self.app_active.subscribe()
+    }
+
+    fn is_app_active(&self) -> bool {
+        *self.app_active.borrow()
     }
 
     /// Keep a doc resident: a pinned doc is never swept by idle eviction.
@@ -4425,6 +4500,60 @@ mod tests {
         })
         .await
         .expect("sweep should trim residents down to the cap");
+    }
+
+    /// The park is what keeps a suspended process off its own data container.
+    /// If `set_app_active(false)` stops holding work, the loops that read and
+    /// fsync go back to running through suspension, which is the RunningBoard
+    /// kill (`0xdead10cc`) this exists to prevent.
+    #[tokio::test]
+    async fn parked_work_waits_for_the_app_to_be_allowed_to_run_again() {
+        let (_dir, repo) = test_repo().await;
+        repo.set_app_active(false);
+        let mut parked = tokio::spawn({
+            let active = repo.app_active();
+            async move { wait_for_active(active).await }
+        });
+        assert!(
+            timeout(Duration::from_millis(200), &mut parked)
+                .await
+                .is_err(),
+            "work should stay parked while the app has no permission to run"
+        );
+        repo.set_app_active(true);
+        timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("the park should release when the app is allowed to run")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The one sweep that has to survive the park: memory pressure is called
+    /// straight through rather than off the idle timer, and it arrives exactly
+    /// when the app is least likely to be frontmost.
+    #[tokio::test]
+    async fn the_memory_pressure_sweep_runs_while_the_app_is_parked() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "resident");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.save_doc_now(id).await.unwrap();
+        repo.set_app_active(false);
+        timeout(Duration::from_secs(20), async {
+            loop {
+                repo.sweep_idle_docs(Duration::ZERO).await;
+                if repo.docs.lock().await.get(&id).is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("memory pressure should still evict while the app is parked");
     }
 
     #[tokio::test]

@@ -403,11 +403,43 @@ final class TableBox: NSObject {
 /// (belt and braces — TextKit caches attachment metrics aggressively).
 final class FittingImageAttachment: NSTextAttachment {
     var idealSize: CGSize = .zero
-    /// Set for asset-backed images: `image` starts as the compressed-backed
-    /// original and the bounded display bitmap is decoded on demand, the first
-    /// time layout asks for this attachment.
+    /// Set for asset-backed images: the bounded display bitmap is decoded off
+    /// the main thread the first time layout asks for this attachment, and a
+    /// flat placeholder stands in until it lands. The full-resolution picture
+    /// is never handed to TextKit — scaling a 12-megapixel photo into a
+    /// 340-point box costs a decode of the whole thing, on the main thread,
+    /// in the middle of a scroll.
     var assetUrl: String?
     var assetCache: AssetCache?
+
+    /// The redraw to run when the in-flight decode lands. TextKit asks for the
+    /// image on every frame that draws this fragment, so without somewhere to
+    /// collapse them each of those frames queues its own waiter and the decode
+    /// arrives as a burst of identical redraws — in the middle of the scroll
+    /// this exists to smooth. The newest requester wins: it is the one whose
+    /// viewport is on screen.
+    private var pendingRefresh: (@MainActor () -> Void)?
+
+    /// One pixel of the colour a picture's slot shows before its bitmap
+    /// arrives. Stretched to the attachment's bounds, it reads as a flat
+    /// placeholder block and costs nothing to draw. An asset-backed
+    /// attachment always carries it, so TextKit never sees an attachment with
+    /// nothing to draw and goes looking for a view provider instead.
+    static let placeholder: PImage = {
+        let size = CGSize(width: 1, height: 1)
+        #if os(macOS)
+        return NSImage(size: size, flipped: false) { rect in
+            NSColor.quaternaryLabelColor.setFill()
+            rect.fill()
+            return true
+        }
+        #else
+        return UIGraphicsImageRenderer(size: size).image { context in
+            UIColor.quaternaryLabel.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+        }
+        #endif
+    }()
 
     private func fitted(to lineFrag: CGRect, padding: CGFloat) -> CGRect {
         var size = bounds.size
@@ -419,22 +451,31 @@ final class FittingImageAttachment: NSTextAttachment {
         return CGRect(origin: bounds.origin, size: size)
     }
 
-    /// The decoded bitmap matches the compressed original's aspect and the
-    /// bounds are already set, so landing a decode never moves layout — the
+    /// The bounds come from the picture's recorded pixel size and the decoded
+    /// bitmap matches its aspect, so landing a decode never moves layout — the
     /// refresh only redraws the attachment's fragment.
     private func resolveDisplayImage(refresh: @escaping @MainActor () -> Void) -> PImage? {
         var resolved = image
         guard let url = assetUrl else { return resolved }
         MainActor.assumeIsolated {
             guard let cache = assetCache else { return }
+            // resolved through the cache every draw and never held here: an
+            // attachment that kept its own bitmap would pin one per picture in
+            // the note, and the cache's ceiling would mean nothing
             if let display = cache.displayImage(for: url) {
                 resolved = display
                 return
             }
+            resolved = Self.placeholder
+            let alreadyWaiting = pendingRefresh != nil
+            pendingRefresh = refresh
+            guard !alreadyWaiting else { return }
             cache.ensureDisplayImage(for: url) { [weak self] display in
-                guard let self, let display else { return }
-                self.image = display
-                refresh()
+                guard let self else { return }
+                let pending = self.pendingRefresh
+                self.pendingRefresh = nil
+                guard display != nil else { return }
+                pending?()
             }
         }
         return resolved
@@ -492,13 +533,17 @@ final class FittingImageAttachment: NSTextAttachment {
                 textContainer: textContainer
             )
         }
+        // rendering attributes and a viewport pass, not a layout invalidation:
+        // the fragment is already the right height, and re-laying it out under
+        // a scroll re-measures the document out from under the scroll view
         return resolveDisplayImage { [weak textContainer] in
             guard let layoutManager = textContainer?.textLayoutManager,
                   let contentManager = layoutManager.textContentManager,
                   let end = contentManager.location(location, offsetBy: 1),
                   let range = NSTextRange(location: location, end: end)
             else { return }
-            layoutManager.invalidateLayout(for: range)
+            layoutManager.invalidateRenderingAttributes(for: range)
+            layoutManager.textViewportLayoutController.layoutViewport()
         }
     }
 }
@@ -565,9 +610,9 @@ final class BlockBox: NSObject {
     override var hash: Int { value.type.hashValue }
 }
 
-/// Bounded stores for asset bytes and full-size decoded images. A Dictionary
-/// of photos never gives anything back; NSCache drops its contents under
-/// pressure, and `AssetCache.bytes(for:)` re-maps the spill file after it does.
+/// A bounded store for asset bytes. A Dictionary of photos never gives
+/// anything back; NSCache drops its contents under pressure and
+/// `AssetCache.bytes(for:)` re-maps the spill file after it does.
 final class AssetByteStore {
     private let cache = NSCache<NSString, NSData>()
 
@@ -586,42 +631,16 @@ final class AssetByteStore {
     }
 }
 
-final class AssetImageStore {
-    private let cache = NSCache<NSString, PImage>()
-
-    init(limit: Int) { cache.totalCostLimit = limit }
-
-    subscript(url: String) -> PImage? {
-        get { cache.object(forKey: url as NSString) }
-        set {
-            let key = url as NSString
-            guard let newValue else {
-                cache.removeObject(forKey: key)
-                return
-            }
-            cache.setObject(newValue, forKey: key, cost: Self.decodedCost(newValue))
-        }
-    }
-
-    /// Roughly what the decoded bitmap occupies. `size` is in points, so iOS
-    /// has to put the scale back to get pixels.
-    private static func decodedCost(_ image: PImage) -> Int {
-        #if os(macOS)
-        let scale: CGFloat = 1
-        #else
-        let scale = image.scale
-        #endif
-        return max(Int(image.size.width * scale * image.size.height * scale * 4), 1)
-    }
-}
-
 @MainActor
 final class AssetCache {
-    let images = AssetImageStore(limit: 64 << 20)
     let imageData = AssetByteStore(limit: 64 << 20)
-    /// Where each asset's bytes were spilled, so an eviction costs a page-in
-    /// rather than a round trip through the core. Paths only.
+    /// Where each asset's bytes were spilled, so a dropped cache entry costs a
+    /// page-in rather than a round trip through the core. Paths only.
     private var spillFiles: [String: URL] = [:]
+    /// The pixel size of each stored image. An attachment lays out against
+    /// this, so nothing has to hold a full-resolution bitmap to know how much
+    /// room a picture takes.
+    var imageSizes: [String: CGSize] = [:]
     var names: [String: String] = [:]
     var fileURLs: [String: URL] = [:]
     var videoThumbs: [String: PImage] = [:]
@@ -633,9 +652,28 @@ final class AssetCache {
     static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
     static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
 
+    /// The widest a picture is ever drawn, in device pixels — `RichText.fitted`
+    /// caps the point size and the densest screen either platform ships is 3x.
+    /// A bitmap bigger than this is memory nothing can see.
+    #if os(macOS)
+    nonisolated static let displayMaxPixels = 420 * 2
+    #else
+    /// The cap is in pixels, so the UIImage carries the matching scale —
+    /// without it the picture measures three times its point size.
+    nonisolated static let displayScale: CGFloat = 3
+    nonisolated static let displayMaxPixels = Int(340 * displayScale)
+    #endif
+
     private static let displayImages: NSCache<NSString, PImage> = {
         let cache = NSCache<NSString, PImage>()
-        cache.totalCostLimit = 48 << 20
+        // a phone's whole budget is a couple of hundred megabytes; the old
+        // 384MB ceiling was one no device could ever reach without being
+        // killed on the way
+        #if os(macOS)
+        cache.totalCostLimit = 384 << 20
+        #else
+        cache.totalCostLimit = 64 << 20
+        #endif
         return cache
     }()
 
@@ -645,39 +683,18 @@ final class AssetCache {
         Self.displayImages.object(forKey: url as NSString)
     }
 
-    @discardableResult
-    func storeImage(_ data: Data, for url: String) -> PImage? {
-        guard let image = PImage(data: data) else { return nil }
-        images[url] = image
-        // Spill to disk and keep the mapped copy. Mapped pages are clean, so
-        // the kernel reclaims them under pressure instead of killing us for
-        // holding a second heap copy of every photo in the note.
-        if let file = Self.mediaFile(for: url, name: "image", data: data),
-           let mapped = try? Data(contentsOf: file, options: .mappedIfSafe) {
-            spillFiles[url] = file
-            imageData[url] = mapped
-        } else {
-            imageData[url] = data
-        }
-        return image
-    }
+    func isImage(_ url: String) -> Bool { imageSizes[url] != nil }
 
-    /// The decoded image, rebuilt from the spill file when the cache has
-    /// dropped it, so an eviction is invisible to callers.
-    func image(for url: String) -> PImage? {
-        if let cached = images[url] { return cached }
-        guard let data = bytes(for: url), let image = PImage(data: data) else { return nil }
-        images[url] = image
-        return image
-    }
-
-    /// Whether this url is a known image, without paying for a decode.
-    func hasImage(_ url: String) -> Bool {
-        images[url] != nil || spillFiles[url] != nil
+    /// The picture at its own resolution, for the info sheet and the
+    /// clipboard. Decoded on the spot and never held: one of these is worth
+    /// tens of the bounded bitmaps the editor draws.
+    func fullImage(for url: String) -> PImage? {
+        bytes(for: url).flatMap(PImage.init(data:))
     }
 
     /// An asset's bytes, re-mapping the spill file when the cache has dropped
-    /// them. The file outlives the cache entry, so an eviction costs a page-in.
+    /// them. The file outlives the cache entry, so a drop costs a page-in
+    /// rather than another trip through the core.
     func bytes(for url: String) -> Data? {
         if let cached = imageData[url] { return cached }
         guard let file = spillFiles[url],
@@ -685,6 +702,27 @@ final class AssetCache {
         else { return nil }
         imageData[url] = mapped
         return mapped
+    }
+
+    /// Keep the bytes and the picture's dimensions. Deliberately not the
+    /// decoded bitmap: a photo off a phone camera costs ~48MB decoded, and a
+    /// note full of them is what runs the app out of memory.
+    @discardableResult
+    func storeImage(_ data: Data, for url: String) -> CGSize? {
+        guard let size = PImage(data: data)?.size, size.width > 0, size.height > 0
+        else { return nil }
+        imageSizes[url] = size
+        // Spill to the file audio and video already use and keep the mapped
+        // copy. Mapped pages are clean, so the kernel can reclaim them; a heap
+        // copy of every photo in the note is what it cannot.
+        if let file = Self.mediaFile(for: url, name: "image", data: data),
+           let mapped = try? Data(contentsOf: file, options: .mappedIfSafe) {
+            spillFiles[url] = file
+            imageData[url] = mapped
+        } else {
+            imageData[url] = data
+        }
+        return size
     }
 
     /// Decode the bounded display bitmap off the main thread, once per url no
@@ -706,18 +744,13 @@ final class AssetCache {
         Self.decodesInFlight[url] = [onReady]
         Task.detached(priority: .userInitiated) {
             let display = Self.decodeDisplay(data)
-            await MainActor.run { [weak self] in
+            await MainActor.run {
                 if let display {
                     Self.displayImages.setObject(
                         display.image,
                         forKey: url as NSString,
                         cost: display.cost
                     )
-                    #if os(macOS)
-                    // drop any full-size rep the compressed-backed original
-                    // cached while it stood in for the thumbnail
-                    self?.images[url]?.recache()
-                    #endif
                 }
                 for waiter in Self.decodesInFlight.removeValue(forKey: url) ?? [] {
                     waiter(display?.image)
@@ -738,15 +771,10 @@ final class AssetCache {
             data as CFData,
             sourceOptions as CFDictionary
         ) else { return nil }
-        #if os(macOS)
-        let scale: CGFloat = 2
-        #else
-        let scale: CGFloat = 3
-        #endif
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: Int(420 * scale),
+            kCGImageSourceThumbnailMaxPixelSize: displayMaxPixels,
             kCGImageSourceShouldCacheImmediately: true,
         ]
         guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
@@ -757,7 +785,7 @@ final class AssetCache {
         #if os(macOS)
         let image = NSImage(cgImage: thumbnail, size: .zero)
         #else
-        let image = UIImage(cgImage: thumbnail, scale: scale, orientation: .up)
+        let image = UIImage(cgImage: thumbnail, scale: displayScale, orientation: .up)
         #endif
         return (image, thumbnail.bytesPerRow * thumbnail.height)
     }
@@ -1718,10 +1746,12 @@ enum RichText {
             attachment = imageBox(drawn, bounds: CGRect(origin: .zero, size: size), ideal: size)
         } else if let url, cache.patchworkDocs.contains(url) {
             attachment = liveBox(width: 460, height: 300)
-        } else if let url, let image = cache.image(for: url) {
-            let size = Self.fitted(image.size)
+        } else if let url, let pixels = cache.imageSizes[url] {
+            // laid out from the recorded pixel size, drawn from the bounded
+            // bitmap the cache decodes off the main thread
+            let size = Self.fitted(pixels)
             let fitting = imageBox(
-                cache.displayImage(for: url) ?? image,
+                cache.displayImage(for: url) ?? FittingImageAttachment.placeholder,
                 bounds: CGRect(origin: .zero, size: size),
                 ideal: size
             )

@@ -291,11 +291,11 @@ final class PadStore {
             fileExtension: fileExtension,
             mimeType: mime
         ) else { return }
-        if let image = cache.storeImage(data, for: assetUrl) {
+        if let pixels = cache.storeImage(data, for: assetUrl) {
             add(
                 imageItem(
                     assetUrl: assetUrl,
-                    size: image.size,
+                    size: pixels,
                     origin: origin,
                     in: padUrl,
                     at: point
@@ -361,7 +361,7 @@ final class PadStore {
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
-                  !cache.hasImage(url), cache.names[url] == nil
+                  !cache.isImage(url), cache.names[url] == nil
             else { return nil }
             return url
         })

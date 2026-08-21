@@ -1276,13 +1276,18 @@ final class EditorCore {
     }
 
     private func fetchMissingAssets(in spans: [SpanNode]) async -> Bool {
+        // one entry per asset, in the order the note uses them: the same
+        // picture placed twice would otherwise be fetched twice and spend two
+        // of the warm slots below on one decode
+        var seen: Set<String> = []
         let urls: [String] = spans.compactMap { node -> String? in
             guard case .block(let block) = node,
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
-                  !cache.hasImage(url), cache.names[url] == nil,
-                  !cache.patchworkDocs.contains(url)
+                  !cache.isImage(url), cache.names[url] == nil,
+                  !cache.patchworkDocs.contains(url),
+                  seen.insert(url).inserted
             else { return nil }
             return url
         }
@@ -1327,7 +1332,23 @@ final class EditorCore {
                 }
             }
         }
+        await warmDisplayImages(urls)
         return populated
+    }
+
+    /// Decode the bounded bitmaps for the pictures at the top of the note
+    /// before it is laid out, one at a time, so the first scroll through them
+    /// isn't a run of empty slots filling in behind it. Only the first few:
+    /// past that the cache is evicting them as fast as they arrive, and the
+    /// ones further down decode when layout reaches them.
+    private func warmDisplayImages(_ urls: [String]) async {
+        var warmed = 0
+        var seen: Set<String> = []
+        for url in urls where cache.isImage(url) && seen.insert(url).inserted {
+            guard warmed < 12 else { return }
+            warmed += 1
+            _ = await cache.displayImage(ensureFor: url)
+        }
     }
 
     /// The media a copied selection stands for, so a paste outside this app
@@ -1345,7 +1366,7 @@ final class EditorCore {
                   let url = box.value.embedUrl,
                   seen.insert(url).inserted
             else { return }
-            if let image = cache.image(for: url) {
+            if let image = cache.fullImage(for: url) {
                 images.append(image)
             } else if let file = cache.fileURLs[url] {
                 files.append(file)
@@ -3879,7 +3900,7 @@ final class EditorCore {
               box.value.isEmbedBlock,
               let url = box.value.embedUrl
         else { return false }
-        return cache.hasImage(url)
+        return cache.isImage(url)
     }
 
     @discardableResult
@@ -3894,8 +3915,13 @@ final class EditorCore {
             return true
         }
         guard let url = block.embedUrl else { return false }
-        if let image = cache.image(for: url) {
-            guard includeImages else { return false }
+        if cache.isImage(url) {
+            // the sheet shows the picture 240 points tall; the bounded bitmap
+            // the editor already drew is plenty, and a fresh full-resolution
+            // decode for it is not
+            guard includeImages,
+                  let image = cache.displayImage(for: url) ?? cache.fullImage(for: url)
+            else { return false }
             controller.sheet = .info(
                 assetUrl: url,
                 name: cache.names[url] ?? "Image",
@@ -4484,7 +4510,7 @@ func editorCopyRange(
         guard attributes[.attachment] != nil,
               let box = attributes[.amBlock] as? BlockBox,
               let url = box.value.embedUrl,
-              core.cache.hasImage(url)
+              core.cache.isImage(url)
         else { continue }
         return NSRange(location: location, length: 1)
     }
@@ -4660,7 +4686,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         for span in spans {
             guard case .block(let block) = span,
                   let url = block.embedUrl,
-                  let image = core?.cache.image(for: url),
+                  let image = core?.cache.fullImage(for: url),
                   let data = Self.pngData(image)
             else { continue }
             inlineImages[url] = data
@@ -5455,7 +5481,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         for span in spans {
             guard case .block(let block) = span,
                   let url = block.embedUrl,
-                  let image = core?.cache.image(for: url),
+                  let image = core?.cache.fullImage(for: url),
                   let data = image.pngData()
             else { continue }
             inlineImages[url] = data
