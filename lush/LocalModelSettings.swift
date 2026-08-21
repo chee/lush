@@ -5,6 +5,7 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
     case imageCaption
     case voiceNoteSummary
     case noteChat
+    case findNotes
 
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         case .imageCaption: "Image captions"
         case .voiceNoteSummary: "Voice note summaries"
         case .noteChat: "Note chat"
+        case .findNotes: "Finding notes"
         }
     }
 
@@ -23,6 +25,7 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         case .imageCaption: "Images"
         case .voiceNoteSummary: "Voice"
         case .noteChat: "Chat"
+        case .findNotes: "Find"
         }
     }
 
@@ -32,6 +35,7 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         case .imageCaption: "photo"
         case .voiceNoteSummary: "waveform"
         case .noteChat: "bubble.left.and.text.bubble.right"
+        case .findNotes: "sparkle.magnifyingglass"
         }
     }
 
@@ -41,6 +45,7 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         case .imageCaption: "Describes images for search and accessibility."
         case .voiceNoteSummary: "Summarizes voice-note transcripts."
         case .noteChat: "Answers questions and proposes edits using note content."
+        case .findNotes: "Searches your notes to answer a question about where something is."
         }
     }
 
@@ -53,6 +58,10 @@ enum LocalModelOperation: String, CaseIterable, Identifiable {
         case .noteChat:
             """
             You help someone understand and edit their notes in Lush. One note is open and its blocks are numbered for you. Answer questions directly from what you have been given — the note is right there, so a question about it needs no tool. Call a tool only when you need something you were not given — other notes, an attachment's contents, the calendar — or when the person wants something changed. Edit by addressing the blocks you are changing, never by rewriting blocks that are already right. Preserve the note's facts, voice, and formatting unless the person asks for a change. Reply with one strict JSON object and nothing else: {"tool": name, "arguments": {…}} to call a tool, or {"answer": …} to answer. The answer value must be your real answer, not a schema description.
+            """
+        case .findNotes:
+            """
+            You are looking through someone's notes for them in Lush. You cannot see their notes: the only notes that exist are the ones a tool hands you, and every url you write must be one a tool gave you. Search for the words that would be in the note rather than the words of the question, read one when its title alone will not settle it, and stop as soon as you can say which note the person is after. Never invent a note, a url, or a fact about a note you have not read. Reply with one strict JSON object and nothing else: {"tool": name, "arguments": {…}} to call a tool, or {"answer": …} to answer. The answer value must be your real answer, not a schema description.
             """
         }
     }
@@ -204,7 +213,7 @@ struct HuggingFaceModelPreset: Identifiable, Equatable {
 
     static func presets(for operation: LocalModelOperation) -> [HuggingFaceModelPreset] {
         switch operation {
-        case .attachmentSummary, .noteChat:
+        case .attachmentSummary, .noteChat, .findNotes:
             return [
                 HuggingFaceModelPreset(
                     id: "lfm25-350m-mlx",

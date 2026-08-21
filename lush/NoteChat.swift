@@ -177,7 +177,7 @@ enum NoteChatAssistant {
         }
     }
 
-    private struct GeneratedReply {
+    struct GeneratedReply {
         let answer: String
         let tool: String?
         let arguments: [String: Any]
@@ -486,13 +486,19 @@ enum NoteChatAssistant {
         }.joined(separator: "\n")
     }
 
-    private static func instructions(_ profile: ChatProfile) -> String {
-        let base = LocalModelSettings.systemPrompt(for: .noteChat)
+    private static func instructions(
+        _ profile: ChatProfile, operation: LocalModelOperation = .noteChat
+    ) -> String {
+        let base = LocalModelSettings.systemPrompt(for: operation)
         return profile.instruction.isEmpty ? base : "\(base)\n\(profile.instruction)"
     }
 
-    private static func generate(
-        _ body: String, choice: ModelChoice, guided: Bool, profile: ChatProfile
+    static func generate(
+        _ body: String,
+        choice: ModelChoice,
+        guided: Bool,
+        profile: ChatProfile,
+        operation: LocalModelOperation = .noteChat
     ) async throws -> GeneratedReply {
         let raw: String
         switch choice.backend {
@@ -500,7 +506,7 @@ enum NoteChatAssistant {
             guard SystemLanguageModel.default.isAvailable else {
                 throw ChatError.appleIntelligenceUnavailable
             }
-            let session = LanguageModelSession(instructions: instructions(profile))
+            let session = LanguageModelSession(instructions: instructions(profile, operation: operation))
             let options = GenerationOptions(
                 temperature: profile.temperature,
                 maximumResponseTokens: profile.maximumResponseTokens
@@ -523,20 +529,20 @@ enum NoteChatAssistant {
                 throw ChatError.promptTooLong
             }
         case .mlx:
-            let config = LocalModelSettings.mlxConfig(for: .noteChat, choice: choice)
+            let config = LocalModelSettings.mlxConfig(for: operation, choice: choice)
             guard !config.repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw ChatError.customModelNotConfigured
             }
             raw = try await LocalLLMRuntime.generateText(
-                prompt: "\(instructions(profile))\n\n\(body)",
+                prompt: "\(instructions(profile, operation: operation))\n\n\(body)",
                 config: config,
                 maxTokens: profile.maximumResponseTokens,
                 temperature: profile.temperature
             )
         case .openRouter, .openAI, .anthropic, .compatible, .ollama:
             raw = try await CloudLLMRuntime.generateText(
-                prompt: "\(instructions(profile))\n\n\(body)",
-                operation: .noteChat,
+                prompt: "\(instructions(profile, operation: operation))\n\n\(body)",
+                operation: operation,
                 choice: choice
             )
         }
@@ -592,7 +598,7 @@ enum NoteChatAssistant {
         return (answer.isEmpty ? "I drafted a change for you." : answer, proposedMarkdown)
     }
 
-    private static func json(_ value: [String: Any]) -> String {
+    static func json(_ value: [String: Any]) -> String {
         guard JSONSerialization.isValidJSONObject(value),
               let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
         else { return "{}" }
@@ -648,7 +654,7 @@ enum NoteChatAssistant {
 
     /// Newest tool results matter most: older ones shrink to their first line
     /// before any of them are dropped.
-    private static func fittedTranscript(_ transcript: [String], to limit: Int) -> String {
+    static func fittedTranscript(_ transcript: [String], to limit: Int) -> String {
         guard !transcript.isEmpty else { return "None." }
         var kept: [String] = []
         var used = 0
@@ -665,7 +671,7 @@ enum NoteChatAssistant {
         return kept.joined(separator: "\n\n")
     }
 
-    private static func limited(_ value: String, to maxCharacters: Int) -> String {
+    static func limited(_ value: String, to maxCharacters: Int) -> String {
         guard value.count > maxCharacters else { return value }
         return String(value.prefix(maxCharacters))
     }
@@ -689,7 +695,7 @@ enum NoteChatAssistant {
         return !answered.isEmpty && answered == bare(question)
     }
 
-    private static func isPlaceholder(_ value: String?) -> Bool {
+    static func isPlaceholder(_ value: String?) -> Bool {
         guard let value else { return false }
         var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         while let last = normalized.last, ".…!".contains(last) {
