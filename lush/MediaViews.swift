@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import CoreLocation
 import AVKit
 import WebKit
 
@@ -361,6 +362,10 @@ struct EditorSheetView: View {
             VideoPlayerSheet(fileURL: fileURL, name: name)
         case .html(let handle):
             HtmlEditorSheet(html: handle.html) { controller.saveHtml(handle, html: $0) }
+        case .logline(let handle):
+            LoglineEditorSheet(draft: handle.draft, isNew: handle.box == nil) {
+                controller.saveLogline(handle, draft: $0)
+            }
         case .info(let assetUrl, let name, let image, let block):
             AssetInfoSheet(
                 name: name,
@@ -896,6 +901,138 @@ struct HtmlEditorSheet: View {
             )
     }
 
+}
+
+struct LoglineEditorSheet: View {
+    @State var draft: LoglineDraft
+    let isNew: Bool
+    let onSave: (LoglineDraft) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var pickingPoint = false
+
+    private static let zones = TimeZone.knownTimeZoneIdentifiers.sorted()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(isNew ? "New Logline" : "Edit Logline").font(.headline)
+            Form {
+                Section("When") {
+                    DatePicker(
+                        "Date and time",
+                        selection: $draft.date,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    // so the picker shows and edits the clock face of the zone
+                    // the logline is being given, not the reader's
+                    .environment(\.timeZone, draft.zone)
+                    Picker("Time zone", selection: zone) {
+                        ForEach(Self.zones, id: \.self) { Text($0).tag($0) }
+                    }
+                }
+                Section("Where") {
+                    TextField("Place", text: $draft.location)
+                    TextField("Latitude", text: $draft.latitude)
+                        .autocorrectionDisabled()
+                    TextField("Longitude", text: $draft.longitude)
+                        .autocorrectionDisabled()
+                    Button("Find on a Map…") { pickingPoint = true }
+                    if draft.coordinateIsBroken {
+                        Label(
+                            "Needs both, as numbers, within ±90 and ±180. Saving now drops them.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                Section("Weather") {
+                    TextField("Weather", text: $draft.weather)
+                }
+                Section {
+                    ForEach($draft.extras) { $extra in
+                        HStack(spacing: 8) {
+                            TextField("Key", text: $extra.key)
+                                .autocorrectionDisabled()
+                            TextField("Value", text: $extra.value)
+                            Button {
+                                draft.extras.removeAll { $0.id == extra.id }
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    Button("Add Detail") {
+                        draft.extras.append(LoglineDraft.Extra(key: "", value: ""))
+                    }
+                } header: {
+                    Text("Details")
+                } footer: {
+                    Text("Anything else the logline records — what was playing, who was there. A row with no key is dropped.")
+                }
+                Section("Preview") {
+                    Text(LoglineStampFormat.string(for: draft.date, zone: draft.zone))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button(isNew ? "Insert" : "Save") {
+                    onSave(draft)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(16)
+        #if os(macOS)
+        .frame(width: 420, height: 560)
+        #endif
+        .sheet(isPresented: $pickingPoint) {
+            MapPointPicker(
+                start: draft.coordinate.map {
+                    CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                },
+                initialName: draft.location,
+                showsRadius: false,
+                requiresName: false,
+                confirmTitle: "Use This Place"
+            ) { point in
+                draft.latitude = String(point.coordinate.latitude)
+                draft.longitude = String(point.coordinate.longitude)
+                // the reverse-geocoded name is a suggestion, not a correction:
+                // a place already named by hand keeps its name
+                if draft.location.trimmingCharacters(in: .whitespaces).isEmpty {
+                    draft.location = point.name
+                }
+            }
+        }
+    }
+
+    /// Changing the zone means "it was this o'clock over there", not "it was
+    /// this same instant, renamed". Keep the numbers on the clock face and
+    /// move the instant under them.
+    private var zone: Binding<String> {
+        Binding(
+            get: { draft.zone.identifier },
+            set: { identifier in
+                guard let next = TimeZone(identifier: identifier) else { return }
+                var from = Calendar(identifier: .gregorian)
+                from.timeZone = draft.zone
+                var to = from
+                to.timeZone = next
+                let face = from.dateComponents(
+                    [.year, .month, .day, .hour, .minute, .second],
+                    from: draft.date
+                )
+                draft.date = to.date(from: face) ?? draft.date
+                draft.zone = next
+            }
+        )
+    }
 }
 
 struct LinkSheet: View {

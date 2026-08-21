@@ -2004,11 +2004,15 @@ impl Core {
     }
 
     /// Start tracking + syncing docs without waiting for them to arrive,
-    /// recursing into subfolders. Once a doc lands, its legacy scalar
-    /// strings are normalized to Text.
-    /// Walks breadth-first. Every doc in a level is asked for before any of
-    /// them is waited on, so one doc the server doesn't have costs the level
-    /// one timeout rather than costing every doc behind it thirty seconds.
+    /// recursing into subfolders. Once a doc lands, its legacy scalar strings
+    /// are normalized to Text.
+    ///
+    /// Walks breadth-first. A whole level is tracked before any of it is waited
+    /// on, so one doc the server doesn't have costs the level one timeout
+    /// rather than costing every doc behind it thirty seconds. Tracking is a
+    /// subscription, not a load; materializing happens inside the buffered
+    /// stage, so the memory this holds is bounded by `PREFETCH_CONCURRENCY`
+    /// rather than by the width of the level.
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
         let index = self.index.clone();
@@ -2025,7 +2029,7 @@ impl Core {
                     return;
                 }
                 for id in &level {
-                    let _ = repo.ensure_doc(*id).await;
+                    repo.track_doc(*id).await;
                 }
                 let found = futures::stream::iter(level.drain(..).map(|id| {
                     let repo = repo.clone();
@@ -2033,6 +2037,13 @@ impl Core {
                     let active = active.clone();
                     async move {
                         if wait_for_active(active).await.is_err() {
+                            return Vec::new();
+                        }
+                        if !repo.wait_for_headroom().await {
+                            tracing::warn!("prefetch stopping: no headroom");
+                            return Vec::new();
+                        }
+                        if repo.ensure_doc(id).await.is_err() {
                             return Vec::new();
                         }
                         if !repo.wait_for_doc(id, PREFETCH_TIMEOUT).await {

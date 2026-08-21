@@ -61,6 +61,8 @@ jobs:
     # in two seconds with no steps and no log. Needs larger runners enabling
     # on the plan first, then this is a one-line change.
     runs-on: macos-26
+    env:
+      SIMULATOR_ONLY: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && '0' || '1' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -92,28 +94,15 @@ jobs:
       # A push to main builds every slice: it is what catches a device or macOS
       # break before a release does, and it leaves a complete cache behind for
       # TestFlight to restore.
-      - name: Build Rust core and PatchworkServer xcframework
-        run: |
-          set -uo pipefail
-          # Two independent workspaces writing to separate target dirs and
-          # generating different files, so they overlap cleanly. Output goes to
-          # a log each rather than interleaving into an unreadable mess.
-          ./core/build-bindings.sh > "$RUNNER_TEMP/core.log" 2>&1 &
-          core=$!
-          ./server-rs/build-xcframework.sh > "$RUNNER_TEMP/server.log" 2>&1 &
-          server=$!
-          core_rc=0; server_rc=0
-          wait $core || core_rc=$?
-          wait $server || server_rc=$?
-          echo "::group::core/build-bindings.sh (exit $core_rc)"
-          cat "$RUNNER_TEMP/core.log"
-          echo "::endgroup::"
-          echo "::group::server-rs/build-xcframework.sh (exit $server_rc)"
-          cat "$RUNNER_TEMP/server.log"
-          echo "::endgroup::"
-          if [ $core_rc -ne 0 ] || [ $server_rc -ne 0 ]; then exit 1; fi
-        env:
-          SIMULATOR_ONLY: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && '0' || '1' }}
+      # A step each. They share the cargo package cache either way, and taking
+      # the same exclusive lock on it is most of what running them together
+      # bought — the "Blocking waiting for file lock on package cache" lines.
+      # Apart they stream their own logs and carry their own timings.
+      - name: Build Rust core
+        run: ./core/build-bindings.sh
+
+      - name: Build PatchworkServer xcframework
+        run: ./server-rs/build-xcframework.sh
 
       - name: Build web bundle
         run: |

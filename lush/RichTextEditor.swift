@@ -14,10 +14,19 @@ struct HtmlBlockHandle: Identifiable {
     let html: String
 }
 
+/// A logline being filled in by hand. A nil box is a new one; a box is the
+/// logline already in the note, which the save writes back over.
+struct LoglineHandle: Identifiable {
+    let id = UUID()
+    let box: BlockBox?
+    let draft: LoglineDraft
+}
+
 enum EditorSheet: Identifiable {
     case audio(assetUrl: String, fileURL: URL, name: String)
     case video(fileURL: URL, name: String)
     case html(HtmlBlockHandle)
+    case logline(LoglineHandle)
     case info(assetUrl: String, name: String, image: PImage?, block: BlockBox)
     case patchworkCreate
     case link(initial: String)
@@ -27,6 +36,7 @@ enum EditorSheet: Identifiable {
         case .audio(let url, _, _): "audio-\(url)"
         case .video(let url, _): "video-\(url.path)"
         case .html(let handle): "html-\(handle.id)"
+        case .logline(let handle): "logline-\(handle.id)"
         case .info(let url, _, _, _): "info-\(url)"
         case .patchworkCreate: "patchwork-create"
         case .link: "link"
@@ -191,7 +201,22 @@ final class EditorController {
     func insertTable() { core?.insertTable() }
     func insertColumns() { core?.insertColumns() }
     func insertHtmlBlock() { core?.insertHtmlBlock() }
-    func insertLogline() { core?.insertLogline() }
+    /// Option held means "let me fill it in", from any of the places that
+    /// insert one — the menu item, the toolbar, the format bar.
+    func insertLogline() {
+        #if os(macOS)
+        if NSEvent.modifierFlags.contains(.option) {
+            insertLoglineDetailed()
+            return
+        }
+        #endif
+        core?.insertLogline()
+    }
+
+    /// Fill a logline in by hand instead of stamping the here and now.
+    func insertLoglineDetailed() { core?.presentLoglineEditor(for: nil) }
+
+    func editLogline(_ box: BlockBox) { core?.presentLoglineEditor(for: box) }
     func insertPatchworkDoc() { sheet = .patchworkCreate }
     func startLiveTranscription() { core?.startLiveTranscription() }
     func stopLiveTranscription() { core?.stopLiveTranscription() }
@@ -255,6 +280,10 @@ final class EditorController {
 
     func saveHtml(_ handle: HtmlBlockHandle, html: String) {
         core?.updateHtmlBlock(handle.box, html: html)
+    }
+
+    func saveLogline(_ handle: LoglineHandle, draft: LoglineDraft) {
+        core?.saveLogline(handle, draft: draft)
     }
 
     func saveImageAltText(_ box: BlockBox, altText: String) {
@@ -1323,7 +1352,7 @@ final class EditorCore {
                 case "video":
                     await prepareVideo(url: url, name: name, data: data)
                 case "audio":
-                    cache.fileURLs[url] = Self.mediaFile(for: url, name: name, data: data)
+                    cache.fileURLs[url] = AssetCache.mediaFile(for: url, name: name, data: data)
                     if let vision = await model.assetVision(url), !vision.ocr.isEmpty {
                         cache.transcripts[url] = vision.ocr
                     }
@@ -1404,7 +1433,7 @@ final class EditorCore {
     }
 
     private func prepareVideo(url: String, name: String, data: Data) async {
-        guard let fileURL = Self.mediaFile(for: url, name: name, data: data) else { return }
+        guard let fileURL = AssetCache.mediaFile(for: url, name: name, data: data) else { return }
         cache.fileURLs[url] = fileURL
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: fileURL))
         generator.appliesPreferredTrackTransform = true
@@ -1417,19 +1446,6 @@ final class EditorCore {
             #endif
             cache.videoThumbs[url] = PImage.playBadged(poster)
         }
-    }
-
-    static func mediaFile(for assetUrl: String, name: String, data: Data) -> URL? {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AssetMedia", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let safe = assetUrl.replacingOccurrences(of: "automerge:", with: "")
-            .replacingOccurrences(of: "/", with: "_")
-        let file = dir.appendingPathComponent("\(safe)-\(name)")
-        if !FileManager.default.fileExists(atPath: file.path) {
-            guard (try? data.write(to: file)) != nil else { return nil }
-        }
-        return file
     }
 
     /// TextKit builds an attachment's view provider while drawing, but only
@@ -3950,7 +3966,7 @@ final class EditorCore {
             guard let self else { return }
             var fileURL = self.cache.fileURLs[url]
             if fileURL == nil, let data = await self.model.assetBytes(url) {
-                fileURL = Self.mediaFile(for: url, name: name, data: data)
+                fileURL = AssetCache.mediaFile(for: url, name: name, data: data)
                 self.cache.fileURLs[url] = fileURL
             }
             guard let fileURL else { return }
@@ -3959,6 +3975,52 @@ final class EditorCore {
                 : .video(fileURL: fileURL, name: name)
         }
         return true
+    }
+
+    /// The logline under `point`, if there is one. A logline is drawn as text
+    /// rather than as an attachment, so `attachmentIndex` never finds one —
+    /// the block attribute on the run is what says it is a logline.
+    func loglineBox(at point: CGPoint) -> BlockBox? {
+        guard let storage = view?.pStorage, storage.length > 0,
+              let raw = view?.pCharacterIndex(atTextContainerPoint: point)
+        else { return nil }
+        let index = min(max(raw, 0), storage.length - 1)
+        guard let box = storage.attribute(.amBlock, at: index, effectiveRange: nil) as? BlockBox,
+              box.value.type == "context"
+        else { return nil }
+        return box
+    }
+
+    /// Open the form, on an existing logline or on a new one. A new one starts
+    /// from the tracker's reading so the common case is a stamp you nudge
+    /// rather than a form you fill from nothing.
+    func presentLoglineEditor(for box: BlockBox?) {
+        var draft = LoglineDraft(block: box?.value)
+        if box == nil, let snap = contextTracker?.snapshot {
+            draft.location = snap.locationName ?? ""
+            draft.weather = snap.weatherDescription ?? ""
+            if let lat = snap.latitude { draft.latitude = String(lat) }
+            if let lon = snap.longitude { draft.longitude = String(lon) }
+        }
+        controller.sheet = .logline(LoglineHandle(box: box, draft: draft))
+    }
+
+    func saveLogline(_ handle: LoglineHandle, draft: LoglineDraft) {
+        let block = draft.applied(to: handle.box?.value)
+        guard let box = handle.box else {
+            // registers its own undo and schedules the save
+            insertBlockAttachment(RichText.contextLine(for: block))
+            return
+        }
+        guard let view, let storage = view.pStorage,
+              let range = range(whereBlockBox: box, in: storage)
+        else { return }
+        let undo = undoSnapshot()
+        view.pPerformStorageEdit { storage in
+            storage.replaceCharacters(in: range, with: RichText.contextLine(for: block))
+        }
+        registerUndo(from: undo, actionName: "Edit Logline")
+        scheduleSave()
     }
 
     func updateHtmlBlock(_ box: BlockBox, html: String) {
@@ -4049,7 +4111,7 @@ final class EditorCore {
                 mimeType: mime
             ) else { return }
             self.cache.names[newUrl] = name
-            self.cache.fileURLs[newUrl] = Self.mediaFile(for: newUrl, name: name, data: data)
+            self.cache.fileURLs[newUrl] = AssetCache.mediaFile(for: newUrl, name: name, data: data)
             guard let view = self.view, let storage = view.pStorage else { return }
             var target: NSRange?
             storage.enumerateAttribute(
@@ -4150,7 +4212,7 @@ final class EditorCore {
                 case "video":
                     await self.prepareVideo(url: url, name: name, data: data)
                 case "audio":
-                    self.cache.fileURLs[url] = Self.mediaFile(for: url, name: name, data: data)
+                    self.cache.fileURLs[url] = AssetCache.mediaFile(for: url, name: name, data: data)
                 default:
                     break
                 }
@@ -4211,7 +4273,7 @@ final class EditorCore {
             return RecordingSaveResult(state: pending, succeeded: false)
         }
         cache.names[url] = targetName
-        cache.fileURLs[url] = Self.mediaFile(for: url, name: targetName, data: data)
+        cache.fileURLs[url] = AssetCache.mediaFile(for: url, name: targetName, data: data)
         if created {
             transcribeIfAudio(url: url, data: data, name: targetName)
         }
@@ -4976,6 +5038,21 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             }
             return menu
         }
+        if let box = core.loglineBox(at: containerPoint) {
+            let menu = standard ?? NSMenu()
+            let item = NSMenuItem(
+                title: "Edit Logline…",
+                action: #selector(editLogline(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = box
+            menu.insertItem(item, at: 0)
+            if standard != nil {
+                menu.insertItem(.separator(), at: 1)
+            }
+            return menu
+        }
         guard let charIndex = core.attachmentIndex(at: containerPoint),
               core.isImageAttachment(at: charIndex)
         else { return standard }
@@ -4992,6 +5069,11 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             menu.insertItem(.separator(), at: 1)
         }
         return menu
+    }
+
+    @objc private func editLogline(_ sender: NSMenuItem) {
+        guard let box = sender.representedObject as? BlockBox else { return }
+        core?.presentLoglineEditor(for: box)
     }
 
     @objc private func setTodoState(_ sender: NSMenuItem) {
@@ -5321,7 +5403,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
 
     private var pendingTodoMenu: UIMenu?
 
-    func showTodoMenu(_ menu: UIMenu, at point: CGPoint) {
+    func showBlockMenu(_ menu: UIMenu, at point: CGPoint) {
         pendingTodoMenu = menu
         todoMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
     }
@@ -5651,7 +5733,7 @@ struct RichTextEditor: UIViewRepresentable {
 
         let press = UILongPressGestureRecognizer(
             target: context.coordinator,
-            action: #selector(Coordinator.handleTodoPress(_:))
+            action: #selector(Coordinator.handleBlockPress(_:))
         )
         press.delegate = context.coordinator
         press.cancelsTouchesInView = false
@@ -5716,9 +5798,10 @@ struct RichTextEditor: UIViewRepresentable {
             core.openAttachment(at: charIndex)
         }
 
-        /// The touch equivalent of right-clicking the box: hold it to pick a
-        /// state instead of just ticking it.
-        @objc func handleTodoPress(_ gesture: UILongPressGestureRecognizer) {
+        /// The touch equivalent of right-clicking a block: hold it to pick a
+        /// todo state instead of just ticking it, or to open a logline's
+        /// details, neither of which a tap can reach.
+        @objc func handleBlockPress(_ gesture: UILongPressGestureRecognizer) {
             guard gesture.state == .began,
                   let textView = gesture.view as? EditorTextView
             else { return }
@@ -5727,6 +5810,17 @@ struct RichTextEditor: UIViewRepresentable {
                 x: point.x - textView.textContainerInset.left,
                 y: point.y - textView.textContainerInset.top
             )
+            if let box = core.loglineBox(at: containerPoint) {
+                textView.showBlockMenu(
+                    UIMenu(children: [
+                        UIAction(title: "Edit Logline…", image: UIImage(systemName: "clock")) {
+                            [core] _ in core.presentLoglineEditor(for: box)
+                        },
+                    ]),
+                    at: point
+                )
+                return
+            }
             guard let todo = core.todoBoxHit(at: containerPoint),
                   let state = core.todoState(at: todo)
             else { return }
@@ -5738,7 +5832,7 @@ struct RichTextEditor: UIViewRepresentable {
                     core.setTodoState(candidate, at: todo)
                 }
             })
-            textView.showTodoMenu(menu, at: point)
+            textView.showBlockMenu(menu, at: point)
         }
 
         var accessory: UIHostingController<FormatAccessoryBar>?
@@ -5869,6 +5963,11 @@ struct FormatAccessoryBar: View {
                             controller.insertLogline()
                         } label: {
                             Label("Logline", systemImage: "clock")
+                        }
+                        Button {
+                            controller.insertLoglineDetailed()
+                        } label: {
+                            Label("Logline…", systemImage: "clock.badge.questionmark")
                         }
                         Button {
                             controller.insertPatchworkDoc()

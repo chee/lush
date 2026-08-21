@@ -246,28 +246,53 @@ struct ContactPlacePicker: View {
     }
 }
 
-struct MapPlacePicker: View {
+/// A point picked off the map. A saved place matches by proximity so it wants
+/// the radius; a logline records one moment at one point and has no use for it.
+struct PickedPoint {
+    var coordinate: CLLocationCoordinate2D
+    var name: String
+    var radius: Double
+}
+
+/// Search for an address, or tap the map, and get a coordinate back with a
+/// reverse-geocoded name. Saved places and loglines both want that; only saved
+/// places want a radius, and only they insist on a name.
+struct MapPointPicker: View {
     let start: CLLocationCoordinate2D?
-    let onAdd: (SavedPlace) -> Void
+    let showsRadius: Bool
+    let requiresName: Bool
+    let confirmTitle: String
+    let onPick: (PickedPoint) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var camera: MapCameraPosition
     @State private var coordinate: CLLocationCoordinate2D?
-    @State private var name = ""
+    @State private var name: String
     @State private var radius: Double = 150
     @State private var query = ""
     @State private var searching = false
     @State private var searchID = UUID()
     @State private var nameID = UUID()
 
-    init(start: CLLocationCoordinate2D?, onAdd: @escaping (SavedPlace) -> Void) {
+    init(
+        start: CLLocationCoordinate2D?,
+        initialName: String = "",
+        showsRadius: Bool = true,
+        requiresName: Bool = true,
+        confirmTitle: String = "Add Place",
+        onPick: @escaping (PickedPoint) -> Void
+    ) {
         self.start = start
-        self.onAdd = onAdd
+        self.showsRadius = showsRadius
+        self.requiresName = requiresName
+        self.confirmTitle = confirmTitle
+        self.onPick = onPick
         let center = start ?? CLLocationCoordinate2D(latitude: 51.5072, longitude: -0.1276)
         _camera = State(initialValue: .region(MKCoordinateRegion(
             center: center,
             span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
         )))
         _coordinate = State(initialValue: start)
+        _name = State(initialValue: initialName)
     }
 
     var body: some View {
@@ -294,10 +319,12 @@ struct MapPlacePicker: View {
             MapReader { proxy in
                 Map(position: $camera) {
                     if let coordinate {
-                        Marker(name.isEmpty ? "New place" : name, coordinate: coordinate)
-                        MapCircle(center: coordinate, radius: radius)
-                            .foregroundStyle(Color.accentColor.opacity(0.2))
-                            .stroke(Color.accentColor, lineWidth: 1)
+                        Marker(name.isEmpty ? "Here" : name, coordinate: coordinate)
+                        if showsRadius {
+                            MapCircle(center: coordinate, radius: radius)
+                                .foregroundStyle(Color.accentColor.opacity(0.2))
+                                .stroke(Color.accentColor, lineWidth: 1)
+                        }
                     }
                 }
                 .onTapGesture { point in
@@ -315,12 +342,14 @@ struct MapPlacePicker: View {
             Form {
                 TextField("Name", text: $name)
                     .onChange(of: name) { nameID = UUID() }
-                LabeledContent("Radius") {
-                    HStack(spacing: 12) {
-                        Slider(value: $radius, in: 25...1000, step: 25)
-                        Text("\(Int(radius))m")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                if showsRadius {
+                    LabeledContent("Radius") {
+                        HStack(spacing: 12) {
+                            Slider(value: $radius, in: 25...1000, step: 25)
+                            Text("\(Int(radius))m")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 Text("Tap the map to move the pin.")
@@ -328,18 +357,22 @@ struct MapPlacePicker: View {
                     .foregroundStyle(.secondary)
             }
             .formStyle(.grouped)
-            .frame(height: 150)
+            .frame(height: showsRadius ? 150 : 110)
 
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
-                Button("Add Place") { add() }
+                Button(confirmTitle) { add() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(coordinate == nil || name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(coordinate == nil || (requiresName && trimmedName.isEmpty))
             }
             .padding(12)
         }
+        // a fixed frame is a window size on the mac; inside a sheet on a phone
+        // it is a box smaller than the screen with the map cropped into it
+        #if os(macOS)
         .frame(width: 520, height: 620)
+        #endif
         .onDisappear {
             searchID = UUID()
             nameID = UUID()
@@ -396,14 +429,13 @@ struct MapPlacePicker: View {
         name = found
     }
 
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespaces)
+    }
+
     private func add() {
         guard let coordinate else { return }
-        onAdd(SavedPlace(
-            name: name.trimmingCharacters(in: .whitespaces),
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude,
-            radius: radius
-        ))
+        onPick(PickedPoint(coordinate: coordinate, name: trimmedName, radius: radius))
         dismiss()
     }
 }

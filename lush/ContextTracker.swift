@@ -96,11 +96,161 @@ struct ContextSnapshot: Equatable {
         longitude = block.attrs["lon"]?.doubleValue
         weatherDescription = block.attrs["weather"]?.stringValue
         extras = block.attrs.reduce(into: [:]) { result, pair in
-            let reserved = ["created", "ts", "location", "lat", "lon", "weather", "pending"]
-            guard !reserved.contains(pair.key), let value = pair.value.stringValue else { return }
+            guard !LoglineDraft.reservedKeys.contains(pair.key),
+                  let value = pair.value.stringValue
+            else { return }
             result[pair.key] = value
         }
     }
+}
+
+/// Everything a logline records, as an editable form. A logline filled in by
+/// hand is the same block the tracker stamps — this is only a way to write the
+/// attrs yourself, for a moment you weren't at a keyboard for.
+struct LoglineDraft {
+    /// The attrs the form has fields of its own for. Everything else is an
+    /// extra, editable as plain text — `ContextSnapshot` draws the same line.
+    static let reservedKeys: Set<String> = [
+        "created", "ts", "tz", "location", "lat", "lon", "weather", "pending",
+    ]
+
+    /// One of the attrs the form has no dedicated field for — `nowPlaying`
+    /// and whatever else a tracker or a future version stamps. Identity is the
+    /// row's own, not the key's, so renaming a key doesn't lose the field
+    /// under the cursor.
+    struct Extra: Identifiable {
+        let id = UUID()
+        var key: String
+        var value: String
+    }
+
+    var date: Date
+    var zone: TimeZone
+    var location: String
+    var latitude: String
+    var longitude: String
+    var weather: String
+    var extras: [Extra]
+    /// Which stamp key the block carries. A note's opening logline is its
+    /// `created` one and there should only ever be the one, so editing never
+    /// changes this — it is carried so saving doesn't turn one into the other.
+    var isCreation: Bool
+
+    init(block: BlockValue? = nil, now: Date = Date()) {
+        isCreation = block?.attrs["created"] != nil
+        date = block?.contextStamp ?? now
+        zone = block?.contextZone ?? .current
+        location = block?.attrs["location"]?.stringValue ?? ""
+        weather = block?.attrs["weather"]?.stringValue ?? ""
+        latitude = Self.text(block?.attrs["lat"]?.doubleValue)
+        longitude = Self.text(block?.attrs["lon"]?.doubleValue)
+        // Only the ones that are already text. A number or a flag under an
+        // unexpected key is left alone rather than retyped as a string by
+        // being shown in a text field.
+        extras = (block?.attrs ?? [:])
+            .filter { !Self.reservedKeys.contains($0.key) && $0.value.stringValue != nil }
+            .map { Extra(key: $0.key, value: $0.value.stringValue ?? "") }
+            .sorted { $0.key < $1.key }
+    }
+
+    /// Latitude and longitude, only when both parse and both are in range. A
+    /// lone or impossible coordinate is worse than none: `mapsURL` would hand
+    /// Maps a pin in the wrong place rather than searching for the name.
+    var coordinate: (lat: Double, lon: Double)? {
+        guard let lat = Double(latitude.trimmingCharacters(in: .whitespaces)),
+              let lon = Double(longitude.trimmingCharacters(in: .whitespaces)),
+              (-90...90).contains(lat), (-180...180).contains(lon)
+        else { return nil }
+        return (lat, lon)
+    }
+
+    /// True when the coordinate fields hold something that isn't a usable
+    /// pair, so the form can say so rather than dropping it silently.
+    var coordinateIsBroken: Bool {
+        let entered = !latitude.trimmingCharacters(in: .whitespaces).isEmpty
+            || !longitude.trimmingCharacters(in: .whitespaces).isEmpty
+        return entered && coordinate == nil
+    }
+
+    /// The draft as a block, keeping whatever the form doesn't cover — the
+    /// `nowPlaying` and other extras the tracker stamps stay put.
+    func applied(to existing: BlockValue?) -> BlockValue {
+        var out = existing ?? BlockValue(type: "context", isEmbed: true)
+        out.type = "context"
+        out.isEmbed = true
+        // Filled in by hand, so there is nothing for a refresh to chase.
+        out.attrs.removeValue(forKey: BlockValue.contextPendingKey)
+        let stamp = ISO8601DateFormatter().string(from: date)
+        out.attrs[isCreation ? "created" : "ts"] = .string(stamp)
+        out.attrs.removeValue(forKey: isCreation ? "ts" : "created")
+        out.attrs["tz"] = .string(zone.identifier)
+        Self.put(&out.attrs, "location", location)
+        Self.put(&out.attrs, "weather", weather)
+        // Drop the text extras and write the rows back, so a removed row is
+        // actually removed. Anything that wasn't text was never shown and
+        // stays where it is.
+        for key in out.attrs.keys
+        where !Self.reservedKeys.contains(key) && out.attrs[key]?.stringValue != nil {
+            out.attrs.removeValue(forKey: key)
+        }
+        for extra in extras {
+            let key = extra.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, !Self.reservedKeys.contains(key) else { continue }
+            out.attrs[key] = .string(extra.value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        if let coordinate {
+            out.attrs["lat"] = .number(coordinate.lat)
+            out.attrs["lon"] = .number(coordinate.lon)
+        } else {
+            out.attrs.removeValue(forKey: "lat")
+            out.attrs.removeValue(forKey: "lon")
+        }
+        return out
+    }
+
+    private static func text(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return String(value)
+    }
+
+    private static func put(_ attrs: inout [String: JSONValue], _ key: String, _ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            attrs.removeValue(forKey: key)
+        } else {
+            attrs[key] = .string(trimmed)
+        }
+    }
+}
+
+/// Renders a logline's stamp from the template in settings, in the zone the
+/// logline was written in.
+///
+/// `DateFormatter` is expensive to build and this runs once per logline per
+/// layout pass, so the built ones are kept. The key carries the template and
+/// the zone because both change what comes out. Touched only while drawing,
+/// which is the main thread, so the cache needs no lock of its own.
+enum LoglineStampFormat {
+    private static var cache: [String: DateFormatter] = [:]
+
+    static func string(for date: Date, zone: TimeZone) -> String {
+        let template = EditorSettings.loglineDateFormat
+        let key = "\(template)|\(zone.identifier)"
+        if let cached = cache[key] { return cached.string(from: date) }
+        let formatter = DateFormatter()
+        formatter.timeZone = zone
+        formatter.locale = .autoupdatingCurrent
+        formatter.setLocalizedDateFormatFromTemplate(template)
+        // A template with nothing usable in it leaves an empty format, which
+        // would render every logline blank. Fall back rather than do that.
+        if formatter.dateFormat?.isEmpty != false {
+            formatter.setLocalizedDateFormatFromTemplate(EditorSettings.defaultLoglineDateFormat)
+        }
+        cache[key] = formatter
+        return formatter.string(from: date)
+    }
+
+    static func forget() { cache.removeAll() }
 }
 
 extension BlockValue {
@@ -114,6 +264,7 @@ extension BlockValue {
         // when the logline was stamped, which is now — the snapshot's own
         // timestamp says how fresh its readings are, a different question
         attrs["ts"] = .string(fmt.string(from: Date()))
+        attrs["tz"] = .string(TimeZone.current.identifier)
         if let loc = snap.locationName { attrs["location"] = .string(loc) }
         if let lat = snap.latitude { attrs["lat"] = .number(lat) }
         if let lon = snap.longitude { attrs["lon"] = .number(lon) }
@@ -127,6 +278,7 @@ extension BlockValue {
         var attrs: [String: JSONValue] = [:]
         let fmt = ISO8601DateFormatter()
         attrs["created"] = .string(fmt.string(from: Date()))
+        attrs["tz"] = .string(TimeZone.current.identifier)
         if let snap {
             if let loc = snap.locationName { attrs["location"] = .string(loc) }
             if let lat = snap.latitude { attrs["lat"] = .number(lat) }
@@ -155,6 +307,26 @@ extension BlockValue {
         (attrs["created"] ?? attrs["ts"])?.stringValue
     }
 
+    /// The zone the logline was stamped in. A logline is a record of a moment
+    /// somewhere, so it is read back in the zone it was written in rather than
+    /// wherever the reader happens to be now — otherwise flying home rewrites
+    /// every entry in the notebook.
+    var contextZone: TimeZone {
+        attrs["tz"]?.stringValue.flatMap(TimeZone.init(identifier:)) ?? .current
+    }
+
+    /// How a logline says when it was written: day, month, year, time and the
+    /// zone. One string for both renderers, so the inline view and the drawn
+    /// line can't drift apart.
+    ///
+    /// Loglines stamped before the zone was recorded have only the reader's to
+    /// go on, and fall back to it — the label still describes the time printed
+    /// beside it, which is the part that has to stay true.
+    var contextDisplayStamp: String? {
+        guard let date = contextStamp else { return nil }
+        return LoglineStampFormat.string(for: date, zone: contextZone)
+    }
+
     /// Stops the spinner, keeping whatever the refresh didn't improve on.
     func resolvingContext(with snap: ContextSnapshot?) -> BlockValue {
         var out = self
@@ -174,15 +346,7 @@ struct ContextInlineView: View {
 
     private var isCreation: Bool { block.attrs["created"] != nil }
 
-    private var dateText: String? {
-        let fmt = ISO8601DateFormatter()
-        let raw = block.attrs["created"] ?? block.attrs["ts"]
-        guard let s = raw?.stringValue, let d = fmt.date(from: s) else { return nil }
-        if isCreation {
-            return d.formatted(.dateTime.month(.abbreviated).day().year().hour().minute())
-        }
-        return d.formatted(.dateTime.hour().minute())
-    }
+    private var dateText: String? { block.contextDisplayStamp }
 
     var body: some View {
         HStack(spacing: 8) {

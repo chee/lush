@@ -610,9 +610,33 @@ final class BlockBox: NSObject {
     override var hash: Int { value.type.hashValue }
 }
 
+/// A bounded store for asset bytes. A Dictionary of photos never gives
+/// anything back; NSCache drops its contents under pressure and
+/// `AssetCache.bytes(for:)` re-maps the spill file after it does.
+final class AssetByteStore {
+    private let cache = NSCache<NSString, NSData>()
+
+    init(limit: Int) { cache.totalCostLimit = limit }
+
+    subscript(url: String) -> Data? {
+        get { cache.object(forKey: url as NSString).map { $0 as Data } }
+        set {
+            let key = url as NSString
+            guard let newValue else {
+                cache.removeObject(forKey: key)
+                return
+            }
+            cache.setObject(newValue as NSData, forKey: key, cost: newValue.count)
+        }
+    }
+}
+
 @MainActor
 final class AssetCache {
-    var imageData: [String: Data] = [:]
+    let imageData = AssetByteStore(limit: 64 << 20)
+    /// Where each asset's bytes were spilled, so a dropped cache entry costs a
+    /// page-in rather than a round trip through the core. Paths only.
+    private var spillFiles: [String: URL] = [:]
     /// The pixel size of each stored image. An attachment lays out against
     /// this, so nothing has to hold a full-resolution bitmap to know how much
     /// room a picture takes.
@@ -659,13 +683,32 @@ final class AssetCache {
         Self.displayImages.object(forKey: url as NSString)
     }
 
-    func isImage(_ url: String) -> Bool { imageSizes[url] != nil }
+    /// Whether this url is an image we can still produce. The size alone is not
+    /// enough: bytes are evictable, so an entry whose spill never landed can
+    /// lose them for good. Saying no here sends it back through
+    /// `fetchMissingAssets`, which stores it again. Layout reads `imageSizes`
+    /// directly, so a picture never reflows over this.
+    func isImage(_ url: String) -> Bool {
+        imageSizes[url] != nil && (spillFiles[url] != nil || imageData[url] != nil)
+    }
 
     /// The picture at its own resolution, for the info sheet and the
     /// clipboard. Decoded on the spot and never held: one of these is worth
     /// tens of the bounded bitmaps the editor draws.
     func fullImage(for url: String) -> PImage? {
-        imageData[url].flatMap(PImage.init(data:))
+        bytes(for: url).flatMap(PImage.init(data:))
+    }
+
+    /// An asset's bytes, re-mapping the spill file when the cache has dropped
+    /// them. The file outlives the cache entry, so a drop costs a page-in
+    /// rather than another trip through the core.
+    func bytes(for url: String) -> Data? {
+        if let cached = imageData[url] { return cached }
+        guard let file = spillFiles[url],
+              let mapped = try? Data(contentsOf: file, options: .mappedIfSafe)
+        else { return nil }
+        imageData[url] = mapped
+        return mapped
     }
 
     /// Keep the bytes and the picture's dimensions. Deliberately not the
@@ -676,7 +719,16 @@ final class AssetCache {
         guard let size = PImage(data: data)?.size, size.width > 0, size.height > 0
         else { return nil }
         imageSizes[url] = size
-        imageData[url] = data
+        // Spill to the file audio and video already use and keep the mapped
+        // copy. Mapped pages are clean, so the kernel can reclaim them; a heap
+        // copy of every photo in the note is what it cannot.
+        if let file = Self.mediaFile(for: url, name: "image", data: data),
+           let mapped = try? Data(contentsOf: file, options: .mappedIfSafe) {
+            spillFiles[url] = file
+            imageData[url] = mapped
+        } else {
+            imageData[url] = data
+        }
         return size
     }
 
@@ -688,7 +740,7 @@ final class AssetCache {
             onReady(display)
             return
         }
-        guard let data = imageData[url] else {
+        guard let data = bytes(for: url) else {
             onReady(nil)
             return
         }
@@ -743,6 +795,21 @@ final class AssetCache {
         let image = UIImage(cgImage: thumbnail, scale: displayScale, orientation: .up)
         #endif
         return (image, thumbnail.bytesPerRow * thumbnail.height)
+    }
+
+    /// Spill an asset's bytes to the caches directory and hand back the file,
+    /// so it can be mapped instead of held, and so AVFoundation has a URL.
+    nonisolated static func mediaFile(for assetUrl: String, name: String, data: Data) -> URL? {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AssetMedia", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let safe = assetUrl.replacingOccurrences(of: "automerge:", with: "")
+            .replacingOccurrences(of: "/", with: "_")
+        let file = dir.appendingPathComponent("\(safe)-\(name)")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            guard (try? data.write(to: file)) != nil else { return nil }
+        }
+        return file
     }
 
     static func kind(forName name: String) -> String {
@@ -858,6 +925,13 @@ enum EditorSettings {
     private static let handFamilyKey = "editorHandFamily"
     private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
+    static let loglineDateFormatKey = "editorLoglineDateFormat"
+    /// A skeleton, not a format: the fields wanted, in no particular order.
+    /// `setLocalizedDateFormatFromTemplate` arranges them the way the reader's
+    /// locale writes dates, so this doesn't hard-code American ordering.
+    /// y year, MMM abbreviated month, d day, j locale-preferred hour, mm
+    /// minute, z short zone.
+    static let defaultLoglineDateFormat = "yMMMdjmmz"
     static let maxNoteCharactersKey = "editorMaxNoteCharacters"
     static let minimapKey = "editorMinimapVisible"
 
@@ -990,6 +1064,17 @@ enum EditorSettings {
 
     static func setAutoInsertLogline(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: autoInsertLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static var loglineDateFormat: String {
+        let stored = UserDefaults.standard.string(forKey: loglineDateFormatKey) ?? ""
+        return stored.isEmpty ? defaultLoglineDateFormat : stored
+    }
+
+    static func setLoglineDateFormat(_ template: String) {
+        UserDefaults.standard.set(template, forKey: loglineDateFormatKey)
+        LoglineStampFormat.forget()
         NotificationCenter.default.post(name: changed, object: nil)
     }
 
@@ -1605,15 +1690,8 @@ enum RichText {
 
     private static func contextLineParts(for block: BlockValue) -> [(text: String, isLocation: Bool)] {
         var parts: [(text: String, isLocation: Bool)] = []
-        let fmt = ISO8601DateFormatter()
-        let isCreation = block.attrs["created"] != nil
-        if let raw = (block.attrs["created"] ?? block.attrs["ts"])?.stringValue,
-           let date = fmt.date(from: raw) {
-            if isCreation {
-                parts.append((date.formatted(.dateTime.month(.abbreviated).day().year().hour().minute()), false))
-            } else {
-                parts.append((date.formatted(.dateTime.hour().minute()), false))
-            }
+        if let stamp = block.contextDisplayStamp {
+            parts.append((stamp, false))
         }
         if let weather = block.attrs["weather"]?.stringValue {
             parts.append((weather, false))
