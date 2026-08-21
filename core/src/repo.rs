@@ -730,6 +730,10 @@ pub struct Repo {
     /// decoding blobs into one doc or building fragments for it does not stall
     /// reads of every other doc — which is what the UI does on every keystroke.
     docs: Mutex<HashMap<DocId, Arc<Mutex<DocState>>>>,
+    /// Docs we've said we care about. Outlives residency deliberately: a
+    /// tracked doc keeps its subscription through an eviction, which is what
+    /// lets it stay current without being held in memory.
+    tracked: Mutex<HashSet<DocId>>,
     last_touched: std::sync::Mutex<HashMap<DocId, Instant>>,
     pins: std::sync::Mutex<HashMap<DocId, u32>>,
     syncs: Mutex<HashMap<DocId, SyncSlot>>,
@@ -1656,6 +1660,7 @@ impl Repo {
             server_url,
             outbox_dir,
             docs: Mutex::new(HashMap::new()),
+            tracked: Mutex::new(HashSet::new()),
             last_touched: std::sync::Mutex::new(HashMap::new()),
             pins: std::sync::Mutex::new(HashMap::new()),
             syncs: Mutex::new(HashMap::new()),
@@ -2148,10 +2153,18 @@ impl Repo {
                 .values()
                 .map(|(succeeded, stats, _)| (*succeeded, stats.total_received() > 0)),
         );
-        if outcome.data_received()
-            && (self.apply_incoming.load(Ordering::Relaxed) || !self.doc_has_heads(id).await)
-        {
-            self.apply_new_blobs(id).await?;
+        if outcome.data_received() {
+            if self.docs.lock().await.contains_key(&id) {
+                if self.apply_incoming.load(Ordering::Relaxed) || !self.doc_has_heads(id).await {
+                    self.apply_new_blobs(id).await?;
+                }
+            } else {
+                // Nothing resident to advance, and reading the batch back just
+                // to discover that would pull every blob — a whole photo, for a
+                // doc we are only keeping current. The bytes are on disk;
+                // announce it and let a reader materialize if it wants to.
+                let _ = self.events.send(RepoEvent::DocChanged(id));
+            }
         }
         Ok(outcome)
     }
@@ -2462,7 +2475,44 @@ impl Repo {
     /// Load a doc from local storage into memory (if not already tracked) and
     /// kick off a network sync + subscription in the background. Unsuccessful
     /// syncs are retried while a successful empty response is final.
+    /// Say this doc matters, without building it: sync its blobs down so it
+    /// works offline, and stop. `apply_stored_batch` already declines to
+    /// materialize a doc nothing is holding, so what arrives lands on disk and
+    /// `DocChanged` says so; a reader builds the doc then.
+    ///
+    /// Not the presence channel — that is `open_local`'s, and belongs to docs
+    /// somebody is looking at.
+    ///
+    /// `ensure_doc` is this plus the load. Callers that only need a doc
+    /// present and current — the prefetch crawl — want this one, which costs
+    /// no memory per doc.
+    pub async fn track_doc(self: &Arc<Self>, id: DocId) {
+        if !self.tracked.lock().await.insert(id) {
+            return;
+        }
+        let repo = self.clone();
+        tokio::spawn(async move {
+            if !repo.wait_connected(Duration::from_secs(15)).await {
+                return;
+            }
+            for attempt in 0..HEAL_MAX_ATTEMPTS {
+                if attempt > 0 {
+                    tokio::time::sleep(HEAL_DELAY).await;
+                    if !repo.is_connected() && !repo.wait_connected(Duration::from_secs(15)).await {
+                        return;
+                    }
+                }
+                match repo.sync_once(id, SYNC_TIMEOUT).await {
+                    Ok(SyncOutcome::Succeeded { .. }) => return,
+                    Ok(SyncOutcome::NoPeers | SyncOutcome::Failed { .. }) => {}
+                    Err(e) => tracing::warn!(doc = %id.to_url(), error = %e, "sync failed"),
+                }
+            }
+        });
+    }
+
     pub async fn ensure_doc(self: &Arc<Self>, id: DocId) -> Result<()> {
+        self.tracked.lock().await.insert(id);
         let fresh = !self.docs.lock().await.contains_key(&id);
         self.open_local(id).await;
         if fresh {
@@ -2816,6 +2866,7 @@ impl Repo {
             }
         }
         self.docs.lock().await.remove(&id);
+        self.tracked.lock().await.remove(&id);
         self.last_touched.lock().unwrap().remove(&id);
         self.syncs.lock().await.remove(&id);
         self.last_server_heads.lock().await.remove(&id);
@@ -4432,6 +4483,59 @@ mod tests {
 
         // The memory-pressure sweep takes everything, headroom notwithstanding.
         assert!(sweep_takes(Duration::ZERO, Duration::ZERO, 1, plenty));
+    }
+
+    /// Tracking is a sync, not a load. The crawl leans on this: it says it
+    /// cares about a whole BFS level and materializes only a few at a time.
+    #[tokio::test]
+    async fn tracking_a_doc_does_not_materialize_it() {
+        let (_dir, repo) = test_repo().await;
+        let id = DocId([3; 16]);
+
+        repo.track_doc(id).await;
+
+        assert!(
+            repo.docs.lock().await.get(&id).is_none(),
+            "track_doc built the doc it was supposed to leave alone"
+        );
+        assert!(repo.tracked.lock().await.contains(&id));
+    }
+
+    /// A doc that arrives for nobody stays on disk. Reading the batch back to
+    /// find that out would pull every blob, which for an asset doc is the
+    /// whole photo.
+    #[tokio::test]
+    async fn a_batch_for_an_unheld_doc_does_not_materialize_it() {
+        let (_dir, repo) = test_repo().await;
+        let mut source = Automerge::new().with_actor(ActorId::from([4; 16].as_slice()));
+        put(&mut source, "value", "from a peer");
+        let id = DocId([4; 16]);
+        let ingested = ingest(
+            &source,
+            id.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("ingest");
+        let batch = StoredBatch {
+            sedimentree_id: id.sedimentree_id(),
+            commits: ingested
+                .commits
+                .into_iter()
+                .map(|(meta, blob)| StoredRecord { meta, blob })
+                .collect(),
+            fragments: ingested
+                .fragments
+                .into_iter()
+                .map(|(meta, blob)| StoredRecord { meta, blob })
+                .collect(),
+        };
+
+        assert!(!repo.apply_stored_batch(batch).await.unwrap());
+        assert!(
+            repo.docs.lock().await.get(&id).is_none(),
+            "a batch for a doc nothing holds should stay on disk"
+        );
     }
 
     /// Memory pressure repeats; one sweep runs at a time.
