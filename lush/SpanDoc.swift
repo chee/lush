@@ -1672,15 +1672,8 @@ enum RichText {
 
     private static func contextLineParts(for block: BlockValue) -> [(text: String, isLocation: Bool)] {
         var parts: [(text: String, isLocation: Bool)] = []
-        let fmt = ISO8601DateFormatter()
-        let isCreation = block.attrs["created"] != nil
-        if let raw = (block.attrs["created"] ?? block.attrs["ts"])?.stringValue,
-           let date = fmt.date(from: raw) {
-            if isCreation {
-                parts.append((date.formatted(.dateTime.month(.abbreviated).day().year().hour().minute()), false))
-            } else {
-                parts.append((date.formatted(.dateTime.hour().minute()), false))
-            }
+        if let stamp = block.contextDisplayStamp {
+            parts.append((stamp, false))
         }
         if let weather = block.attrs["weather"]?.stringValue {
             parts.append((weather, false))

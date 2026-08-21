@@ -96,7 +96,7 @@ struct ContextSnapshot: Equatable {
         longitude = block.attrs["lon"]?.doubleValue
         weatherDescription = block.attrs["weather"]?.stringValue
         extras = block.attrs.reduce(into: [:]) { result, pair in
-            let reserved = ["created", "ts", "location", "lat", "lon", "weather", "pending"]
+            let reserved = ["created", "ts", "tz", "location", "lat", "lon", "weather", "pending"]
             guard !reserved.contains(pair.key), let value = pair.value.stringValue else { return }
             result[pair.key] = value
         }
@@ -114,6 +114,7 @@ extension BlockValue {
         // when the logline was stamped, which is now — the snapshot's own
         // timestamp says how fresh its readings are, a different question
         attrs["ts"] = .string(fmt.string(from: Date()))
+        attrs["tz"] = .string(TimeZone.current.identifier)
         if let loc = snap.locationName { attrs["location"] = .string(loc) }
         if let lat = snap.latitude { attrs["lat"] = .number(lat) }
         if let lon = snap.longitude { attrs["lon"] = .number(lon) }
@@ -127,6 +128,7 @@ extension BlockValue {
         var attrs: [String: JSONValue] = [:]
         let fmt = ISO8601DateFormatter()
         attrs["created"] = .string(fmt.string(from: Date()))
+        attrs["tz"] = .string(TimeZone.current.identifier)
         if let snap {
             if let loc = snap.locationName { attrs["location"] = .string(loc) }
             if let lat = snap.latitude { attrs["lat"] = .number(lat) }
@@ -155,6 +157,31 @@ extension BlockValue {
         (attrs["created"] ?? attrs["ts"])?.stringValue
     }
 
+    /// The zone the logline was stamped in. A logline is a record of a moment
+    /// somewhere, so it is read back in the zone it was written in rather than
+    /// wherever the reader happens to be now — otherwise flying home rewrites
+    /// every entry in the notebook.
+    var contextZone: TimeZone {
+        attrs["tz"]?.stringValue.flatMap(TimeZone.init(identifier:)) ?? .current
+    }
+
+    /// How a logline says when it was written: day, month, year, time and the
+    /// zone. One string for both renderers, so the inline view and the drawn
+    /// line can't drift apart.
+    ///
+    /// Loglines stamped before the zone was recorded have only the reader's to
+    /// go on, and fall back to it — the label still describes the time printed
+    /// beside it, which is the part that has to stay true.
+    var contextDisplayStamp: String? {
+        guard let date = contextStamp else { return nil }
+        var style = Date.FormatStyle.dateTime
+            .month(.abbreviated).day().year()
+            .hour().minute()
+            .timeZone(.specificName(.short))
+        style.timeZone = contextZone
+        return date.formatted(style)
+    }
+
     /// Stops the spinner, keeping whatever the refresh didn't improve on.
     func resolvingContext(with snap: ContextSnapshot?) -> BlockValue {
         var out = self
@@ -174,15 +201,7 @@ struct ContextInlineView: View {
 
     private var isCreation: Bool { block.attrs["created"] != nil }
 
-    private var dateText: String? {
-        let fmt = ISO8601DateFormatter()
-        let raw = block.attrs["created"] ?? block.attrs["ts"]
-        guard let s = raw?.stringValue, let d = fmt.date(from: s) else { return nil }
-        if isCreation {
-            return d.formatted(.dateTime.month(.abbreviated).day().year().hour().minute())
-        }
-        return d.formatted(.dateTime.hour().minute())
-    }
+    private var dateText: String? { block.contextDisplayStamp }
 
     var body: some View {
         HStack(spacing: 8) {

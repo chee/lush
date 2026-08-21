@@ -50,6 +50,48 @@ final class SpanDocTests: XCTestCase {
         XCTAssertEqual(encoded, "and my own words")
     }
 
+    private func logline(zone: String) -> String? {
+        BlockValue(
+            type: "context",
+            attrs: ["ts": .string("2026-08-21T04:04:00Z"), "tz": .string(zone)],
+            isEmbed: true
+        ).contextDisplayStamp
+    }
+
+    /// A logline is a record of a moment somewhere, so it reads back in the
+    /// zone it was stamped in. Rendering it in the reader's zone would rewrite
+    /// every entry in the notebook the first time you flew home.
+    func testALoglineReadsBackInTheZoneItWasStampedIn() {
+        guard let tokyo = logline(zone: "Asia/Tokyo"),
+              let losAngeles = logline(zone: "America/Los_Angeles")
+        else { return XCTFail("a stamped logline should say when it was written") }
+
+        XCTAssertNotEqual(tokyo, losAngeles, "the stored zone should decide how a stamp reads")
+    }
+
+    /// The stamped logline used to carry the time alone, so a note read a month
+    /// later couldn't say which day it was written on.
+    func testAStampedLoglineCarriesTheWholeDate() {
+        guard let stamp = logline(zone: "UTC") else {
+            return XCTFail("a stamped logline should say when it was written")
+        }
+
+        XCTAssertTrue(stamp.contains("2026"), stamp)
+        XCTAssertTrue(stamp.contains("21"), stamp)
+    }
+
+    /// Falling back to the reader's zone is fine; silently printing a time in
+    /// one zone under the name of another is not.
+    func testALoglineWithNoStoredZoneUsesTheReadersOwn() {
+        let stamp = BlockValue(
+            type: "context",
+            attrs: ["ts": .string("2026-08-21T04:04:00Z")],
+            isEmbed: true
+        ).contextDisplayStamp
+
+        XCTAssertEqual(stamp, logline(zone: TimeZone.current.identifier))
+    }
+
     func testALoglineNobodyTypedOnEncodesToItsBlockAlone() {
         let text = NSMutableAttributedString(string: "12:04 | Glasgow")
         text.addAttribute(
