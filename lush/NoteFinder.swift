@@ -406,6 +406,7 @@ struct NoteFinderView: View {
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(isFinding || question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Ask")
+                .accessibilityLabel("Ask")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
