@@ -277,11 +277,14 @@ struct CalendarSidebarLabel: View {
         return "\(Calendar.current.component(.day, from: Date())).calendar"
     }
 
+    /// Pink on the phone, where the sidebar is a list of coloured glyphs.
+    /// On the mac it reads as text: a red glyph in a sidebar of black ones
+    /// looks like a badge on something that is only a place to go.
     private var tint: Color {
         #if os(iOS)
         .lushPink
         #else
-        .red
+        .primary
         #endif
     }
 

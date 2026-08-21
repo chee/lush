@@ -75,11 +75,60 @@ struct MapPlace: Identifiable, Sendable {
         visits.compactMap(\.stamped).max()
     }
 
-    static func cluster(_ locations: [NoteLocation], within metres: CLLocationDistance = 200) -> [MapPlace] {
+    /// How far apart two loglines can be and still share a pin, when nothing
+    /// says how far the map is zoomed in. Only the first draw uses it — the
+    /// camera has the answer from then on.
+    static let defaultClusterRadius: CLLocationDistance = 200
+
+    /// The closest two pins are ever allowed to be. A fix wanders by a few
+    /// dozen metres between sittings, so without a floor the same desk
+    /// scatters into a cloud of pins once the map is zoomed far enough in.
+    static let minimumClusterRadius: CLLocationDistance = 25
+
+    /// Metres to a degree of latitude. Longitude narrows towards the poles but
+    /// latitude does not, so this is the one direction a span converts to the
+    /// ground without knowing where on the globe it is.
+    static let metresPerDegreeLatitude: Double = 111_320
+
+    /// The grouping distance for a map showing `span` in `height` points: the
+    /// distance on the ground that `spacing` points of screen covers. Pins
+    /// merge exactly when they would have overlapped, so a continent shows one
+    /// pin a city and a street shows one pin a doorway — rather than the fixed
+    /// 200m that piles a whole province into one illegible stack.
+    ///
+    /// MapKit's projection is conformal, so the scale it works out down the
+    /// screen is the scale across it too.
+    static func clusterRadius(
+        forSpan span: MKCoordinateSpan,
+        height: CGFloat,
+        spacing: CGFloat = 60
+    ) -> CLLocationDistance {
+        guard height > 0, span.latitudeDelta > 0, span.latitudeDelta.isFinite else {
+            return defaultClusterRadius
+        }
+        let metresPerPoint = span.latitudeDelta * metresPerDegreeLatitude / Double(height)
+        return max(metresPerPoint * Double(spacing), minimumClusterRadius)
+    }
+
+    static func cluster(
+        _ locations: [NoteLocation],
+        within metres: CLLocationDistance = defaultClusterRadius
+    ) -> [MapPlace] {
         var groups: [(centre: CLLocation, members: [NoteLocation])] = []
         for location in locations.sorted(by: { ($0.stamped ?? .distantPast) < ($1.stamped ?? .distantPast) }) {
             let point = CLLocation(latitude: location.latitude, longitude: location.longitude)
-            if let index = groups.firstIndex(where: { $0.centre.distance(from: point) <= metres }) {
+            // the nearest group in range, not the first one found: zoomed out
+            // the range is wide enough that first-match would chain one pin
+            // across everything that happens to touch it
+            var nearest: Int?
+            var nearestDistance = metres
+            for index in groups.indices {
+                let distance = groups[index].centre.distance(from: point)
+                guard distance <= nearestDistance else { continue }
+                nearestDistance = distance
+                nearest = index
+            }
+            if let index = nearest {
                 groups[index].members.append(location)
                 let count = Double(groups[index].members.count)
                 let centre = groups[index].centre.coordinate
@@ -152,10 +201,17 @@ struct NotesMapScreen: View {
     let open: (String) -> Void
 
     @Environment(NotesModel.self) private var model
+    /// Every logline that carried a fix, kept whole: the pins are a view of
+    /// this at the zoom the map happens to be at, and re-grouping has to start
+    /// from the loglines rather than from the last set of pins.
+    @State private var locations: [NoteLocation] = []
     @State private var places: [MapPlace] = []
     @State private var selected: String?
     @State private var camera: MapCameraPosition = .automatic
     @State private var loading = true
+    @State private var radius = MapPlace.defaultClusterRadius
+    @State private var span: MKCoordinateSpan?
+    @State private var mapHeight: CGFloat = 0
 
     private var selectedPlace: MapPlace? {
         places.first { $0.id == selected }
@@ -180,6 +236,9 @@ struct NotesMapScreen: View {
         }
         .navigationTitle("Map")
         .task { await reload() }
+        // the grouping distance is the trigger: a zoom works out a new one and
+        // this re-groups against it, cancelling a regroup still in flight
+        .task(id: radius) { await regroup() }
     }
 
     private var map: some View {
@@ -193,6 +252,16 @@ struct NotesMapScreen: View {
             }
         }
         .mapStyle(.standard(pointsOfInterest: .excludingAll))
+        .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { height in
+            mapHeight = height
+            rescale()
+        }
+        // .onEnd, not .continuous: pins that re-group mid-pinch jump about
+        // under the fingers doing the pinching
+        .onMapCameraChange(frequency: .onEnd) { context in
+            span = context.region.span
+            rescale()
+        }
         .overlay(alignment: .topLeading) { summary }
         .overlay(alignment: .bottomLeading) {
             if let place = selectedPlace {
@@ -339,15 +408,57 @@ struct NotesMapScreen: View {
 
     private func reload() async {
         loading = true
-        let locations = await model.noteLocations()
-        let clustered = await Task.detached { MapPlace.cluster(locations) }.value
+        let found = await model.noteLocations()
+        guard !Task.isCancelled else { return }
+        let grouping = radius
+        let clustered = await Task.detached { MapPlace.cluster(found, within: grouping) }.value
         guard !Task.isCancelled else { return }
         let isFirstLoad = places.isEmpty
-        places = clustered
+        locations = found
+        apply(clustered)
         loading = false
-        if selected != nil, !clustered.contains(where: { $0.id == selected }) { selected = nil }
         if isFirstLoad, let region = MapPlace.region(covering: clustered) {
             camera = .region(region)
         }
+        // the map was not on screen while this loaded, so nothing has reported
+        // a camera yet — group for the region it is about to frame
+        rescale()
+    }
+
+    /// The grouping distance for the map as it stands. Called on every camera
+    /// settle, and only stirs when the scale really moved: a pan across a city
+    /// leaves the pins where they are, a zoom re-groups them.
+    private func rescale() {
+        let grouping = MapPlace.clusterRadius(forSpan: span ?? fallbackSpan, height: mapHeight)
+        guard grouping > radius * 1.1 || grouping < radius / 1.1 else { return }
+        radius = grouping
+    }
+
+    private func regroup() async {
+        guard !locations.isEmpty else { return }
+        let found = locations
+        let grouping = radius
+        let clustered = await Task.detached { MapPlace.cluster(found, within: grouping) }.value
+        guard !Task.isCancelled else { return }
+        apply(clustered)
+    }
+
+    /// The span to group by before the map has reported a camera: whatever the
+    /// places themselves cover, which is what `.automatic` is about to frame.
+    private var fallbackSpan: MKCoordinateSpan {
+        MapPlace.region(covering: places)?.span
+            ?? MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+    }
+
+    /// Swap in a new set of pins, keeping the open card on the place it was
+    /// opened for. A pin's id is its earliest logline, so the one the reader
+    /// picked is still in whichever pin swallowed it.
+    private func apply(_ clustered: [MapPlace]) {
+        let anchor = selected
+        places = clustered
+        guard let anchor else { return }
+        selected = clustered
+            .first { place in place.visits.contains { $0.id == anchor } }?
+            .id
     }
 }
