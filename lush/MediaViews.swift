@@ -361,6 +361,10 @@ struct EditorSheetView: View {
             VideoPlayerSheet(fileURL: fileURL, name: name)
         case .html(let handle):
             HtmlEditorSheet(html: handle.html) { controller.saveHtml(handle, html: $0) }
+        case .logline(let handle):
+            LoglineEditorSheet(draft: handle.draft, isNew: handle.box == nil) {
+                controller.saveLogline(handle, draft: $0)
+            }
         case .info(let assetUrl, let name, let image, let block):
             AssetInfoSheet(
                 name: name,
@@ -896,6 +900,94 @@ struct HtmlEditorSheet: View {
             )
     }
 
+}
+
+struct LoglineEditorSheet: View {
+    @State var draft: LoglineDraft
+    let isNew: Bool
+    let onSave: (LoglineDraft) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private static let zones = TimeZone.knownTimeZoneIdentifiers.sorted()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(isNew ? "New Logline" : "Edit Logline").font(.headline)
+            Form {
+                Section("When") {
+                    DatePicker(
+                        "Date and time",
+                        selection: $draft.date,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    // so the picker shows and edits the clock face of the zone
+                    // the logline is being given, not the reader's
+                    .environment(\.timeZone, draft.zone)
+                    Picker("Time zone", selection: zone) {
+                        ForEach(Self.zones, id: \.self) { Text($0).tag($0) }
+                    }
+                }
+                Section("Where") {
+                    TextField("Place", text: $draft.location)
+                    TextField("Latitude", text: $draft.latitude)
+                        .autocorrectionDisabled()
+                    TextField("Longitude", text: $draft.longitude)
+                        .autocorrectionDisabled()
+                    if draft.coordinateIsBroken {
+                        Label(
+                            "Needs both, as numbers, within ±90 and ±180. Saving now drops them.",
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                Section("Weather") {
+                    TextField("Weather", text: $draft.weather)
+                }
+                Section("Preview") {
+                    Text(LoglineStampFormat.string(for: draft.date, zone: draft.zone))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button(isNew ? "Insert" : "Save") {
+                    onSave(draft)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(16)
+        #if os(macOS)
+        .frame(width: 420, height: 520)
+        #endif
+    }
+
+    /// Changing the zone means "it was this o'clock over there", not "it was
+    /// this same instant, renamed". Keep the numbers on the clock face and
+    /// move the instant under them.
+    private var zone: Binding<String> {
+        Binding(
+            get: { draft.zone.identifier },
+            set: { identifier in
+                guard let next = TimeZone(identifier: identifier) else { return }
+                var from = Calendar(identifier: .gregorian)
+                from.timeZone = draft.zone
+                var to = from
+                to.timeZone = next
+                let face = from.dateComponents(
+                    [.year, .month, .day, .hour, .minute, .second],
+                    from: draft.date
+                )
+                draft.date = to.date(from: face) ?? draft.date
+                draft.zone = next
+            }
+        )
+    }
 }
 
 struct LinkSheet: View {

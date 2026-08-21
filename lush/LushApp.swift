@@ -404,6 +404,8 @@ struct FormatCommands: Commands {
             Divider()
             Button("Insert Logline") { editor?.insertLogline() }
                 .keyboardShortcut("l", modifiers: [.command])
+            Button("Insert Logline…") { editor?.insertLoglineDetailed() }
+                .keyboardShortcut("l", modifiers: [.command, .option])
             Button("Insert Table") { editor?.insertTable() }
                 .keyboardShortcut("t", modifiers: [.command, .option])
             Button("Insert Columns") { editor?.insertColumns() }

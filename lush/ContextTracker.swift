@@ -103,6 +103,119 @@ struct ContextSnapshot: Equatable {
     }
 }
 
+/// Everything a logline records, as an editable form. A logline filled in by
+/// hand is the same block the tracker stamps — this is only a way to write the
+/// attrs yourself, for a moment you weren't at a keyboard for.
+struct LoglineDraft {
+    var date: Date
+    var zone: TimeZone
+    var location: String
+    var latitude: String
+    var longitude: String
+    var weather: String
+    /// Which stamp key the block carries. A note's opening logline is its
+    /// `created` one and there should only ever be the one, so editing never
+    /// changes this — it is carried so saving doesn't turn one into the other.
+    var isCreation: Bool
+
+    init(block: BlockValue? = nil, now: Date = Date()) {
+        isCreation = block?.attrs["created"] != nil
+        date = block?.contextStamp ?? now
+        zone = block?.contextZone ?? .current
+        location = block?.attrs["location"]?.stringValue ?? ""
+        weather = block?.attrs["weather"]?.stringValue ?? ""
+        latitude = Self.text(block?.attrs["lat"]?.doubleValue)
+        longitude = Self.text(block?.attrs["lon"]?.doubleValue)
+    }
+
+    /// Latitude and longitude, only when both parse and both are in range. A
+    /// lone or impossible coordinate is worse than none: `mapsURL` would hand
+    /// Maps a pin in the wrong place rather than searching for the name.
+    var coordinate: (lat: Double, lon: Double)? {
+        guard let lat = Double(latitude.trimmingCharacters(in: .whitespaces)),
+              let lon = Double(longitude.trimmingCharacters(in: .whitespaces)),
+              (-90...90).contains(lat), (-180...180).contains(lon)
+        else { return nil }
+        return (lat, lon)
+    }
+
+    /// True when the coordinate fields hold something that isn't a usable
+    /// pair, so the form can say so rather than dropping it silently.
+    var coordinateIsBroken: Bool {
+        let entered = !latitude.trimmingCharacters(in: .whitespaces).isEmpty
+            || !longitude.trimmingCharacters(in: .whitespaces).isEmpty
+        return entered && coordinate == nil
+    }
+
+    /// The draft as a block, keeping whatever the form doesn't cover — the
+    /// `nowPlaying` and other extras the tracker stamps stay put.
+    func applied(to existing: BlockValue?) -> BlockValue {
+        var out = existing ?? BlockValue(type: "context", isEmbed: true)
+        out.type = "context"
+        out.isEmbed = true
+        // Filled in by hand, so there is nothing for a refresh to chase.
+        out.attrs.removeValue(forKey: BlockValue.contextPendingKey)
+        let stamp = ISO8601DateFormatter().string(from: date)
+        out.attrs[isCreation ? "created" : "ts"] = .string(stamp)
+        out.attrs.removeValue(forKey: isCreation ? "ts" : "created")
+        out.attrs["tz"] = .string(zone.identifier)
+        Self.put(&out.attrs, "location", location)
+        Self.put(&out.attrs, "weather", weather)
+        if let coordinate {
+            out.attrs["lat"] = .number(coordinate.lat)
+            out.attrs["lon"] = .number(coordinate.lon)
+        } else {
+            out.attrs.removeValue(forKey: "lat")
+            out.attrs.removeValue(forKey: "lon")
+        }
+        return out
+    }
+
+    private static func text(_ value: Double?) -> String {
+        guard let value else { return "" }
+        return String(value)
+    }
+
+    private static func put(_ attrs: inout [String: JSONValue], _ key: String, _ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            attrs.removeValue(forKey: key)
+        } else {
+            attrs[key] = .string(trimmed)
+        }
+    }
+}
+
+/// Renders a logline's stamp from the template in settings, in the zone the
+/// logline was written in.
+///
+/// `DateFormatter` is expensive to build and this runs once per logline per
+/// layout pass, so the built ones are kept. The key carries the template and
+/// the zone because both change what comes out. Touched only while drawing,
+/// which is the main thread, so the cache needs no lock of its own.
+enum LoglineStampFormat {
+    private static var cache: [String: DateFormatter] = [:]
+
+    static func string(for date: Date, zone: TimeZone) -> String {
+        let template = EditorSettings.loglineDateFormat
+        let key = "\(template)|\(zone.identifier)"
+        if let cached = cache[key] { return cached.string(from: date) }
+        let formatter = DateFormatter()
+        formatter.timeZone = zone
+        formatter.locale = .autoupdatingCurrent
+        formatter.setLocalizedDateFormatFromTemplate(template)
+        // A template with nothing usable in it leaves an empty format, which
+        // would render every logline blank. Fall back rather than do that.
+        if formatter.dateFormat?.isEmpty != false {
+            formatter.setLocalizedDateFormatFromTemplate(EditorSettings.defaultLoglineDateFormat)
+        }
+        cache[key] = formatter
+        return formatter.string(from: date)
+    }
+
+    static func forget() { cache.removeAll() }
+}
+
 extension BlockValue {
     /// A logline stamped from a snapshot that a refresh is still chasing. It
     /// draws a spinner until `resolvingContext` folds the fresher reading in.
@@ -174,12 +287,7 @@ extension BlockValue {
     /// beside it, which is the part that has to stay true.
     var contextDisplayStamp: String? {
         guard let date = contextStamp else { return nil }
-        var style = Date.FormatStyle.dateTime
-            .month(.abbreviated).day().year()
-            .hour().minute()
-            .timeZone(.specificName(.short))
-        style.timeZone = contextZone
-        return date.formatted(style)
+        return LoglineStampFormat.string(for: date, zone: contextZone)
     }
 
     /// Stops the spinner, keeping whatever the refresh didn't improve on.

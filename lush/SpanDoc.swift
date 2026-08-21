@@ -925,6 +925,13 @@ enum EditorSettings {
     private static let handFamilyKey = "editorHandFamily"
     private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
+    static let loglineDateFormatKey = "editorLoglineDateFormat"
+    /// A skeleton, not a format: the fields wanted, in no particular order.
+    /// `setLocalizedDateFormatFromTemplate` arranges them the way the reader's
+    /// locale writes dates, so this doesn't hard-code American ordering.
+    /// y year, MMM abbreviated month, d day, j locale-preferred hour, mm
+    /// minute, z short zone.
+    static let defaultLoglineDateFormat = "yMMMdjmmz"
     static let maxNoteCharactersKey = "editorMaxNoteCharacters"
     static let minimapKey = "editorMinimapVisible"
 
@@ -1057,6 +1064,17 @@ enum EditorSettings {
 
     static func setAutoInsertLogline(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: autoInsertLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static var loglineDateFormat: String {
+        let stored = UserDefaults.standard.string(forKey: loglineDateFormatKey) ?? ""
+        return stored.isEmpty ? defaultLoglineDateFormat : stored
+    }
+
+    static func setLoglineDateFormat(_ template: String) {
+        UserDefaults.standard.set(template, forKey: loglineDateFormatKey)
+        LoglineStampFormat.forget()
         NotificationCenter.default.post(name: changed, object: nil)
     }
 

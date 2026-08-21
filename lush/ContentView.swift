@@ -4157,6 +4157,11 @@ struct NoteDetail: View {
                 Label("Logline", systemImage: "clock")
             }
             Button {
+                editor.insertLoglineDetailed()
+            } label: {
+                Label("Logline…", systemImage: "clock.badge.questionmark")
+            }
+            Button {
                 editor.insertTable()
             } label: {
                 Label("Table", systemImage: "tablecells")

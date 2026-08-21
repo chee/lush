@@ -92,6 +92,78 @@ final class SpanDocTests: XCTestCase {
         XCTAssertEqual(stamp, logline(zone: TimeZone.current.identifier))
     }
 
+    private func contextBlock(_ attrs: [String: JSONValue]) -> BlockValue {
+        BlockValue(type: "context", attrs: attrs, isEmbed: true)
+    }
+
+    /// The form covers when and where; the tracker stamps more than that. An
+    /// edit must not quietly drop what it can't show.
+    func testEditingALoglineKeepsWhatTheFormDoesNotCover() {
+        let existing = contextBlock([
+            "ts": .string("2026-08-21T04:04:00Z"),
+            "tz": .string("UTC"),
+            "nowPlaying": .string("Aphex Twin"),
+        ])
+        var draft = LoglineDraft(block: existing)
+        draft.location = "Glasgow"
+
+        let saved = draft.applied(to: existing)
+
+        XCTAssertEqual(saved.attrs["nowPlaying"]?.stringValue, "Aphex Twin")
+        XCTAssertEqual(saved.attrs["location"]?.stringValue, "Glasgow")
+    }
+
+    /// A lone or impossible coordinate would put a Maps pin somewhere the
+    /// logline never was, which is worse than having no pin at all.
+    func testAnUnusableCoordinateIsNotSaved() {
+        var half = LoglineDraft(block: nil)
+        half.latitude = "55.86"
+        var outOfRange = LoglineDraft(block: nil)
+        outOfRange.latitude = "155.0"
+        outOfRange.longitude = "4.2"
+
+        XCTAssertTrue(half.coordinateIsBroken)
+        XCTAssertTrue(outOfRange.coordinateIsBroken)
+        XCTAssertNil(half.applied(to: nil).attrs["lat"])
+        XCTAssertNil(outOfRange.applied(to: nil).attrs["lat"])
+    }
+
+    func testAUsableCoordinateIsSavedAsAPair() {
+        var draft = LoglineDraft(block: nil)
+        draft.latitude = "55.86"
+        draft.longitude = "-4.25"
+
+        let saved = draft.applied(to: nil)
+
+        XCTAssertFalse(draft.coordinateIsBroken)
+        XCTAssertEqual(saved.attrs["lat"]?.doubleValue, 55.86)
+        XCTAssertEqual(saved.attrs["lon"]?.doubleValue, -4.25)
+    }
+
+    /// A note has one opening logline. Editing it must not turn it into an
+    /// ordinary stamp, which would leave the note with none.
+    func testEditingACreationLoglineLeavesItACreationLogline() {
+        let existing = contextBlock(["created": .string("2026-08-21T04:04:00Z")])
+        var draft = LoglineDraft(block: existing)
+        draft.location = "Glasgow"
+
+        let saved = draft.applied(to: existing)
+
+        XCTAssertNotNil(saved.attrs["created"])
+        XCTAssertNil(saved.attrs["ts"])
+    }
+
+    /// Filled in by hand, so there is nothing for a refresh to chase — and a
+    /// spinner that never stops is what would be left otherwise.
+    func testAHandWrittenLoglineIsNotPending() {
+        let existing = contextBlock([
+            "ts": .string("2026-08-21T04:04:00Z"),
+            "pending": .bool(true),
+        ])
+
+        XCTAssertFalse(LoglineDraft(block: existing).applied(to: existing).isPendingContext)
+    }
+
     func testALoglineNobodyTypedOnEncodesToItsBlockAlone() {
         let text = NSMutableAttributedString(string: "12:04 | Glasgow")
         text.addAttribute(

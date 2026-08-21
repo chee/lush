@@ -535,6 +535,10 @@ struct ImportSettingsPane: View {
 struct LoglineSettingsPane: View {
     @Environment(ContextTracker.self) private var contextTracker
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var dateFormat = EditorSettings.loglineDateFormat
+    /// A fixed instant, so the preview reads the same every time the pane is
+    /// opened and only the format is seen to change.
+    private let previewDate = Date(timeIntervalSince1970: 1_775_000_000)
     @State private var placesEnabled = SavedPlaces.enabled
     @State private var weatherEnabled = ContextTracker.weatherEnabled
     @State private var places = SavedPlaces.all
@@ -551,6 +555,30 @@ struct LoglineSettingsPane: View {
                     .onChange(of: autoInsertLogline) {
                         EditorSettings.setAutoInsertLogline(autoInsertLogline)
                     }
+            }
+            Section {
+                TextField("Date format", text: $dateFormat)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .onChange(of: dateFormat) {
+                        EditorSettings.setLoglineDateFormat(dateFormat)
+                    }
+                LabeledContent("Preview") {
+                    Text(LoglineStampFormat.string(for: previewDate, zone: .current))
+                        .foregroundStyle(.secondary)
+                }
+                if dateFormat != EditorSettings.defaultLoglineDateFormat {
+                    Button("Reset to \(EditorSettings.defaultLoglineDateFormat)") {
+                        dateFormat = EditorSettings.defaultLoglineDateFormat
+                        EditorSettings.setLoglineDateFormat(dateFormat)
+                    }
+                }
+            } header: {
+                Text("Date Format")
+            } footer: {
+                Text("The fields a logline shows, in any order — the arrangement follows your language's own. y year, M month (MMM for a name), d day, j hour, mm minute, z zone, E weekday. A format with nothing usable in it falls back to the default.")
             }
             Section {
                 Toggle("Include Location in Loglines", isOn: $placesEnabled)
