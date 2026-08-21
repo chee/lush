@@ -7,9 +7,12 @@ import AppKit
 /// a stored range, so an edit anywhere moves ownership with the characters
 /// instead of invalidating an index.
 private let notebookNote = NSAttributedString.Key("lushNotebookNote")
-/// The title line standing between two notes. Owned by nothing, so the save
-/// pass walks straight past it.
+/// Structure rather than content: the title line between two notes and the
+/// newlines that close it off. The body save pass walks straight past it.
 private let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
+/// The editable part of a boundary — the note's name. Typing here renames the
+/// note; the newlines on either side carry no title and so cannot be typed in.
+private let notebookTitle = NSAttributedString.Key("lushNotebookTitle")
 
 /// A folder read as one document: every note's content in one text view, one
 /// scroll view, one caret. The notes are not embedded editors — they are
@@ -26,6 +29,7 @@ final class FolderNotebookCore {
     private struct Section {
         var heads: [String]
         var lastJSON: String
+        var lastName: String
     }
 
     @ObservationIgnored let storage = NSTextStorage()
@@ -66,9 +70,17 @@ final class FolderNotebookCore {
                 value: node.url,
                 range: NSRange(location: 0, length: body.length)
             )
-            built.append(boundary(titled: node.displayName, first: nextOrder.isEmpty))
+            built.append(boundary(
+                titled: node.displayName,
+                url: node.url,
+                first: nextOrder.isEmpty
+            ))
             built.append(body)
-            next[node.url] = Section(heads: snapshot.heads, lastJSON: snapshot.spansJson)
+            next[node.url] = Section(
+                heads: snapshot.heads,
+                lastJSON: snapshot.spansJson,
+                lastName: node.displayName
+            )
             nextOrder.append(node.url)
         }
 
@@ -84,14 +96,46 @@ final class FolderNotebookCore {
     /// It closes that note's last paragraph so the title does not land on the
     /// same line, while keeping it out of the note's own slice — a trailing
     /// newline inside the slice would save an empty paragraph onto every note.
-    private func boundary(titled title: String, first: Bool) -> NSAttributedString {
+    private func boundary(titled title: String, url: String, first: Bool) -> NSAttributedString {
         var attributes = RichText.attributes(block: .heading(level: 2), marks: [:])
         attributes[notebookBoundary] = true
         attributes[.foregroundColor] = NSColor.secondaryLabelColor
-        return NSAttributedString(
-            string: (first ? "" : "\n") + title + "\n",
-            attributes: attributes
-        )
+        let line = NSMutableAttributedString()
+        if !first {
+            line.append(NSAttributedString(string: "\n", attributes: attributes))
+        }
+        var titleAttributes = attributes
+        titleAttributes[notebookTitle] = url
+        line.append(NSAttributedString(string: title, attributes: titleAttributes))
+        line.append(NSAttributedString(string: "\n", attributes: attributes))
+        return line
+    }
+
+    private func titleOwner(at location: Int) -> String? {
+        guard location >= 0, location < storage.length else { return nil }
+        return storage.attribute(notebookTitle, at: location, effectiveRange: nil) as? String
+    }
+
+    /// The note whose name a caret at `location` is editing, by the same rule
+    /// bodies use: the run under the caret, else the one it sits just past.
+    func title(forCaretAt location: Int) -> String? {
+        if let url = titleOwner(at: location) { return url }
+        if location > 0, let url = titleOwner(at: location - 1) { return url }
+        return nil
+    }
+
+    private func titleRange(of url: String) -> NSRange? {
+        var found: NSRange?
+        storage.enumerateAttribute(
+            notebookTitle,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, range, stop in
+            if value as? String == url {
+                found = range
+                stop.pointee = true
+            }
+        }
+        return found
     }
 
     // MARK: - Ownership
@@ -116,36 +160,62 @@ final class FolderNotebookCore {
     }
 
     /// Typed text inherits the attributes to its left, which at the head of a
-    /// note is the boundary. Stamping the caret keeps new text with its note.
+    /// note is the boundary and at the head of a title is a bare newline.
+    /// Stamping the caret keeps new text with whatever it is being typed into.
     func typingAttributes(
         from current: [NSAttributedString.Key: Any],
         at location: Int
     ) -> [NSAttributedString.Key: Any] {
         var attributes = current
+        if let url = title(forCaretAt: location) {
+            attributes[notebookNote] = nil
+            attributes[notebookBoundary] = true
+            attributes[notebookTitle] = url
+            return attributes
+        }
         attributes[notebookBoundary] = nil
+        attributes[notebookTitle] = nil
         if let url = note(forCaretAt: location) {
             attributes[notebookNote] = url
         }
         return attributes
     }
 
-    /// No edit may touch a boundary or reach across one. That is what makes
-    /// every character's owner unambiguous, and what stops a backspace at the
-    /// top of a note from swallowing the one above it.
-    func allowsEdit(in range: NSRange) -> Bool {
+    /// An edit stays inside one note's body or inside one note's title, and
+    /// never spans two of either or touches the newlines holding a boundary
+    /// together. That is what makes every character's owner unambiguous, and
+    /// what stops a backspace at the top of a note swallowing the one above.
+    func allowsEdit(in range: NSRange, replacement: String) -> Bool {
         guard range.length > 0 else {
-            // An insertion point inside a boundary owns nothing, including the
+            if title(forCaretAt: range.location) != nil {
+                return !replacement.contains("\n")
+            }
+            // An insertion point in the structure owns nothing, including the
             // one above the first title: a notebook starts at its first note.
             return note(forCaretAt: range.location) != nil
         }
-        var seen: Set<String> = []
+
+        var titles: Set<String> = []
+        var bodies: Set<String> = []
         for location in range.location..<NSMaxRange(range) {
-            if isBoundary(at: location) { return false }
-            guard let url = owner(at: location) else { return false }
-            seen.insert(url)
-            if seen.count > 1 { return false }
+            if let url = titleOwner(at: location) {
+                titles.insert(url)
+            } else if isBoundary(at: location) {
+                return false
+            } else if let url = owner(at: location) {
+                bodies.insert(url)
+            } else {
+                return false
+            }
+            if titles.count + bodies.count > 1 { return false }
         }
-        return true
+
+        guard let url = titles.first else { return true }
+        // A title is one line, and retyping all of it is fine — but deleting
+        // it outright would leave nowhere to type and no way to name the note
+        // again, so the run has to survive.
+        if replacement.contains("\n") { return false }
+        return !replacement.isEmpty || range.length < (titleRange(of: url)?.length ?? 0)
     }
 
     // MARK: - Saving
@@ -179,7 +249,22 @@ final class FolderNotebookCore {
             pieces[url] = piece
         }
 
+        var titles: [String: String] = [:]
+        storage.enumerateAttribute(
+            notebookTitle,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, range, _ in
+            guard let url = value as? String else { return }
+            titles[url, default: ""] += storage.attributedSubstring(from: range).string
+        }
+
         for url in order {
+            if let name = titles[url]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               name != sections[url]?.lastName,
+               let node = model.node(for: url) {
+                sections[url]?.lastName = name
+                model.renameNode(node, to: name)
+            }
             guard let section = sections[url], let text = pieces[url] else { continue }
             let spans = RichText.spans(from: text)
             let json = SpanNode.encodeList(spans)
@@ -250,7 +335,7 @@ struct FolderNotebookText: NSViewRepresentable {
             shouldChangeTextIn affectedCharRange: NSRange,
             replacementString: String?
         ) -> Bool {
-            core.allowsEdit(in: affectedCharRange)
+            core.allowsEdit(in: affectedCharRange, replacement: replacementString ?? "")
         }
 
         func textDidChange(_ notification: Notification) {
