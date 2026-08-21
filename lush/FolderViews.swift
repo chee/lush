@@ -131,39 +131,35 @@ private struct FolderEmptyState: View {
     }
 }
 
-/// The folder as one continuous document — every note in order, editable in
-/// place, separated by a rule rather than boxed into cards. One scroll view
-/// owns the whole thing: the editors are sized to their content and do not
-/// scroll themselves, because a scroll view inside another that scrolls the
-/// same way is the thing the HIG tells you not to build.
+/// The folder as one continuous document: every note's content in a single
+/// editor, one scroll view and one caret, with the boundary between two notes
+/// drawn as a heading rather than the edge of a box. The notes are rendered
+/// like any other text — not embedded editors — so nothing here nests a
+/// scroll view inside another that scrolls the same way.
 struct FolderNotebook: View {
     let children: [FolderNode]
+
+    @Environment(NotesModel.self) private var model
+    @State private var core: FolderNotebookCore?
 
     private var notes: [FolderNode] { children.filter(\.isNote) }
 
     var body: some View {
-        if notes.isEmpty {
-            FolderEmptyState(message: "No notes in this folder")
-        } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(notes) { node in
-                        Text(node.displayName)
-                            .font(.headline)
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 20)
-                            .padding(.top, 22)
-                            .padding(.bottom, 2)
-                        FolderNoteCard(noteUrl: node.url)
-                        if node.id != notes.last?.id {
-                            Divider().padding(.horizontal, 20)
-                        }
-                    }
-                }
-                .frame(maxWidth: 760, alignment: .leading)
-                .frame(maxWidth: .infinity)
-                .padding(.bottom, 40)
+        Group {
+            if notes.isEmpty {
+                FolderEmptyState(message: "No notes in this folder")
+            } else if let core, core.loaded {
+                FolderNotebookText(core: core)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        }
+        .task(id: notes.map(\.url)) {
+            let core = FolderNotebookCore(model: model)
+            self.core = core
+            await core.load(notes)
         }
     }
 }
