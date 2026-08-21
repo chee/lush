@@ -6,8 +6,9 @@ use std::time::Duration;
 use anyhow::Result;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
-use crate::api::{EmbeddingChunk, IndexedNote, RecentNote, SearchFilter, SearchHit};
+use crate::api::{EmbeddingChunk, IndexedNote, NotePlace, RecentNote, SearchFilter, SearchHit};
 use crate::shapes;
+use crate::shapes::ContextPlace;
 
 /// Cosine below this is noise rather than a weak match.
 const MIN_SEMANTIC_SCORE: f32 = 0.36;
@@ -47,6 +48,8 @@ pub struct IndexedDoc {
     pub tags: Vec<String>,
     pub weather: Vec<String>,
     pub locations: Vec<String>,
+    /// Every logline that carried a fix, in document order.
+    pub places: Vec<ContextPlace>,
     pub facets: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
@@ -63,6 +66,15 @@ fn encode_tags(tags: &[String]) -> String {
         return String::new();
     }
     format!(" {} ", tags.join(" "))
+}
+
+/// Places ride as one JSON array rather than a delimited line each: a place
+/// name is free text and would collide with any separator worth reading back.
+fn encode_places(places: &[ContextPlace]) -> String {
+    if places.is_empty() {
+        return String::new();
+    }
+    serde_json::to_string(places).unwrap_or_default()
 }
 
 /// Open the db and touch its schema so a corrupt file surfaces here rather
@@ -214,6 +226,10 @@ impl SearchIndex {
             "ALTER TABLE search_docs ADD COLUMN facets TEXT NOT NULL DEFAULT ''",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN places TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS search_docs_modified
                 ON search_docs(modified DESC);
@@ -246,19 +262,29 @@ impl SearchIndex {
         if !doc.heads.is_empty() {
             // A row written before `created` existed has to be rewritten even
             // though its heads still match, or it never gets one.
-            let stored: Option<(String, i64, String, String, String)> = conn
+            let stored: Option<(String, i64, String, String, String, String)> = conn
                 .query_row(
-                    "SELECT heads, created, weather, locations, facets FROM search_docs WHERE url = ?1",
+                    "SELECT heads, created, weather, locations, facets, places FROM search_docs WHERE url = ?1",
                     params![doc.url],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            if let Some((heads, created, weather, locations, facets)) = stored {
+            if let Some((heads, created, weather, locations, facets, places)) = stored {
                 if heads == doc.heads
                     && (created != 0 || doc.created == 0)
                     && weather == doc.weather.join("\n")
                     && locations == doc.locations.join("\n")
                     && facets == encode_tags(&doc.facets)
+                    && places == encode_places(&doc.places)
                 {
                     return Ok(());
                 }
@@ -266,8 +292,8 @@ impl SearchIndex {
         }
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, places)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -280,7 +306,8 @@ impl SearchIndex {
                 created = excluded.created,
                 weather = excluded.weather,
                 locations = excluded.locations,
-                facets = excluded.facets",
+                facets = excluded.facets,
+                places = excluded.places",
             params![
                 doc.url,
                 doc.kind,
@@ -294,7 +321,8 @@ impl SearchIndex {
                 doc.created,
                 doc.weather.join("\n"),
                 doc.locations.join("\n"),
-                encode_tags(&doc.facets)
+                encode_tags(&doc.facets),
+                encode_places(&doc.places)
             ],
         )?;
         tx.execute(
@@ -570,6 +598,35 @@ impl SearchIndex {
         Ok(out)
     }
 
+    /// Every logline the index has seen that carried a fix, note by note. The
+    /// indexer has already read each doc once, so a map of them all costs one
+    /// query rather than a walk of the whole collection.
+    pub fn note_places(&self) -> Result<Vec<NotePlace>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, places FROM search_docs WHERE places <> '' ORDER BY url",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let url: String = row.get(0)?;
+            let stored: String = row.get(1)?;
+            let places: Vec<ContextPlace> = serde_json::from_str(&stored).unwrap_or_default();
+            for (ordinal, place) in places.into_iter().enumerate() {
+                out.push(NotePlace {
+                    url: url.clone(),
+                    ordinal: ordinal as u32,
+                    latitude: place.lat,
+                    longitude: place.lon,
+                    name: place.name,
+                    weather: place.weather,
+                    stamped: place.ts,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// Everything a filter can narrow, resolved to a url set. Only worth the
     /// scan when a filter is actually set — it exists so a hit on an asset can
     /// check the notes that embed it against the same filter as the asset.
@@ -704,6 +761,7 @@ pub fn indexed_doc(
         tags: shapes::doc_tags(doc),
         weather: shapes::context_values(doc, "weather"),
         locations: shapes::context_values(doc, "location"),
+        places: shapes::context_places(doc),
         facets: shapes::doc_facets(doc),
         when: shapes::doc_when(doc),
         heads: heads.join(","),
@@ -900,6 +958,7 @@ mod tests {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             weather: Vec::new(),
             locations: Vec::new(),
+            places: Vec::new(),
             facets: Vec::new(),
             when: when.into(),
             heads: String::new(),
@@ -1007,6 +1066,59 @@ mod tests {
             urls(index.search("cake", &SearchFilter::default()).unwrap()),
             ["note"]
         );
+    }
+
+    #[test]
+    fn placed_loglines_come_back_note_by_note() {
+        let index = fixture();
+        let mut doc = indexed("placed", "trip", &[], "");
+        doc.places = vec![
+            ContextPlace {
+                lat: 55.8642,
+                lon: -4.2518,
+                name: "Glasgow".into(),
+                weather: "Rain".into(),
+                ts: "2026-03-04T09:00:00Z".into(),
+            },
+            ContextPlace {
+                lat: 51.5072,
+                lon: -0.1276,
+                name: String::new(),
+                weather: String::new(),
+                ts: String::new(),
+            },
+        ];
+        index.upsert(doc).unwrap();
+
+        let places = index.note_places().unwrap();
+        assert_eq!(places.len(), 2);
+        assert_eq!(places[0].url, "placed");
+        assert_eq!(places[0].ordinal, 0);
+        assert_eq!(places[0].name, "Glasgow");
+        assert_eq!(places[0].stamped, "2026-03-04T09:00:00Z");
+        assert_eq!(places[1].ordinal, 1);
+        assert!((places[1].longitude + 0.1276).abs() < 0.0001);
+    }
+
+    /// A row written before the column existed keeps its heads, so only the
+    /// places comparison can tell the upsert it is out of date.
+    #[test]
+    fn placeless_note_is_rewritten_when_its_loglines_arrive() {
+        let index = fixture();
+        let mut doc = indexed("late", "trip", &[], "");
+        doc.heads = "abc".into();
+        index.upsert(doc.clone()).unwrap();
+        assert!(index.note_places().unwrap().is_empty());
+
+        doc.places = vec![ContextPlace {
+            lat: 55.8642,
+            lon: -4.2518,
+            name: "Glasgow".into(),
+            weather: String::new(),
+            ts: String::new(),
+        }];
+        index.upsert(doc).unwrap();
+        assert_eq!(index.note_places().unwrap().len(), 1);
     }
 
     #[test]

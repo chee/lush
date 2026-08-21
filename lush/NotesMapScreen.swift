@@ -23,31 +23,22 @@ struct NoteLocation: Identifiable, Hashable, Sendable {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
 
-    static func loglines(inSpansJson json: String, of url: String) -> [NoteLocation] {
-        var found: [NoteLocation] = []
-        for span in SpanNode.decodeList(json) {
-            guard case .block(let block) = span,
-                  let snap = ContextSnapshot(block: block),
-                  let latitude = snap.latitude,
-                  let longitude = snap.longitude
-            else { continue }
-            found.append(NoteLocation(
-                noteUrl: url,
-                ordinal: found.count,
-                name: snap.locationName,
-                latitude: latitude,
-                longitude: longitude,
-                weather: snap.weatherDescription,
-                stamped: snap.timestamp == .distantPast ? nil : snap.timestamp
-            ))
+    /// The whole batch at once: one date formatter does for all of them, and
+    /// the index hands them over in one go anyway.
+    static func from(_ places: [NotePlace]) -> [NoteLocation] {
+        let fmt = ISO8601DateFormatter()
+        return places.map { place in
+            NoteLocation(
+                noteUrl: place.url,
+                ordinal: Int(place.ordinal),
+                name: place.name.isEmpty ? nil : place.name,
+                latitude: place.latitude,
+                longitude: place.longitude,
+                weather: place.weather.isEmpty ? nil : place.weather,
+                stamped: place.stamped.isEmpty ? nil : fmt.date(from: place.stamped)
+            )
         }
-        return found
     }
-}
-
-struct NoteLocationEntry: Sendable {
-    let heads: [String]
-    let places: [NoteLocation]
 }
 
 /// Loglines close enough together to be the same place, drawn as one pin. A fix

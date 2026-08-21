@@ -2159,6 +2159,55 @@ pub fn context_values(doc: &Automerge, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// A logline that carried a fix. The stamp stays the string the block was
+/// written with — whoever reads it back knows the format it went in as.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextPlace {
+    pub lat: f64,
+    pub lon: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub weather: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ts: String,
+}
+
+/// Every logline in the doc that knows where it was stamped. A logline without
+/// a fix is nowhere on a map, so it is left out here rather than downstream.
+pub fn context_places(doc: &Automerge) -> Vec<ContextPlace> {
+    let Ok(spans) = spans_to_json(doc) else {
+        return Vec::new();
+    };
+    spans
+        .into_iter()
+        .filter_map(|span| {
+            let SpanJson::Block { value } = span else {
+                return None;
+            };
+            if value.get("type").and_then(Json::as_str) != Some("context") {
+                return None;
+            }
+            let attrs = value.get("attrs").and_then(Json::as_object)?;
+            let text = |key: &str| {
+                attrs
+                    .get(key)
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let created = text("created");
+            Some(ContextPlace {
+                lat: attrs.get("lat").and_then(Json::as_f64)?,
+                lon: attrs.get("lon").and_then(Json::as_f64)?,
+                name: text("location"),
+                weather: text("weather"),
+                ts: if created.is_empty() { text("ts") } else { created },
+            })
+        })
+        .collect()
+}
+
 pub fn doc_facets(doc: &Automerge) -> Vec<String> {
     let kind = doc_kind(doc);
     let mut facets = Vec::new();
@@ -2224,6 +2273,72 @@ pub fn search_snippet(text: &str, query: &str) -> Option<String> {
 
 pub fn doc_field(doc: &Automerge, key: &str) -> String {
     read_str(doc, &ROOT, key).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod context_place_tests {
+    use super::*;
+
+    fn doc_with(raw: &str) -> Automerge {
+        let mut doc = Automerge::new();
+        let spans: Vec<SpanJson> = serde_json::from_str(raw).unwrap();
+        update_spans_from_json(&mut doc, &spans).unwrap();
+        doc
+    }
+
+    #[test]
+    fn every_logline_with_a_fix_is_kept_in_order() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-03-04T09:00:00Z","location":"Glasgow",
+                         "weather":"Rain","lat":55.8642,"lon":-4.2518}}},
+              {"type":"text","value":"some words"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"ts":"2026-03-05T09:00:00Z","location":"London",
+                         "lat":51.5072,"lon":-0.1276}}}
+            ]"#,
+        );
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 2);
+        assert_eq!(places[0].name, "Glasgow");
+        assert_eq!(places[0].weather, "Rain");
+        assert_eq!(places[0].ts, "2026-03-04T09:00:00Z");
+        assert!((places[0].lat - 55.8642).abs() < 0.0001);
+        assert_eq!(places[1].name, "London");
+        assert_eq!(places[1].weather, "");
+        assert_eq!(places[1].ts, "2026-03-05T09:00:00Z");
+    }
+
+    #[test]
+    fn a_logline_without_a_fix_is_nowhere() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-03-04T09:00:00Z","location":"Somewhere"}}},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-03-04T10:00:00Z","lat":55.8642}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"words"}
+            ]"#,
+        );
+        assert!(context_places(&doc).is_empty());
+    }
+
+    #[test]
+    fn a_whole_number_coordinate_still_reads_as_one() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":55,"lon":-4}}}
+            ]"#,
+        );
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].lat, 55.0);
+        assert_eq!(places[0].lon, -4.0);
+        assert_eq!(places[0].ts, "");
+    }
 }
 
 #[cfg(test)]
