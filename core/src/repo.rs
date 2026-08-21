@@ -845,6 +845,7 @@ struct Ingested {
     fragments: Vec<(SedimentreeFragment, Blob)>,
     commit_heads: Vec<ChangeHash>,
     fragment_heads: Vec<ChangeHash>,
+    digests: Vec<Digest<Blob>>,
     skipped: bool,
 }
 
@@ -881,6 +882,7 @@ fn ingest(
             fragments: Vec::new(),
             commit_heads: Vec::new(),
             fragment_heads: Vec::new(),
+            digests: Vec::new(),
             skipped: false,
         };
         for f in doc.fragments(0..) {
@@ -916,6 +918,7 @@ fn ingest(
             };
             let blob = Blob::new(bytes);
             let meta = BlobMeta::new(&blob);
+            out.digests.push(meta.digest());
             let id = CommitId::new(head.0);
             if level == 0 {
                 out.commits
@@ -1846,7 +1849,9 @@ impl Repo {
         self.events.subscribe()
     }
 
-    /// Drops loose commits that a fragment already covers, tree by tree.
+    /// Drops records the doc's fragment view has moved past — loose commits
+    /// a fragment absorbed, fragments a bigger fragment replaced — tree by
+    /// tree. Only resident docs participate; the rest catch up when opened.
     ///
     /// Nothing else ever reclaims them: subduction only deletes loose commits
     /// when a whole document is destroyed, so every commit ever written stays
@@ -1866,24 +1871,25 @@ impl Repo {
         Ok((trees, dropped))
     }
 
-    /// One doc's worth of the same pass, diffed in memory: `stored_commits`
-    /// mirrors what this process has written to or read from disk, so any
-    /// hash in it that the doc no longer reports at level 0 has been
-    /// absorbed into a fragment. The diff and the doc walk happen under the
-    /// state lock, so a record a sync just persisted — on disk before its
-    /// in-memory apply — is never a candidate: it doesn't enter
-    /// `stored_commits` until the apply that also makes it live. Enumerating
-    /// the disk here instead would race that gap and delete live data.
+    /// One doc's worth of the same pass, diffed in memory: the stored sets
+    /// mirror what this process has written to or read from disk, so any
+    /// hash in them the doc no longer reports has been absorbed — a loose
+    /// commit into a fragment, a fragment into a bigger fragment. The diff
+    /// and the doc walk happen under the state lock, so a record a sync
+    /// just persisted — on disk before its in-memory apply — is never a
+    /// candidate: it doesn't enter the stored sets until the apply that
+    /// also makes it live. Enumerating the disk here instead would race
+    /// that gap and delete live data.
     ///
     /// Only runs against a resident, hydrated doc. A doc still loading
-    /// reports no commits, and diffing against that would read as
+    /// reports no fragments, and diffing against that would read as
     /// "everything is absorbed".
     pub(crate) async fn reclaim_doc(&self, id: DocId) -> u64 {
         let sid = id.sedimentree_id();
         let Some(shared) = self.docs.lock().await.get(&id).cloned() else {
             return 0;
         };
-        let absorbed: Vec<ChangeHash> = {
+        let (absorbed_commits, absorbed_fragments) = {
             let state = shared.lock().await;
             if state.doc.get_heads().is_empty() {
                 return 0;
@@ -1906,14 +1912,19 @@ impl Repo {
             if live.is_empty() {
                 return 0;
             }
-            state
-                .stored_commits
-                .iter()
-                .filter(|hash| !live.contains(*hash))
-                .copied()
-                .collect()
+            let absorbed = |stored: &HashSet<ChangeHash>| -> Vec<ChangeHash> {
+                stored
+                    .iter()
+                    .filter(|hash| !live.contains(*hash))
+                    .copied()
+                    .collect()
+            };
+            (
+                absorbed(&state.stored_commits),
+                absorbed(&state.stored_fragments),
+            )
         };
-        let deleted: Vec<ChangeHash> = futures::stream::iter(absorbed)
+        let deleted_commits: Vec<ChangeHash> = futures::stream::iter(absorbed_commits)
             .map(|hash| async move {
                 match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(
                     &self.storage,
@@ -1933,13 +1944,36 @@ impl Repo {
             .filter_map(|hash| async move { hash })
             .collect()
             .await;
-        if !deleted.is_empty() {
+        let deleted_fragments: Vec<ChangeHash> = futures::stream::iter(absorbed_fragments)
+            .map(|hash| async move {
+                match <ObservedStorage as Storage<Sendable>>::delete_fragment(
+                    &self.storage,
+                    sid,
+                    CommitId::new(hash.0),
+                )
+                .await
+                {
+                    Ok(()) => Some(hash),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "deleting fragment failed");
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(RECLAIM_DELETE_CONCURRENCY)
+            .filter_map(|hash| async move { hash })
+            .collect()
+            .await;
+        if !deleted_commits.is_empty() || !deleted_fragments.is_empty() {
             let mut state = shared.lock().await;
-            for hash in &deleted {
+            for hash in &deleted_commits {
                 state.stored_commits.remove(hash);
             }
+            for hash in &deleted_fragments {
+                state.stored_fragments.remove(hash);
+            }
         }
-        deleted.len() as u64
+        (deleted_commits.len() + deleted_fragments.len()) as u64
     }
 
     pub fn announce_notes_prefetched(&self) {
@@ -2455,10 +2489,11 @@ impl Repo {
         }
         let id = DocId::from_sedimentree_id(batch.sedimentree_id);
         let count = batch.commits.len() + batch.fragments.len();
-        // Fragments arriving from a peer cover commits this device may still be
-        // holding loose, so the same reclaim runs on receive as on save.
+        // Fragments arriving from a peer cover records this device may still
+        // be holding, so the same reclaim runs on receive as on save — but
+        // only when the batch actually advanced the doc, which filters out
+        // re-deliveries and the observer's echo of local saves.
         let received_fragments = !batch.fragments.is_empty();
-        let sid = batch.sedimentree_id;
         let (advanced, failed) = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 // Untracked doc: the blobs are on disk but nothing in memory
@@ -2473,8 +2508,7 @@ impl Repo {
             cpu_heavy(|| apply_batch_to_state(&mut state, batch, id))
         };
         self.emit_batch_events(id, count, advanced, failed);
-        if received_fragments {
-            let _ = sid;
+        if received_fragments && advanced {
             self.reclaim_doc(id).await;
         }
         Ok(advanced)
@@ -2536,6 +2570,7 @@ impl Repo {
             fragments,
             commit_heads,
             fragment_heads,
+            digests,
             skipped,
         } = ingested;
         self.core
@@ -2548,6 +2583,10 @@ impl Repo {
             let mut state = shared.lock().await;
             state.stored_commits.extend(commit_heads);
             state.stored_fragments.extend(fragment_heads);
+            // The observer echoes every stored record back through the apply
+            // loop; pre-marking the digests makes the doc's own saves filter
+            // to nothing instead of being parsed back into it.
+            state.applied.extend(digests);
         }
         if muted {
             self.stage_doc(id).await?;
@@ -2981,6 +3020,11 @@ impl Repo {
                 tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to persist");
             }
         }
+        // Records superseded before this process ever saw the doc — old
+        // fragments a bigger fragment replaced, loose commits it absorbed —
+        // would otherwise be re-read on every open forever. The diff is
+        // in-memory and the deletes are no-ops when there's nothing to drop.
+        self.reclaim_doc(id).await;
         self.request_sync(id).await;
     }
 
@@ -5186,6 +5230,115 @@ mod tests {
         fresh.ensure_doc(id).await.unwrap();
         let heads = fresh.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
         assert_eq!(heads, source.get_heads());
+    }
+
+    /// Fragment folding is a scale phenomenon: with byte-granular levels a
+    /// level-2 fragment needs on the order of 65k changes, and only then do
+    /// the level-1 fragments it covers leave the doc's reported view. This
+    /// drives a doc past that point and checks the superseded records
+    /// actually leave the disk.
+    #[tokio::test]
+    async fn reclaim_drops_fragments_a_bigger_fragment_replaced() {
+        let (dir, repo) = test_repo().await;
+        let id = DocId([37; 16]);
+        // Levels are content-hash-derived, so whether a level-2 boundary
+        // appears by 70k changes depends on the exact bytes; this actor and
+        // key shape are known to fold. If an automerge update changes the
+        // fragment rules, the "proves nothing" assert below says so.
+        let mut source = Automerge::new().with_actor(ActorId::from([40; 16].as_slice()));
+        for index in 0..8_000 {
+            put(&mut source, &format!("v-{index}"), index as i64);
+        }
+        let early = ingest(&source, id.sedimentree_id(), &HashSet::new(), &HashSet::new()).unwrap();
+        assert!(!early.fragments.is_empty());
+        let early_commits: HashSet<ChangeHash> = early.commit_heads.iter().copied().collect();
+        let early_fragments: HashSet<ChangeHash> = early.fragment_heads.iter().copied().collect();
+        repo.core
+            .store_built_batch(id.sedimentree_id(), early.commits, early.fragments)
+            .await
+            .unwrap();
+        for index in 8_000..70_000 {
+            put(&mut source, &format!("v-{index}"), index as i64);
+        }
+        let late = ingest(&source, id.sedimentree_id(), &early_commits, &early_fragments).unwrap();
+        repo.core
+            .store_built_batch(id.sedimentree_id(), late.commits, late.fragments)
+            .await
+            .unwrap();
+
+        repo.ensure_doc(id).await.unwrap();
+        let _ = repo.reclaim_doc(id).await;
+        let live: HashSet<ChangeHash> = repo
+            .read_doc(id, |doc| {
+                Ok(doc.fragments(0..).into_iter().map(|f| f.head).collect())
+            })
+            .await
+            .unwrap();
+        let superseded: Vec<_> = early_fragments
+            .iter()
+            .filter(|head| !live.contains(*head))
+            .collect();
+        assert!(
+            !superseded.is_empty(),
+            "no early fragment was replaced; the test proves nothing"
+        );
+        let remaining: HashSet<ChangeHash> =
+            <ObservedStorage as Storage<Sendable>>::load_fragment_metas(
+                &repo.storage,
+                id.sedimentree_id(),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|meta| ChangeHash(*meta.head().as_bytes()))
+            .collect();
+        for head in superseded {
+            assert!(!remaining.contains(head), "superseded fragment still on disk");
+        }
+        for head in &remaining {
+            assert!(live.contains(head), "reclaim left a dead fragment behind");
+        }
+
+        let fresh = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        fresh.ensure_doc(id).await.unwrap();
+        let heads = fresh.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(heads, source.get_heads());
+    }
+
+    #[tokio::test]
+    async fn saved_blobs_are_marked_applied_before_the_echo() {
+        let (_dir, repo) = test_repo().await;
+        let id = DocId([36; 16]);
+        repo.ensure_doc(id).await.unwrap();
+        repo.change_doc(id, |doc| {
+            put(doc, "value", "saved");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let (commits, fragments) = tokio::try_join!(
+            <ObservedStorage as Storage<Sendable>>::load_loose_commits(
+                &repo.storage,
+                id.sedimentree_id()
+            ),
+            <ObservedStorage as Storage<Sendable>>::load_fragments(
+                &repo.storage,
+                id.sedimentree_id()
+            ),
+        )
+        .unwrap();
+        assert!(!commits.is_empty());
+        let shared = repo.docs.lock().await.get(&id).cloned().unwrap();
+        let state = shared.lock().await;
+        for blob in commits
+            .iter()
+            .map(|verified| verified.blob())
+            .chain(fragments.iter().map(|verified| verified.blob()))
+        {
+            assert!(state.applied.contains(&BlobMeta::new(blob).digest()));
+        }
     }
 
     /// Builds an outbox log holding one un-ingested keystroke per key — a

@@ -188,7 +188,19 @@ is the fallback.
 
 ## Memory and disk growth
 
-### M1 — superseded fragments are never deleted · MEDIUM
+### M1 — superseded fragments are never deleted · MEDIUM · **FIXED**
+
+*Fixed 2026-08-21:* `reclaim_doc` now diffs `stored_fragments` against the
+live view under the same lock as the commit diff and deletes fragments the
+doc no longer reports; a reclaim pass also runs at the end of `open_local`,
+so long-dormant docs shed accumulated cruft the first time they're read.
+Empirical note from building the test: folding is a scale phenomenon —
+levels are content-hash-derived and a level-2 fragment needs on the order
+of 65k changes, at which point the covered level-1 fragments leave the
+reported view. `reclaim_drops_fragments_a_bigger_fragment_replaced` drives
+a doc past that point and verifies the superseded records leave the disk
+while the doc rebuilds identically. The Settings action is now honestly
+named "Reclaim Absorbed Records". Original finding:
 
 `reclaim_doc` deletes loose commits only; `delete_fragment` has no caller in
 repo.rs. Every fragment automerge ever forms — including every level-n
@@ -198,7 +210,11 @@ stale commits (source.ts:1813-1848). Extend reclaim to fragments with the
 same live-set logic — after S1's fix, since fragment deletion through a racy
 reclaim would raise the stakes.
 
-### M2 — per-doc sets grow without bound during residency · MEDIUM-LOW
+### M2 — per-doc sets grow without bound during residency · MEDIUM-LOW · **MOSTLY FIXED**
+
+*Update:* `stored_fragments` and `stored_commits` are both pruned by
+reclaim now. `applied`/`failed` still grow for the residency (cleared by
+eviction), which is the remaining sliver of this finding.
 
 `stored_fragments` never shrinks (the post-reclaim `retain` at 1910 touches
 only `stored_commits`); `applied`/`failed` accumulate a digest for every
@@ -206,7 +222,14 @@ record ever seen and are cleared only by eviction. Fine for notes; long
 sessions on pinned, high-churn docs pay it. M1's fix naturally prunes
 `stored_fragments`.
 
-### M3 — every local save echoes back through the apply loop · LOW-MEDIUM
+### M3 — every local save echoes back through the apply loop · LOW-MEDIUM · **FIXED**
+
+*Fixed 2026-08-21:* `save_doc_now` pre-marks the stored blobs' digests in
+`state.applied` in the same lock that extends the stored sets, so the echo
+filters to nothing; and the on-receive reclaim now runs only when a batch
+actually advanced the doc, which drops the second reclaim per
+fragment-writing save. `saved_blobs_are_marked_applied_before_the_echo`
+pins the mechanism. Original finding:
 
 `store_built_batch` writes through `ObservedStorage`, which clones each
 record into the channel unconditionally — including the doc's own saves.
@@ -310,18 +333,16 @@ repeated failures would complete the loop the reference closes with
 1. ~~S1 (reclaim race)~~ — **done**.
 2. ~~S2 (outbox salvage)~~ — **done**.
 3. ~~P1 (stop full-tree reads in steady state)~~ — **done**.
-4. M3 (echo suppression) — one lock-site change, wins CPU + removes the
-   double reclaim.
-5. C1 (save single-flight + fast path).
-6. S4, F1, then M1/M2 — fragment GC is now a small extension of the fixed
-   reclaim (`stored_fragments − live` under the same lock), pending the
-   author's call.
+4. ~~M3 (echo suppression)~~ — **done**.
+5. ~~M1/M2 (fragment GC + set pruning)~~ — **done**.
+6. C1 (save single-flight + fast path).
+7. S4, F1, and the rest as they annoy you.
 
 ## Test results
 
-After the S1/S2/P1 fixes, `cargo test --release --lib` on this container
-(Linux host, same crate): **98 passed, 0 failed, 6 ignored** (the benches),
-stable across four consecutive runs.
+After the S1/S2/P1/M1/M2/M3 fixes, `cargo test --release --lib` on this
+container (Linux host, same crate): **100 passed, 0 failed, 6 ignored**
+(the benches), stable across repeated runs.
 
 Tests added by the audit and fixes:
 
