@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreText
 import ImageIO
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #else
@@ -533,17 +534,21 @@ final class FittingImageAttachment: NSTextAttachment {
                 textContainer: textContainer
             )
         }
-        // rendering attributes and a viewport pass, not a layout invalidation:
-        // the fragment is already the right height, and re-laying it out under
-        // a scroll re-measures the document out from under the scroll view
+        // TextKit 2 keeps what it drew for a fragment and will not draw it
+        // again for a rendering-attribute pass, so a decode that landed after
+        // the first draw left the placeholder on screen for good. Invalidating
+        // the attachment's own character is what actually redraws it, and it
+        // is one character: `attachmentBounds` still answers from the recorded
+        // pixel size, so the fragment comes back the same height and nothing
+        // above or below it moves. The pending refresh above is what keeps
+        // this to one invalidation per decode rather than one per drawn frame.
         return resolveDisplayImage { [weak textContainer] in
             guard let layoutManager = textContainer?.textLayoutManager,
                   let contentManager = layoutManager.textContentManager,
                   let end = contentManager.location(location, offsetBy: 1),
                   let range = NSTextRange(location: location, end: end)
             else { return }
-            layoutManager.invalidateRenderingAttributes(for: range)
-            layoutManager.textViewportLayoutController.layoutViewport()
+            layoutManager.invalidateLayout(for: range)
         }
     }
 }
@@ -795,6 +800,17 @@ final class AssetCache {
         let image = UIImage(cgImage: thumbnail, scale: displayScale, orientation: .up)
         #endif
         return (image, thumbnail.bytesPerRow * thumbnail.height)
+    }
+
+    /// The picture's own file type, read from its own bytes. An image is
+    /// stored with no name — nothing records one — so a drag, a save or a
+    /// share would otherwise hand the receiving app a blob to guess at.
+    nonisolated static func imageType(of data: Data) -> UTType? {
+        let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary),
+              let identifier = CGImageSourceGetType(source)
+        else { return nil }
+        return UTType(identifier as String)
     }
 
     /// Spill an asset's bytes to the caches directory and hand back the file,
