@@ -683,7 +683,14 @@ final class AssetCache {
         Self.displayImages.object(forKey: url as NSString)
     }
 
-    func isImage(_ url: String) -> Bool { imageSizes[url] != nil }
+    /// Whether this url is an image we can still produce. The size alone is not
+    /// enough: bytes are evictable, so an entry whose spill never landed can
+    /// lose them for good. Saying no here sends it back through
+    /// `fetchMissingAssets`, which stores it again. Layout reads `imageSizes`
+    /// directly, so a picture never reflows over this.
+    func isImage(_ url: String) -> Bool {
+        imageSizes[url] != nil && (spillFiles[url] != nil || imageData[url] != nil)
+    }
 
     /// The picture at its own resolution, for the info sheet and the
     /// clipboard. Decoded on the spot and never held: one of these is worth
