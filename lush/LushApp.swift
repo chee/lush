@@ -69,7 +69,7 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         await bounded(seconds: 5) {
             await PatchworkScripting.shared.flushAll()
         }
-        NotesModel.shared.activeEditor?.core?.pushNow()
+        NotesModel.shared.pushLiveEditors()
         NotesModel.shared.presence.leave()
         NotesModel.shared.core?.shutdown()
     }
@@ -113,7 +113,7 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         while done.wait(timeout: .now()) == .timedOut, Date.now < deadline {
             _ = RunLoop.current.run(mode: .default, before: Date.now + 0.05)
         }
-        NotesModel.shared.activeEditor?.core?.pushNow()
+        NotesModel.shared.pushLiveEditors()
         NotesModel.shared.presence.leave()
         NotesModel.shared.core?.shutdown()
     }
@@ -651,7 +651,7 @@ struct LushApp: App {
                     while done.wait(timeout: .now()) == .timedOut, Date.now < deadline {
                         _ = RunLoop.current.run(mode: .default, before: Date.now + 0.05)
                     }
-                    NotesModel.shared.activeEditor?.core?.pushNow()
+                    NotesModel.shared.pushLiveEditors()
                     NotesModel.shared.presence.leave()
                     NotesModel.shared.core?.shutdown()
                 }

@@ -429,26 +429,58 @@ private final class EditorDocumentSession {
 
 @MainActor
 private enum EditorDocumentSessions {
-    private static let capacity = 12
+    /// Only sessions nothing is editing are cached. A session a core still
+    /// holds is never evicted: `EditorCore.session` is a stored reference
+    /// while `pushNow` writes its heads back through a fresh lookup, so
+    /// dropping one out from under a live core splits the note into two
+    /// sessions whose heads then diverge.
+    private static let detachedCapacity = 12
     private static var sessions: [String: EditorDocumentSession] = [:]
-    private static var recency: [String] = []
+    private static var holders: [String: Int] = [:]
+    private static var detachedRecency: [String] = []
 
     static func session(for noteUrl: String) -> EditorDocumentSession {
-        recency.removeAll { $0 == noteUrl }
-        recency.append(noteUrl)
         if let session = sessions[noteUrl] {
+            if holders[noteUrl] == nil { touchDetached(noteUrl) }
             return session
         }
         let session = EditorDocumentSession(noteUrl: noteUrl)
         sessions[noteUrl] = session
         NotesModel.shared.pinNote(noteUrl)
-        while sessions.count > capacity,
-              let oldest = recency.first(where: { $0 != noteUrl && sessions[$0] != nil }) {
-            sessions.removeValue(forKey: oldest)
-            recency.removeAll { $0 == oldest }
+        if holders[noteUrl] == nil { touchDetached(noteUrl) }
+        return session
+    }
+
+    /// A core holds its session for as long as it lives, so how many notes
+    /// stay resident follows how many editors are mounted rather than a fixed
+    /// count. A lazy container mounts what it can show, which is what bounds
+    /// this — the core refuses to sweep a pinned doc, so nothing else will.
+    static func hold(_ noteUrl: String) {
+        holders[noteUrl, default: 0] += 1
+        detachedRecency.removeAll { $0 == noteUrl }
+    }
+
+    static func release(_ noteUrl: String) {
+        guard let count = holders[noteUrl] else { return }
+        if count > 1 {
+            holders[noteUrl] = count - 1
+            return
+        }
+        holders[noteUrl] = nil
+        guard sessions[noteUrl] != nil else { return }
+        touchDetached(noteUrl)
+    }
+
+    private static func touchDetached(_ noteUrl: String) {
+        detachedRecency.removeAll { $0 == noteUrl }
+        detachedRecency.append(noteUrl)
+        while detachedRecency.count > detachedCapacity {
+            let oldest = detachedRecency.removeFirst()
+            guard holders[oldest] == nil,
+                  sessions.removeValue(forKey: oldest) != nil
+            else { continue }
             NotesModel.shared.unpinNote(oldest)
         }
-        return session
     }
 }
 
@@ -579,6 +611,8 @@ final class EditorCore {
         self.model = model
         self.controller = controller
         model.pinNote(noteUrl)
+        EditorDocumentSessions.hold(noteUrl)
+        model.registerLiveEditor(controller, id: ObjectIdentifier(self))
         controller.core = self
         inline.core = self
         noteObserverId = model.addNoteObserver { [weak self] url in
@@ -609,6 +643,8 @@ final class EditorCore {
         caretMemoryTask?.cancel()
         let identity = ObjectIdentifier(self)
         Task { @MainActor [model, noteObserverId, peersObserverId, noteUrl] in
+            model.unregisterLiveEditor(identity)
+            EditorDocumentSessions.release(noteUrl)
             model.unpinNote(noteUrl)
             if let noteObserverId {
                 model.removeNoteObserver(noteObserverId)
@@ -648,12 +684,15 @@ final class EditorCore {
         // undo entries hold snapshots and ranges of the OLD note; replaying
         // them against the next note corrupts it
         view?.pUndoManager?.removeAllActions()
+        let previousUrl = noteUrl
         model.unpinNote(noteUrl)
         model.pinNote(url)
         noteUrl = url
         caretRestored = false
         localWriteHeadsTask = nil
         session = EditorDocumentSessions.session(for: url)
+        EditorDocumentSessions.hold(url)
+        EditorDocumentSessions.release(previousUrl)
         // fold state is per-note; recompute hidden ranges for the incoming
         // storage BEFORE the swap rebuilds its elements
         folding.foldedHeadings.removeAll()
@@ -682,6 +721,13 @@ final class EditorCore {
         #else
         view?.pStorage ?? session.storage
         #endif
+    }
+
+    /// The inspector tabs, the scratchpad and the suspend-time pushes all
+    /// speak to one editor, and it is the one being typed in — not whichever
+    /// one a lazy container happened to mount last.
+    func becameFocused() {
+        model.activeEditor = controller
     }
 
     func attachViewToSharedStorage() {
@@ -4599,6 +4645,12 @@ func editorCopyRange(
 class EditorTextView: NSTextView, EditorTextViewLike {
     weak var core: EditorCore?
 
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { core?.becameFocused() }
+        return became
+    }
+
     private var windowKeyObserver: (any NSObjectProtocol)?
 
     override func viewDidMoveToWindow() {
@@ -5346,6 +5398,12 @@ private final class SuppressedKeyboardInputView: UIInputView {
 
 final class EditorTextView: UITextView, EditorTextViewLike {
     weak var core: EditorCore?
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { core?.becameFocused() }
+        return became
+    }
 
     var editorAccessoryView: UIView?
     private lazy var keyboardSuppressingInputView: UIInputView = {
