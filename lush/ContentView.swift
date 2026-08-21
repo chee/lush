@@ -233,6 +233,7 @@ struct ContentView: View {
     @State private var sidebarSelectionTask: Task<Void, Never>?
     @State private var deferredSidebarTag: String?
     @State private var searchScope: String?
+    @State private var askRequest: NoteFinderRequest?
     @State private var renamingUrl: String?
     @State private var renameText = ""
     @FocusState private var sidebarFocused: Bool
@@ -741,6 +742,7 @@ struct ContentView: View {
                     .listRowSeparator(.hidden)
             } else {
                 if let searchScope { searchScopeRow(searchScope) }
+                askRow
                 saveSearchRow
                 ForEach(searchHits, id: \.url) { hit in
                     searchHitRow(hit)
@@ -768,6 +770,12 @@ struct ContentView: View {
         .sheet(item: $folderSettingsTarget) { node in
             FolderSettingsEditor(node: node)
                 .environment(model)
+        }
+        .sheet(item: $askRequest) { request in
+            NoteFinderView(request: request) { url in
+                selectSidebarRow(url)
+            }
+            .environment(model)
         }
         .task {
             expanded = Set(
@@ -1392,6 +1400,22 @@ struct ContentView: View {
         }
         .font(.caption.weight(.medium))
         .foregroundStyle(Self.selectionTint)
+        .padding(.vertical, 4)
+        .listRowInsets(sidebarRowInsets(depth: 0))
+    }
+
+    /// The same words, handed to the model instead of to the index. It searches
+    /// with them, reads what it turns up, and answers with the notes it means.
+    private var askRow: some View {
+        Button {
+            askRequest = NoteFinderRequest(question: searchQueryText, scope: searchScope)
+        } label: {
+            Label("Ask \u{201C}\(searchQueryText)\u{201D}", systemImage: "sparkle.magnifyingglass")
+                .font(.body.weight(.medium))
+                .foregroundStyle(Self.selectionTint)
+                .lineLimit(1)
+        }
+        .buttonStyle(.plain)
         .padding(.vertical, 4)
         .listRowInsets(sidebarRowInsets(depth: 0))
     }
@@ -2376,6 +2400,7 @@ struct FolderScreen: View {
     @State private var expandedFolders: Set<String> = []
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
+    @State private var askRequest: NoteFinderRequest?
     @Environment(\.editMode) private var editMode
 
     private static let pinnedExpandedKey = "pinnedExpanded"
@@ -2595,6 +2620,15 @@ struct FolderScreen: View {
                         SearchSyntaxPills(text: $searchText)
                     }
                     Button {
+                        askRequest = NoteFinderRequest(question: searchText, scope: folderUrl)
+                    } label: {
+                        Label(
+                            "Ask \u{201C}\(searchText)\u{201D}",
+                            systemImage: "sparkle.magnifyingglass"
+                        )
+                        .lineLimit(1)
+                    }
+                    Button {
                         smartEditor = SmartNotebookEdit(
                             folder: newSmartNotebook(query: searchText, scope: folderUrl ?? ""),
                             isNew: true
@@ -2717,6 +2751,12 @@ struct FolderScreen: View {
         .sheet(item: $folderSettingsTarget) { node in
             FolderSettingsEditor(node: node)
                 .environment(model)
+        }
+        .sheet(item: $askRequest) { request in
+            NoteFinderView(request: request) { url in
+                push(.note(url))
+            }
+            .environment(model)
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
