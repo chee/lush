@@ -361,7 +361,7 @@ final class PadStore {
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
-                  cache.images[url] == nil, cache.names[url] == nil
+                  !cache.hasImage(url), cache.names[url] == nil
             else { return nil }
             return url
         })

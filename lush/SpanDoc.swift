@@ -565,10 +565,63 @@ final class BlockBox: NSObject {
     override var hash: Int { value.type.hashValue }
 }
 
+/// Bounded stores for asset bytes and full-size decoded images. A Dictionary
+/// of photos never gives anything back; NSCache drops its contents under
+/// pressure, and `AssetCache.bytes(for:)` re-maps the spill file after it does.
+final class AssetByteStore {
+    private let cache = NSCache<NSString, NSData>()
+
+    init(limit: Int) { cache.totalCostLimit = limit }
+
+    subscript(url: String) -> Data? {
+        get { cache.object(forKey: url as NSString).map { $0 as Data } }
+        set {
+            let key = url as NSString
+            guard let newValue else {
+                cache.removeObject(forKey: key)
+                return
+            }
+            cache.setObject(newValue as NSData, forKey: key, cost: newValue.count)
+        }
+    }
+}
+
+final class AssetImageStore {
+    private let cache = NSCache<NSString, PImage>()
+
+    init(limit: Int) { cache.totalCostLimit = limit }
+
+    subscript(url: String) -> PImage? {
+        get { cache.object(forKey: url as NSString) }
+        set {
+            let key = url as NSString
+            guard let newValue else {
+                cache.removeObject(forKey: key)
+                return
+            }
+            cache.setObject(newValue, forKey: key, cost: Self.decodedCost(newValue))
+        }
+    }
+
+    /// Roughly what the decoded bitmap occupies. `size` is in points, so iOS
+    /// has to put the scale back to get pixels.
+    private static func decodedCost(_ image: PImage) -> Int {
+        #if os(macOS)
+        let scale: CGFloat = 1
+        #else
+        let scale = image.scale
+        #endif
+        return max(Int(image.size.width * scale * image.size.height * scale * 4), 1)
+    }
+}
+
 @MainActor
 final class AssetCache {
-    var images: [String: PImage] = [:]
-    var imageData: [String: Data] = [:]
+    let images = AssetImageStore(limit: 64 << 20)
+    let imageData = AssetByteStore(limit: 64 << 20)
+    /// Where each asset's bytes were spilled, so an eviction costs a page-in
+    /// rather than a round trip through the core. Paths only.
+    private var spillFiles: [String: URL] = [:]
     var names: [String: String] = [:]
     var fileURLs: [String: URL] = [:]
     var videoThumbs: [String: PImage] = [:]
@@ -582,7 +635,7 @@ final class AssetCache {
 
     private static let displayImages: NSCache<NSString, PImage> = {
         let cache = NSCache<NSString, PImage>()
-        cache.totalCostLimit = 384 << 20
+        cache.totalCostLimit = 48 << 20
         return cache
     }()
 
@@ -596,8 +649,42 @@ final class AssetCache {
     func storeImage(_ data: Data, for url: String) -> PImage? {
         guard let image = PImage(data: data) else { return nil }
         images[url] = image
-        imageData[url] = data
+        // Spill to disk and keep the mapped copy. Mapped pages are clean, so
+        // the kernel reclaims them under pressure instead of killing us for
+        // holding a second heap copy of every photo in the note.
+        if let file = Self.mediaFile(for: url, name: "image", data: data),
+           let mapped = try? Data(contentsOf: file, options: .mappedIfSafe) {
+            spillFiles[url] = file
+            imageData[url] = mapped
+        } else {
+            imageData[url] = data
+        }
         return image
+    }
+
+    /// The decoded image, rebuilt from the spill file when the cache has
+    /// dropped it, so an eviction is invisible to callers.
+    func image(for url: String) -> PImage? {
+        if let cached = images[url] { return cached }
+        guard let data = bytes(for: url), let image = PImage(data: data) else { return nil }
+        images[url] = image
+        return image
+    }
+
+    /// Whether this url is a known image, without paying for a decode.
+    func hasImage(_ url: String) -> Bool {
+        images[url] != nil || spillFiles[url] != nil
+    }
+
+    /// An asset's bytes, re-mapping the spill file when the cache has dropped
+    /// them. The file outlives the cache entry, so an eviction costs a page-in.
+    func bytes(for url: String) -> Data? {
+        if let cached = imageData[url] { return cached }
+        guard let file = spillFiles[url],
+              let mapped = try? Data(contentsOf: file, options: .mappedIfSafe)
+        else { return nil }
+        imageData[url] = mapped
+        return mapped
     }
 
     /// Decode the bounded display bitmap off the main thread, once per url no
@@ -608,7 +695,7 @@ final class AssetCache {
             onReady(display)
             return
         }
-        guard let data = imageData[url] else {
+        guard let data = bytes(for: url) else {
             onReady(nil)
             return
         }
@@ -673,6 +760,21 @@ final class AssetCache {
         let image = UIImage(cgImage: thumbnail, scale: scale, orientation: .up)
         #endif
         return (image, thumbnail.bytesPerRow * thumbnail.height)
+    }
+
+    /// Spill an asset's bytes to the caches directory and hand back the file,
+    /// so it can be mapped instead of held, and so AVFoundation has a URL.
+    nonisolated static func mediaFile(for assetUrl: String, name: String, data: Data) -> URL? {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("AssetMedia", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let safe = assetUrl.replacingOccurrences(of: "automerge:", with: "")
+            .replacingOccurrences(of: "/", with: "_")
+        let file = dir.appendingPathComponent("\(safe)-\(name)")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            guard (try? data.write(to: file)) != nil else { return nil }
+        }
+        return file
     }
 
     static func kind(forName name: String) -> String {
@@ -1616,7 +1718,7 @@ enum RichText {
             attachment = imageBox(drawn, bounds: CGRect(origin: .zero, size: size), ideal: size)
         } else if let url, cache.patchworkDocs.contains(url) {
             attachment = liveBox(width: 460, height: 300)
-        } else if let url, let image = cache.images[url] {
+        } else if let url, let image = cache.image(for: url) {
             let size = Self.fitted(image.size)
             let fitting = imageBox(
                 cache.displayImage(for: url) ?? image,

@@ -2041,6 +2041,10 @@ impl Core {
                     return;
                 }
                 for id in &level {
+                    if !repo.wait_for_headroom().await {
+                        tracing::warn!("prefetch stopping: no headroom");
+                        return;
+                    }
                     let _ = repo.ensure_doc(*id).await;
                 }
                 let found = futures::stream::iter(level.drain(..).map(|id| {

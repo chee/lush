@@ -1281,7 +1281,7 @@ final class EditorCore {
                   block.isEmbedBlock,
                   let url = block.embedUrl,
                   url.hasPrefix("automerge:"),
-                  cache.images[url] == nil, cache.names[url] == nil,
+                  !cache.hasImage(url), cache.names[url] == nil,
                   !cache.patchworkDocs.contains(url)
             else { return nil }
             return url
@@ -1318,7 +1318,7 @@ final class EditorCore {
                 case "video":
                     await prepareVideo(url: url, name: name, data: data)
                 case "audio":
-                    cache.fileURLs[url] = Self.mediaFile(for: url, name: name, data: data)
+                    cache.fileURLs[url] = AssetCache.mediaFile(for: url, name: name, data: data)
                     if let vision = await model.assetVision(url), !vision.ocr.isEmpty {
                         cache.transcripts[url] = vision.ocr
                     }
@@ -1345,7 +1345,7 @@ final class EditorCore {
                   let url = box.value.embedUrl,
                   seen.insert(url).inserted
             else { return }
-            if let image = cache.images[url] {
+            if let image = cache.image(for: url) {
                 images.append(image)
             } else if let file = cache.fileURLs[url] {
                 files.append(file)
@@ -1383,7 +1383,7 @@ final class EditorCore {
     }
 
     private func prepareVideo(url: String, name: String, data: Data) async {
-        guard let fileURL = Self.mediaFile(for: url, name: name, data: data) else { return }
+        guard let fileURL = AssetCache.mediaFile(for: url, name: name, data: data) else { return }
         cache.fileURLs[url] = fileURL
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: fileURL))
         generator.appliesPreferredTrackTransform = true
@@ -1396,19 +1396,6 @@ final class EditorCore {
             #endif
             cache.videoThumbs[url] = PImage.playBadged(poster)
         }
-    }
-
-    static func mediaFile(for assetUrl: String, name: String, data: Data) -> URL? {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AssetMedia", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let safe = assetUrl.replacingOccurrences(of: "automerge:", with: "")
-            .replacingOccurrences(of: "/", with: "_")
-        let file = dir.appendingPathComponent("\(safe)-\(name)")
-        if !FileManager.default.fileExists(atPath: file.path) {
-            guard (try? data.write(to: file)) != nil else { return nil }
-        }
-        return file
     }
 
     /// TextKit builds an attachment's view provider while drawing, but only
@@ -3892,7 +3879,7 @@ final class EditorCore {
               box.value.isEmbedBlock,
               let url = box.value.embedUrl
         else { return false }
-        return cache.images[url] != nil
+        return cache.hasImage(url)
     }
 
     @discardableResult
@@ -3907,7 +3894,7 @@ final class EditorCore {
             return true
         }
         guard let url = block.embedUrl else { return false }
-        if let image = cache.images[url] {
+        if let image = cache.image(for: url) {
             guard includeImages else { return false }
             controller.sheet = .info(
                 assetUrl: url,
@@ -3924,7 +3911,7 @@ final class EditorCore {
             guard let self else { return }
             var fileURL = self.cache.fileURLs[url]
             if fileURL == nil, let data = await self.model.assetBytes(url) {
-                fileURL = Self.mediaFile(for: url, name: name, data: data)
+                fileURL = AssetCache.mediaFile(for: url, name: name, data: data)
                 self.cache.fileURLs[url] = fileURL
             }
             guard let fileURL else { return }
@@ -4023,7 +4010,7 @@ final class EditorCore {
                 mimeType: mime
             ) else { return }
             self.cache.names[newUrl] = name
-            self.cache.fileURLs[newUrl] = Self.mediaFile(for: newUrl, name: name, data: data)
+            self.cache.fileURLs[newUrl] = AssetCache.mediaFile(for: newUrl, name: name, data: data)
             guard let view = self.view, let storage = view.pStorage else { return }
             var target: NSRange?
             storage.enumerateAttribute(
@@ -4124,7 +4111,7 @@ final class EditorCore {
                 case "video":
                     await self.prepareVideo(url: url, name: name, data: data)
                 case "audio":
-                    self.cache.fileURLs[url] = Self.mediaFile(for: url, name: name, data: data)
+                    self.cache.fileURLs[url] = AssetCache.mediaFile(for: url, name: name, data: data)
                 default:
                     break
                 }
@@ -4185,7 +4172,7 @@ final class EditorCore {
             return RecordingSaveResult(state: pending, succeeded: false)
         }
         cache.names[url] = targetName
-        cache.fileURLs[url] = Self.mediaFile(for: url, name: targetName, data: data)
+        cache.fileURLs[url] = AssetCache.mediaFile(for: url, name: targetName, data: data)
         if created {
             transcribeIfAudio(url: url, data: data, name: targetName)
         }
@@ -4497,7 +4484,7 @@ func editorCopyRange(
         guard attributes[.attachment] != nil,
               let box = attributes[.amBlock] as? BlockBox,
               let url = box.value.embedUrl,
-              core.cache.images[url] != nil
+              core.cache.hasImage(url)
         else { continue }
         return NSRange(location: location, length: 1)
     }
@@ -4673,7 +4660,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         for span in spans {
             guard case .block(let block) = span,
                   let url = block.embedUrl,
-                  let image = core?.cache.images[url],
+                  let image = core?.cache.image(for: url),
                   let data = Self.pngData(image)
             else { continue }
             inlineImages[url] = data
@@ -5468,7 +5455,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         for span in spans {
             guard case .block(let block) = span,
                   let url = block.embedUrl,
-                  let image = core?.cache.images[url],
+                  let image = core?.cache.image(for: url),
                   let data = image.pngData()
             else { continue }
             inlineImages[url] = data

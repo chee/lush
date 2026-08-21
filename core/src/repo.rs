@@ -104,6 +104,10 @@ const EVICT_IDLE: Duration = Duration::from_secs(300);
 const MAX_RESIDENT_DOCS: usize = 48;
 /// Headroom below which the sweep stops waiting for docs to go idle.
 const LOW_HEADROOM: u64 = 96 * 1024 * 1024;
+/// How long a speculative job parks for, and how many times, before giving up
+/// and leaving the rest for the next launch.
+const HEADROOM_BACKOFF: Duration = Duration::from_secs(2);
+const HEADROOM_TRIES: usize = 6;
 
 /// Bytes this process may still allocate before the OS kills it, when the OS
 /// will say. iOS gives an app a footprint limit and jetsams it on contact, with
@@ -122,6 +126,10 @@ fn headroom() -> Option<u64> {
 #[cfg(not(target_vendor = "apple"))]
 fn headroom() -> Option<u64> {
     None
+}
+
+fn low_headroom() -> bool {
+    headroom().is_some_and(|free| free < LOW_HEADROOM)
 }
 
 /// Whether the sweep takes the next-oldest doc. Past the idle threshold it
@@ -2863,6 +2871,23 @@ impl Repo {
             tracing::warn!(resident, free_mb = ?after.map(|b| b >> 20), "sweep freed nothing");
         }
         evicted
+    }
+
+    /// Park a speculative job while memory is short, sweeping as it waits.
+    /// Returns false when headroom never came back, which is the caller's cue
+    /// to stop rather than push the device further.
+    ///
+    /// Nobody is waiting on the work this gates, so it yields instead of
+    /// competing with the sweep it would otherwise outrun.
+    pub async fn wait_for_headroom(&self) -> bool {
+        for _ in 0..HEADROOM_TRIES {
+            if !low_headroom() {
+                return true;
+            }
+            self.sweep_idle_docs(Duration::ZERO).await;
+            tokio::time::sleep(HEADROOM_BACKOFF).await;
+        }
+        !low_headroom()
     }
 
     /// Sign and fan out an opaque ephemeral payload on the doc's topic.

@@ -857,7 +857,7 @@ private struct PadCardView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: "\(item.data)#\(store.version)") {
             display = await store.cache.displayImage(ensureFor: item.data)
-                ?? store.cache.images[item.data]
+                ?? store.cache.image(for: item.data)
         }
     }
 
