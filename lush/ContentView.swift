@@ -1028,7 +1028,6 @@ struct ContentView: View {
                     selectionBackground(url: Agenda.sidebarTag, tag: Agenda.sidebarTag)
                 )
             mapRow
-                .modifier(SectionDragReorder(section: .calendar, order: $sectionOrder))
                 .listRowInsets(sidebarRowInsets(depth: 0))
                 .listRowBackground(
                     selectionBackground(url: NotesMap.sidebarTag, tag: NotesMap.sidebarTag)
