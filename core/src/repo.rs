@@ -4911,4 +4911,173 @@ mod tests {
         let loaded = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
         assert_eq!(loaded, expected);
     }
+
+    /// SYNC_AUDIT.md S1. A record a peer's sync just persisted sits on disk
+    /// before its in-memory apply, so reclaim's live snapshot doesn't know it
+    /// — reclaim deletes it, and the late apply then marks its head stored,
+    /// so no later save puts it back. Ignored until reclaim diffs
+    /// `stored_commits` under the state lock instead of re-listing the disk.
+    #[tokio::test]
+    #[ignore]
+    async fn reclaim_spares_a_commit_persisted_but_not_yet_applied() {
+        let (dir, repo) = test_repo().await;
+        let id = DocId([31; 16]);
+        repo.ensure_doc(id).await.unwrap();
+        repo.change_doc(id, |doc| {
+            put(doc, "value", "local");
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (local_bytes, live_commits, live_fragments) = repo
+            .read_doc(id, |doc| {
+                let mut commits = HashSet::new();
+                let mut fragments = HashSet::new();
+                for f in doc.fragments(0..) {
+                    if f.level == 0 {
+                        commits.insert(f.head);
+                    } else {
+                        fragments.insert(f.head);
+                    }
+                }
+                Ok((doc.save(), commits, fragments))
+            })
+            .await
+            .unwrap();
+        let mut peer = Automerge::load(&local_bytes)
+            .unwrap()
+            .with_actor(ActorId::from([32; 16].as_slice()));
+        put(&mut peer, "value", "peer");
+        let ingested = ingest(&peer, id.sedimentree_id(), &live_commits, &live_fragments).unwrap();
+        assert!(!ingested.commits.is_empty());
+        let records: Vec<StoredRecord<LooseCommit>> = ingested
+            .commits
+            .iter()
+            .map(|(meta, blob)| StoredRecord {
+                meta: meta.clone(),
+                blob: blob.clone(),
+            })
+            .collect();
+
+        // A second repo over the same directory persists the peer records the
+        // way a sync write does, without this repo's apply loop hearing of it.
+        let writer = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        writer
+            .core
+            .store_built_batch(id.sedimentree_id(), ingested.commits, ingested.fragments)
+            .await
+            .unwrap();
+
+        let dropped = repo.reclaim_doc(id).await;
+        assert_eq!(dropped, 0, "reclaim deleted a live peer commit");
+
+        repo.apply_stored_batch(StoredBatch {
+            sedimentree_id: id.sedimentree_id(),
+            commits: records,
+            fragments: Vec::new(),
+        })
+        .await
+        .unwrap();
+        repo.save_doc(id).await.unwrap();
+        let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+
+        let fresh = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        fresh.ensure_doc(id).await.unwrap();
+        let reloaded = fresh.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(reloaded, expected, "peer commit lost from local storage");
+    }
+
+    /// Builds an outbox log holding two un-ingested keystrokes: a full-save
+    /// chunk and an appended delta chunk, with both pending ingests aborted so
+    /// the log is the only copy. Returns the log path and the first chunk's
+    /// length.
+    async fn staged_two_chunk_outbox(repo: &Arc<Repo>, id: DocId) -> (std::path::PathBuf, u64) {
+        repo.ensure_doc(id).await.unwrap();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+            put(doc, "keystroke", "durable");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        if let Some(pending) = repo.pending_saves.lock().await.remove(&id) {
+            pending.handle.abort();
+        }
+        let path = repo.outbox_path(id);
+        let staged_len = std::fs::metadata(&path).unwrap().len();
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+            put(doc, "torn", "half-written");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        if let Some(pending) = repo.pending_saves.lock().await.remove(&id) {
+            pending.handle.abort();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > staged_len);
+        (path, staged_len)
+    }
+
+    async fn reopened_keystroke(dir: &TempDir, id: DocId) -> Option<String> {
+        let fresh = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        fresh.ensure_doc(id).await.unwrap();
+        fresh
+            .read_doc(id, |doc| {
+                Ok(doc
+                    .get(ROOT, "keystroke")
+                    .ok()
+                    .flatten()
+                    .map(|(v, _)| v.to_string()))
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The crash shape: an append that died mid-write leaves a truncated
+    /// tail chunk. The fsync'd prefix must replay.
+    #[tokio::test]
+    async fn a_torn_outbox_append_keeps_the_flushed_prefix() {
+        let (dir, repo) = test_repo().await;
+        let id = DocId([33; 16]);
+        let (path, staged_len) = staged_two_chunk_outbox(&repo, id).await;
+        let appended_len = std::fs::metadata(&path).unwrap().len();
+        let torn = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        torn.set_len(staged_len + (appended_len - staged_len) / 2)
+            .unwrap();
+        torn.sync_all().unwrap();
+
+        assert!(reopened_keystroke(&dir, id).await.is_some());
+    }
+
+    /// SYNC_AUDIT.md S2. One corrupt byte inside a chunk voids the whole-file
+    /// replay — including intact chunks after it — and the abandoned log is
+    /// then overwritten by the next stage. Ignored until replay salvages the
+    /// chunks that do parse, or preserves the log aside first.
+    #[tokio::test]
+    #[ignore]
+    async fn a_corrupt_outbox_chunk_keeps_the_other_chunks() {
+        let (dir, repo) = test_repo().await;
+        let id = DocId([33; 16]);
+        let (path, staged_len) = staged_two_chunk_outbox(&repo, id).await;
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = (staged_len / 2) as usize;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            reopened_keystroke(&dir, id).await.is_some(),
+            "one corrupt chunk abandoned the whole log"
+        );
+    }
 }
