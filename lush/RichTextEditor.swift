@@ -125,6 +125,11 @@ final class EditorController {
     var filePickerVisible = false
     var cameraPickerVisible = false
     #endif
+    /// The note's laid-out height, for hosts that give the editor its whole
+    /// height rather than scrolling it. A folder's notebook stacks notes into
+    /// one scroll view, and a scroll view inside another that scrolls the same
+    /// way is the thing the HIG tells you not to build.
+    var contentHeight: CGFloat = 0
     @ObservationIgnored weak var core: EditorCore?
 
     func openFind() {
@@ -5186,6 +5191,10 @@ struct RichTextEditor: NSViewRepresentable {
     let model: NotesModel
     let controller: EditorController
     let contextTracker: ContextTracker
+    /// False when the host sizes the editor to its content instead. The
+    /// editor then reports its height through the controller and never
+    /// scrolls itself.
+    var scrolls = true
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -5231,11 +5240,27 @@ struct RichTextEditor: NSViewRepresentable {
         context.coordinator.markers.driveSelection(from: textView)
 
         let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
+        scroll.hasVerticalScroller = scrolls
         scroll.drawsBackground = true
         // the editor extends under the toolbar; content rests below it
-        scroll.automaticallyAdjustsContentInsets = true
+        scroll.automaticallyAdjustsContentInsets = scrolls
         scroll.documentView = textView
+        if !scrolls {
+            scroll.verticalScrollElasticity = .none
+            textView.postsFrameChangedNotifications = true
+            let controller = self.controller
+            controller.contentHeight = textView.frame.height
+            context.coordinator.heightObserver = NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification,
+                object: textView,
+                queue: nil
+            ) { [weak textView] _ in
+                MainActor.assumeIsolated {
+                    guard let textView else { return }
+                    controller.contentHeight = textView.frame.height
+                }
+            }
+        }
         scroll.contentView.postsBoundsChangedNotifications = true
         context.coordinator.scrollObserver = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -5272,6 +5297,7 @@ struct RichTextEditor: NSViewRepresentable {
         let core: EditorCore
         let markers = ListMarkerLayoutDelegate()
         var scrollObserver: (any NSObjectProtocol)?
+        var heightObserver: (any NSObjectProtocol)?
         var openInTab: ((String) -> Void)?
         private var lastScenePhase: ScenePhase?
 
@@ -5283,6 +5309,9 @@ struct RichTextEditor: NSViewRepresentable {
         deinit {
             if let scrollObserver {
                 NotificationCenter.default.removeObserver(scrollObserver)
+            }
+            if let heightObserver {
+                NotificationCenter.default.removeObserver(heightObserver)
             }
         }
 
