@@ -551,11 +551,10 @@ impl Core {
                 .try_init();
         });
         tracing::info!("lush-core built {}", env!("LUSH_BUILD_TS"));
-        // The default blocking pool is sized for a server: 512 threads at 2MiB
-        // of stack each is more address space than an iOS app gets. `cpu_heavy`
-        // hands work to this pool on every file read and every automerge save,
-        // and a burst can grow it faster than the keep-alive reaps it — one
-        // crash report came back with 501 live blocking threads. Cap it.
+        // `cpu_heavy` hands work to the blocking pool on every file read and
+        // every automerge save. The default cap is sized for a server: 512
+        // threads at 2MiB of stack each is more address space than an iOS app
+        // gets, and a burst grows the pool faster than the keep-alive reaps it.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .max_blocking_threads(32)

@@ -98,9 +98,38 @@ const LOCAL_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSERVER_QUEUE: usize = 64;
 const EVICT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const EVICT_IDLE: Duration = Duration::from_secs(300);
-/// Above this many resident docs the sweep keeps evicting oldest-first even
-/// before they reach the idle threshold.
+/// Ceiling on resident docs. A count is a poor stand-in for a size — one
+/// long-edited note can outweigh forty short ones — so it is a backstop, and
+/// the only trigger left on platforms where `headroom` says nothing.
 const MAX_RESIDENT_DOCS: usize = 48;
+/// Headroom below which the sweep stops waiting for docs to go idle.
+const LOW_HEADROOM: u64 = 96 * 1024 * 1024;
+
+/// Bytes this process may still allocate before the OS kills it, when the OS
+/// will say. iOS gives an app a footprint limit and jetsams it on contact, with
+/// no failed allocation to catch first, so this is the only number that says
+/// how close the drop is. Zero means no limit is being enforced — every macOS
+/// process, and anything that isn't an app — and reads as `None`.
+#[cfg(target_vendor = "apple")]
+fn headroom() -> Option<u64> {
+    extern "C" {
+        fn os_proc_available_memory() -> usize;
+    }
+    let free = unsafe { os_proc_available_memory() } as u64;
+    (free > 0).then_some(free)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn headroom() -> Option<u64> {
+    None
+}
+
+/// Whether the sweep takes the next-oldest doc. Past the idle threshold it
+/// always does; short of it, only to get back under the resident ceiling or
+/// out of the low-headroom margin.
+fn sweep_takes(age: Duration, idle: Duration, resident: usize, headroom: Option<u64>) -> bool {
+    age >= idle || resident > MAX_RESIDENT_DOCS || headroom.is_some_and(|free| free < LOW_HEADROOM)
+}
 
 /// Requests reaching the loopback sync server must come from the app's own
 /// webview, which loads under the custom `lushweb://` scheme. Native peers send
@@ -718,9 +747,8 @@ pub struct Repo {
     /// still running — interleaving them would strand changes in neither
     /// place. Not the doc lock: the append fsyncs, and reads shouldn't wait.
     outbox_locks: std::sync::Mutex<HashMap<DocId, Arc<Mutex<()>>>>,
-    /// Held for the duration of an idle sweep. Memory pressure arrives as a
-    /// repeating signal, so without this every warning stacks another sweep on
-    /// top of the ones already rebuilding docs from disk.
+    /// Held for the duration of an idle sweep, so the repeating memory-pressure
+    /// signal runs one sweep rather than one per warning.
     sweep_lock: Mutex<()>,
     /// Whether the app may still touch the disk — frontmost, or holding a
     /// background assertion, or inside a BGTask. Opportunistic work parks
@@ -1034,22 +1062,17 @@ fn apply_batch_to_state(state: &mut DocState, batch: StoredBatch, id: DocId) -> 
 /// takes any concatenation of `save_incremental` output — loose commits and
 /// fragment bundles, in any order — and resolves the dependencies itself.
 ///
-/// The records are consumed as they are copied, so the concatenation replaces
-/// the blobs instead of doubling them. What is being copied here is a doc's
-/// whole stored history, and it is being copied on the path a device short of
-/// memory takes to open a note. Each blob's place in the buffer comes back
-/// alongside it, so a batch that won't load can still be retried one blob at a
-/// time without a second copy of anything.
+/// Consumes the records as it copies, so the concatenation replaces the blobs
+/// rather than doubling them, and returns each blob's range in the buffer so a
+/// batch that won't load can be retried one blob at a time without a second
+/// copy.
 fn concat_blob_batch(
     commits: Vec<StoredRecord<LooseCommit>>,
     fragments: Vec<StoredRecord<SedimentreeFragment>>,
 ) -> (Vec<u8>, Vec<(Digest<Blob>, std::ops::Range<usize>)>) {
-    // One blob is already its own concatenation, and taking it whole costs
-    // nothing where copying it costs all of it. automerge-repo skips the same
-    // copy at both of its load sites (`blobs.length === 1 ? blobs[0] :
-    // mergeArrays(blobs)`, src/subduction/source.ts). It is the shape a live
-    // sync delta arrives in, and the shape an asset doc — a photo, whole — is
-    // stored in.
+    // One blob is already its own concatenation — the shape a live sync delta
+    // and a whole asset doc arrive in. automerge-repo skips the same copy
+    // (`blobs.length === 1 ? blobs[0] : mergeArrays(blobs)`, source.ts).
     if commits.len() + fragments.len() == 1 {
         let blob = match commits.into_iter().next() {
             Some(record) => record.blob,
@@ -1060,9 +1083,8 @@ fn concat_blob_batch(
         let len = bytes.len();
         return (bytes, vec![(digest, 0..len)]);
     }
-    // Sized up front: growing by doubling means a moment where the old buffer
-    // and the new one are both live, and this runs while the device is already
-    // out of memory.
+    // Sized up front: growing by doubling would leave both buffers live at
+    // once, on the path a device short of memory takes to open a note.
     let total: usize = commits
         .iter()
         .map(|record| record.blob.as_slice().len())
@@ -2822,15 +2844,9 @@ impl Repo {
         // `staged_heads` is the proof, and asking it costs nothing. It is only
         // ever set to heads the disk can reproduce: by `stage_doc`, which has
         // just written a log that replays to them, or by `truncate_outbox`,
-        // which drops the log precisely because the sedimentree already holds
-        // them. `open_local` performs that same replay, so a doc whose heads
-        // match is a doc that comes back.
-        //
-        // Rebuilding the doc from disk and asking automerge for each head's
-        // change answered the same question, but it cost a whole second copy
-        // of the doc plus a change reconstruction per head — spent by the
-        // routine whose job is to give memory back, at the moment there is
-        // none. That is what the sweep was aborting in.
+        // which drops the log because the sedimentree already holds them.
+        // `open_local` performs that same replay, so a doc whose heads match
+        // is a doc that comes back.
         let (heads, rebuildable) = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 return false;
@@ -2869,18 +2885,17 @@ impl Repo {
         true
     }
 
-    /// Evict every unpinned doc idle longer than `idle`, oldest first, then
-    /// keep going past the threshold while more than MAX_RESIDENT_DOCS remain.
+    /// Evict unpinned docs oldest first, taking each one `sweep_takes` allows.
     /// `Duration::ZERO` is the memory-pressure sweep: everything evictable goes.
     ///
-    /// One at a time. The memory-pressure signal repeats for as long as the
-    /// pressure lasts, and a sweep already in flight is doing this one's work,
-    /// so drop it and let the next signal through once that finishes.
+    /// One at a time. The pressure signal repeats for as long as the pressure
+    /// lasts, and a sweep already in flight is doing this one's work.
     pub async fn sweep_idle_docs(&self, idle: Duration) -> usize {
         let Ok(_sweeping) = self.sweep_lock.try_lock() else {
             tracing::debug!("idle sweep already running; skipping");
             return 0;
         };
+        let before = headroom();
         let now = Instant::now();
         let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
         let mut candidates: Vec<(Duration, DocId)> = {
@@ -2898,7 +2913,9 @@ impl Repo {
         let mut resident = candidates.len();
         let mut evicted = 0;
         for (age, id) in candidates {
-            if age < idle && resident <= MAX_RESIDENT_DOCS {
+            // Re-read per doc: giving memory back is the point, so once the
+            // sweep is out of the low-headroom margin it can stop.
+            if !sweep_takes(age, idle, resident, headroom()) {
                 break;
             }
             if self.evict_doc(id).await {
@@ -2906,8 +2923,19 @@ impl Repo {
                 resident -= 1;
             }
         }
+        let after = headroom();
         if evicted > 0 {
-            tracing::info!(evicted, resident, "idle sweep");
+            tracing::info!(
+                evicted,
+                resident,
+                before_mb = ?before.map(|b| b >> 20),
+                after_mb = ?after.map(|b| b >> 20),
+                "idle sweep"
+            );
+        } else if after.is_some_and(|free| free < LOW_HEADROOM) {
+            // The one worth seeing in a crash report: headroom gone and
+            // nothing evictable to give back.
+            tracing::warn!(resident, free_mb = ?after.map(|b| b >> 20), "sweep freed nothing");
         }
         evicted
     }
@@ -3432,10 +3460,8 @@ mod tests {
         );
     }
 
-    /// A one-record batch is taken whole rather than copied, so it skips the
-    /// concatenating loop entirely. It still has to come back with the same
-    /// digest and a range covering the blob, or the per-blob retry and the
-    /// `applied` bookkeeping downstream of it read the wrong bytes.
+    /// The whole-blob path still owes its caller the same digest and a range
+    /// covering the blob, or the per-blob retry reads the wrong bytes.
     #[test]
     fn a_single_blob_batch_is_taken_whole() {
         let mut source = Automerge::new().with_actor(ActorId::from([9; 16].as_slice()));
@@ -4179,11 +4205,8 @@ mod tests {
         .expect("stored blobs for an untracked doc should announce themselves");
     }
 
-    /// What eviction now takes as its proof that a doc is on disk. A save
-    /// leaves `staged_heads` on the doc's own heads — the outbox log replays
-    /// to them, or the sedimentree already holds them and the log is gone.
-    /// Break that and eviction stops happening at all, quietly, so it is
-    /// worth a test of its own rather than a timeout in one of the sweeps.
+    /// Eviction's proof that a doc is on disk. Break it and eviction stops
+    /// happening at all, quietly.
     #[tokio::test]
     async fn a_save_leaves_the_staged_heads_on_the_docs_own_heads() {
         let (_dir, repo) = test_repo().await;
@@ -4355,8 +4378,31 @@ mod tests {
         assert!(repo.docs.lock().await.get(&applying).is_some());
     }
 
-    /// Memory pressure repeats, and each warning used to spawn another sweep
-    /// that rebuilt every doc from disk alongside the ones already doing it.
+    /// The sweep's whole policy. A count of docs is what it falls back to;
+    /// where the OS reports headroom, that decides.
+    #[test]
+    fn low_headroom_takes_docs_the_resident_count_would_have_kept() {
+        let idle = Duration::from_secs(300);
+        let fresh = Duration::from_secs(1);
+        let plenty = Some(4 * 1024 * 1024 * 1024);
+        let scarce = Some(LOW_HEADROOM - 1);
+
+        assert!(sweep_takes(idle, idle, 1, plenty), "past idle, always");
+        assert!(!sweep_takes(fresh, idle, 1, plenty));
+        assert!(sweep_takes(fresh, idle, MAX_RESIDENT_DOCS + 1, plenty));
+        assert!(
+            sweep_takes(fresh, idle, 1, scarce),
+            "headroom overrides age"
+        );
+        // No limit reported (macOS, Linux): the resident ceiling is all there is.
+        assert!(!sweep_takes(fresh, idle, 1, None));
+        assert!(sweep_takes(fresh, idle, MAX_RESIDENT_DOCS + 1, None));
+
+        // The memory-pressure sweep takes everything, headroom notwithstanding.
+        assert!(sweep_takes(Duration::ZERO, Duration::ZERO, 1, plenty));
+    }
+
+    /// Memory pressure repeats; one sweep runs at a time.
     #[tokio::test]
     async fn a_sweep_in_flight_turns_the_next_one_away() {
         let (_dir, repo) = test_repo().await;
