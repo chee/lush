@@ -11,7 +11,7 @@ use futures::StreamExt;
 use tokio::runtime::Runtime;
 
 use crate::{
-    repo::{DocId, Repo, RepoEvent, DEFAULT_SERVER},
+    repo::{wait_for_active, DocId, Repo, RepoEvent, DEFAULT_SERVER},
     search::{self, SearchIndex},
     shapes,
 };
@@ -273,9 +273,6 @@ pub struct Core {
     index_slots: Arc<IndexSlots>,
     folder: std::sync::Mutex<Option<DocId>>,
     history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
-    /// Whether the app still has permission to run. Opportunistic background
-    /// work watches this and parks while it is false — see `set_app_active`.
-    app_active: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -284,18 +281,6 @@ struct CachedDocHistory {
     frontier: HashSet<ChangeHash>,
     known_hashes: HashSet<ChangeHash>,
     entries: Vec<DocHistoryEntry>,
-}
-
-/// Park until the app may run again. Returns `Err` only when the `Core` that
-/// owns the channel is gone, which means the caller should stop for good.
-async fn wait_for_active(
-    mut active: tokio::sync::watch::Receiver<bool>,
-) -> Result<(), tokio::sync::watch::error::RecvError> {
-    if *active.borrow_and_update() {
-        return Ok(());
-    }
-    active.wait_for(|active| *active).await?;
-    Ok(())
 }
 
 fn normalized_heads(mut heads: Vec<ChangeHash>) -> Vec<ChangeHash> {
@@ -599,7 +584,6 @@ impl Core {
             index_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             folder: std::sync::Mutex::new(None),
             history_cache: std::sync::Mutex::new(HashMap::new()),
-            app_active: tokio::sync::watch::channel(true).0,
         });
         core.start_index_updates();
         tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "core constructed");
@@ -2009,15 +1993,15 @@ impl Core {
     /// Tell the core whether the app may still do work — frontmost, or
     /// holding a background assertion, or inside a BGTask.
     ///
-    /// The prefetch walk is the app's longest-running background job: up to
-    /// `PREFETCH_MAX_DOCS` docs, each one a load, a normalizing write and an
-    /// FTS index update. Nothing used to stop it when the app went away, so
-    /// it kept reading, renaming and fsyncing inside the data container long
-    /// after iOS suspended the process — which is what RunningBoard kills an
-    /// app for (`0xdead10cc`, "held a file lock while suspended"). Parking
-    /// the walk lets the process go quiet, and it resumes where it stopped.
+    /// Everything opportunistic parks: the prefetch walk here, and in the repo
+    /// the idle sweep, sync rounds and the head announcements that start them.
+    /// All of them read, rename and fsync inside the data container, and none
+    /// of them used to stop when the app went away — which is what
+    /// RunningBoard kills an app for (`0xdead10cc`, "held a file lock while
+    /// suspended"). Parking lets the process go quiet, and each picks back up
+    /// where it stopped.
     pub fn set_app_active(&self, active: bool) {
-        let _ = self.app_active.send(active);
+        self.repo.set_app_active(active);
     }
 
     /// Start tracking + syncing docs without waiting for them to arrive,
@@ -2029,7 +2013,7 @@ impl Core {
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
         let index = self.index.clone();
-        let active = self.app_active.subscribe();
+        let active = self.repo.app_active();
         self.runtime.spawn(async move {
             let mut visited = HashSet::new();
             let mut level: Vec<DocId> = urls
@@ -2241,11 +2225,20 @@ impl Core {
                 if !repo.wait_for_doc(id, OPEN_TIMEOUT).await {
                     anyhow::bail!("asset not found locally or on the server");
                 }
-                repo.read_doc(id, |doc| {
-                    shapes::file_bytes(doc)
-                        .ok_or_else(|| anyhow::anyhow!("doc has no binary content"))
-                })
-                .await
+                let bytes = repo
+                    .read_doc(id, |doc| {
+                        shapes::file_bytes(doc)
+                            .ok_or_else(|| anyhow::anyhow!("doc has no binary content"))
+                    })
+                    .await;
+                // An asset doc is one immutable blob and the caller now holds
+                // a copy of it. Leaving it resident means a note of photos
+                // carries every one of them twice for the five minutes until
+                // the idle sweep, which is enough to lose a phone. Eviction is
+                // strict — it declines while anything is in flight — so this
+                // is a hint, not a promise.
+                repo.evict_doc(id).await;
+                bytes
             })
             .await??;
         Ok(bytes)

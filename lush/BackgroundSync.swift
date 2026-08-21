@@ -147,9 +147,13 @@ enum BackgroundSync {
 
     private static func endAssertion() {
         guard assertion != .invalid else { return }
+        // park the core before giving the assertion back, not after: the
+        // moment `endBackgroundTask` returns the process can be suspended,
+        // and a core still reading and fsyncing through that is the one
+        // RunningBoard kills (`0xdead10cc`)
+        endBackgroundHold()
         UIApplication.shared.endBackgroundTask(assertion)
         assertion = .invalid
-        endBackgroundHold()
     }
 
     private static func run(_ task: BGTask, budget: Duration) async {
