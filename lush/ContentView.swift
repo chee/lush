@@ -6066,7 +6066,7 @@ enum FolderViewMode: String, CaseIterable {
 struct FolderDetail: View {
     let folderUrl: String
     @Environment(NotesModel.self) private var model
-    @AppStorage("folderViewMode") private var viewMode: FolderViewMode = .document
+    @State private var viewMode: FolderViewMode = .document
 
     var body: some View {
         VStack(spacing: 0) {
