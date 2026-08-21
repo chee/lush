@@ -889,6 +889,13 @@ fn ingest(
                 f.boundary.iter().map(|h| CommitId::new(h.0)).collect();
             let checkpoints: Vec<CommitId> =
                 f.checkpoints.iter().map(|h| CommitId::new(h.0)).collect();
+            // One fragment at a time, where automerge-repo hands its whole
+            // filtered set to `bundleFragmentMetadata` and indexes the result.
+            // `bundle_fragments` is a `filter_map`: a fragment it can't encode
+            // is dropped from the output with nothing to say which one went, so
+            // a batched call can only report a short vec. `skipped` has to name
+            // the failure — it is what holds the outbox log back from being
+            // truncated, and that log is the only copy of the edit.
             let Some(bytes) = doc.bundle_fragments([f]).into_iter().next() else {
                 tracing::warn!(
                     ?head,
