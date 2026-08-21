@@ -16,6 +16,7 @@ enum NavRoute: Hashable {
     case smart(String)
     case calendar
     case meetingNotes
+    case map
     case shortcutsHelp
 }
 
@@ -317,7 +318,9 @@ struct ContentView: View {
             let deferred = deferredSidebarTag
             deferredSidebarTag = nil
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
-            guard !tag.hasPrefix("smart:"), tag != Agenda.sidebarTag, tag != Agenda.meetingNotesTag else { return }
+            guard !tag.hasPrefix("smart:"), tag != Agenda.sidebarTag, tag != Agenda.meetingNotesTag,
+                  tag != NotesMap.sidebarTag
+            else { return }
             guard !initialSelection else { return }
             let delay = deferred == tag ? 80 : 0
             scheduleSidebarSelection(Self.sidebarUrl(tag), delay: delay)
@@ -697,6 +700,8 @@ struct ContentView: View {
                 AgendaScreen { openMobile(.note($0)) }
             case .meetingNotes:
                 MeetingNotesScreen { openMobile(.note($0)) }
+            case .map:
+                NotesMapScreen { openMobile(.note($0)) }
             case .shortcutsHelp:
                 ShortcutsHelpView()
             }
@@ -928,6 +933,7 @@ struct ContentView: View {
             switch section {
             case .calendar:
                 tags.append(Agenda.sidebarTag)
+                tags.append(NotesMap.sidebarTag)
             case .pinned:
                 if pinnedExpanded {
                     tags += model.pinnedNodes.map { "pinned:\($0.url)" }
@@ -1020,6 +1026,12 @@ struct ContentView: View {
                 .listRowInsets(sidebarRowInsets(depth: 0))
                 .listRowBackground(
                     selectionBackground(url: Agenda.sidebarTag, tag: Agenda.sidebarTag)
+                )
+            mapRow
+                .modifier(SectionDragReorder(section: .calendar, order: $sectionOrder))
+                .listRowInsets(sidebarRowInsets(depth: 0))
+                .listRowBackground(
+                    selectionBackground(url: NotesMap.sidebarTag, tag: NotesMap.sidebarTag)
                 )
         case .pinned:
             if !model.pinnedNodes.isEmpty {
@@ -1128,12 +1140,42 @@ struct ContentView: View {
             .listRowInsets(sidebarRowInsets(depth: 0))
     }
 
+    private var mapRow: some View {
+        Label {
+            Text("Map")
+        } icon: {
+            Image(systemName: "map")
+                .foregroundStyle(Color.lushPink)
+        }
+        .font(.title3.weight(.medium))
+        .foregroundStyle(.primary)
+        .lineLimit(1)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 5)
+        .padding(.trailing, sidebarTrailingGutter)
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(NotesMap.sidebarTag) })
+        .contextMenu {
+            Button {
+                MainWindowTabs.open(selection: NotesMap.sidebarTag, using: openWindow)
+            } label: {
+                Label("Open in New Tab", systemImage: "plus.square.on.square")
+            }
+        }
+        .tag(NotesMap.sidebarTag)
+        .listRowInsets(sidebarRowInsets(depth: 0))
+    }
+
     private var calendarSelected: Bool {
         selectedItemUrls.count == 1 && selectedItemUrls.first == Agenda.sidebarTag
     }
 
     private var meetingNotesSelected: Bool {
         selectedItemUrls.count == 1 && selectedItemUrls.first == Agenda.meetingNotesTag
+    }
+
+    private var mapSelected: Bool {
+        selectedItemUrls.count == 1 && selectedItemUrls.first == NotesMap.sidebarTag
     }
 
     @ViewBuilder
@@ -1762,7 +1804,8 @@ struct ContentView: View {
         guard selection.count == 1, let tag = selection.first,
               !tag.hasPrefix("smart:"),
               tag != Agenda.sidebarTag,
-              tag != Agenda.meetingNotesTag
+              tag != Agenda.meetingNotesTag,
+              tag != NotesMap.sidebarTag
         else { return nil }
         let url = Self.sidebarUrl(tag)
         guard url.hasPrefix("automerge:"), model.node(for: url)?.kind != "folder" else { return nil }
@@ -1773,6 +1816,7 @@ struct ContentView: View {
         guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return "Lush" }
         if tag == Agenda.sidebarTag { return "Calendar" }
         if tag == Agenda.meetingNotesTag { return "Meeting Notes" }
+        if tag == NotesMap.sidebarTag { return "Map" }
         if tag.hasPrefix("smart:") {
             return model.smartNotebook(id: String(tag.dropFirst(6)))?.name ?? "Smart Notebook"
         }
@@ -1797,6 +1841,8 @@ struct ContentView: View {
                     MeetingNotesScreen { open($0) }
                 } else if calendarSelected {
                     AgendaScreen { open($0) }
+                } else if mapSelected {
+                    NotesMapScreen { open($0) }
                 } else if let url = selectedDocumentUrl {
                     detailContent(for: url)
                 } else {
@@ -2016,7 +2062,8 @@ struct ContentView: View {
             return
         }
         let identity: String
-        if tag.hasPrefix("smart:") || tag == Agenda.sidebarTag || tag == Agenda.meetingNotesTag {
+        if tag.hasPrefix("smart:") || tag == Agenda.sidebarTag || tag == Agenda.meetingNotesTag
+            || tag == NotesMap.sidebarTag {
             identity = tag
         } else {
             identity = Self.sidebarUrl(tag)
@@ -2043,7 +2090,8 @@ struct ContentView: View {
         if visibleSidebarRowTags.contains(entry.tag)
             || entry.tag.hasPrefix("smart:")
             || entry.tag == Agenda.sidebarTag
-            || entry.tag == Agenda.meetingNotesTag {
+            || entry.tag == Agenda.meetingNotesTag
+            || entry.tag == NotesMap.sidebarTag {
             tag = entry.tag
         } else if entry.identity.hasPrefix("automerge:") {
             tag = rowTag(for: entry.identity)
@@ -2463,6 +2511,17 @@ struct FolderScreen: View {
                         push(.calendar)
                     } label: {
                         CalendarSidebarLabel()
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        push(.map)
+                    } label: {
+                        Label {
+                            Text("Map")
+                        } icon: {
+                            Image(systemName: "map")
+                                .foregroundStyle(Color.lushPink)
+                        }
                     }
                     .buttonStyle(.plain)
                 }

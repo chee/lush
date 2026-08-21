@@ -253,6 +253,9 @@ final class NotesModel {
     /// must not re-read the whole tree; docChanged drops the entries it stales.
     @ObservationIgnored private var metaFetched: Set<String> = []
     @ObservationIgnored private var contextMetaLoading: Set<String> = []
+    /// Loglines with a fix, keyed by note. Held across visits to the map so
+    /// a second look only re-reads the notes whose heads moved.
+    @ObservationIgnored private var noteLocationCache: [String: NoteLocationEntry] = [:]
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
     @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
@@ -946,6 +949,31 @@ final class NotesModel {
         return (previews, thumbnails)
     }
 
+    private nonisolated static func fetchLocations(
+        core: Core,
+        urls: [String],
+        cache: [String: NoteLocationEntry]
+    ) async -> [String: NoteLocationEntry] {
+        var found: [String: NoteLocationEntry] = [:]
+        await withTaskGroup(of: (String, NoteLocationEntry?).self) { group in
+            for url in urls {
+                group.addTask {
+                    let heads = await core.docHeads(url: url)
+                    if let cached = cache[url], cached.heads == heads { return (url, cached) }
+                    guard let json = try? await core.noteSpansJson(url: url) else { return (url, nil) }
+                    let places = await Task.detached {
+                        NoteLocation.loglines(inSpansJson: json, of: url)
+                    }.value
+                    return (url, NoteLocationEntry(heads: heads, places: places))
+                }
+            }
+            for await (url, entry) in group {
+                if let entry { found[url] = entry }
+            }
+        }
+        return found
+    }
+
     private nonisolated static func visibleNotes(in tree: [FolderNode]) -> [FolderNode] {
         var out: [FolderNode] = []
         func walk(_ nodes: [FolderNode]) {
@@ -1587,6 +1615,19 @@ final class NotesModel {
             break
         }
         noteRow(for: url).contextMeta = meta
+    }
+
+    /// Every logline that carries a fix, across every note in the tree. Notes
+    /// are read straight from the core rather than from the rows, since a note
+    /// that has never been scrolled into view has no context meta yet — and
+    /// that meta only keeps the first logline, while the map wants them all.
+    func noteLocations() async -> [NoteLocation] {
+        if core == nil { await start() }
+        guard let core else { return [] }
+        let urls = visibleNoteNodes.map(\.url)
+        let entries = await Self.fetchLocations(core: core, urls: urls, cache: noteLocationCache)
+        noteLocationCache = entries
+        return urls.flatMap { entries[$0]?.places ?? [] }
     }
 
     func documentHistorySummary(url: String) async -> DocumentHistorySummary {
