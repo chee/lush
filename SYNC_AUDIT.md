@@ -27,7 +27,16 @@ and fuzz coverage over ingest, the outbox, and eviction is genuinely strong.
 
 ## Data safety
 
-### S1 — `reclaim_doc` can delete a just-persisted inbound commit · HIGH
+### S1 — `reclaim_doc` can delete a just-persisted inbound commit · HIGH · **FIXED**
+
+*Fixed 2026-08-21:* `reclaim_doc` now computes `absorbed = stored_commits −
+live` under the state lock — a record persisted but not yet applied isn't in
+`stored_commits`, so it can't be a candidate — and prunes the set only for
+deletes that actually succeeded (failed deletes retry next pass, matching
+the reference). The repro below is un-ignored and passing, and a new
+positive test (`reclaim_drops_absorbed_commits_and_keeps_the_doc_rebuildable`)
+proves absorbed commits still get dropped and the doc still rebuilds.
+Original finding kept for the record:
 
 `reclaim_doc` (repo.rs:1843) snapshots the live set from the in-memory doc,
 **drops the state lock**, then enumerates loose commits *on disk*
@@ -64,9 +73,20 @@ constructs the persisted-but-not-yet-applied state deterministically and
 fails today at `assert_eq!(dropped, 0)` — reclaim deletes the peer's commit.
 Un-ignore it when the fix lands.
 
-### S2 — one corrupt outbox chunk voids the whole log, which is then overwritten · MEDIUM
+### S2 — one corrupt outbox chunk voids the whole log, which is then overwritten · MEDIUM · **FIXED**
 
-This one was tested empirically, and the results split it in two:
+*Fixed 2026-08-21:* when the whole-file replay fails, `open_local` now
+renames the log to `.automerge.corrupt` before anything can overwrite it,
+then salvages the chunks that still parse (`salvage_outbox`, splitting on
+automerge's chunk magic) and persists whatever applied. Further empirical
+refinement while fixing: automerge's own replay already tolerates
+corruption *past* the first chunk (applies the prefix, drops the
+unreachable tail), so the fatal shape was first-chunk corruption — its
+content is beyond recovery by anything, but the log now survives for
+forensics instead of being destroyed. Three tests cover the shapes:
+`a_torn_outbox_append_keeps_the_flushed_prefix`,
+`corruption_after_the_first_chunk_keeps_the_prefix`, and
+`a_corrupt_outbox_chunk_preserves_the_log`. Original finding:
 
 - **The crash shape is safe.** A torn tail — an append that died mid-write —
   replays its fsync'd prefix fine. Verified by a new (live) regression test,
@@ -209,7 +229,15 @@ worth remembering when a multi-doc burst lands behind a big asset apply.
 
 ## Performance
 
-### P1 — full-tree disk reads on hot paths · HIGH (perf)
+### P1 — full-tree disk reads on hot paths · HIGH (perf) · **FIXED (hot paths)**
+
+*Fixed 2026-08-21:* `apply_missing_blobs` diffs record heads (cheap
+metadata enumeration) against the in-memory stored sets and loads only the
+blobs those sets don't know — in steady state, none, since the
+stored-batch channel already delivered everything a sync wrote. `sync_once`
+and `on_remote_heads` now use it; the full-tree read remains only where it
+belongs: the open path, the apply-error recovery path, and the
+`pending_change_count` diagnostic. Original finding:
 
 Four paths re-read **every blob of a doc** from disk:
 
@@ -279,26 +307,32 @@ repeated failures would complete the loop the reference closes with
 
 ## Suggested order
 
-1. S1 (reclaim race) — small diff, closes the one true data-loss hole.
-2. S2 (outbox salvage) — preserve-then-salvage on replay failure.
-3. M3 (echo suppression) — one lock-site change, wins CPU + removes the
+1. ~~S1 (reclaim race)~~ — **done**.
+2. ~~S2 (outbox salvage)~~ — **done**.
+3. ~~P1 (stop full-tree reads in steady state)~~ — **done**.
+4. M3 (echo suppression) — one lock-site change, wins CPU + removes the
    double reclaim.
-4. C1 (save single-flight + fast path).
-5. P1 (stop full-tree reads in steady state) — biggest felt performance
-   win for collaboration and battery.
-6. S4, F1, then M1/M2 (fragment GC) once S1 is in.
+5. C1 (save single-flight + fast path).
+6. S4, F1, then M1/M2 — fragment GC is now a small extension of the fixed
+   reclaim (`stored_fragments − live` under the same lock), pending the
+   author's call.
 
 ## Test results
 
-`cargo test --release --lib` on this container (Linux host, same crate):
-**94 passed, 0 failed, 8 ignored** (the 6 `bench_*` tests plus the two
-`#[ignore]`d bug repros added by this audit) in 1.83 s after build.
+After the S1/S2/P1 fixes, `cargo test --release --lib` on this container
+(Linux host, same crate): **98 passed, 0 failed, 6 ignored** (the benches),
+stable across four consecutive runs.
 
-Added by the audit:
+Tests added by the audit and fixes:
 
-- `a_torn_outbox_append_keeps_the_flushed_prefix` — **passes**; guards the
-  torn-append safety that S2's testing confirmed.
-- `reclaim_spares_a_commit_persisted_but_not_yet_applied` — `#[ignore]`d;
-  fails today, demonstrating S1. Un-ignore with the fix.
-- `a_corrupt_outbox_chunk_keeps_the_other_chunks` — `#[ignore]`d; fails
-  today, demonstrating S2's residual case. Un-ignore with the fix.
+- `reclaim_spares_a_commit_persisted_but_not_yet_applied` — the S1 repro,
+  now live and passing.
+- `reclaim_drops_absorbed_commits_and_keeps_the_doc_rebuildable` — the
+  positive path: absorbed commits leave the disk, live tail stays, the doc
+  rebuilds byte-identical.
+- `a_torn_outbox_append_keeps_the_flushed_prefix` — torn-append crash
+  shape replays its fsync'd prefix.
+- `corruption_after_the_first_chunk_keeps_the_prefix` — mid-log corruption
+  keeps the intact prefix.
+- `a_corrupt_outbox_chunk_preserves_the_log` — first-chunk corruption
+  moves the log aside and later stages leave it untouched.

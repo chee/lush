@@ -1171,6 +1171,39 @@ fn merge_outbox_into(doc: &mut Automerge, bytes: &[u8]) -> Result<()> {
     }
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum OutboxReplay {
+    Empty,
+    Full,
+    Salvaged,
+}
+
+/// One corrupt byte fails the whole-file replay, including intact chunks
+/// after it. Chunks start with automerge's magic bytes, so this walks the
+/// magic offsets and applies each piece that still parses. Later chunks are
+/// deltas chained on earlier heads, so what this recovers in practice is the
+/// intact prefix — plus anything later whose dependencies survived.
+fn salvage_outbox(doc: &mut Automerge, bytes: &[u8]) -> bool {
+    const MAGIC: [u8; 4] = [0x85, 0x6f, 0x4a, 0x83];
+    let mut offsets: Vec<usize> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, window)| *window == MAGIC)
+        .map(|(index, _)| index)
+        .collect();
+    offsets.push(bytes.len());
+    let mut applied = false;
+    for pair in offsets.windows(2) {
+        if pair[0] >= pair[1] {
+            continue;
+        }
+        if doc.load_incremental(&bytes[pair[0]..pair[1]]).is_ok() {
+            applied = true;
+        }
+    }
+    applied
+}
+
 impl Repo {
     fn outbox_path(&self, id: DocId) -> PathBuf {
         self.outbox_dir
@@ -1833,19 +1866,24 @@ impl Repo {
         Ok((trees, dropped))
     }
 
-    /// One doc's worth of the same pass, using automerge as the source of
-    /// truth: any persisted hash the doc no longer reports is absorbed, so
-    /// dropping it is provably safe.
+    /// One doc's worth of the same pass, diffed in memory: `stored_commits`
+    /// mirrors what this process has written to or read from disk, so any
+    /// hash in it that the doc no longer reports at level 0 has been
+    /// absorbed into a fragment. The diff and the doc walk happen under the
+    /// state lock, so a record a sync just persisted — on disk before its
+    /// in-memory apply — is never a candidate: it doesn't enter
+    /// `stored_commits` until the apply that also makes it live. Enumerating
+    /// the disk here instead would race that gap and delete live data.
     ///
-    /// Only runs against a resident, hydrated doc. A doc still loading reports
-    /// no commits, and comparing that against what is on disk would read as
-    /// "everything is absorbed" and delete live data.
+    /// Only runs against a resident, hydrated doc. A doc still loading
+    /// reports no commits, and diffing against that would read as
+    /// "everything is absorbed".
     pub(crate) async fn reclaim_doc(&self, id: DocId) -> u64 {
         let sid = id.sedimentree_id();
         let Some(shared) = self.docs.lock().await.get(&id).cloned() else {
             return 0;
         };
-        let live: HashSet<ChangeHash> = {
+        let absorbed: Vec<ChangeHash> = {
             let state = shared.lock().await;
             if state.doc.get_heads().is_empty() {
                 return 0;
@@ -1856,60 +1894,52 @@ impl Repo {
                     .fragments(0..)
                     .into_iter()
                     .map(|f| f.head)
-                    .collect()
+                    .collect::<HashSet<ChangeHash>>()
             }));
-            match collected {
+            let live = match collected {
                 Ok(live) => live,
                 Err(_) => {
                     tracing::warn!(doc = %id.to_url(), "fragment walk panicked; skipping reclaim");
                     return 0;
                 }
-            }
-        };
-        if live.is_empty() {
-            return 0;
-        }
-        let commits = match <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(
-            &self.storage,
-            sid,
-        )
-        .await
-        {
-            Ok(commits) => commits,
-            Err(e) => {
-                tracing::warn!(error = %e, "loading loose commits failed");
+            };
+            if live.is_empty() {
                 return 0;
             }
+            state
+                .stored_commits
+                .iter()
+                .filter(|hash| !live.contains(*hash))
+                .copied()
+                .collect()
         };
-        let absorbed: Vec<_> = commits
-            .into_iter()
-            .map(|commit| commit.head())
-            .filter(|head| !live.contains(&ChangeHash(*head.as_bytes())))
-            .collect();
-        let dropped: u64 = futures::stream::iter(absorbed)
-            .map(|head| async move {
+        let deleted: Vec<ChangeHash> = futures::stream::iter(absorbed)
+            .map(|hash| async move {
                 match <ObservedStorage as Storage<Sendable>>::delete_loose_commit(
                     &self.storage,
                     sid,
-                    head,
+                    CommitId::new(hash.0),
                 )
                 .await
                 {
-                    Ok(()) => 1,
+                    Ok(()) => Some(hash),
                     Err(e) => {
                         tracing::warn!(error = %e, "deleting loose commit failed");
-                        0
+                        None
                     }
                 }
             })
             .buffer_unordered(RECLAIM_DELETE_CONCURRENCY)
-            .fold(0u64, |total, n| async move { total + n })
+            .filter_map(|hash| async move { hash })
+            .collect()
             .await;
-        if dropped > 0 {
+        if !deleted.is_empty() {
             let mut state = shared.lock().await;
-            state.stored_commits.retain(|hash| live.contains(hash));
+            for hash in &deleted {
+                state.stored_commits.remove(hash);
+            }
         }
-        dropped
+        deleted.len() as u64
     }
 
     pub fn announce_notes_prefetched(&self) {
@@ -2127,7 +2157,7 @@ impl Repo {
             self.request_sync_forced(id).await;
             return;
         }
-        let _ = self.apply_new_blobs(id).await;
+        let _ = self.apply_missing_blobs(id).await;
         let still_missing = {
             let Some(state) = self.docs.lock().await.get(&id).cloned() else {
                 return;
@@ -2156,7 +2186,7 @@ impl Repo {
         if outcome.data_received() {
             if self.docs.lock().await.contains_key(&id) {
                 if self.apply_incoming.load(Ordering::Relaxed) || !self.doc_has_heads(id).await {
-                    self.apply_new_blobs(id).await?;
+                    self.apply_missing_blobs(id).await?;
                 }
             } else {
                 // Nothing resident to advance, and reading the batch back just
@@ -2314,6 +2344,90 @@ impl Repo {
     async fn apply_new_blobs(&self, id: DocId) -> Result<bool> {
         let batch = self.stored_batch(id).await?;
         self.apply_stored_batch(batch).await
+    }
+
+    /// Bring the in-memory doc up to date with local storage by metadata
+    /// diff: enumerating record heads is cheap, so only the blobs whose
+    /// heads the stored sets don't know get read. The steady-state answer
+    /// is "none" — the stored-batch channel already delivered everything a
+    /// sync wrote — so the hot paths stop paying a full-tree read per round.
+    async fn apply_missing_blobs(&self, id: DocId) -> Result<bool> {
+        let sid = id.sedimentree_id();
+        let Some(shared) = self.docs.lock().await.get(&id).cloned() else {
+            return self.apply_new_blobs(id).await;
+        };
+        let (known_commits, known_fragments) = {
+            let state = shared.lock().await;
+            (state.stored_commits.clone(), state.stored_fragments.clone())
+        };
+        let (commit_metas, fragment_metas) = tokio::try_join!(
+            <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(&self.storage, sid),
+            <ObservedStorage as Storage<Sendable>>::load_fragment_metas(&self.storage, sid),
+        )
+        .map_err(|e| anyhow!("loading stored metas failed: {e}"))?;
+        let missing_commits: Vec<CommitId> = commit_metas
+            .into_iter()
+            .map(|meta| meta.head())
+            .filter(|head| !known_commits.contains(&ChangeHash(*head.as_bytes())))
+            .collect();
+        let missing_fragments: Vec<CommitId> = fragment_metas
+            .into_iter()
+            .map(|meta| meta.head())
+            .filter(|head| !known_fragments.contains(&ChangeHash(*head.as_bytes())))
+            .collect();
+        if missing_commits.is_empty() && missing_fragments.is_empty() {
+            return Ok(false);
+        }
+        let mut commits = Vec::new();
+        for loaded in futures::stream::iter(missing_commits)
+            .map(|commit_id| {
+                <ObservedStorage as Storage<Sendable>>::load_loose_commit(
+                    &self.storage,
+                    sid,
+                    commit_id,
+                )
+            })
+            .buffer_unordered(RECLAIM_DELETE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+        {
+            match loaded {
+                Ok(Some(verified)) => commits.push(StoredRecord {
+                    meta: verified.payload().clone(),
+                    blob: verified.blob().clone(),
+                }),
+                Ok(None) => {}
+                Err(e) => return Err(anyhow!("loading loose commit failed: {e}")),
+            }
+        }
+        let mut fragments = Vec::new();
+        for loaded in futures::stream::iter(missing_fragments)
+            .map(|fragment_head| {
+                <ObservedStorage as Storage<Sendable>>::load_fragment(
+                    &self.storage,
+                    sid,
+                    fragment_head,
+                )
+            })
+            .buffer_unordered(RECLAIM_DELETE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+        {
+            match loaded {
+                Ok(Some(verified)) => fragments.push(StoredRecord {
+                    meta: verified.payload().clone(),
+                    blob: verified.blob().clone(),
+                }),
+                Ok(None) => {}
+                Err(e) => return Err(anyhow!("loading fragment failed: {e}")),
+            }
+        }
+        self.apply_stored_batch(StoredBatch {
+            sedimentree_id: sid,
+            commits,
+            fragments,
+        })
+        .await
     }
 
     fn emit_batch_events(&self, id: DocId, count: usize, advanced: bool, failed: bool) {
@@ -2825,29 +2939,44 @@ impl Repo {
                 (0, false, false)
             }
         };
-        let merged_staged = cpu_heavy(|| {
-            let Ok(bytes) = std::fs::read(self.outbox_path(id)) else {
-                return false;
+        let replay = cpu_heavy(|| {
+            let path = self.outbox_path(id);
+            let Ok(bytes) = std::fs::read(&path) else {
+                return OutboxReplay::Empty;
             };
             match merge_outbox_into(&mut guard.doc, &bytes) {
-                Ok(()) => true,
+                Ok(()) => OutboxReplay::Full,
                 Err(e) => {
-                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to replay");
-                    false
+                    tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to replay; salvaging");
+                    // The log is the only copy of whatever it holds. Move it
+                    // out of the outbox path before anything can overwrite
+                    // it, then recover the chunks that still parse.
+                    let preserved = path.with_extension("automerge.corrupt");
+                    if let Err(e) = std::fs::rename(&path, &preserved) {
+                        tracing::warn!(doc = %id.to_url(), error = %e, "preserving corrupt staged doc failed");
+                    }
+                    if salvage_outbox(&mut guard.doc, &bytes) {
+                        OutboxReplay::Salvaged
+                    } else {
+                        OutboxReplay::Empty
+                    }
                 }
             }
         });
-        if merged_staged {
+        if replay == OutboxReplay::Full {
             // The log on disk covers everything the doc now holds that the
             // sedimentree doesn't, so record that as the baseline: without
             // it the first keystroke after opening a note rewrites the whole
-            // thing instead of appending one change.
+            // thing instead of appending one change. A salvaged replay makes
+            // no such claim — its log is gone from the outbox path — so it
+            // leaves `staged_heads` unset and relies on the save below to
+            // make the recovered changes durable.
             let heads = guard.doc.get_heads();
             guard.staged_heads = Some(heads);
         }
         drop(guard);
         self.emit_batch_events(id, count, advanced, failed);
-        if merged_staged {
+        if replay != OutboxReplay::Empty {
             if let Err(e) = self.save_doc_now(id).await {
                 tracing::warn!(doc = %id.to_url(), error = %e, "staged doc failed to persist");
             }
@@ -4913,12 +5042,11 @@ mod tests {
     }
 
     /// SYNC_AUDIT.md S1. A record a peer's sync just persisted sits on disk
-    /// before its in-memory apply, so reclaim's live snapshot doesn't know it
-    /// — reclaim deletes it, and the late apply then marks its head stored,
-    /// so no later save puts it back. Ignored until reclaim diffs
-    /// `stored_commits` under the state lock instead of re-listing the disk.
+    /// before its in-memory apply; reclaim used to enumerate the disk and
+    /// delete it, and the late apply then marked its head stored, so no
+    /// later save put it back. Reclaim now diffs `stored_commits` under the
+    /// state lock, which cannot see — and so cannot touch — that record.
     #[tokio::test]
-    #[ignore]
     async fn reclaim_spares_a_commit_persisted_but_not_yet_applied() {
         let (dir, repo) = test_repo().await;
         let id = DocId([31; 16]);
@@ -4992,36 +5120,97 @@ mod tests {
         assert_eq!(reloaded, expected, "peer commit lost from local storage");
     }
 
-    /// Builds an outbox log holding two un-ingested keystrokes: a full-save
-    /// chunk and an appended delta chunk, with both pending ingests aborted so
-    /// the log is the only copy. Returns the log path and the first chunk's
-    /// length.
-    async fn staged_two_chunk_outbox(repo: &Arc<Repo>, id: DocId) -> (std::path::PathBuf, u64) {
+    #[tokio::test]
+    async fn reclaim_drops_absorbed_commits_and_keeps_the_doc_rebuildable() {
+        let (dir, repo) = test_repo().await;
+        let id = DocId([34; 16]);
+        let mut source = Automerge::new().with_actor(ActorId::from([34; 16].as_slice()));
+        for index in 0..100 {
+            put(&mut source, &format!("value-{index}"), index as i64);
+        }
+        let early = ingest(&source, id.sedimentree_id(), &HashSet::new(), &HashSet::new()).unwrap();
+        let early_commits: HashSet<ChangeHash> = early.commit_heads.iter().copied().collect();
+        let early_fragments: HashSet<ChangeHash> = early.fragment_heads.iter().copied().collect();
+        repo.core
+            .store_built_batch(id.sedimentree_id(), early.commits, early.fragments)
+            .await
+            .unwrap();
+        for index in 100..1_000 {
+            put(&mut source, &format!("value-{index}"), index as i64);
+        }
+        let late = ingest(&source, id.sedimentree_id(), &early_commits, &early_fragments).unwrap();
+        assert!(!late.fragments.is_empty());
+        repo.core
+            .store_built_batch(id.sedimentree_id(), late.commits, late.fragments)
+            .await
+            .unwrap();
+
         repo.ensure_doc(id).await.unwrap();
-        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
-            put(doc, "keystroke", "durable");
-            Ok(())
-        })
-        .await
-        .unwrap();
-        if let Some(pending) = repo.pending_saves.lock().await.remove(&id) {
-            pending.handle.abort();
+        let _ = repo.reclaim_doc(id).await;
+        let live: HashSet<ChangeHash> = repo
+            .read_doc(id, |doc| {
+                Ok(doc
+                    .fragments(0..)
+                    .into_iter()
+                    .filter(|f| f.level == 0)
+                    .map(|f| f.head)
+                    .collect())
+            })
+            .await
+            .unwrap();
+        let remaining: HashSet<ChangeHash> =
+            <ObservedStorage as Storage<Sendable>>::load_loose_commit_metas(
+                &repo.storage,
+                id.sedimentree_id(),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|meta| ChangeHash(*meta.head().as_bytes()))
+            .collect();
+        let absorbed: Vec<_> = early_commits
+            .iter()
+            .filter(|head| !live.contains(head))
+            .collect();
+        assert!(!absorbed.is_empty(), "nothing was absorbed; the test proves nothing");
+        for head in absorbed {
+            assert!(!remaining.contains(head), "absorbed loose commit still on disk");
         }
+        for head in &remaining {
+            assert!(live.contains(head), "reclaim left a non-live commit behind");
+        }
+
+        let fresh = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        fresh.ensure_doc(id).await.unwrap();
+        let heads = fresh.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        assert_eq!(heads, source.get_heads());
+    }
+
+    /// Builds an outbox log holding one un-ingested keystroke per key — a
+    /// full-save chunk then appended delta chunks — with every pending ingest
+    /// aborted so the log is the only copy. Returns the log path and the
+    /// file's length after each stage.
+    async fn staged_outbox(repo: &Arc<Repo>, id: DocId, keys: &[&str]) -> (std::path::PathBuf, Vec<u64>) {
+        repo.ensure_doc(id).await.unwrap();
         let path = repo.outbox_path(id);
-        let staged_len = std::fs::metadata(&path).unwrap().len();
-        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
-        repo.change_doc_at_deferred_ingest(id, heads, |doc| {
-            put(doc, "torn", "half-written");
-            Ok(())
-        })
-        .await
-        .unwrap();
-        if let Some(pending) = repo.pending_saves.lock().await.remove(&id) {
-            pending.handle.abort();
+        let mut lens = Vec::new();
+        for key in keys {
+            let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+            repo.change_doc_at_deferred_ingest(id, heads, |doc| {
+                put(doc, key, "staged");
+                Ok(())
+            })
+            .await
+            .unwrap();
+            if let Some(pending) = repo.pending_saves.lock().await.remove(&id) {
+                pending.handle.abort();
+            }
+            lens.push(std::fs::metadata(&path).unwrap().len());
         }
-        assert!(std::fs::metadata(&path).unwrap().len() > staged_len);
-        (path, staged_len)
+        assert!(lens.windows(2).all(|pair| pair[1] > pair[0]));
+        (path, lens)
     }
 
     async fn reopened_keystroke(dir: &TempDir, id: DocId) -> Option<String> {
@@ -5047,37 +5236,65 @@ mod tests {
     async fn a_torn_outbox_append_keeps_the_flushed_prefix() {
         let (dir, repo) = test_repo().await;
         let id = DocId([33; 16]);
-        let (path, staged_len) = staged_two_chunk_outbox(&repo, id).await;
-        let appended_len = std::fs::metadata(&path).unwrap().len();
+        let (path, lens) = staged_outbox(&repo, id, &["keystroke", "torn"]).await;
         let torn = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
             .unwrap();
-        torn.set_len(staged_len + (appended_len - staged_len) / 2)
-            .unwrap();
+        torn.set_len(lens[0] + (lens[1] - lens[0]) / 2).unwrap();
         torn.sync_all().unwrap();
 
         assert!(reopened_keystroke(&dir, id).await.is_some());
     }
 
-    /// SYNC_AUDIT.md S2. One corrupt byte inside a chunk voids the whole-file
-    /// replay — including intact chunks after it — and the abandoned log is
-    /// then overwritten by the next stage. Ignored until replay salvages the
-    /// chunks that do parse, or preserves the log aside first.
+    /// Corruption past the first chunk is tolerated by the replay itself:
+    /// the intact prefix applies and the unreachable tail drops.
     #[tokio::test]
-    #[ignore]
-    async fn a_corrupt_outbox_chunk_keeps_the_other_chunks() {
+    async fn corruption_after_the_first_chunk_keeps_the_prefix() {
         let (dir, repo) = test_repo().await;
-        let id = DocId([33; 16]);
-        let (path, staged_len) = staged_two_chunk_outbox(&repo, id).await;
+        let id = DocId([35; 16]);
+        let (path, lens) = staged_outbox(&repo, id, &["keystroke", "second", "third"]).await;
         let mut bytes = std::fs::read(&path).unwrap();
-        let mid = (staged_len / 2) as usize;
+        let mid = (lens[0] + (lens[1] - lens[0]) / 2) as usize;
         bytes[mid] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
+        assert!(reopened_keystroke(&dir, id).await.is_some());
+    }
+
+    /// SYNC_AUDIT.md S2. A corrupt first chunk fails the whole-file replay,
+    /// and the log — the only copy of every keystroke in it — used to sit in
+    /// the outbox path waiting to be overwritten by the next stage. Replay
+    /// now moves it aside first: the corrupt chunk's own content is beyond
+    /// recovery, but the file survives for forensics instead of being
+    /// destroyed.
+    #[tokio::test]
+    async fn a_corrupt_outbox_chunk_preserves_the_log() {
+        let (dir, repo) = test_repo().await;
+        let id = DocId([33; 16]);
+        let (path, lens) = staged_outbox(&repo, id, &["keystroke", "second"]).await;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[(lens[0] / 2) as usize] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let fresh = Repo::start(dir.path().to_path_buf(), "http://[".to_string(), false)
+            .await
+            .unwrap();
+        fresh.ensure_doc(id).await.unwrap();
+        let preserved = path.with_extension("automerge.corrupt");
+        assert!(preserved.exists(), "the corrupt log was not preserved");
+        let heads = fresh.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        fresh
+            .change_doc_at_deferred_ingest(id, heads, |doc| {
+                put(doc, "after", "recovered");
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert!(
-            reopened_keystroke(&dir, id).await.is_some(),
-            "one corrupt chunk abandoned the whole log"
+            preserved.exists(),
+            "a later stage destroyed the preserved log"
         );
+        assert_eq!(std::fs::read(&preserved).unwrap(), bytes);
     }
 }
