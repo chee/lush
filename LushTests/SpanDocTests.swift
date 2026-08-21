@@ -153,6 +153,55 @@ final class SpanDocTests: XCTestCase {
         XCTAssertNil(saved.attrs["ts"])
     }
 
+    /// The extras are the form's open end: whatever a tracker or a later
+    /// version stamps can still be read and changed here.
+    func testAnExtraCanBeAddedRenamedAndRemoved() {
+        let existing = contextBlock([
+            "ts": .string("2026-08-21T04:04:00Z"),
+            "nowPlaying": .string("Aphex Twin"),
+            "with": .string("nobody"),
+        ])
+        var draft = LoglineDraft(block: existing)
+        XCTAssertEqual(draft.extras.count, 2)
+
+        draft.extras.removeAll { $0.key == "with" }
+        draft.extras.append(LoglineDraft.Extra(key: "mood", value: "fine"))
+        let saved = draft.applied(to: existing)
+
+        XCTAssertEqual(saved.attrs["nowPlaying"]?.stringValue, "Aphex Twin")
+        XCTAssertEqual(saved.attrs["mood"]?.stringValue, "fine")
+        XCTAssertNil(saved.attrs["with"], "a removed row should not survive the save")
+    }
+
+    /// A half-typed row and a row aimed at a field the form already owns are
+    /// both ways to lose data if they are written through.
+    func testAnExtraCannotBeEmptyOrStealAFieldTheFormOwns() {
+        var draft = LoglineDraft(block: contextBlock(["ts": .string("2026-08-21T04:04:00Z")]))
+        draft.location = "Glasgow"
+        draft.extras = [
+            LoglineDraft.Extra(key: "  ", value: "orphan"),
+            LoglineDraft.Extra(key: "location", value: "Tokyo"),
+        ]
+
+        let saved = draft.applied(to: nil)
+
+        XCTAssertEqual(saved.attrs["location"]?.stringValue, "Glasgow")
+        XCTAssertEqual(saved.attrs.keys.filter { $0.hasPrefix(" ") }.count, 0)
+    }
+
+    /// An attr that isn't text was never shown in the form, so a save must not
+    /// drop it on the way past.
+    func testASaveKeepsAnExtraTheFormCouldNotShow() {
+        let existing = contextBlock([
+            "ts": .string("2026-08-21T04:04:00Z"),
+            "steps": .number(4021),
+        ])
+
+        let saved = LoglineDraft(block: existing).applied(to: existing)
+
+        XCTAssertEqual(saved.attrs["steps"]?.doubleValue, 4021)
+    }
+
     /// Filled in by hand, so there is nothing for a refresh to chase — and a
     /// spinner that never stops is what would be left otherwise.
     func testAHandWrittenLoglineIsNotPending() {

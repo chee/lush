@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import CoreLocation
 import AVKit
 import WebKit
 
@@ -907,6 +908,7 @@ struct LoglineEditorSheet: View {
     let isNew: Bool
     let onSave: (LoglineDraft) -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var pickingPoint = false
 
     private static let zones = TimeZone.knownTimeZoneIdentifiers.sorted()
 
@@ -933,6 +935,7 @@ struct LoglineEditorSheet: View {
                         .autocorrectionDisabled()
                     TextField("Longitude", text: $draft.longitude)
                         .autocorrectionDisabled()
+                    Button("Find on a Map…") { pickingPoint = true }
                     if draft.coordinateIsBroken {
                         Label(
                             "Needs both, as numbers, within ±90 and ±180. Saving now drops them.",
@@ -944,6 +947,29 @@ struct LoglineEditorSheet: View {
                 }
                 Section("Weather") {
                     TextField("Weather", text: $draft.weather)
+                }
+                Section {
+                    ForEach($draft.extras) { $extra in
+                        HStack(spacing: 8) {
+                            TextField("Key", text: $extra.key)
+                                .autocorrectionDisabled()
+                            TextField("Value", text: $extra.value)
+                            Button {
+                                draft.extras.removeAll { $0.id == extra.id }
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    Button("Add Detail") {
+                        draft.extras.append(LoglineDraft.Extra(key: "", value: ""))
+                    }
+                } header: {
+                    Text("Details")
+                } footer: {
+                    Text("Anything else the logline records — what was playing, who was there. A row with no key is dropped.")
                 }
                 Section("Preview") {
                     Text(LoglineStampFormat.string(for: draft.date, zone: draft.zone))
@@ -963,8 +989,27 @@ struct LoglineEditorSheet: View {
         }
         .padding(16)
         #if os(macOS)
-        .frame(width: 420, height: 520)
+        .frame(width: 420, height: 560)
         #endif
+        .sheet(isPresented: $pickingPoint) {
+            MapPointPicker(
+                start: draft.coordinate.map {
+                    CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon)
+                },
+                initialName: draft.location,
+                showsRadius: false,
+                requiresName: false,
+                confirmTitle: "Use This Place"
+            ) { point in
+                draft.latitude = String(point.coordinate.latitude)
+                draft.longitude = String(point.coordinate.longitude)
+                // the reverse-geocoded name is a suggestion, not a correction:
+                // a place already named by hand keeps its name
+                if draft.location.trimmingCharacters(in: .whitespaces).isEmpty {
+                    draft.location = point.name
+                }
+            }
+        }
     }
 
     /// Changing the zone means "it was this o'clock over there", not "it was

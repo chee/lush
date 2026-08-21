@@ -666,8 +666,13 @@ struct LoglineSettingsPane: View {
             }
         }
         .sheet(isPresented: $mapPickerPresented) {
-            MapPlacePicker(start: currentCoordinate) { place in
-                add([place])
+            MapPointPicker(start: currentCoordinate) { point in
+                add([SavedPlace(
+                    name: point.name,
+                    latitude: point.coordinate.latitude,
+                    longitude: point.coordinate.longitude,
+                    radius: point.radius
+                )])
                 importStatus = nil
             }
         }
