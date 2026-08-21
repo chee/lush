@@ -848,6 +848,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func notePad(url: String)  -> String?
     
+    /**
+     * Every logline the index has seen that carried a fix. The indexer has
+     * already been through each note, so this reads its work rather than the
+     * notes themselves.
+     */
+    func notePlaces()  -> [NotePlace]
+    
     func notePreview(url: String) async  -> String
     
     func noteSpansJson(url: String) async throws  -> String
@@ -955,13 +962,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * Tell the core whether the app may still do work — frontmost, or
      * holding a background assertion, or inside a BGTask.
      *
-     * The prefetch walk is the app's longest-running background job: up to
-     * `PREFETCH_MAX_DOCS` docs, each one a load, a normalizing write and an
-     * FTS index update. Nothing used to stop it when the app went away, so
-     * it kept reading, renaming and fsyncing inside the data container long
-     * after iOS suspended the process — which is what RunningBoard kills an
-     * app for (`0xdead10cc`, "held a file lock while suspended"). Parking
-     * the walk lets the process go quiet, and it resumes where it stopped.
+     * Everything opportunistic parks: the prefetch walk here, and in the repo
+     * the idle sweep, sync rounds and the head announcements that start them.
+     * All of them read, rename and fsync inside the data container, and none
+     * of them used to stop when the app went away — which is what
+     * RunningBoard kills an app for (`0xdead10cc`, "held a file lock while
+     * suspended"). Parking lets the process go quiet, and each picks back up
+     * where it stopped.
      */
     func setAppActive(active: Bool) 
     
@@ -1926,6 +1933,18 @@ open func notePad(url: String) -> String?  {
 })
 }
     
+    /**
+     * Every logline the index has seen that carried a fix. The indexer has
+     * already been through each note, so this reads its work rather than the
+     * notes themselves.
+     */
+open func notePlaces() -> [NotePlace]  {
+    return try!  FfiConverterSequenceTypeNotePlace.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_note_places(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func notePreview(url: String)async  -> String  {
     return
         try!  await uniffiRustCallAsync(
@@ -2278,13 +2297,13 @@ open func semanticSearch(vector: [Float], limit: UInt32, excluding: [String], fi
      * Tell the core whether the app may still do work — frontmost, or
      * holding a background assertion, or inside a BGTask.
      *
-     * The prefetch walk is the app's longest-running background job: up to
-     * `PREFETCH_MAX_DOCS` docs, each one a load, a normalizing write and an
-     * FTS index update. Nothing used to stop it when the app went away, so
-     * it kept reading, renaming and fsyncing inside the data container long
-     * after iOS suspended the process — which is what RunningBoard kills an
-     * app for (`0xdead10cc`, "held a file lock while suspended"). Parking
-     * the walk lets the process go quiet, and it resumes where it stopped.
+     * Everything opportunistic parks: the prefetch walk here, and in the repo
+     * the idle sweep, sync rounds and the head announcements that start them.
+     * All of them read, rename and fsync inside the data container, and none
+     * of them used to stop when the app went away — which is what
+     * RunningBoard kills an app for (`0xdead10cc`, "held a file lock while
+     * suspended"). Parking lets the process go quiet, and each picks back up
+     * where it stopped.
      */
 open func setAppActive(active: Bool)  {try! rustCall() {
     uniffi_lush_core_fn_method_core_set_app_active(self.uniffiClonePointer(),
@@ -4215,6 +4234,133 @@ public func FfiConverterTypeNoteInfo_lower(_ value: NoteInfo) -> RustBuffer {
 }
 
 
+/**
+ * One logline that carried a fix, as the index kept it.
+ */
+public struct NotePlace {
+    public var url: String
+    /**
+     * Which of the note's placed loglines this is, in document order.
+     */
+    public var ordinal: UInt32
+    public var latitude: Double
+    public var longitude: Double
+    public var name: String
+    public var weather: String
+    /**
+     * When the logline was stamped, as it was written: an ISO 8601 string,
+     * empty when the block carries no stamp.
+     */
+    public var stamped: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, 
+        /**
+         * Which of the note's placed loglines this is, in document order.
+         */ordinal: UInt32, latitude: Double, longitude: Double, name: String, weather: String, 
+        /**
+         * When the logline was stamped, as it was written: an ISO 8601 string,
+         * empty when the block carries no stamp.
+         */stamped: String) {
+        self.url = url
+        self.ordinal = ordinal
+        self.latitude = latitude
+        self.longitude = longitude
+        self.name = name
+        self.weather = weather
+        self.stamped = stamped
+    }
+}
+
+#if compiler(>=6)
+extension NotePlace: Sendable {}
+#endif
+
+
+extension NotePlace: Equatable, Hashable {
+    public static func ==(lhs: NotePlace, rhs: NotePlace) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.ordinal != rhs.ordinal {
+            return false
+        }
+        if lhs.latitude != rhs.latitude {
+            return false
+        }
+        if lhs.longitude != rhs.longitude {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.weather != rhs.weather {
+            return false
+        }
+        if lhs.stamped != rhs.stamped {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(ordinal)
+        hasher.combine(latitude)
+        hasher.combine(longitude)
+        hasher.combine(name)
+        hasher.combine(weather)
+        hasher.combine(stamped)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNotePlace: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NotePlace {
+        return
+            try NotePlace(
+                url: FfiConverterString.read(from: &buf), 
+                ordinal: FfiConverterUInt32.read(from: &buf), 
+                latitude: FfiConverterDouble.read(from: &buf), 
+                longitude: FfiConverterDouble.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                weather: FfiConverterString.read(from: &buf), 
+                stamped: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NotePlace, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterUInt32.write(value.ordinal, into: &buf)
+        FfiConverterDouble.write(value.latitude, into: &buf)
+        FfiConverterDouble.write(value.longitude, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.weather, into: &buf)
+        FfiConverterString.write(value.stamped, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotePlace_lift(_ buf: RustBuffer) throws -> NotePlace {
+    return try FfiConverterTypeNotePlace.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotePlace_lower(_ value: NotePlace) -> RustBuffer {
+    return FfiConverterTypeNotePlace.lower(value)
+}
+
+
 public struct NoteSpansSnapshot {
     public var spansJson: String
     public var heads: [String]
@@ -5788,6 +5934,31 @@ fileprivate struct FfiConverterSequenceTypeNoteInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeNotePlace: FfiConverterRustBuffer {
+    typealias SwiftType = [NotePlace]
+
+    public static func write(_ value: [NotePlace], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNotePlace.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NotePlace] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NotePlace]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNotePlace.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePadItem: FfiConverterRustBuffer {
     typealias SwiftType = [PadItem]
 
@@ -6195,6 +6366,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_note_pad() != 50991) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_note_places() != 6513) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_note_preview() != 55716) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6276,7 +6450,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_semantic_search() != 33300) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_set_app_active() != 48668) {
+    if (uniffi_lush_core_checksum_method_core_set_app_active() != 40186) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_apply_incoming() != 5016) {

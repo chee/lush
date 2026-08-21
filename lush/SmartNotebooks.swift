@@ -187,10 +187,10 @@ extension NotesModel {
         }
     }
 
-    /// A background launch can reach the check before the docs have loaded.
-    /// The core says when they have; this only bounds how long it is worth
-    /// holding a background task open waiting to hear it.
-    private func waitForStartup(timeout: Duration = .seconds(20)) async -> Bool {
+    /// A background launch, or a screen opened while Lush is still coming up,
+    /// can reach the docs before they have loaded. The core says when they
+    /// have; this only bounds how long it is worth waiting to hear it.
+    func waitForStartup(timeout: Duration = .seconds(20)) async -> Bool {
         guard !startupSettled else { return true }
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.awaitStartup() }

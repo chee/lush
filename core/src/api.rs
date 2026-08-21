@@ -237,6 +237,21 @@ pub struct IndexedNote {
     pub when: String,
 }
 
+/// One logline that carried a fix, as the index kept it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NotePlace {
+    pub url: String,
+    /// Which of the note's placed loglines this is, in document order.
+    pub ordinal: u32,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub name: String,
+    pub weather: String,
+    /// When the logline was stamped, as it was written: an ISO 8601 string,
+    /// empty when the block carries no stamp.
+    pub stamped: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AssetVision {
     pub description: String,
@@ -2093,6 +2108,13 @@ impl Core {
         self.index
             .search(&query, &filter.unwrap_or_default())
             .unwrap_or_default()
+    }
+
+    /// Every logline the index has seen that carried a fix. The indexer has
+    /// already been through each note, so this reads its work rather than the
+    /// notes themselves.
+    pub fn note_places(&self) -> Vec<NotePlace> {
+        self.index.note_places().unwrap_or_default()
     }
 
     /// Hands the index the folder tree as child -> parent edges, so a scoped

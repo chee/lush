@@ -1589,6 +1589,18 @@ final class NotesModel {
         noteRow(for: url).contextMeta = meta
     }
 
+    /// Every logline that carries a fix. The indexer reads each note as it
+    /// lands and keeps its placed loglines, so this is one query against the
+    /// index rather than a walk of the whole collection — and it waits for the
+    /// startup crawl, since an early answer would be a short one.
+    func noteLocations() async -> [NoteLocation] {
+        if core == nil { await start() }
+        guard let core else { return [] }
+        _ = await waitForStartup()
+        let places = await Task.detached { NoteLocation.from(core.notePlaces()) }.value
+        return places.filter { node(for: $0.noteUrl) != nil }
+    }
+
     func documentHistorySummary(url: String) async -> DocumentHistorySummary {
         guard let core else {
             return DocumentHistorySummary(changeCount: 0, heads: [], modified: nil, entries: [], pendingEntries: [])
