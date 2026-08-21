@@ -23,6 +23,15 @@ final class NoteFinderTests: XCTestCase {
         )
     }
 
+    /// Citing the longer of two overlapping urls must not select the shorter.
+    func testAUrlThatStartsAnotherIsNotCountedAsCited() {
+        let found = [hit("automerge:aaa", "Pasta"), hit("automerge:aaa2", "Bikes")]
+        XCTAssertEqual(
+            NoteFinder.hits(citedIn: "It is automerge:aaa2.", from: found).map(\.url),
+            ["automerge:aaa2"]
+        )
+    }
+
     /// One url being the start of another must not leave half of it behind.
     func testUrlsAreReadBackAsNames() {
         let found = [hit("automerge:aaa", "Pasta"), hit("automerge:aaa2", "")]

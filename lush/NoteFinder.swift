@@ -100,11 +100,18 @@ final class NoteFinderSession {
             let folder = Self.string(arguments["folder_url"]) ?? Self.string(arguments["url"])
             let nodes = folder.flatMap { model.node(for: $0)?.children } ?? (folder == nil ? model.folderTree : [])
             guard !nodes.isEmpty else { return folder == nil ? "No notebooks." : "Empty, or there is nothing at that url." }
-            return nodes.prefix(60).map { "\($0.kind): \($0.displayName) — \($0.url)" }.joined(separator: "\n")
+            let listed = Array(nodes.prefix(60))
+            // a title can be enough to settle it, so a note named here has to be
+            // one the answer can name — and one the person can then open
+            _ = remember(listed.filter { $0.kind != "folder" }.map {
+                SearchHit(url: $0.url, name: $0.displayName, snippet: "")
+            })
+            return listed.map { "\($0.kind): \($0.displayName) — \($0.url)" }.joined(separator: "\n")
 
         case "read_note", "read", "open_note":
             guard let url = Self.string(arguments["url"]) else { return "read_note needs a url." }
-            let spans = SpanNode.decodeList(await model.spansJSON(for: url))
+            let json = await model.spansJSON(for: url)
+            let spans = await Task.detached { SpanNode.decodeList(json) }.value
             guard !spans.isEmpty else { return "That note is empty or could not be read." }
             let name = model.node(for: url)?.displayName ?? "Untitled"
             _ = remember([SearchHit(url: url, name: name, snippet: "")])
@@ -265,8 +272,16 @@ enum NoteFinder {
     /// falling back to all of them, because an answer with nothing under it is
     /// no use to someone looking for a note.
     static func hits(citedIn text: String, from found: [SearchHit]) -> [SearchHit] {
-        let cited = found.filter { text.contains($0.url) }
-        return Array((cited.isEmpty ? found : cited).prefix(12))
+        // longest first, striking each one out as it is found: otherwise a url
+        // that is the start of the one actually cited looks cited too
+        var rest = text
+        var cited: Set<String> = []
+        for hit in found.sorted(by: { $0.url.count > $1.url.count }) where rest.contains(hit.url) {
+            rest = rest.replacingOccurrences(of: hit.url, with: " ")
+            cited.insert(hit.url)
+        }
+        let named = found.filter { cited.contains($0.url) }
+        return Array((named.isEmpty ? found : named).prefix(12))
     }
 
     /// A url is how the model addresses a note and not how a person reads one.
@@ -384,7 +399,8 @@ struct NoteFinderView: View {
                     .lineLimit(1...4)
                     .onSubmit(find)
                 Button(action: find) {
-                    Image(systemName: "arrow.up.circle.fill")
+                    Label("Ask", systemImage: "arrow.up.circle.fill")
+                        .labelStyle(.iconOnly)
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut(.return, modifiers: .command)
