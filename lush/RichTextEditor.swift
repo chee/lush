@@ -1338,7 +1338,8 @@ final class EditorCore {
     /// ones further down decode when layout reaches them.
     private func warmDisplayImages(_ urls: [String]) async {
         var warmed = 0
-        for url in urls where cache.isImage(url) {
+        var seen: Set<String> = []
+        for url in urls where cache.isImage(url) && seen.insert(url).inserted {
             guard warmed < 12 else { return }
             warmed += 1
             _ = await cache.displayImage(ensureFor: url)
