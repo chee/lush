@@ -1148,29 +1148,26 @@ struct ContentView: View {
     }
 
     private var mapRow: some View {
-        Label {
-            Text("Map")
-        } icon: {
-            Image(systemName: "map")
-                .foregroundStyle(Color.lushPink)
-        }
-        .font(.title3.weight(.medium))
-        .foregroundStyle(.primary)
-        .lineLimit(1)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 5)
-        .padding(.trailing, sidebarTrailingGutter)
-        .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(NotesMap.sidebarTag) })
-        .contextMenu {
-            Button {
-                MainWindowTabs.open(selection: NotesMap.sidebarTag, using: openWindow)
-            } label: {
-                Label("Open in New Tab", systemImage: "plus.square.on.square")
+        // no tint on the glyph: it takes the row's text colour, the way the
+        // calendar beside it does
+        Label("Map", systemImage: "map")
+            .font(.title3.weight(.medium))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 5)
+            .padding(.trailing, sidebarTrailingGutter)
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded { selectSidebarRow(NotesMap.sidebarTag) })
+            .contextMenu {
+                Button {
+                    MainWindowTabs.open(selection: NotesMap.sidebarTag, using: openWindow)
+                } label: {
+                    Label("Open in New Tab", systemImage: "plus.square.on.square")
+                }
             }
-        }
-        .tag(NotesMap.sidebarTag)
-        .listRowInsets(sidebarRowInsets(depth: 0))
+            .tag(NotesMap.sidebarTag)
+            .listRowInsets(sidebarRowInsets(depth: 0))
     }
 
     private var calendarSelected: Bool {
@@ -2439,6 +2436,16 @@ struct SearchSyntaxSuggestions: View {
 
 #if os(iOS)
 
+private extension View {
+    /// A fixed sidebar row's label, filling the row it sits in. A plain button
+    /// is only as wide as its label, so without this Calendar, Map and Recents
+    /// answer a tap on the words and ignore the rest of the bar.
+    func sidebarRowLabel() -> some View {
+        frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+    }
+}
+
 /// Finder-style drill-down: one screen per folder, notes push the editor.
 struct FolderScreen: View {
     let folderUrl: String?
@@ -2544,7 +2551,7 @@ struct FolderScreen: View {
                     Button {
                         push(.calendar)
                     } label: {
-                        CalendarSidebarLabel()
+                        CalendarSidebarLabel().sidebarRowLabel()
                     }
                     .buttonStyle(.plain)
                     Button {
@@ -2556,6 +2563,7 @@ struct FolderScreen: View {
                             Image(systemName: "map")
                                 .foregroundStyle(Color.lushPink)
                         }
+                        .sidebarRowLabel()
                     }
                     .buttonStyle(.plain)
                 }
@@ -2563,7 +2571,7 @@ struct FolderScreen: View {
                     Button {
                         push(.recents)
                     } label: {
-                        Label("Recents", systemImage: "clock")
+                        Label("Recents", systemImage: "clock").sidebarRowLabel()
                     }
                     .buttonStyle(.plain)
                     ForEach(model.pinnedNodes) { node in
