@@ -417,18 +417,58 @@ struct FormatCommands: Commands {
 }
 
 #if os(macOS)
+/// `canUndo` and `canRedo` republished as something SwiftUI can watch.
+///
+/// UndoManager isn't observable, so a menu item whose enabled state is
+/// conditioned on it keeps whatever shape it had when the view graph last
+/// updated for some other reason. Redo is the half that suffers: undo becomes
+/// available while you type, under a steady stream of other updates that
+/// redraw the menu in passing, but redo becomes available only at the instant
+/// of an undo — and an undo changes nothing else the menu is watching, so the
+/// item stays disabled and ⌘⇧Z does nothing.
+///
+/// Every manager in the app, deliberately: the menu reads whichever one the
+/// front window's editor is using, and that is not knowable from here.
+@MainActor
+@Observable
+final class UndoStacks {
+    static let shared = UndoStacks()
+
+    private(set) var revision = 0
+    @ObservationIgnored private var observers: [any NSObjectProtocol] = []
+
+    private init() {
+        for name: Notification.Name in [
+            .NSUndoManagerDidCloseUndoGroup,
+            .NSUndoManagerDidUndoChange,
+            .NSUndoManagerDidRedoChange,
+        ] {
+            observers.append(NotificationCenter.default.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.revision &+= 1 }
+            })
+        }
+    }
+}
+
 struct UndoCommands: Commands {
     let model: NotesModel
     @FocusedValue(\.editorController) private var editor
     @Environment(\.undoManager) private var systemUndoManager
+    private let stacks = UndoStacks.shared
 
     private var undoManager: UndoManager? {
+        _ = stacks.revision
         if editor?.undoManager?.canUndo == true { return editor?.undoManager }
         if systemUndoManager?.canUndo == true { return systemUndoManager }
         return model.undoManager
     }
 
     private var redoManager: UndoManager? {
+        _ = stacks.revision
         if editor?.undoManager?.canRedo == true { return editor?.undoManager }
         if systemUndoManager?.canRedo == true { return systemUndoManager }
         return model.undoManager
