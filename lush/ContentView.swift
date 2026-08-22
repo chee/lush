@@ -20,6 +20,13 @@ enum NavRoute: Hashable {
     case meetingNotes
     case map
     case shortcutsHelp
+
+    /// Whether this screen carries a menu the moon can live in while it is
+    /// dark. Only the note does.
+    var isNote: Bool {
+        if case .note = self { return true }
+        return false
+    }
 }
 
 struct MoveTarget: Identifiable {
@@ -719,7 +726,7 @@ struct ContentView: View {
                 ShortcutsHelpView()
             }
         }
-        .moonToolbar(model)
+        .moonToolbar(model, hasMenu: route.isNote)
     }
     #endif
 
@@ -2798,24 +2805,12 @@ struct FolderScreen: View {
         .toolbar {
             if folderUrl == nil {
                 ToolbarItemGroup(placement: .topBarLeading) {
-                    // Lit, the moon is both the sign that it is on and the way
-                    // back out, so it keeps its place. Dark, it is a setting
-                    // like any other and the bar has better uses for the room.
-                    if model.focusModeEngaged {
-                        FocusModeControl(model: model)
-                    }
-                    Menu {
-                        if !model.focusModeEngaged {
-                            FocusModeControl(model: model)
-                        }
-                        Button {
-                            showingSettings = true
-                        } label: {
-                            Label("Settings", systemImage: "gearshape")
-                        }
+                    Button {
+                        showingSettings = true
                     } label: {
-                        Label("More", systemImage: "ellipsis")
+                        Label("Settings", systemImage: "gearshape")
                     }
+                    FocusModeControl(model: model)
                 }
             }
             if let folderUrl, nodes.contains(where: \.isNote) {
@@ -4501,6 +4496,14 @@ struct NoteDetail: View {
                     }
                 }
             }
+            #if os(iOS)
+            // Where the moon lives on a note while it is dark. Lit, it is in
+            // the bar instead, where it says so and where one tap leaves.
+            if !model.focusModeEngaged {
+                Divider()
+                FocusModeControl(model: model)
+            }
+            #endif
         }
     }
 
@@ -4777,19 +4780,26 @@ private struct FocusModeControl: View {
 #if os(iOS)
 private struct MoonToolbar: ViewModifier {
     let model: NotesModel
+    /// Whether the screen has a menu of its own to keep the moon in. Where it
+    /// does, a dark moon goes there and leaves the bar the room: it is a
+    /// setting like any other until it is on. Lit, it stays in the bar
+    /// wherever you are — it is both the sign that it is on and the way out.
+    let hasMenu: Bool
 
     func body(content: Content) -> some View {
         content.toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                FocusModeControl(model: model)
+            if model.focusModeEngaged || !hasMenu {
+                ToolbarItem(placement: .topBarTrailing) {
+                    FocusModeControl(model: model)
+                }
             }
         }
     }
 }
 
 extension View {
-    fileprivate func moonToolbar(_ model: NotesModel) -> some View {
-        modifier(MoonToolbar(model: model))
+    fileprivate func moonToolbar(_ model: NotesModel, hasMenu: Bool = false) -> some View {
+        modifier(MoonToolbar(model: model, hasMenu: hasMenu))
     }
 }
 #endif
