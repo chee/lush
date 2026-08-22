@@ -732,6 +732,8 @@ impl SearchIndex {
                     name: place.name,
                     weather: place.weather,
                     stamped: place.ts,
+                    excerpt: place.excerpt,
+                    image: place.image,
                 });
             }
         }
@@ -1242,6 +1244,8 @@ mod tests {
                 name: "Glasgow".into(),
                 weather: "Rain".into(),
                 ts: "2026-03-04T09:00:00Z".into(),
+                excerpt: "rained the whole way".into(),
+                image: String::new(),
             },
             ContextPlace {
                 lat: 51.5072,
@@ -1249,6 +1253,8 @@ mod tests {
                 name: String::new(),
                 weather: String::new(),
                 ts: String::new(),
+                excerpt: String::new(),
+                image: String::new(),
             },
         ];
         index.upsert(doc).unwrap();
@@ -1259,6 +1265,7 @@ mod tests {
         assert_eq!(places[0].ordinal, 0);
         assert_eq!(places[0].name, "Glasgow");
         assert_eq!(places[0].stamped, "2026-03-04T09:00:00Z");
+        assert_eq!(places[0].excerpt, "rained the whole way");
         assert_eq!(places[1].ordinal, 1);
         assert!((places[1].longitude + 0.1276).abs() < 0.0001);
     }
@@ -1279,6 +1286,8 @@ mod tests {
             name: "Glasgow".into(),
             weather: String::new(),
             ts: String::new(),
+            excerpt: String::new(),
+            image: String::new(),
         }];
         index.upsert(doc).unwrap();
         assert_eq!(index.note_places().unwrap().len(), 1);

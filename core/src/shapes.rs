@@ -1160,6 +1160,27 @@ pub fn file_bytes(doc: &Automerge) -> Option<Vec<u8>> {
     }
 }
 
+/// The automerge URL a block embeds, if it embeds one.
+fn embed_url(obj: &serde_json::Map<String, Json>) -> Option<String> {
+    let is_embed = obj
+        .get("isEmbed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || matches!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("embed") | Some("image")
+        );
+    if !is_embed {
+        return None;
+    }
+    let url = obj
+        .get("attrs")
+        .and_then(|v| v.as_object())
+        .and_then(|a| a.get("url").or_else(|| a.get("src")))
+        .and_then(|v| v.as_str())?;
+    url.starts_with("automerge:").then(|| url.to_string())
+}
+
 /// Automerge URLs of embed/image blocks in a note's content.
 pub fn embed_urls(doc: &Automerge) -> Vec<String> {
     let Ok(spans) = spans_to_json(doc) else {
@@ -1173,25 +1194,8 @@ pub fn embed_urls(doc: &Automerge) -> Vec<String> {
         let Some(obj) = value.as_object() else {
             continue;
         };
-        let is_embed = obj
-            .get("isEmbed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || matches!(
-                obj.get("type").and_then(|v| v.as_str()),
-                Some("embed") | Some("image")
-            );
-        if !is_embed {
-            continue;
-        }
-        let attrs = obj.get("attrs").and_then(|v| v.as_object());
-        let url = attrs
-            .and_then(|a| a.get("url").or_else(|| a.get("src")))
-            .and_then(|v| v.as_str());
-        if let Some(url) = url {
-            if url.starts_with("automerge:") {
-                out.push(url.to_string());
-            }
+        if let Some(url) = embed_url(obj) {
+            out.push(url);
         }
     }
     out
@@ -2446,48 +2450,123 @@ pub struct ContextPlace {
     pub weather: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ts: String,
+    /// The opening of what was written under this logline, which is what
+    /// tells one visit to a place from another.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub excerpt: String,
+    /// The first image written under it, if there was one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image: String,
 }
 
-/// Every logline in the doc that knows where it was stamped. A logline without
-/// a fix is nowhere on a map, so it is left out here rather than downstream.
+/// Every logline in the doc that knows where it was stamped, with the opening
+/// of what was written under it. A logline without a fix is nowhere on a map,
+/// so it is left out here rather than downstream.
+///
+/// The writing matters as much as the fix. A note visited three times has
+/// three loglines at one pin, and without what was written under each they are
+/// the same row three times over.
 pub fn context_places(doc: &Automerge) -> Vec<ContextPlace> {
     let Ok(spans) = spans_to_json(doc) else {
         return Vec::new();
     };
-    spans
-        .into_iter()
-        .filter_map(|span| {
-            let SpanJson::Block { value } = span else {
-                return None;
-            };
-            if value.get("type").and_then(Json::as_str) != Some("context") {
-                return None;
+    let mut out: Vec<ContextPlace> = Vec::new();
+    // What is being written under, once a logline with a fix has opened a
+    // stretch. A logline without one opens nothing but still closes the
+    // stretch above it: what was written under one logline is not what was
+    // written under the next.
+    let mut open: Option<usize> = None;
+    for span in spans {
+        match span {
+            SpanJson::Block { value } => {
+                let Some(obj) = value.as_object() else {
+                    continue;
+                };
+                if obj.get("type").and_then(Json::as_str) != Some("context") {
+                    if let Some(index) = open {
+                        if out[index].image.is_empty() {
+                            if let Some(url) = embed_url(obj) {
+                                out[index].image = url;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                open = None;
+                let Some(attrs) = obj.get("attrs").and_then(Json::as_object) else {
+                    continue;
+                };
+                let text = |key: &str| {
+                    attrs
+                        .get(key)
+                        .and_then(Json::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let (Some(lat), Some(lon)) = (
+                    attrs.get("lat").and_then(Json::as_f64),
+                    attrs.get("lon").and_then(Json::as_f64),
+                ) else {
+                    continue;
+                };
+                // a doc can arrive from anywhere, and two numbers are not yet a
+                // place: what is not on the globe never becomes a pin
+                if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+                    continue;
+                }
+                let created = text("created");
+                out.push(ContextPlace {
+                    lat,
+                    lon,
+                    name: text("location"),
+                    weather: text("weather"),
+                    ts: if created.is_empty() { text("ts") } else { created },
+                    excerpt: String::new(),
+                    image: String::new(),
+                });
+                open = Some(out.len() - 1);
             }
-            let attrs = value.get("attrs").and_then(Json::as_object)?;
-            let text = |key: &str| {
-                attrs
-                    .get(key)
-                    .and_then(Json::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            let created = text("created");
-            let lat = attrs.get("lat").and_then(Json::as_f64)?;
-            let lon = attrs.get("lon").and_then(Json::as_f64)?;
-            // a doc can arrive from anywhere, and two numbers are not yet a
-            // place: what is not on the globe never becomes a pin
-            if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
-                return None;
+            SpanJson::Text { value, .. } => {
+                if let Some(index) = open {
+                    extend_excerpt(&mut out[index].excerpt, &value);
+                }
             }
-            Some(ContextPlace {
-                lat,
-                lon,
-                name: text("location"),
-                weather: text("weather"),
-                ts: if created.is_empty() { text("ts") } else { created },
-            })
-        })
-        .collect()
+        }
+    }
+    out
+}
+
+/// How much of what was written under a logline rides in the index: enough to
+/// tell one visit to a place from another on a card, not so much that a note
+/// with fifty loglines stores itself twice over.
+const EXCERPT_LIMIT: usize = 160;
+
+/// Appends a run of text to an excerpt, a paragraph at a time and without the
+/// blank ones, stopping once there is enough to read.
+fn extend_excerpt(excerpt: &mut String, text: &str) {
+    for piece in text.split('\n') {
+        if excerpt.chars().count() >= EXCERPT_LIMIT {
+            return;
+        }
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if !excerpt.is_empty() {
+            excerpt.push(' ');
+        }
+        excerpt.push_str(piece);
+    }
+    if excerpt.chars().count() > EXCERPT_LIMIT {
+        let end = excerpt
+            .char_indices()
+            .nth(EXCERPT_LIMIT)
+            .map(|(i, _)| i)
+            .unwrap_or(excerpt.len());
+        excerpt.truncate(end);
+        let trimmed = excerpt.trim_end().to_string();
+        *excerpt = trimmed;
+    }
 }
 
 pub fn calendar_event_ids(doc: &Automerge) -> Vec<String> {
@@ -2684,6 +2763,99 @@ mod context_place_tests {
         assert_eq!(places[0].lat, 55.0);
         assert_eq!(places[0].lon, -4.0);
         assert_eq!(places[0].ts, "");
+    }
+
+    #[test]
+    fn each_logline_keeps_the_writing_under_it() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":55.8642,"lon":-4.2518,"location":"Glasgow"}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"rain again"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":51.5072,"lon":-0.1276,"location":"London"}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"warmer here"}
+            ]"#,
+        );
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 2);
+        assert_eq!(places[0].excerpt, "rain again");
+        assert_eq!(places[1].excerpt, "warmer here");
+    }
+
+    /// Nothing was written before the first logline, and nothing written under
+    /// it belongs to the one after.
+    #[test]
+    fn writing_above_the_first_logline_belongs_to_no_place() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"a title"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":55.8642,"lon":-4.2518}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"under it"}
+            ]"#,
+        );
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].excerpt, "under it");
+    }
+
+    /// A logline that never got a fix is nowhere on a map, but it still ends
+    /// the stretch above it.
+    #[test]
+    fn a_logline_without_a_fix_still_closes_the_one_before_it() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":55.8642,"lon":-4.2518}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"mine"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,"attrs":{}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"not mine"}
+            ]"#,
+        );
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].excerpt, "mine");
+    }
+
+    #[test]
+    fn a_logline_keeps_the_first_image_under_it() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"lat":55.8642,"lon":-4.2518}}},
+              {"type":"block","value":{"type":"embed","parents":[],"isEmbed":true,
+                "attrs":{"url":"automerge:first"}}},
+              {"type":"block","value":{"type":"embed","parents":[],"isEmbed":true,
+                "attrs":{"url":"automerge:second"}}}
+            ]"#,
+        );
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].image, "automerge:first");
+    }
+
+    #[test]
+    fn a_long_entry_is_cut_down_to_an_excerpt() {
+        let long = "word ".repeat(80);
+        let doc = doc_with(&format!(
+            r#"[
+              {{"type":"block","value":{{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{{"lat":55.8642,"lon":-4.2518}}}}}},
+              {{"type":"block","value":{{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{{}}}}}},
+              {{"type":"text","value":"{long}"}}
+            ]"#
+        ));
+        let places = context_places(&doc);
+        assert_eq!(places.len(), 1);
+        assert!(places[0].excerpt.chars().count() <= EXCERPT_LIMIT);
+        assert!(places[0].excerpt.starts_with("word word"));
     }
 }
 

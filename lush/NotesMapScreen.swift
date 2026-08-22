@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreLocation
+import ImageIO
 import MapKit
 
 enum NotesMap {
@@ -16,6 +17,11 @@ struct NoteLocation: Identifiable, Hashable, Sendable {
     let longitude: Double
     let weather: String?
     let stamped: Date?
+    /// The opening of what was written under this logline. Two visits to the
+    /// same place on the same day are otherwise the same row twice.
+    let excerpt: String?
+    /// The first image written under it.
+    let imageUrl: String?
 
     var id: String { "\(noteUrl)#\(ordinal)" }
 
@@ -42,7 +48,9 @@ struct NoteLocation: Identifiable, Hashable, Sendable {
                 latitude: place.latitude,
                 longitude: place.longitude,
                 weather: place.weather.isEmpty ? nil : place.weather,
-                stamped: place.stamped.isEmpty ? nil : fmt.date(from: place.stamped)
+                stamped: place.stamped.isEmpty ? nil : fmt.date(from: place.stamped),
+                excerpt: place.excerpt.isEmpty ? nil : place.excerpt,
+                imageUrl: place.image.isEmpty ? nil : place.image
             )
         }
     }
@@ -197,6 +205,92 @@ struct MapPlace: Identifiable, Sendable {
     }
 }
 
+/// A note's own menu, when the note is still there. A logline can outlive the
+/// note it was written in — the index row survives until the next crawl — and
+/// a row with no note behind it should still open nothing rather than crash.
+private struct OptionalNoteMenu: ViewModifier {
+    let node: FolderNode?
+
+    func body(content: Content) -> some View {
+        if let node {
+            content.contextMenu { NoteContextMenu(node: node) }
+        } else {
+            content
+        }
+    }
+}
+
+/// The side a card thumbnail draws at, and the pixels to decode for it —
+/// three times over, for the densest screen either platform ships.
+private let visitThumbnailSide: CGFloat = 46
+private let visitThumbnailPixels = Int(visitThumbnailSide * 3)
+
+/// A decoded picture on its way back from the thread that decoded it. Neither
+/// platform's image type is Sendable; this one is made there, touched by
+/// nobody on the way, and read only by the main actor once it lands.
+private struct DecodedImage: @unchecked Sendable {
+    let image: PImage
+}
+
+/// Decoded straight to the size it will be drawn at rather than decoded and
+/// then shrunk, so a photograph never exists at full size in the first place.
+private func decodeVisitThumbnail(_ data: Data) -> DecodedImage? {
+    let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+    guard let source = CGImageSourceCreateWithData(
+        data as CFData,
+        sourceOptions as CFDictionary
+    ) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: visitThumbnailPixels,
+        kCGImageSourceShouldCacheImmediately: true,
+    ]
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
+        source,
+        0,
+        options as CFDictionary
+    ) else { return nil }
+    #if os(macOS)
+    return DecodedImage(image: NSImage(cgImage: cgImage, size: .zero))
+    #else
+    return DecodedImage(image: UIImage(cgImage: cgImage, scale: 3, orientation: .up))
+    #endif
+}
+
+/// A logline's picture at the size the card draws it. A place can hold a dozen
+/// entries, and a dozen full-resolution photographs is a card that costs more
+/// to open than the notes it points at.
+private struct VisitThumbnail: View {
+    let assetUrl: String
+
+    @Environment(NotesModel.self) private var model
+    @State private var image: PImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(pImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Rectangle()
+                    .fill(.quaternary)
+            }
+        }
+        .frame(width: visitThumbnailSide, height: visitThumbnailSide)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .task(id: assetUrl) {
+            guard let data = await model.assetBytes(assetUrl) else { return }
+            let decoded = await Task.detached(priority: .utility) {
+                decodeVisitThumbnail(data)
+            }.value
+            guard !Task.isCancelled else { return }
+            image = decoded?.image
+        }
+    }
+}
+
 struct NotesMapScreen: View {
     let open: (String) -> Void
 
@@ -274,8 +368,12 @@ struct NotesMapScreen: View {
 
     private func pin(_ place: MapPlace) -> some View {
         let isSelected = place.id == selected
+        // Loglines, not notes. The map is a record of times you were
+        // somewhere, and a note written here over three visits is three of
+        // them — counting notes made a pin that said 1 stand for an
+        // afternoon and a pin that said 1 stand for a year.
         return VStack(spacing: 2) {
-            Text("\(place.noteUrls.count)")
+            Text("\(place.visits.count)")
                 .font(.caption.weight(.semibold).monospacedDigit())
                 .foregroundStyle(.white)
                 .frame(minWidth: 26, minHeight: 26)
@@ -328,11 +426,16 @@ struct NotesMapScreen: View {
         .padding(16)
     }
 
+    /// Counted the way the badges count, so the badges add up to it. Notes
+    /// were the wrong unit twice over: the badges deduped them within a pin
+    /// and this deduped them across every pin, so a note written in five
+    /// places counted five times on the map and once in the summary, and
+    /// neither number was the sum of the other.
     private var countLine: String {
-        let notes = Set(places.flatMap(\.noteUrls)).count
-        let noteWord = notes == 1 ? "note" : "notes"
+        let loglines = places.reduce(0) { $0 + $1.visits.count }
+        let logWord = loglines == 1 ? "logline" : "loglines"
         let placeWord = places.count == 1 ? "place" : "places"
-        return "\(notes) \(noteWord) · \(places.count) \(placeWord)"
+        return "\(loglines) \(logWord) · \(places.count) \(placeWord)"
     }
 
     private func card(_ place: MapPlace) -> some View {
@@ -358,19 +461,13 @@ struct NotesMapScreen: View {
             Divider()
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(nodes(at: place), id: \.url) { node in
-                        NoteRowView(node: node, showFolder: true)
-                            .padding(.vertical, 2)
-                            .contentShape(Rectangle())
-                            .onTapGesture { open(node.url) }
-                            .contextMenu { NoteContextMenu(node: node) }
-                            #if os(macOS)
-                            .pointerStyle(.link)
-                            #endif
+                    ForEach(Array(visits(at: place).enumerated()), id: \.element.id) { index, visit in
+                        if index > 0 { Divider() }
+                        visitRow(visit)
                     }
                 }
             }
-            .frame(maxHeight: 260)
+            .frame(maxHeight: 300)
             .fixedSize(horizontal: false, vertical: true)
         }
         .padding(12)
@@ -379,31 +476,77 @@ struct NotesMapScreen: View {
         .padding(16)
     }
 
+    /// The place in summary. Weather belongs to a moment rather than to a
+    /// place, so it sits on the entries below instead of up here where the
+    /// last one to arrive would speak for all of them.
     private func subtitle(_ place: MapPlace) -> String {
         var parts: [String] = []
-        let visits = place.visits.count
-        parts.append("\(visits) \(visits == 1 ? "logline" : "loglines")")
+        let count = place.visits.count
+        parts.append("\(count) \(count == 1 ? "logline" : "loglines")")
+        let notes = place.noteUrls.count
+        if notes != count {
+            parts.append("\(notes) \(notes == 1 ? "note" : "notes")")
+        }
         if let last = place.lastStamped {
             parts.append("last \(last.formatted(.dateTime.month(.abbreviated).day().year()))")
-        }
-        if let weather = place.visits.compactMap(\.weather).last {
-            parts.append(weather)
         }
         return parts.joined(separator: "  ·  ")
     }
 
-    /// Newest stamp first: the note she was just at this place for is the one
-    /// she is most likely reaching for.
-    private func nodes(at place: MapPlace) -> [FolderNode] {
-        var newest: [String: Date] = [:]
-        for visit in place.visits {
-            let when = visit.stamped ?? .distantPast
-            if let existing = newest[visit.noteUrl], existing >= when { continue }
-            newest[visit.noteUrl] = when
+    /// One row per logline rather than per note. A note written here over
+    /// three visits is three entries, and collapsing them threw away the only
+    /// thing that told them apart — when each was written, and what was
+    /// written under it.
+    ///
+    /// Newest first: the entry she was just here for is the one she is most
+    /// likely reaching for.
+    private func visits(at place: MapPlace) -> [NoteLocation] {
+        place.visits.sorted { ($0.stamped ?? .distantPast) > ($1.stamped ?? .distantPast) }
+    }
+
+    @ViewBuilder
+    private func visitRow(_ visit: NoteLocation) -> some View {
+        let node = model.node(for: visit.noteUrl)
+        HStack(alignment: .top, spacing: 8) {
+            if let imageUrl = visit.imageUrl {
+                VisitThumbnail(assetUrl: imageUrl)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(node?.displayName ?? "Untitled")
+                        .uiFont(.subheadline, weight: .medium)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if let stamped = visit.stamped {
+                        Text(stamped.formatted(
+                            .dateTime.month(.abbreviated).day().hour().minute()
+                        ))
+                        .uiFont(.caption2)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    }
+                }
+                if let line = entryLine(visit) {
+                    Text(line)
+                        .uiFont(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
-        return newest
-            .sorted { $0.value > $1.value }
-            .compactMap { model.node(for: $0.key) }
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture { open(visit.noteUrl) }
+        .modifier(OptionalNoteMenu(node: node))
+        #if os(macOS)
+        .pointerStyle(.link)
+        #endif
+    }
+
+    private func entryLine(_ visit: NoteLocation) -> String? {
+        let parts = [visit.weather, visit.excerpt].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
     private func reload() async {

@@ -296,6 +296,12 @@ pub struct NotePlace {
     /// When the logline was stamped, as it was written: an ISO 8601 string,
     /// empty when the block carries no stamp.
     pub stamped: String,
+    /// The opening of what was written under this logline, which is what tells
+    /// one visit to a place from another.
+    pub excerpt: String,
+    /// The automerge URL of the first image written under it, empty when there
+    /// wasn't one.
+    pub image: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
