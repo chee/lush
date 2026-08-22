@@ -1883,7 +1883,17 @@ mod tests {
             Some(1_787_321_002 - 7_200)
         );
         assert_eq!(parse_iso_seconds("2026-08-21T14:03"), Some(1_787_321_002 - 22));
+        assert_eq!(
+            parse_iso_seconds("2026-08-21T14:03:22-0700"),
+            Some(1_787_321_002 + 25_200)
+        );
         assert_eq!(parse_iso_seconds("garbage"), None);
+        assert_eq!(parse_iso_seconds("2026-08-21T24:00:00Z"), None);
+        assert_eq!(parse_iso_seconds("2026-08-21T14:99:00Z"), None);
+        assert_eq!(parse_iso_seconds("2026-08-21T14:03:61Z"), None);
+        assert_eq!(parse_iso_seconds("2026-08-21T14:03:22+0X:00"), None);
+        assert_eq!(parse_iso_seconds("2026-08-21T14:03:22+2"), None);
+        assert_eq!(parse_iso_seconds("20260821T140322Z"), None);
         assert_eq!(weekday_from_ymd(2026, 8, 21), "Friday");
         assert_eq!(weekday_from_ymd(1970, 1, 1), "Thursday");
     }
@@ -2212,6 +2222,10 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 fn iso_ymd(value: &str) -> Option<(i64, u32, u32)> {
+    let bytes = value.as_bytes();
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
     let year: i64 = value.get(0..4)?.parse().ok()?;
     let month: u32 = value.get(5..7)?.parse().ok()?;
     let day: u32 = value.get(8..10)?.parse().ok()?;
@@ -2228,12 +2242,14 @@ fn iso_hour(value: &str) -> Option<u32> {
     (hour < 24).then_some(hour)
 }
 
+/// A malformed stamp is None, never a guessed instant: this feeds
+/// `calendar_event_window`, where a wrong epoch is worse than an absent one.
 pub fn parse_iso_seconds(value: &str) -> Option<i64> {
     let (year, month, day) = iso_ymd(value)?;
-    let hour: i64 = value.get(11..13)?.parse().ok()?;
-    let minute: i64 = value.get(14..16)?.parse().ok()?;
+    let hour: i64 = value.get(11..13)?.parse().ok().filter(|h| *h < 24)?;
+    let minute: i64 = value.get(14..16)?.parse().ok().filter(|m| *m < 60)?;
     let second: i64 = match value.as_bytes().get(16) {
-        Some(b':') => value.get(17..19).and_then(|s| s.parse().ok()).unwrap_or(0),
+        Some(b':') => value.get(17..19)?.parse().ok().filter(|s| *s < 60)?,
         _ => 0,
     };
     let mut seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
@@ -2241,8 +2257,13 @@ pub fn parse_iso_seconds(value: &str) -> Option<i64> {
     if let Some(index) = tail.find(['+', '-']) {
         let offset = &tail[index..];
         let sign: i64 = if offset.starts_with('+') { 1 } else { -1 };
-        let offset_hours: i64 = offset.get(1..3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let offset_minutes: i64 = offset.get(4..6).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let offset_hours: i64 = offset.get(1..3)?.parse().ok().filter(|h| *h < 24)?;
+        let offset_minutes: i64 = match offset.as_bytes().get(3) {
+            Some(b':') => offset.get(4..6)?.parse().ok().filter(|m| *m < 60)?,
+            Some(b'0'..=b'9') => offset.get(3..5)?.parse().ok().filter(|m| *m < 60)?,
+            None => 0,
+            _ => return None,
+        };
         seconds -= sign * (offset_hours * 3_600 + offset_minutes * 60);
     }
     Some(seconds)

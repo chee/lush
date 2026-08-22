@@ -306,9 +306,9 @@ impl SearchIndex {
             // A row written before `created` existed has to be rewritten even
             // though its heads still match, or it never gets one. The same
             // holds for every column added after `heads`.
-            let stored: Option<(String, i64, String, String, String, String, i64, String, String)> =
+            let stored: Option<(String, i64, String, String, String, String, i64, i64, String, String)> =
                 conn.query_row(
-                    "SELECT heads, created, weather, locations, facets, context, event_start, event_ids, places
+                    "SELECT heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places
                      FROM search_docs WHERE url = ?1",
                     params![doc.url],
                     |row| {
@@ -322,6 +322,7 @@ impl SearchIndex {
                             row.get(6)?,
                             row.get(7)?,
                             row.get(8)?,
+                            row.get(9)?,
                         ))
                     },
                 )
@@ -334,6 +335,7 @@ impl SearchIndex {
                 facets,
                 context,
                 event_start,
+                event_end,
                 event_ids,
                 places,
             )) = stored
@@ -345,6 +347,7 @@ impl SearchIndex {
                     && facets == encode_tags(&doc.facets)
                     && context == doc.context
                     && event_start == doc.event_start
+                    && event_end == doc.event_end
                     && event_ids == doc.event_ids.join("\n")
                     && places == encode_places(&doc.places)
                 {
@@ -1107,6 +1110,9 @@ mod tests {
         doc.heads = "h1".to_string();
         assert!(index.upsert(doc.clone()).unwrap());
         assert!(!index.upsert(doc.clone()).unwrap());
+        doc.event_end = 300;
+        assert!(index.upsert(doc.clone()).unwrap());
+        assert!(!index.upsert(doc.clone()).unwrap());
         doc.heads = "h2".to_string();
         assert!(index.upsert(doc).unwrap());
 
@@ -1115,7 +1121,7 @@ mod tests {
         assert_eq!(row.body, "cake recipe");
         assert_eq!(row.context, "Logline morning");
         assert_eq!(row.event_start, 100);
-        assert_eq!(row.event_end, 200);
+        assert_eq!(row.event_end, 300);
         assert_eq!(row.event_ids, vec!["ev1".to_string()]);
         assert_eq!(row.tags, vec!["baking".to_string()]);
         assert_eq!(row.when, "2026-08-21");

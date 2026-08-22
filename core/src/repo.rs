@@ -2001,9 +2001,12 @@ impl Repo {
             return catching(|| f(&state.doc));
         }
         let mut doc = self.stored_doc(id).await?;
-        if let Ok(bytes) = std::fs::read(self.outbox_path(id)) {
-            let _ = cpu_heavy(|| merge_outbox_into(&mut doc, &bytes));
-        }
+        let outbox = self.outbox_path(id);
+        cpu_heavy(|| {
+            if let Ok(bytes) = std::fs::read(outbox) {
+                let _ = merge_outbox_into(&mut doc, &bytes);
+            }
+        });
         catching(|| f(&doc))
     }
 
