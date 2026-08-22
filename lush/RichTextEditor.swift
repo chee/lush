@@ -5776,18 +5776,35 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     /// view gets a screenful of room under it so its end can be scrolled up
     /// to where the eyes are; the tail keeps a few lines on screen once the
     /// scroll is all the way down.
+    ///
+    /// The room belongs to the text container, not to `contentInset`. As an
+    /// inset it told the scroll view the content ran a screenful further than
+    /// it does, and three things believed it. Selection autoscroll took its
+    /// speed from the travel it thought was left and ran away down the note.
+    /// `scrollRangeToVisible` sizes its target against bounds less insets, so
+    /// with a screenful claimed it had almost no room to aim at. And
+    /// `contentInset.bottom` is the system's own channel for keyboard
+    /// avoidance — reapplying the room from `layoutSubviews` stamped on what
+    /// the keyboard had just set, which left the caret under it. In the
+    /// container the room is ordinary content, and the inset goes back to
+    /// meaning only what the system means by it.
     private static let scrollPastEndTail: CGFloat = 120
 
     func pApplyScrollPastEnd() {
         let viewport = bounds.height - safeAreaInsets.top - safeAreaInsets.bottom
         guard viewport > 0 else { return }
-        // measured against the text alone: adding the room doesn't grow
-        // contentSize, so this can't talk itself into another pass
-        let room = contentSize.height > viewport
-            ? max(0, viewport - Self.scrollPastEndTail)
-            : 0
-        guard abs(contentInset.bottom - room) > 0.5 else { return }
-        contentInset.bottom = room
+        // The laid-out text, which the room is not part of. contentSize is,
+        // now that the room lives in the container, so measuring against that
+        // would talk this into growing on every pass.
+        let text = textLayoutManager?.usageBoundsForTextContainer.maxY ?? 0
+        let room = text > viewport ? max(0, viewport - Self.scrollPastEndTail) : 0
+        guard abs(textContainerInset.bottom - room) > 0.5 else { return }
+        textContainerInset = UIEdgeInsets(
+            top: textContainerInset.top,
+            left: textContainerInset.left,
+            bottom: room,
+            right: textContainerInset.right
+        )
     }
 
     override func layoutSubviews() {
@@ -5815,8 +5832,8 @@ final class EditorTextView: UITextView, EditorTextViewLike {
             )
         }
         let minY = -adjustedContentInset.top
-        // the bottom inset is a screenful of scroll-past-the-end room, so the
-        // furthest the view goes is the content plus that, less its own height
+        // the scroll-past-the-end room is inside contentHeight, being part of
+        // the container; the inset here is the keyboard and the safe area
         let maxY = max(minY, contentHeight + adjustedContentInset.bottom - bounds.height)
         let target = min(max(y, minY), maxY)
         setContentOffset(CGPoint(x: contentOffset.x, y: target), animated: false)
