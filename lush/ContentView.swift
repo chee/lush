@@ -2477,6 +2477,10 @@ struct FolderScreen: View {
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
     @State private var askRequest: NoteFinderRequest?
+    /// UndoManager is not observable, so nothing would notice the redo stack
+    /// filling or emptying and the toolbar would keep whatever shape it had
+    /// when something else last redrew it. Its own notifications are the nudge.
+    @State private var undoRevision = 0
     @Environment(\.editMode) private var editMode
 
     private static let pinnedExpandedKey = "pinnedExpanded"
@@ -2794,12 +2798,24 @@ struct FolderScreen: View {
         .toolbar {
             if folderUrl == nil {
                 ToolbarItemGroup(placement: .topBarLeading) {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
+                    // Lit, the moon is both the sign that it is on and the way
+                    // back out, so it keeps its place. Dark, it is a setting
+                    // like any other and the bar has better uses for the room.
+                    if model.focusModeEngaged {
+                        FocusModeControl(model: model)
                     }
-                    FocusModeControl(model: model)
+                    Menu {
+                        if !model.focusModeEngaged {
+                            FocusModeControl(model: model)
+                        }
+                        Button {
+                            showingSettings = true
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                    } label: {
+                        Label("More", systemImage: "ellipsis")
+                    }
                 }
             }
             if let folderUrl, nodes.contains(where: \.isNote) {
@@ -2814,19 +2830,32 @@ struct FolderScreen: View {
             ToolbarItem {
                 EditButton()
             }
-            ToolbarItemGroup {
-                Button {
-                    model.undoManager.undo()
+            ToolbarItem {
+                // Tap to undo, press and hold for redo. Redo is always
+                // reachable that way, so it only takes a place of its own
+                // while there is actually something on its stack.
+                Menu {
+                    Button {
+                        model.undoManager.redo()
+                    } label: {
+                        Label("Redo", systemImage: "arrow.uturn.forward")
+                    }
+                    .disabled(!model.undoManager.canRedo)
                 } label: {
                     Label("Undo", systemImage: "arrow.uturn.backward")
+                } primaryAction: {
+                    model.undoManager.undo()
                 }
-                .disabled(!model.undoManager.canUndo)
-                Button {
-                    model.undoManager.redo()
-                } label: {
-                    Label("Redo", systemImage: "arrow.uturn.forward")
+                .disabled(!model.undoManager.canUndo && !model.undoManager.canRedo)
+            }
+            if model.undoManager.canRedo {
+                ToolbarItem {
+                    Button {
+                        model.undoManager.redo()
+                    } label: {
+                        Label("Redo", systemImage: "arrow.uturn.forward")
+                    }
                 }
-                .disabled(!model.undoManager.canRedo)
             }
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarSpacer(.flexible, placement: .bottomBar)
@@ -2834,6 +2863,15 @@ struct FolderScreen: View {
                 newMenu
             }
         }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .NSUndoManagerDidCloseUndoGroup)
+        ) { _ in undoRevision += 1 }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .NSUndoManagerDidUndoChange)
+        ) { _ in undoRevision += 1 }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .NSUndoManagerDidRedoChange)
+        ) { _ in undoRevision += 1 }
         .searchable(
             text: $searchText,
             prompt: folderUrl == nil ? "Search notes" : "Search \(title)"
@@ -4698,9 +4736,7 @@ struct NoteDetail: View {
 private struct FocusModeControl: View {
     @Bindable var model: NotesModel
 
-    private var engaged: Bool {
-        !model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence
-    }
+    private var engaged: Bool { model.focusModeEngaged }
 
     var body: some View {
         Button {

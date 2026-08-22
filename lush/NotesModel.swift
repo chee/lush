@@ -53,6 +53,13 @@ final class NotesModel {
         !applyingIncomingChanges && !sendingChanges && !sharingPresence
     }
 
+    /// Any one of the three held back, which is what the moon fills in for.
+    /// `focusModeEnabled` wants all three: the icon means something is being
+    /// held back, the window's border means everything is.
+    var focusModeEngaged: Bool {
+        !applyingIncomingChanges || !sendingChanges || !sharingPresence
+    }
+
     func setApplyingIncomingChanges(_ enabled: Bool) {
         guard let core else {
             applyingIncomingChanges = enabled
