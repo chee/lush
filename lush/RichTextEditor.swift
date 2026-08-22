@@ -5695,9 +5695,18 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     /// `textStorage` can go stale after the content storage adopts the shared
     /// session storage, so everything resolves through the content storage.
     var pStorage: NSTextStorage? { pContentStorage?.textStorage }
+    /// UIKit keeps its own idea of where the next keystroke goes, and it is
+    /// not the one the view draws. Moving the selection in code without
+    /// saying so leaves the keyboard aiming at the offset it last heard
+    /// about: the caret is drawn in the right place and the typing lands
+    /// somewhere else entirely.
     var pSelectedRange: NSRange {
         get { selectedRange }
-        set { selectedRange = clampedRange(newValue) }
+        set {
+            inputDelegate?.selectionWillChange(self)
+            selectedRange = clampedRange(newValue)
+            inputDelegate?.selectionDidChange(self)
+        }
     }
     var pTypingAttributes: [NSAttributedString.Key: Any] {
         get { typingAttributes }
@@ -5705,7 +5714,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     }
     var pSelectedRanges: [NSRange] {
         get { [selectedRange] }
-        set { if let first = newValue.first { selectedRange = first } }
+        set { if let first = newValue.first { pSelectedRange = first } }
     }
     var pTextLayoutManager: NSTextLayoutManager? { textLayoutManager }
     var pContentStorage: NSTextContentStorage? {
@@ -5839,8 +5848,12 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         setContentOffset(CGPoint(x: contentOffset.x, y: target), animated: false)
     }
 
+    /// The same accounting as `pSelectedRange`, for the text itself: an edit
+    /// made straight to the storage is one UIKit never hears about, and every
+    /// offset it is holding on to means something different afterwards.
     func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void) {
         guard let storage = pStorage else { return }
+        inputDelegate?.textWillChange(self)
         if let contentStorage = pContentStorage {
             contentStorage.performEditingTransaction {
                 edit(storage)
@@ -5848,6 +5861,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         } else {
             edit(storage)
         }
+        inputDelegate?.textDidChange(self)
     }
 
     func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int? {
