@@ -1,63 +1,56 @@
 import SwiftUI
-
-#if os(macOS)
+#if canImport(AppKit)
 import AppKit
+#else
+import UIKit
+#endif
 
 /// Which note owns a run of text. It rides on the text itself rather than on
 /// a stored range, so an edit anywhere moves ownership with the characters
 /// instead of invalidating an index.
-private let notebookNote = NSAttributedString.Key("lushNotebookNote")
+let notebookNote = NSAttributedString.Key("lushNotebookNote")
 /// Structure rather than content: the title line between two notes and the
 /// newlines that close it off. The body save pass walks straight past it.
-private let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
+let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
 /// The editable part of a boundary — the note's name. Typing here renames the
 /// note; the newlines on either side carry no title and so cannot be typed in.
-private let notebookTitle = NSAttributedString.Key("lushNotebookTitle")
+let notebookTitle = NSAttributedString.Key("lushNotebookTitle")
 
-/// A folder read as one document: every note's content in one text view, one
-/// scroll view, one caret. The notes are not embedded editors — they are
-/// rendered like any other text, and the boundary between two of them is a
-/// heading rather than the edge of a box.
+/// The folder's notes concatenated into one piece of text, and the rules for
+/// reading and editing it: who owns each character, where a caret is writing,
+/// and which edits are allowed.
 ///
 /// Boundaries are hard. A note's text is its own, an edit is never allowed to
 /// span two of them, and every character maps to exactly one note. Merging two
 /// notes by deleting the boundary would have to be a real operation with its
 /// own undo, and until it is one a single keystroke must not be able to do it.
+///
+/// Deliberately knows nothing about the document store: the rules are worth
+/// testing on their own, and a test should not need a Rust core to run.
 @MainActor
-@Observable
-final class FolderNotebookCore {
-    private struct Section {
-        var heads: [String]
-        var lastJSON: String
-        var lastName: String
+final class NotebookDocument {
+    struct Section {
+        let url: String
+        let title: String
+        let body: NSAttributedString
     }
 
-    @ObservationIgnored let storage = NSTextStorage()
-    private(set) var loaded = false
+    let storage = NSTextStorage()
+    private(set) var order: [String] = []
 
-    @ObservationIgnored private var sections: [String: Section] = [:]
-    @ObservationIgnored private var order: [String] = []
-    @ObservationIgnored private let cache = AssetCache()
-    @ObservationIgnored private let model: NotesModel
-    @ObservationIgnored private let origin = UUID()
-    @ObservationIgnored private var saveTask: Task<Void, Never>?
-    @ObservationIgnored private var applying = false
-
-    init(model: NotesModel) {
-        self.model = model
+    private var boundaryColor: PColor {
+        #if os(macOS)
+        .secondaryLabelColor
+        #else
+        .secondaryLabel
+        #endif
     }
 
-    func load(_ notes: [FolderNode]) async {
+    func rebuild(_ sections: [Section]) {
         let built = NSMutableAttributedString()
-        var next: [String: Section] = [:]
-        var nextOrder: [String] = []
-
-        for node in notes {
-            guard let snapshot = await model.spansSnapshot(for: node.url) else { continue }
-            let spans = SpanNode.decodeList(snapshot.spansJson)
-            let body = NSMutableAttributedString(
-                attributedString: RichText.attributed(from: spans, cache: cache)
-            )
+        var urls: [String] = []
+        for section in sections {
+            let body = NSMutableAttributedString(attributedString: section.body)
             // An empty note still needs somewhere to put the caret.
             if body.length == 0 {
                 body.append(NSAttributedString(
@@ -67,29 +60,19 @@ final class FolderNotebookCore {
             }
             body.addAttribute(
                 notebookNote,
-                value: node.url,
+                value: section.url,
                 range: NSRange(location: 0, length: body.length)
             )
             built.append(boundary(
-                titled: node.displayName,
-                url: node.url,
-                first: nextOrder.isEmpty
+                titled: section.title,
+                url: section.url,
+                first: urls.isEmpty
             ))
             built.append(body)
-            next[node.url] = Section(
-                heads: snapshot.heads,
-                lastJSON: snapshot.spansJson,
-                lastName: node.displayName
-            )
-            nextOrder.append(node.url)
+            urls.append(section.url)
         }
-
-        applying = true
         storage.setAttributedString(built)
-        applying = false
-        sections = next
-        order = nextOrder
-        loaded = true
+        order = urls
     }
 
     /// The leading newline belongs to the boundary, not to the note above it.
@@ -99,7 +82,14 @@ final class FolderNotebookCore {
     private func boundary(titled title: String, url: String, first: Bool) -> NSAttributedString {
         var attributes = RichText.attributes(block: .heading(level: 2), marks: [:])
         attributes[notebookBoundary] = true
-        attributes[.foregroundColor] = NSColor.secondaryLabelColor
+        attributes[.foregroundColor] = boundaryColor
+        // Room above the title for the rule the text view draws there.
+        if !first,
+           let base = attributes[.paragraphStyle] as? NSParagraphStyle,
+           let spaced = base.mutableCopy() as? NSMutableParagraphStyle {
+            spaced.paragraphSpacingBefore = 30
+            attributes[.paragraphStyle] = spaced
+        }
         let line = NSMutableAttributedString()
         if !first {
             line.append(NSAttributedString(string: "\n", attributes: attributes))
@@ -111,9 +101,30 @@ final class FolderNotebookCore {
         return line
     }
 
-    private func titleOwner(at location: Int) -> String? {
+    // MARK: - Ownership
+
+    func owner(at location: Int) -> String? {
+        guard location >= 0, location < storage.length else { return nil }
+        return storage.attribute(notebookNote, at: location, effectiveRange: nil) as? String
+    }
+
+    func titleOwner(at location: Int) -> String? {
         guard location >= 0, location < storage.length else { return nil }
         return storage.attribute(notebookTitle, at: location, effectiveRange: nil) as? String
+    }
+
+    func isBoundary(at location: Int) -> Bool {
+        guard location >= 0, location < storage.length else { return false }
+        return storage.attribute(notebookBoundary, at: location, effectiveRange: nil) != nil
+    }
+
+    /// The note a caret at `location` is writing into. A caret resting at the
+    /// very start of a note sits just past a boundary, where looking backwards
+    /// would answer with the note above it.
+    func note(forCaretAt location: Int) -> String? {
+        if let url = owner(at: location) { return url }
+        if location > 0, let url = owner(at: location - 1) { return url }
+        return nil
     }
 
     /// The note whose name a caret at `location` is editing, by the same rule
@@ -124,7 +135,7 @@ final class FolderNotebookCore {
         return nil
     }
 
-    private func titleRange(of url: String) -> NSRange? {
+    func titleRange(of url: String) -> NSRange? {
         var found: NSRange?
         storage.enumerateAttribute(
             notebookTitle,
@@ -138,25 +149,18 @@ final class FolderNotebookCore {
         return found
     }
 
-    // MARK: - Ownership
-
-    private func owner(at location: Int) -> String? {
-        guard location >= 0, location < storage.length else { return nil }
-        return storage.attribute(notebookNote, at: location, effectiveRange: nil) as? String
-    }
-
-    private func isBoundary(at location: Int) -> Bool {
-        guard location >= 0, location < storage.length else { return false }
-        return storage.attribute(notebookBoundary, at: location, effectiveRange: nil) != nil
-    }
-
-    /// The note a caret at `location` is writing into. A caret resting at the
-    /// very start of a note sits just past a boundary, where looking backwards
-    /// would answer with the note above it.
-    func note(forCaretAt location: Int) -> String? {
-        if let url = owner(at: location) { return url }
-        if location > 0, let url = owner(at: location - 1) { return url }
-        return nil
+    /// Where the text view draws a rule between two notes: the head of every
+    /// title but the first, which has nothing above it to be separated from.
+    func separatorLocations() -> [Int] {
+        var locations: [Int] = []
+        storage.enumerateAttribute(
+            notebookTitle,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, range, _ in
+            guard value != nil, range.location > 0 else { return }
+            locations.append(range.location)
+        }
+        return locations
     }
 
     /// Typed text inherits the attributes to its left, which at the head of a
@@ -190,8 +194,8 @@ final class FolderNotebookCore {
             if title(forCaretAt: range.location) != nil {
                 return !replacement.contains("\n")
             }
-            // An insertion point in the structure owns nothing, including the
-            // one above the first title: a notebook starts at its first note.
+            // An insertion point belonging to no note at all, which only an
+            // empty notebook has.
             return note(forCaretAt: range.location) != nil
         }
 
@@ -218,26 +222,11 @@ final class FolderNotebookCore {
         return !replacement.isEmpty || range.length < (titleRange(of: url)?.length ?? 0)
     }
 
-    // MARK: - Saving
+    // MARK: - Reading back
 
-    func scheduleSave() {
-        guard loaded, !applying else { return }
-        saveTask?.cancel()
-        saveTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(300))
-            guard !Task.isCancelled else { return }
-            await self?.saveNow()
-        }
-    }
-
-    /// Slice the one storage back into the notes it came from and write each
-    /// against the heads it was loaded at, so a note edited elsewhere in the
-    /// meantime conflicts rather than being clobbered.
-    func saveNow() async {
-        guard loaded else { return }
-        saveTask?.cancel()
-        saveTask = nil
-
+    /// The storage sliced back into the notes it came from. Boundary runs own
+    /// no note and so never reach a slice.
+    func bodies() -> [String: NSAttributedString] {
         var pieces: [String: NSMutableAttributedString] = [:]
         storage.enumerateAttribute(
             notebookNote,
@@ -248,24 +237,102 @@ final class FolderNotebookCore {
             piece.append(storage.attributedSubstring(from: range))
             pieces[url] = piece
         }
+        return pieces
+    }
 
-        var titles: [String: String] = [:]
+    func titles() -> [String: String] {
+        var names: [String: String] = [:]
         storage.enumerateAttribute(
             notebookTitle,
             in: NSRange(location: 0, length: storage.length)
         ) { value, range, _ in
             guard let url = value as? String else { return }
-            titles[url, default: ""] += storage.attributedSubstring(from: range).string
+            names[url, default: ""] += storage.attributedSubstring(from: range).string
+        }
+        return names
+    }
+}
+
+#if os(macOS)
+
+/// A folder read as one document: every note's content in one text view, one
+/// scroll view, one caret. The notes are not embedded editors — they are
+/// rendered like any other text, and the boundary between two of them is a
+/// title over a dotted rule rather than the edge of a box.
+@MainActor
+@Observable
+final class FolderNotebookCore {
+    private struct Section {
+        var heads: [String]
+        var lastJSON: String
+        var lastName: String
+    }
+
+    @ObservationIgnored let document = NotebookDocument()
+    private(set) var loaded = false
+
+    @ObservationIgnored private var sections: [String: Section] = [:]
+    @ObservationIgnored private let cache = AssetCache()
+    @ObservationIgnored private let model: NotesModel
+    @ObservationIgnored private let origin = UUID()
+    @ObservationIgnored private var saveTask: Task<Void, Never>?
+
+    init(model: NotesModel) {
+        self.model = model
+    }
+
+    func load(_ notes: [FolderNode]) async {
+        var built: [NotebookDocument.Section] = []
+        var next: [String: Section] = [:]
+
+        for node in notes {
+            guard let snapshot = await model.spansSnapshot(for: node.url) else { continue }
+            let spans = SpanNode.decodeList(snapshot.spansJson)
+            built.append(NotebookDocument.Section(
+                url: node.url,
+                title: node.displayName,
+                body: RichText.attributed(from: spans, cache: cache)
+            ))
+            next[node.url] = Section(
+                heads: snapshot.heads,
+                lastJSON: snapshot.spansJson,
+                lastName: node.displayName
+            )
         }
 
-        for url in order {
+        document.rebuild(built)
+        sections = next
+        loaded = true
+    }
+
+    func scheduleSave() {
+        guard loaded else { return }
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await self?.saveNow()
+        }
+    }
+
+    /// Write each note back against the heads it was loaded at, so a note
+    /// edited elsewhere in the meantime conflicts rather than being clobbered.
+    func saveNow() async {
+        guard loaded else { return }
+        saveTask?.cancel()
+        saveTask = nil
+
+        let bodies = document.bodies()
+        let titles = document.titles()
+
+        for url in document.order {
             if let name = titles[url]?.trimmingCharacters(in: .whitespacesAndNewlines),
                name != sections[url]?.lastName,
                let node = model.node(for: url) {
                 sections[url]?.lastName = name
                 model.renameNode(node, to: name)
             }
-            guard let section = sections[url], let text = pieces[url] else { continue }
+            guard let section = sections[url], let text = bodies[url] else { continue }
             let spans = RichText.spans(from: text)
             let json = SpanNode.encodeList(spans)
             guard json != section.lastJSON else { continue }
@@ -282,6 +349,43 @@ final class FolderNotebookCore {
     }
 }
 
+/// Draws the rule between two notes. It is painted rather than inserted: a
+/// character standing in for the seam would be one more thing an edit could
+/// land on, and the boundary rules exist to keep that from happening.
+final class NotebookTextView: NSTextView {
+    weak var document: NotebookDocument?
+
+    override func drawBackground(in rect: NSRect) {
+        super.drawBackground(in: rect)
+        guard let document,
+              let layoutManager = textLayoutManager,
+              let contentManager = layoutManager.textContentManager
+        else { return }
+
+        let inset = textContainerInset
+        PColor.separatorColor.setStroke()
+
+        for location in document.separatorLocations() {
+            guard let start = contentManager.location(
+                contentManager.documentRange.location,
+                offsetBy: location
+            ), let fragment = layoutManager.textLayoutFragment(for: start) else { continue }
+
+            // Half the spacing above the title, on a half pixel so a one point
+            // line lands on a device pixel instead of straddling two.
+            let y = (fragment.layoutFragmentFrame.minY + inset.height - 15).rounded() + 0.5
+            guard y >= rect.minY - 20, y <= rect.maxY + 20 else { continue }
+
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: inset.width, y: y))
+            path.line(to: NSPoint(x: bounds.width - inset.width, y: y))
+            path.lineWidth = 1
+            path.setLineDash([1.5, 4], count: 2, phase: 0)
+            path.stroke()
+        }
+    }
+}
+
 struct FolderNotebookText: NSViewRepresentable {
     let core: FolderNotebookCore
 
@@ -290,7 +394,8 @@ struct FolderNotebookText: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let textView = NSTextView(usingTextLayoutManager: true)
+        let textView = NotebookTextView(usingTextLayoutManager: true)
+        textView.document = core.document
         textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         textView.allowsUndo = true
@@ -306,7 +411,7 @@ struct FolderNotebookText: NSViewRepresentable {
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude
         )
-        textView.textContentStorage?.textStorage = core.storage
+        textView.textContentStorage?.textStorage = core.document.storage
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -317,9 +422,10 @@ struct FolderNotebookText: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
-        if textView.textContentStorage?.textStorage !== core.storage {
-            textView.textContentStorage?.textStorage = core.storage
+        guard let textView = scrollView.documentView as? NotebookTextView else { return }
+        textView.document = core.document
+        if textView.textContentStorage?.textStorage !== core.document.storage {
+            textView.textContentStorage?.textStorage = core.document.storage
         }
     }
 
@@ -335,7 +441,10 @@ struct FolderNotebookText: NSViewRepresentable {
             shouldChangeTextIn affectedCharRange: NSRange,
             replacementString: String?
         ) -> Bool {
-            core.allowsEdit(in: affectedCharRange, replacement: replacementString ?? "")
+            core.document.allowsEdit(
+                in: affectedCharRange,
+                replacement: replacementString ?? ""
+            )
         }
 
         func textDidChange(_ notification: Notification) {
@@ -344,7 +453,7 @@ struct FolderNotebookText: NSViewRepresentable {
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
-            textView.typingAttributes = core.typingAttributes(
+            textView.typingAttributes = core.document.typingAttributes(
                 from: textView.typingAttributes,
                 at: textView.selectedRange().location
             )
