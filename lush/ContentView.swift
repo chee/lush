@@ -690,13 +690,8 @@ struct ContentView: View {
             case .folder(let url):
                 FolderScreen(folderUrl: url, push: openMobile)
             case .folderNotebook(let url):
-                FolderNotebook(
-                    children: model.orderedChildren(
-                        model.node(for: url)?.children ?? [],
-                        in: url
-                    )
-                )
-                .navigationTitle(model.node(for: url)?.displayName ?? "Notebook")
+                FolderNotebook(folderUrl: url)
+                    .navigationTitle(model.node(for: url)?.displayName ?? "Notebook")
             case .note(let url):
                 NoteDetail(noteUrl: model.resolvedNoteUrl(url))
                     .onAppear { model.selectedNoteUrl = url }
@@ -2818,7 +2813,7 @@ struct FolderScreen: View {
                     }
                 }
             }
-            if let folderUrl, nodes.contains(where: \.isNote) {
+            if let folderUrl, folderHoldsANote(folderUrl, in: model) {
                 ToolbarItem {
                     Button {
                         push(.folderNotebook(folderUrl))

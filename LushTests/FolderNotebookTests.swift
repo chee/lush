@@ -290,12 +290,85 @@ final class FolderNotebookTests: XCTestCase {
         XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
     }
 
+    // MARK: - Notes found in subfolders
+
+    /// The layout a nested note gets, and the offsets the rest of these turn
+    /// on:
+    ///
+    ///     0 ..< 7   path "Trip / "
+    ///     7 ..< 12  title "Ferry"
+    ///     12        newline closing the title
+    ///     13 ..< 18 body "waves"
+    private func makeNested() -> NotebookDocument {
+        let document = NotebookDocument()
+        document.rebuild([
+            .init(url: alpha, title: "Ferry", path: "Trip", body: body("waves")),
+        ])
+        return document
+    }
+
+    func testTheFolderPathIsDrawnAheadOfTheTitle() {
+        let document = makeNested()
+        XCTAssertEqual(document.storage.string, "Trip / Ferry\nwaves")
+    }
+
+    /// The path says where the note is, not what it is called, so it must not
+    /// reach the name — a rename would otherwise write the folder into it.
+    func testTheFolderPathIsNotPartOfTheName() {
+        let document = makeNested()
+        XCTAssertEqual(document.titles(), [alpha: "Ferry"])
+        XCTAssertEqual(document.bodies()[alpha]?.string, "waves")
+    }
+
+    func testTheFolderPathBelongsToNoNote() {
+        let document = makeNested()
+        for location in 0..<7 {
+            XCTAssertNil(document.owner(at: location), "location \(location)")
+            XCTAssertNil(document.titleOwner(at: location), "location \(location)")
+            XCTAssertTrue(document.isBoundary(at: location), "location \(location)")
+        }
+    }
+
+    func testTheFolderPathCannotBeTypedIn() {
+        let document = makeNested()
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 2, length: 0), replacement: "x"))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 0, length: 4), replacement: ""))
+        // and an edit may not reach out of the title into it
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 5, length: 4), replacement: ""))
+    }
+
+    func testTheTitleAfterAPathIsStillEditable() {
+        let document = makeNested()
+        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 9, length: 0), replacement: "x"))
+        XCTAssertEqual(document.title(forCaretAt: 7), alpha)
+        XCTAssertEqual(document.title(forCaretAt: 12), alpha)
+    }
+
+    /// A folder's own notes carry no path and are laid out exactly as before.
+    func testANoteInTheFolderItselfGetsNoPath() {
+        let document = NotebookDocument()
+        document.rebuild([.init(url: alpha, title: "Alpha", body: body("alpha"))])
+        XCTAssertEqual(document.storage.string, "Alpha\nalpha")
+    }
+
     // MARK: - Separators
 
     /// One rule between each pair of notes, and none above the first — it has
     /// nothing to be separated from.
     func testSeparatorSitsBetweenNotesOnly() {
         let document = makeDocument()
+        XCTAssertEqual(document.separatorLocations(), [12])
+    }
+
+    /// The rule goes above the whole boundary line, path and all — drawn at
+    /// the title it would cut underneath the path.
+    func testTheSeamSitsAboveTheFolderPath() {
+        let document = NotebookDocument()
+        document.rebuild([
+            .init(url: alpha, title: "Alpha", body: body("alpha")),
+            .init(url: beta, title: "Ferry", path: "Trip", body: body("waves")),
+        ])
+        XCTAssertEqual(document.storage.string, "Alpha\nalpha\nTrip / Ferry\nwaves")
         XCTAssertEqual(document.separatorLocations(), [12])
     }
 
