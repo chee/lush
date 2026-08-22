@@ -180,7 +180,7 @@ struct LoglineDraft {
         out.isEmbed = true
         // Filled in by hand, so there is nothing for a refresh to chase.
         out.attrs.removeValue(forKey: BlockValue.contextPendingKey)
-        let stamp = ISO8601DateFormatter().string(from: date)
+        let stamp = BlockValue.isoStamp(date, in: zone)
         out.attrs[isCreation ? "created" : "ts"] = .string(stamp)
         out.attrs.removeValue(forKey: isCreation ? "ts" : "created")
         out.attrs["tz"] = .string(zone.identifier)
@@ -258,12 +258,20 @@ extension BlockValue {
     /// draws a spinner until `resolvingContext` folds the fresher reading in.
     static let contextPendingKey = "pending"
 
+    /// Stamps carry the writer's wall-clock offset, so a reader — the core's
+    /// logline enrichment included — knows what "morning" meant without a
+    /// timezone database.
+    static func isoStamp(_ date: Date, in zone: TimeZone = .autoupdatingCurrent) -> String {
+        let fmt = ISO8601DateFormatter()
+        fmt.timeZone = zone
+        return fmt.string(from: date)
+    }
+
     static func contextBlock(from snap: ContextSnapshot, pending: Bool = false) -> BlockValue {
         var attrs: [String: JSONValue] = [:]
-        let fmt = ISO8601DateFormatter()
         // when the logline was stamped, which is now — the snapshot's own
         // timestamp says how fresh its readings are, a different question
-        attrs["ts"] = .string(fmt.string(from: Date()))
+        attrs["ts"] = .string(isoStamp(Date()))
         attrs["tz"] = .string(TimeZone.current.identifier)
         if let loc = snap.locationName { attrs["location"] = .string(loc) }
         if let lat = snap.latitude { attrs["lat"] = .number(lat) }
@@ -276,8 +284,7 @@ extension BlockValue {
 
     static func creationBlock(snap: ContextSnapshot? = nil, pending: Bool = false) -> BlockValue {
         var attrs: [String: JSONValue] = [:]
-        let fmt = ISO8601DateFormatter()
-        attrs["created"] = .string(fmt.string(from: Date()))
+        attrs["created"] = .string(isoStamp(Date()))
         attrs["tz"] = .string(TimeZone.current.identifier)
         if let snap {
             if let loc = snap.locationName { attrs["location"] = .string(loc) }

@@ -97,6 +97,15 @@ extension String {
 
 enum Agenda {
     static let iso = ISO8601DateFormatter()
+    /// For stamps written into note blocks: carries the local offset so the
+    /// wall-clock time survives into search text. Never used for event ids —
+    /// those stay on `iso`, and changing their format would orphan every
+    /// stored calendar link.
+    static let isoLocal: ISO8601DateFormatter = {
+        let fmt = ISO8601DateFormatter()
+        fmt.timeZone = .autoupdatingCurrent
+        return fmt
+    }()
     static let sidebarTag = "agenda:calendar"
     static let meetingNotesTag = "agenda:meeting-notes"
     static let reminderPrefix = "reminder:"
@@ -679,13 +688,13 @@ extension BlockValue {
             "event": .string(series ? (item.seriesId ?? item.id) : item.id),
             "kind": .string(item.kind.rawValue),
             "title": .string(item.title),
-            "start": .string(Agenda.iso.string(from: item.start)),
+            "start": .string(Agenda.isoLocal.string(from: item.start)),
         ]
         if series {
             attrs["series"] = .bool(true)
             if let text = item.recurrenceText { attrs["repeat"] = .string(text) }
         }
-        if let end = item.end { attrs["end"] = .string(Agenda.iso.string(from: end)) }
+        if let end = item.end { attrs["end"] = .string(Agenda.isoLocal.string(from: end)) }
         if item.isAllDay { attrs["allDay"] = .bool(true) }
         if !item.listName.isEmpty { attrs["calendar"] = .string(item.listName) }
         if let location = item.location { attrs["location"] = .string(location) }
