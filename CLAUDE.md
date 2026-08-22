@@ -63,6 +63,23 @@ send you chasing a scaling problem that isn't there. The `bench_*` tests in
 `core/src/repo.rs` are `#[ignore]`d; run them with
 `cargo test --release --lib bench_ -- --ignored --nocapture`.
 
+## Reading note content
+
+The search index (`search.sqlite3`) is the single extraction stage. The indexer
+listens for `DocChanged`, opens the doc once (`indexed_doc` in
+`core/src/search.rs`), writes one row, and `DocIndexed` fires once the row is
+fresh.
+
+Anything that wants a note's content — previews, Spotlight, embeddings, maps —
+reads the index row (`core.noteContent(url:)` / `SearchIndex::indexed_note`)
+and subscribes to `DocIndexed`. Don't open docs to read them; `DocChanged` is
+the indexer's cue, not yours, and fires before the row catches up.
+
+Need something the row doesn't carry? Add it to the index first: a column, its
+extraction in `indexed_doc`, and its comparison in `upsert`'s no-op check so
+existing rows backfill on the next crawl. Then read it back like everything
+else.
+
 ## Style
 
 Follow the existing code — no comments, no ceremony, plain functions over classes where they fit.
