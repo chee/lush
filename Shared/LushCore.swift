@@ -4482,6 +4482,16 @@ public struct NotePlace {
      * empty when the block carries no stamp.
      */
     public var stamped: String
+    /**
+     * The opening of what was written under this logline, which is what tells
+     * one visit to a place from another.
+     */
+    public var excerpt: String
+    /**
+     * The automerge URL of the first image written under it, empty when there
+     * wasn't one.
+     */
+    public var image: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -4492,7 +4502,15 @@ public struct NotePlace {
         /**
          * When the logline was stamped, as it was written: an ISO 8601 string,
          * empty when the block carries no stamp.
-         */stamped: String) {
+         */stamped: String, 
+        /**
+         * The opening of what was written under this logline, which is what tells
+         * one visit to a place from another.
+         */excerpt: String, 
+        /**
+         * The automerge URL of the first image written under it, empty when there
+         * wasn't one.
+         */image: String) {
         self.url = url
         self.ordinal = ordinal
         self.latitude = latitude
@@ -4500,6 +4518,8 @@ public struct NotePlace {
         self.name = name
         self.weather = weather
         self.stamped = stamped
+        self.excerpt = excerpt
+        self.image = image
     }
 }
 
@@ -4531,6 +4551,12 @@ extension NotePlace: Equatable, Hashable {
         if lhs.stamped != rhs.stamped {
             return false
         }
+        if lhs.excerpt != rhs.excerpt {
+            return false
+        }
+        if lhs.image != rhs.image {
+            return false
+        }
         return true
     }
 
@@ -4542,6 +4568,8 @@ extension NotePlace: Equatable, Hashable {
         hasher.combine(name)
         hasher.combine(weather)
         hasher.combine(stamped)
+        hasher.combine(excerpt)
+        hasher.combine(image)
     }
 }
 
@@ -4560,7 +4588,9 @@ public struct FfiConverterTypeNotePlace: FfiConverterRustBuffer {
                 longitude: FfiConverterDouble.read(from: &buf), 
                 name: FfiConverterString.read(from: &buf), 
                 weather: FfiConverterString.read(from: &buf), 
-                stamped: FfiConverterString.read(from: &buf)
+                stamped: FfiConverterString.read(from: &buf), 
+                excerpt: FfiConverterString.read(from: &buf), 
+                image: FfiConverterString.read(from: &buf)
         )
     }
 
@@ -4572,6 +4602,8 @@ public struct FfiConverterTypeNotePlace: FfiConverterRustBuffer {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterString.write(value.weather, into: &buf)
         FfiConverterString.write(value.stamped, into: &buf)
+        FfiConverterString.write(value.excerpt, into: &buf)
+        FfiConverterString.write(value.image, into: &buf)
     }
 }
 
