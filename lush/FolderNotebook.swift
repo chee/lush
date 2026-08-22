@@ -516,6 +516,12 @@ struct FolderNotebookText: NSViewRepresentable {
 final class NotebookTextView: UITextView {
     weak var document: NotebookDocument?
 
+    /// UIKit has no `textContentStorage`; the content manager is the same
+    /// object under a name it doesn't advertise.
+    var contentStorage: NSTextContentStorage? {
+        textLayoutManager?.textContentManager as? NSTextContentStorage
+    }
+
     override func draw(_ rect: CGRect) {
         super.draw(rect)
         guard let document,
@@ -565,14 +571,14 @@ struct FolderNotebookText: UIViewRepresentable {
         // this the strip revealed by a scroll is never asked to redraw.
         textView.contentMode = .redraw
         textView.textContainer.widthTracksTextView = true
-        textView.textContentStorage?.textStorage = core.document.storage
+        textView.contentStorage?.textStorage = core.document.storage
         return textView
     }
 
     func updateUIView(_ textView: NotebookTextView, context: Context) {
         textView.document = core.document
-        if textView.textContentStorage?.textStorage !== core.document.storage {
-            textView.textContentStorage?.textStorage = core.document.storage
+        if textView.contentStorage?.textStorage !== core.document.storage {
+            textView.contentStorage?.textStorage = core.document.storage
         }
     }
 
