@@ -17,6 +17,18 @@ func reordered<T: Equatable>(_ items: [T], moving item: T, adjacentTo target: T,
     return next
 }
 
+/// Something holding typed text that hasn't reached the doc yet. Both halves
+/// matter at suspend: `pushNow` starts every writer at once from the
+/// synchronous termination paths, `flushNow` is what waits for them.
+@MainActor
+protocol LiveWriter: AnyObject {
+    /// Give up whatever debounce is running and start writing. Returns
+    /// immediately.
+    func pushNow()
+    /// The same, and wait for it to land.
+    func flushNow() async
+}
+
 @Observable @MainActor
 final class NotesModel {
     static let shared = NotesModel()
@@ -51,6 +63,13 @@ final class NotesModel {
 
     var focusModeEnabled: Bool {
         !applyingIncomingChanges && !sendingChanges && !sharingPresence
+    }
+
+    /// Any one of the three held back, which is what the moon fills in for.
+    /// `focusModeEnabled` wants all three: the icon means something is being
+    /// held back, the window's border means everything is.
+    var focusModeEngaged: Bool {
+        !applyingIncomingChanges || !sendingChanges || !sharingPresence
     }
 
     func setApplyingIncomingChanges(_ enabled: Bool) {
@@ -1336,7 +1355,9 @@ final class NotesModel {
     /// only in memory — behind the editor's 300ms push debounce, then behind
     /// the core's save debounce — and a kill in that window loses it.
     func flushPendingWrites() async {
-        await activeEditor?.core?.flushNow()
+        for writer in liveWriters {
+            await writer.flushNow()
+        }
         for task in Array(noteWriteTasks.values) {
             _ = await task.value
         }
@@ -1347,7 +1368,7 @@ final class NotesModel {
     func syncNow(budget: Duration) async {
         if core == nil { await start() }
         guard let core else { return }
-        activeEditor?.core?.pushNow()
+        pushLiveEditors()
         core.connect()
         await drainSharedIntake()
         let urls = rootFolderUrls
@@ -2126,6 +2147,50 @@ final class NotesModel {
     }
 
     // Editor support -----------------------------------------------------
+
+    private struct LiveWriterBox {
+        weak var writer: (any LiveWriter)?
+    }
+
+    /// Everything holding an edit behind a debounce, not just the focused
+    /// editor. A folder shows many editors at once, the notebook is a writer
+    /// in its own right, and each keeps its own debounce for a suspend-time
+    /// kill to lose.
+    @ObservationIgnored private var liveWriterBoxes: [ObjectIdentifier: LiveWriterBox] = [:]
+
+    /// Keyed and held by the writer itself rather than by anything pointing
+    /// at it. A view rebuild can hand a new core the same controller, and
+    /// reaching writers through `controller.core` would then flush the new
+    /// core twice and the old one — the one still holding the edit — never.
+    func registerLiveWriter(_ writer: any LiveWriter) {
+        liveWriterBoxes[ObjectIdentifier(writer)] = LiveWriterBox(writer: writer)
+    }
+
+    func unregisterLiveWriter(_ id: ObjectIdentifier) {
+        liveWriterBoxes[id] = nil
+    }
+
+    /// Focused editor first: if the suspend window closes early, the note
+    /// being typed in is the one that had to reach disk.
+    var liveWriters: [any LiveWriter] {
+        var seen: Set<ObjectIdentifier> = []
+        var result: [any LiveWriter] = []
+        if let core = activeEditor?.core {
+            seen.insert(ObjectIdentifier(core))
+            result.append(core)
+        }
+        for box in liveWriterBoxes.values {
+            guard let writer = box.writer,
+                  seen.insert(ObjectIdentifier(writer)).inserted
+            else { continue }
+            result.append(writer)
+        }
+        return result
+    }
+
+    func pushLiveEditors() {
+        for writer in liveWriters { writer.pushNow() }
+    }
 
     private var memoryPressureSource: DispatchSourceMemoryPressure?
 

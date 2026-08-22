@@ -149,6 +149,11 @@ final class EditorController {
     var filePickerVisible = false
     var cameraPickerVisible = false
     #endif
+    /// The note's laid-out height, for hosts that give the editor its whole
+    /// height rather than scrolling it. A folder's notebook stacks notes into
+    /// one scroll view, and a scroll view inside another that scrolls the same
+    /// way is the thing the HIG tells you not to build.
+    var contentHeight: CGFloat = 0
     @ObservationIgnored weak var core: EditorCore?
 
     func openFind() {
@@ -453,26 +458,58 @@ private final class EditorDocumentSession {
 
 @MainActor
 private enum EditorDocumentSessions {
-    private static let capacity = 12
+    /// Only sessions nothing is editing are cached. A session a core still
+    /// holds is never evicted: `EditorCore.session` is a stored reference
+    /// while `pushNow` writes its heads back through a fresh lookup, so
+    /// dropping one out from under a live core splits the note into two
+    /// sessions whose heads then diverge.
+    private static let detachedCapacity = 12
     private static var sessions: [String: EditorDocumentSession] = [:]
-    private static var recency: [String] = []
+    private static var holders: [String: Int] = [:]
+    private static var detachedRecency: [String] = []
 
     static func session(for noteUrl: String) -> EditorDocumentSession {
-        recency.removeAll { $0 == noteUrl }
-        recency.append(noteUrl)
         if let session = sessions[noteUrl] {
+            if holders[noteUrl] == nil { touchDetached(noteUrl) }
             return session
         }
         let session = EditorDocumentSession(noteUrl: noteUrl)
         sessions[noteUrl] = session
         NotesModel.shared.pinNote(noteUrl)
-        while sessions.count > capacity,
-              let oldest = recency.first(where: { $0 != noteUrl && sessions[$0] != nil }) {
-            sessions.removeValue(forKey: oldest)
-            recency.removeAll { $0 == oldest }
+        if holders[noteUrl] == nil { touchDetached(noteUrl) }
+        return session
+    }
+
+    /// A core holds its session for as long as it lives, so how many notes
+    /// stay resident follows how many editors are mounted rather than a fixed
+    /// count. A lazy container mounts what it can show, which is what bounds
+    /// this — the core refuses to sweep a pinned doc, so nothing else will.
+    static func hold(_ noteUrl: String) {
+        holders[noteUrl, default: 0] += 1
+        detachedRecency.removeAll { $0 == noteUrl }
+    }
+
+    static func release(_ noteUrl: String) {
+        guard let count = holders[noteUrl] else { return }
+        if count > 1 {
+            holders[noteUrl] = count - 1
+            return
+        }
+        holders[noteUrl] = nil
+        guard sessions[noteUrl] != nil else { return }
+        touchDetached(noteUrl)
+    }
+
+    private static func touchDetached(_ noteUrl: String) {
+        detachedRecency.removeAll { $0 == noteUrl }
+        detachedRecency.append(noteUrl)
+        while detachedRecency.count > detachedCapacity {
+            let oldest = detachedRecency.removeFirst()
+            guard holders[oldest] == nil,
+                  sessions.removeValue(forKey: oldest) != nil
+            else { continue }
             NotesModel.shared.unpinNote(oldest)
         }
-        return session
     }
 }
 
@@ -544,7 +581,7 @@ private func embedCount(in spans: [SpanNode]) -> Int {
 }
 
 @MainActor
-final class EditorCore {
+final class EditorCore: LiveWriter {
     private static let softLineBreak = "\u{2028}"
     /// The core that most recently attached for each note. Presence has one
     /// shared session, so a departing core must not leave it out from under a
@@ -603,6 +640,8 @@ final class EditorCore {
         self.model = model
         self.controller = controller
         model.pinNote(noteUrl)
+        EditorDocumentSessions.hold(noteUrl)
+        model.registerLiveWriter(self)
         controller.core = self
         inline.core = self
         noteObserverId = model.addNoteObserver { [weak self] url in
@@ -633,6 +672,8 @@ final class EditorCore {
         caretMemoryTask?.cancel()
         let identity = ObjectIdentifier(self)
         Task { @MainActor [model, noteObserverId, peersObserverId, noteUrl] in
+            model.unregisterLiveWriter(identity)
+            EditorDocumentSessions.release(noteUrl)
             model.unpinNote(noteUrl)
             if let noteObserverId {
                 model.removeNoteObserver(noteObserverId)
@@ -672,12 +713,15 @@ final class EditorCore {
         // undo entries hold snapshots and ranges of the OLD note; replaying
         // them against the next note corrupts it
         view?.pUndoManager?.removeAllActions()
+        let previousUrl = noteUrl
         model.unpinNote(noteUrl)
         model.pinNote(url)
         noteUrl = url
         caretRestored = false
         localWriteHeadsTask = nil
         session = EditorDocumentSessions.session(for: url)
+        EditorDocumentSessions.hold(url)
+        EditorDocumentSessions.release(previousUrl)
         // fold state is per-note; recompute hidden ranges for the incoming
         // storage BEFORE the swap rebuilds its elements
         folding.foldedHeadings.removeAll()
@@ -706,6 +750,13 @@ final class EditorCore {
         #else
         view?.pStorage ?? session.storage
         #endif
+    }
+
+    /// The inspector tabs, the scratchpad and the suspend-time pushes all
+    /// speak to one editor, and it is the one being typed in — not whichever
+    /// one a lazy container happened to mount last.
+    func becameFocused() {
+        model.activeEditor = controller
     }
 
     func attachViewToSharedStorage() {
@@ -4674,6 +4725,12 @@ func editorCopyRange(
 class EditorTextView: NSTextView, EditorTextViewLike {
     weak var core: EditorCore?
 
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { core?.becameFocused() }
+        return became
+    }
+
     /// Where the last context menu was opened, so Share has somewhere in the
     /// view to hang its popover off.
     private var contextPoint: CGPoint = .zero
@@ -5373,6 +5430,10 @@ struct RichTextEditor: NSViewRepresentable {
     let model: NotesModel
     let controller: EditorController
     let contextTracker: ContextTracker
+    /// False when the host sizes the editor to its content instead. The
+    /// editor then reports its height through the controller and never
+    /// scrolls itself.
+    var scrolls = true
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -5418,11 +5479,27 @@ struct RichTextEditor: NSViewRepresentable {
         context.coordinator.markers.driveSelection(from: textView)
 
         let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
+        scroll.hasVerticalScroller = scrolls
         scroll.drawsBackground = true
         // the editor extends under the toolbar; content rests below it
-        scroll.automaticallyAdjustsContentInsets = true
+        scroll.automaticallyAdjustsContentInsets = scrolls
         scroll.documentView = textView
+        if !scrolls {
+            scroll.verticalScrollElasticity = .none
+            textView.postsFrameChangedNotifications = true
+            let controller = self.controller
+            controller.contentHeight = textView.frame.height
+            context.coordinator.heightObserver = NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification,
+                object: textView,
+                queue: nil
+            ) { [weak textView] _ in
+                MainActor.assumeIsolated {
+                    guard let textView else { return }
+                    controller.contentHeight = textView.frame.height
+                }
+            }
+        }
         scroll.contentView.postsBoundsChangedNotifications = true
         context.coordinator.scrollObserver = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification,
@@ -5459,6 +5536,7 @@ struct RichTextEditor: NSViewRepresentable {
         let core: EditorCore
         let markers = ListMarkerLayoutDelegate()
         var scrollObserver: (any NSObjectProtocol)?
+        var heightObserver: (any NSObjectProtocol)?
         var openInTab: ((String) -> Void)?
         private var lastScenePhase: ScenePhase?
 
@@ -5470,6 +5548,9 @@ struct RichTextEditor: NSViewRepresentable {
         deinit {
             if let scrollObserver {
                 NotificationCenter.default.removeObserver(scrollObserver)
+            }
+            if let heightObserver {
+                NotificationCenter.default.removeObserver(heightObserver)
             }
         }
 
@@ -5586,6 +5667,12 @@ private final class SuppressedKeyboardInputView: UIInputView {
 final class EditorTextView: UITextView, EditorTextViewLike {
     weak var core: EditorCore?
 
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { core?.becameFocused() }
+        return became
+    }
+
     var editorAccessoryView: UIView?
     private lazy var keyboardSuppressingInputView: UIInputView = {
         let view = SuppressedKeyboardInputView(frame: .zero, inputViewStyle: .keyboard)
@@ -5608,9 +5695,18 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     /// `textStorage` can go stale after the content storage adopts the shared
     /// session storage, so everything resolves through the content storage.
     var pStorage: NSTextStorage? { pContentStorage?.textStorage }
+    /// UIKit keeps its own idea of where the next keystroke goes, and it is
+    /// not the one the view draws. Moving the selection in code without
+    /// saying so leaves the keyboard aiming at the offset it last heard
+    /// about: the caret is drawn in the right place and the typing lands
+    /// somewhere else entirely.
     var pSelectedRange: NSRange {
         get { selectedRange }
-        set { selectedRange = clampedRange(newValue) }
+        set {
+            inputDelegate?.selectionWillChange(self)
+            selectedRange = clampedRange(newValue)
+            inputDelegate?.selectionDidChange(self)
+        }
     }
     var pTypingAttributes: [NSAttributedString.Key: Any] {
         get { typingAttributes }
@@ -5618,7 +5714,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     }
     var pSelectedRanges: [NSRange] {
         get { [selectedRange] }
-        set { if let first = newValue.first { selectedRange = first } }
+        set { if let first = newValue.first { pSelectedRange = first } }
     }
     var pTextLayoutManager: NSTextLayoutManager? { textLayoutManager }
     var pContentStorage: NSTextContentStorage? {
@@ -5689,18 +5785,35 @@ final class EditorTextView: UITextView, EditorTextViewLike {
     /// view gets a screenful of room under it so its end can be scrolled up
     /// to where the eyes are; the tail keeps a few lines on screen once the
     /// scroll is all the way down.
+    ///
+    /// The room belongs to the text container, not to `contentInset`. As an
+    /// inset it told the scroll view the content ran a screenful further than
+    /// it does, and three things believed it. Selection autoscroll took its
+    /// speed from the travel it thought was left and ran away down the note.
+    /// `scrollRangeToVisible` sizes its target against bounds less insets, so
+    /// with a screenful claimed it had almost no room to aim at. And
+    /// `contentInset.bottom` is the system's own channel for keyboard
+    /// avoidance — reapplying the room from `layoutSubviews` stamped on what
+    /// the keyboard had just set, which left the caret under it. In the
+    /// container the room is ordinary content, and the inset goes back to
+    /// meaning only what the system means by it.
     private static let scrollPastEndTail: CGFloat = 120
 
     func pApplyScrollPastEnd() {
         let viewport = bounds.height - safeAreaInsets.top - safeAreaInsets.bottom
         guard viewport > 0 else { return }
-        // measured against the text alone: adding the room doesn't grow
-        // contentSize, so this can't talk itself into another pass
-        let room = contentSize.height > viewport
-            ? max(0, viewport - Self.scrollPastEndTail)
-            : 0
-        guard abs(contentInset.bottom - room) > 0.5 else { return }
-        contentInset.bottom = room
+        // The laid-out text, which the room is not part of. contentSize is,
+        // now that the room lives in the container, so measuring against that
+        // would talk this into growing on every pass.
+        let text = textLayoutManager?.usageBoundsForTextContainer.maxY ?? 0
+        let room = text > viewport ? max(0, viewport - Self.scrollPastEndTail) : 0
+        guard abs(textContainerInset.bottom - room) > 0.5 else { return }
+        textContainerInset = UIEdgeInsets(
+            top: textContainerInset.top,
+            left: textContainerInset.left,
+            bottom: room,
+            right: textContainerInset.right
+        )
     }
 
     override func layoutSubviews() {
@@ -5728,15 +5841,19 @@ final class EditorTextView: UITextView, EditorTextViewLike {
             )
         }
         let minY = -adjustedContentInset.top
-        // the bottom inset is a screenful of scroll-past-the-end room, so the
-        // furthest the view goes is the content plus that, less its own height
+        // the scroll-past-the-end room is inside contentHeight, being part of
+        // the container; the inset here is the keyboard and the safe area
         let maxY = max(minY, contentHeight + adjustedContentInset.bottom - bounds.height)
         let target = min(max(y, minY), maxY)
         setContentOffset(CGPoint(x: contentOffset.x, y: target), animated: false)
     }
 
+    /// The same accounting as `pSelectedRange`, for the text itself: an edit
+    /// made straight to the storage is one UIKit never hears about, and every
+    /// offset it is holding on to means something different afterwards.
     func pPerformStorageEdit(_ edit: (NSTextStorage) -> Void) {
         guard let storage = pStorage else { return }
+        inputDelegate?.textWillChange(self)
         if let contentStorage = pContentStorage {
             contentStorage.performEditingTransaction {
                 edit(storage)
@@ -5744,6 +5861,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         } else {
             edit(storage)
         }
+        inputDelegate?.textDidChange(self)
     }
 
     func pCharacterIndex(atTextContainerPoint point: CGPoint) -> Int? {

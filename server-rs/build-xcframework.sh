@@ -7,15 +7,17 @@ LIB=libpatchwork_server.a
 STAGING=target/xcframework-staging
 KIT=../PatchworkServerKit
 
-# A test run links the simulator slice and nothing else, so CI sets this and
-# skips the device and macOS builds — they were most of the build and none of
-# the test. Anything that ships must leave it unset.
+# CI sets this to skip the iOS device slice, which nothing on a pull request
+# links and which was most of the build. macOS is built either way: the app's
+# Mac-only code is a large share of it, and a test run that cannot link macOS
+# is a test run that never compiles that code. Anything that ships leaves this
+# unset.
 SIMULATOR_ONLY=${SIMULATOR_ONLY:-0}
 
 cargo build --release --target aarch64-apple-ios-sim
+cargo build --release --target aarch64-apple-darwin
 if [[ $SIMULATOR_ONLY == 0 ]]; then
   cargo build --release --target aarch64-apple-ios
-  cargo build --release --target aarch64-apple-darwin
 fi
 
 # Bindgen reads metadata out of a host dylib
@@ -33,9 +35,9 @@ cp target/bindings/patchwork_serverFFI.modulemap "$STAGING/headers/module.module
 # while, so the app could not run on an Intel Mac regardless of what this
 # built; the second slice was weight nothing loaded.
 slices=(-library target/aarch64-apple-ios-sim/release/$LIB -headers "$STAGING/headers")
+slices+=(-library target/aarch64-apple-darwin/release/$LIB -headers "$STAGING/headers")
 if [[ $SIMULATOR_ONLY == 0 ]]; then
   slices+=(-library target/aarch64-apple-ios/release/$LIB -headers "$STAGING/headers")
-  slices+=(-library target/aarch64-apple-darwin/release/$LIB -headers "$STAGING/headers")
 fi
 
 rm -rf "$KIT/Artifacts/PatchworkServerFFI.xcframework"

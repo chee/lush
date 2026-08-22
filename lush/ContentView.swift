@@ -9,6 +9,8 @@ import PhotosUI
 
 enum NavRoute: Hashable {
     case folder(String)
+    /// The same folder read as one document rather than listed.
+    case folderNotebook(String)
     case note(String)
     case patchwork(String)
     case script(String)
@@ -687,6 +689,14 @@ struct ContentView: View {
             switch route {
             case .folder(let url):
                 FolderScreen(folderUrl: url, push: openMobile)
+            case .folderNotebook(let url):
+                FolderNotebook(
+                    children: model.orderedChildren(
+                        model.node(for: url)?.children ?? [],
+                        in: url
+                    )
+                )
+                .navigationTitle(model.node(for: url)?.displayName ?? "Notebook")
             case .note(let url):
                 NoteDetail(noteUrl: model.resolvedNoteUrl(url))
                     .onAppear { model.selectedNoteUrl = url }
@@ -1830,7 +1840,7 @@ struct ContentView: View {
               tag != NotesMap.sidebarTag
         else { return nil }
         let url = Self.sidebarUrl(tag)
-        guard url.hasPrefix("automerge:"), model.node(for: url)?.kind != "folder" else { return nil }
+        guard url.hasPrefix("automerge:") else { return nil }
         return url
     }
 
@@ -2006,6 +2016,16 @@ struct ContentView: View {
     @ViewBuilder
     private func detailContent(for url: String) -> some View {
         let node = model.node(for: url)
+        if node?.kind == "folder" {
+            FolderDetail(folderUrl: url, open: open)
+                .id(url)
+        } else {
+            detailContentNonFolder(for: url, node: node)
+        }
+    }
+
+    @ViewBuilder
+    private func detailContentNonFolder(for url: String, node: FolderNode?) -> some View {
         let isPatchwork = model.patchworkDocUrls.contains(url)
         // Checked-out drafts redirect the editor to the draft's clone; the
         // sidebar, node and title all keep speaking about the origin url.
@@ -2457,6 +2477,10 @@ struct FolderScreen: View {
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
     @State private var askRequest: NoteFinderRequest?
+    /// UndoManager is not observable, so nothing would notice the redo stack
+    /// filling or emptying and the toolbar would keep whatever shape it had
+    /// when something else last redrew it. Its own notifications are the nudge.
+    @State private var undoRevision = 0
     @Environment(\.editMode) private var editMode
 
     private static let pinnedExpandedKey = "pinnedExpanded"
@@ -2774,30 +2798,68 @@ struct FolderScreen: View {
         .toolbar {
             if folderUrl == nil {
                 ToolbarItemGroup(placement: .topBarLeading) {
-                    Button {
-                        showingSettings = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
+                    // Lit, the moon is both the sign that it is on and the way
+                    // back out, so it keeps its place. Dark, it is a setting
+                    // like any other and the bar has better uses for the room.
+                    if model.focusModeEngaged {
+                        FocusModeControl(model: model)
                     }
-                    FocusModeControl(model: model)
+                    Menu {
+                        if !model.focusModeEngaged {
+                            FocusModeControl(model: model)
+                        }
+                        Button {
+                            showingSettings = true
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
+                    } label: {
+                        Label("More", systemImage: "ellipsis")
+                    }
+                }
+            }
+            if let folderUrl, nodes.contains(where: \.isNote) {
+                ToolbarItem {
+                    Button {
+                        push(.folderNotebook(folderUrl))
+                    } label: {
+                        Label("Notebook", systemImage: "doc.text")
+                    }
                 }
             }
             ToolbarItem {
                 EditButton()
             }
-            ToolbarItemGroup {
-                Button {
-                    model.undoManager.undo()
+            ToolbarItem {
+                // Tap to undo, press and hold for redo. Redo is always
+                // reachable that way, so it only takes a place of its own
+                // while there is actually something on its stack.
+                Menu {
+                    Button {
+                        model.undoManager.redo()
+                    } label: {
+                        Label("Redo", systemImage: "arrow.uturn.forward")
+                    }
+                    .disabled(!model.undoManager.canRedo)
                 } label: {
                     Label("Undo", systemImage: "arrow.uturn.backward")
+                } primaryAction: {
+                    model.undoManager.undo()
                 }
+                // Only undo is on the button itself: with nothing to undo,
+                // holding it for redo would mean an enabled control whose tap
+                // does nothing, and redo has its own place in the bar exactly
+                // then.
                 .disabled(!model.undoManager.canUndo)
-                Button {
-                    model.undoManager.redo()
-                } label: {
-                    Label("Redo", systemImage: "arrow.uturn.forward")
+            }
+            if model.undoManager.canRedo {
+                ToolbarItem {
+                    Button {
+                        model.undoManager.redo()
+                    } label: {
+                        Label("Redo", systemImage: "arrow.uturn.forward")
+                    }
                 }
-                .disabled(!model.undoManager.canRedo)
             }
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarSpacer(.flexible, placement: .bottomBar)
@@ -2805,6 +2867,27 @@ struct FolderScreen: View {
                 newMenu
             }
         }
+        // Scoped to the stack the toolbar reads: every editor window has an
+        // undo manager of its own, and unfiltered these would redraw this
+        // screen on any of them.
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .NSUndoManagerDidCloseUndoGroup,
+                object: model.undoManager
+            )
+        ) { _ in undoRevision += 1 }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .NSUndoManagerDidUndoChange,
+                object: model.undoManager
+            )
+        ) { _ in undoRevision += 1 }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .NSUndoManagerDidRedoChange,
+                object: model.undoManager
+            )
+        ) { _ in undoRevision += 1 }
         .searchable(
             text: $searchText,
             prompt: folderUrl == nil ? "Search notes" : "Search \(title)"
@@ -4669,9 +4752,7 @@ struct NoteDetail: View {
 private struct FocusModeControl: View {
     @Bindable var model: NotesModel
 
-    private var engaged: Bool {
-        !model.applyingIncomingChanges || !model.sendingChanges || !model.sharingPresence
-    }
+    private var engaged: Bool { model.focusModeEngaged }
 
     var body: some View {
         Button {

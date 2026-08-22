@@ -55,7 +55,7 @@ jobs:
       - run: pnpm build
 
   app:
-    name: app (iOS simulator)
+    name: app (iOS + macOS)
     # Would be worth ~2x here — the job is ~70% rustc — but macos-26-xlarge
     # is not available to this account: the job is handed no runner and fails
     # in two seconds with no steps and no log. Needs larger runners enabling
@@ -89,8 +89,10 @@ jobs:
       # The lib and the generated bindings carry matching API checksums, so the
       # app can only be built from freshly generated ones — see build-bindings.sh.
       #
-      # A pull request only runs tests on an arm64 simulator, so it builds that
-      # slice and the host one bindgen needs and skips the rest — 29m to 19m.
+      # A pull request tests an arm64 simulator and macOS, so it builds those
+      # two slices and skips the iOS device one. macOS earns its place: most of
+      # the Mac-only code is behind `#if os(macOS)`, and a simulator-only run
+      # never puts a compiler in front of any of it.
       # A push to main builds every slice: it is what catches a device or macOS
       # break before a release does, and it leaves a complete cache behind for
       # TestFlight to restore.
@@ -130,13 +132,28 @@ jobs:
           echo "SIMULATOR_UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl list devices available | grep -B1 "$UDID" || true
 
-      - name: Build and test
+      - name: Build and test (iOS simulator)
         run: |
           xcodebuild test \
             -project Lush.xcodeproj \
             -scheme Lush \
             -destination "id=$SIMULATOR_UDID" \
-            -resultBundlePath "$RUNNER_TEMP/Lush.xcresult" \
+            -resultBundlePath "$RUNNER_TEMP/Lush-ios.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+
+      # Compiled, not run. The Mac app claims entitlements a provisioning
+      # profile has to grant — push, Maps, WeatherKit, Wi-Fi Aware, the app
+      # group — and launchd refuses to spawn a bundle asserting entitlements
+      # nothing backs, whatever it is signed with. Only the release workflow
+      # holds those credentials. Compiling is the part CI was missing anyway:
+      # the tests themselves are platform-agnostic and already run above.
+      - name: Build (macOS)
+        run: |
+          xcodebuild build-for-testing \
+            -project Lush.xcodeproj \
+            -scheme Lush \
+            -destination "platform=macOS" \
+            -resultBundlePath "$RUNNER_TEMP/Lush-macos.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
       - name: Upload test results
@@ -144,5 +161,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: xcresult
-          path: ${{ runner.temp }}/Lush.xcresult
+          path: |
+            ${{ runner.temp }}/Lush-ios.xcresult
+            ${{ runner.temp }}/Lush-macos.xcresult
           retention-days: 7
