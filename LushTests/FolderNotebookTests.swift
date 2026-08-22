@@ -16,11 +16,35 @@ final class FolderNotebookTests: XCTestCase {
     private let alpha = "automerge:alpha"
     private let beta = "automerge:beta"
 
+    private let stuff = "automerge:stuff"
+
     private func makeDocument() -> NotebookDocument {
         let document = NotebookDocument()
         document.rebuild([
-            .init(url: alpha, title: "Alpha", body: body("alpha")),
-            .init(url: beta, title: "Beta", body: body("beta")),
+            .note(.init(url: alpha, title: "Alpha", body: body("alpha"))),
+            .note(.init(url: beta, title: "Beta", body: body("beta"))),
+        ])
+        return document
+    }
+
+    /// The two-note notebook with a folder row between them:
+    ///
+    ///     0 ..< 5   title "Alpha"
+    ///     5         newline closing the title
+    ///     6 ..< 11  body "alpha"
+    ///     11        newline opening the link row
+    ///     12 ..< 19 the row: icon, space, "Stuff"
+    ///     19        newline closing the row
+    ///     20        newline opening Beta's boundary
+    ///     21 ..< 25 title "Beta"
+    ///     25        newline closing the title
+    ///     26 ..< 30 body "beta"
+    private func makeMixedDocument() -> NotebookDocument {
+        let document = NotebookDocument()
+        document.rebuild([
+            .note(.init(url: alpha, title: "Alpha", body: body("alpha"))),
+            .link(.init(url: stuff, title: "Stuff", symbol: "folder")),
+            .note(.init(url: beta, title: "Beta", body: body("beta"))),
         ])
         return document
     }
@@ -42,7 +66,7 @@ final class FolderNotebookTests: XCTestCase {
 
     func testEmptyNoteStillHasSomewhereToPutTheCaret() {
         let document = NotebookDocument()
-        document.rebuild([.init(url: alpha, title: "Alpha", body: NSAttributedString())])
+        document.rebuild([.note(.init(url: alpha, title: "Alpha", body: NSAttributedString()))])
         XCTAssertEqual(document.note(forCaretAt: 6), alpha)
     }
 
@@ -290,6 +314,95 @@ final class FolderNotebookTests: XCTestCase {
         XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
     }
 
+    // MARK: - Link rows
+
+    func testLinkRowSitsBetweenNotesInOrder() {
+        let document = makeMixedDocument()
+        XCTAssertEqual(document.storage.string, "Alpha\nalpha\n\u{FFFC} Stuff\n\nBeta\nbeta")
+        // Only notes reach the save pass.
+        XCTAssertEqual(document.order, [alpha, beta])
+    }
+
+    func testLinkRowIsStructureBelongingToNoNote() {
+        let document = makeMixedDocument()
+        for location in 11...20 {
+            XCTAssertNil(document.owner(at: location), "location \(location)")
+            XCTAssertNil(document.titleOwner(at: location), "location \(location)")
+            XCTAssertTrue(document.isBoundary(at: location), "location \(location)")
+        }
+    }
+
+    /// The whole row is the button: its glyphs, and the position a click in
+    /// its empty tail resolves to. The row's leading newline carries no link,
+    /// so a click resolving to the end of the note above must not open the
+    /// folder — that position still writes into the note, per the caret rule.
+    func testLinkIsFoundAcrossItsWholeRow() {
+        let document = makeMixedDocument()
+        XCTAssertEqual(document.link(nearCaretAt: 12), stuff)
+        XCTAssertEqual(document.link(nearCaretAt: 15), stuff)
+        XCTAssertEqual(document.link(nearCaretAt: 19), stuff)
+        XCTAssertNil(document.link(nearCaretAt: 11))
+        XCTAssertNil(document.link(nearCaretAt: 21))
+    }
+
+    func testEditsInsideALinkRowAreRefused() {
+        let document = makeMixedDocument()
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 14, length: 0), replacement: "x"))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 12, length: 7), replacement: ""))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 19, length: 1), replacement: ""))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 6, length: 15), replacement: ""))
+    }
+
+    func testNotesAroundALinkRowStayEditable() {
+        let document = makeMixedDocument()
+        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 11, length: 0), replacement: "x"))
+        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 26, length: 0), replacement: "x"))
+        XCTAssertEqual(document.note(forCaretAt: 11), alpha)
+        XCTAssertEqual(document.note(forCaretAt: 26), beta)
+    }
+
+    func testLinkRowsNeverReachSavedContent() {
+        let document = makeMixedDocument()
+        let bodies = document.bodies()
+        XCTAssertEqual(Set(bodies.keys), [alpha, beta])
+        XCTAssertEqual(bodies[alpha]?.string, "alpha")
+        XCTAssertEqual(bodies[beta]?.string, "beta")
+        XCTAssertEqual(document.titles(), [alpha: "Alpha", beta: "Beta"])
+    }
+
+    func testTypingNearALinkDropsTheLinkStamp() {
+        let document = makeMixedDocument()
+        let attributes = document.typingAttributes(from: [notebookLink: stuff], at: 11)
+        XCTAssertNil(attributes[notebookLink])
+        XCTAssertEqual(attributes[notebookNote] as? String, alpha)
+    }
+
+    /// Text copied out of a link row and pasted into a note arrives wearing
+    /// the link stamp; claiming strips it, or the pasted words would still be
+    /// a button.
+    func testClaimStripsTheLinkStamp() {
+        let document = makeMixedDocument()
+        let row = document.storage.attributedSubstring(from: NSRange(location: 13, length: 6))
+        document.storage.insert(row, at: 8)
+        document.claim(NSRange(location: 8, length: 6), for: alpha, asTitle: false)
+        XCTAssertNil(document.link(at: 8))
+        XCTAssertEqual(document.bodies()[alpha]?.string, "al Stuffpha")
+        XCTAssertEqual(document.owner(at: 8), alpha)
+    }
+
+    /// A notebook of nothing but links is navigation, not writing surface.
+    func testNotebookOfOnlyLinksRefusesTyping() {
+        let document = NotebookDocument()
+        document.rebuild([.link(.init(url: stuff, title: "Stuff", symbol: "folder"))])
+        XCTAssertTrue(document.order.isEmpty)
+        for location in 0...document.storage.length {
+            XCTAssertFalse(
+                document.allowsEdit(in: NSRange(location: location, length: 0), replacement: "x"),
+                "location \(location)"
+            )
+        }
+    }
+
     // MARK: - Separators
 
     /// One rule between each pair of notes, and none above the first — it has
@@ -301,7 +414,7 @@ final class FolderNotebookTests: XCTestCase {
 
     func testSingleNoteHasNoSeparator() {
         let document = NotebookDocument()
-        document.rebuild([.init(url: alpha, title: "Alpha", body: body("alpha"))])
+        document.rebuild([.note(.init(url: alpha, title: "Alpha", body: body("alpha")))])
         XCTAssertTrue(document.separatorLocations().isEmpty)
     }
 }

@@ -701,7 +701,16 @@ struct ContentView: View {
                     children: model.orderedChildren(
                         model.node(for: url)?.children ?? [],
                         in: url
-                    )
+                    ),
+                    open: { childUrl in
+                        guard let node = model.node(for: childUrl) else { return }
+                        openMobile(
+                            node.kind == "folder" ? .folder(childUrl)
+                                : node.kind == "lush:script" ? .script(childUrl)
+                                : node.isNote ? .note(childUrl)
+                                : .patchwork(childUrl)
+                        )
+                    }
                 )
                 .navigationTitle(model.node(for: url)?.displayName ?? "Notebook")
             case .note(let url):
