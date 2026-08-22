@@ -2846,7 +2846,11 @@ struct FolderScreen: View {
                 } primaryAction: {
                     model.undoManager.undo()
                 }
-                .disabled(!model.undoManager.canUndo && !model.undoManager.canRedo)
+                // Only undo is on the button itself: with nothing to undo,
+                // holding it for redo would mean an enabled control whose tap
+                // does nothing, and redo has its own place in the bar exactly
+                // then.
+                .disabled(!model.undoManager.canUndo)
             }
             if model.undoManager.canRedo {
                 ToolbarItem {
@@ -2863,14 +2867,26 @@ struct FolderScreen: View {
                 newMenu
             }
         }
+        // Scoped to the stack the toolbar reads: every editor window has an
+        // undo manager of its own, and unfiltered these would redraw this
+        // screen on any of them.
         .onReceive(
-            NotificationCenter.default.publisher(for: .NSUndoManagerDidCloseUndoGroup)
+            NotificationCenter.default.publisher(
+                for: .NSUndoManagerDidCloseUndoGroup,
+                object: model.undoManager
+            )
         ) { _ in undoRevision += 1 }
         .onReceive(
-            NotificationCenter.default.publisher(for: .NSUndoManagerDidUndoChange)
+            NotificationCenter.default.publisher(
+                for: .NSUndoManagerDidUndoChange,
+                object: model.undoManager
+            )
         ) { _ in undoRevision += 1 }
         .onReceive(
-            NotificationCenter.default.publisher(for: .NSUndoManagerDidRedoChange)
+            NotificationCenter.default.publisher(
+                for: .NSUndoManagerDidRedoChange,
+                object: model.undoManager
+            )
         ) { _ in undoRevision += 1 }
         .searchable(
             text: $searchText,

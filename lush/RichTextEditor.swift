@@ -581,7 +581,7 @@ private func embedCount(in spans: [SpanNode]) -> Int {
 }
 
 @MainActor
-final class EditorCore {
+final class EditorCore: LiveWriter {
     private static let softLineBreak = "\u{2028}"
     /// The core that most recently attached for each note. Presence has one
     /// shared session, so a departing core must not leave it out from under a
@@ -641,7 +641,7 @@ final class EditorCore {
         self.controller = controller
         model.pinNote(noteUrl)
         EditorDocumentSessions.hold(noteUrl)
-        model.registerLiveEditor(controller, id: ObjectIdentifier(self))
+        model.registerLiveWriter(self)
         controller.core = self
         inline.core = self
         noteObserverId = model.addNoteObserver { [weak self] url in
@@ -672,7 +672,7 @@ final class EditorCore {
         caretMemoryTask?.cancel()
         let identity = ObjectIdentifier(self)
         Task { @MainActor [model, noteObserverId, peersObserverId, noteUrl] in
-            model.unregisterLiveEditor(identity)
+            model.unregisterLiveWriter(identity)
             EditorDocumentSessions.release(noteUrl)
             model.unpinNote(noteUrl)
             if let noteObserverId {

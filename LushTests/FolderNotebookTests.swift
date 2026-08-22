@@ -224,6 +224,72 @@ final class FolderNotebookTests: XCTestCase {
         XCTAssertEqual(document.bodies()[beta]?.string, "beta")
     }
 
+    // MARK: - Edit targets
+
+    func testAnEditKnowsWhichNoteItIsIn() {
+        let document = makeDocument()
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 8, length: 0))?.url, alpha)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 18, length: 2))?.url, beta)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 11, length: 0))?.url, alpha)
+    }
+
+    func testAnEditInATitleIsMarkedAsOne() {
+        let document = makeDocument()
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 2, length: 0))?.isTitle, true)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 12, length: 3))?.url, beta)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 12, length: 3))?.isTitle, true)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 8, length: 0))?.isTitle, false)
+    }
+
+    // MARK: - Claiming
+
+    /// What paste does: text lands carrying no stamp at all, and reads back
+    /// as part of no note until it is claimed.
+    func testUnstampedTextIsClaimedByTheNoteItLandedIn() {
+        let document = makeDocument()
+        let target = document.target(forEditIn: NSRange(location: 8, length: 0))
+        document.storage.insert(NSAttributedString(string: "XY"), at: 8)
+        XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
+
+        document.claim(
+            NSRange(location: 8, length: 2),
+            for: target!.url,
+            asTitle: target!.isTitle
+        )
+        XCTAssertEqual(document.bodies()[alpha]?.string, "alXYpha")
+    }
+
+    /// The worse half: text copied out of one note keeps that note's stamp,
+    /// so without claiming it saves into the note it came from.
+    func testTextCarryingAnotherNotesStampIsReclaimed() {
+        let document = makeDocument()
+        let stolen = document.storage.attributedSubstring(from: NSRange(location: 6, length: 5))
+        let target = document.target(forEditIn: NSRange(location: 21, length: 0))
+        document.storage.insert(stolen, at: 21)
+        XCTAssertEqual(document.bodies()[alpha]?.string, "alphaalpha")
+
+        document.claim(
+            NSRange(location: 21, length: stolen.length),
+            for: target!.url,
+            asTitle: target!.isTitle
+        )
+        XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
+        XCTAssertEqual(document.bodies()[beta]?.string, "betaalpha")
+    }
+
+    func testTextClaimedByATitleBecomesPartOfTheName() {
+        let document = makeDocument()
+        let target = document.target(forEditIn: NSRange(location: 5, length: 0))
+        document.storage.insert(NSAttributedString(string: "!"), at: 5)
+        document.claim(
+            NSRange(location: 5, length: 1),
+            for: target!.url,
+            asTitle: target!.isTitle
+        )
+        XCTAssertEqual(document.titles()[alpha], "Alpha!")
+        XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
+    }
+
     // MARK: - Separators
 
     /// One rule between each pair of notes, and none above the first — it has

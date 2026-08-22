@@ -222,6 +222,50 @@ final class NotebookDocument {
         return !replacement.isEmpty || range.length < (titleRange(of: url)?.length ?? 0)
     }
 
+    /// Which note an edit over `range` belongs to, and whether it is that
+    /// note's name rather than its body. `allowsEdit` has already refused
+    /// anything spanning two of them, so there is only ever one answer — but
+    /// it has to be asked before the edit lands, while the text it is
+    /// replacing is still there to answer with.
+    func target(forEditIn range: NSRange) -> (url: String, isTitle: Bool)? {
+        guard range.length > 0 else {
+            if let url = title(forCaretAt: range.location) { return (url, true) }
+            if let url = note(forCaretAt: range.location) { return (url, false) }
+            return nil
+        }
+        for location in range.location..<NSMaxRange(range) {
+            if let url = titleOwner(at: location) { return (url, true) }
+            if let url = owner(at: location) { return (url, false) }
+        }
+        return nil
+    }
+
+    /// Puts a run of text into a note whatever it arrived wearing. Typing
+    /// carries the caret's stamp on its own, but pasted, dropped and dictated
+    /// text comes with the attributes of wherever it came from: none at all,
+    /// or — worse, because it reads as fine — the note it was copied out of.
+    /// Either way `bodies()` would file it somewhere other than where the
+    /// reader can see it.
+    func claim(_ range: NSRange, for url: String, asTitle: Bool) {
+        guard range.location >= 0, range.location < storage.length else { return }
+        let target = NSRange(
+            location: range.location,
+            length: min(range.length, storage.length - range.location)
+        )
+        guard target.length > 0 else { return }
+        storage.beginEditing()
+        storage.removeAttribute(notebookNote, range: target)
+        storage.removeAttribute(notebookTitle, range: target)
+        storage.removeAttribute(notebookBoundary, range: target)
+        if asTitle {
+            storage.addAttribute(notebookBoundary, value: true, range: target)
+            storage.addAttribute(notebookTitle, value: url, range: target)
+        } else {
+            storage.addAttribute(notebookNote, value: url, range: target)
+        }
+        storage.endEditing()
+    }
+
     // MARK: - Reading back
 
     /// The storage sliced back into the notes it came from. Boundary runs own
@@ -259,27 +303,56 @@ final class NotebookDocument {
 /// title over a dotted rule rather than the edge of a box.
 @MainActor
 @Observable
-final class FolderNotebookCore {
+final class FolderNotebookCore: LiveWriter {
     private struct Section {
         var heads: [String]
         var lastJSON: String
         var lastName: String
     }
 
+    /// Where an edit is about to land, taken down before it happens. After
+    /// the fact the new text is simply there, wearing whatever attributes it
+    /// arrived with, and only the document as it stood knows whose it is.
+    private struct PendingEdit {
+        let url: String
+        let isTitle: Bool
+        let location: Int
+        let removed: Int
+        let lengthBefore: Int
+    }
+
     @ObservationIgnored let document = NotebookDocument()
     private(set) var loaded = false
 
     @ObservationIgnored private var sections: [String: Section] = [:]
+    /// The notes touched since the last write. A folder can hold a great deal
+    /// of text and re-encoding all of it on every keystroke would make one
+    /// keypress cost the whole folder.
+    @ObservationIgnored private var dirty: Set<String> = []
+    @ObservationIgnored private var pending: PendingEdit?
     @ObservationIgnored private let cache = AssetCache()
     @ObservationIgnored private let model: NotesModel
     @ObservationIgnored private let origin = UUID()
     @ObservationIgnored private var saveTask: Task<Void, Never>?
+    @ObservationIgnored private var writeTask: Task<Void, Never>?
 
     init(model: NotesModel) {
         self.model = model
+        model.registerLiveWriter(self)
     }
 
+    deinit {
+        saveTask?.cancel()
+        let identity = ObjectIdentifier(self)
+        Task { @MainActor [model] in model.unregisterLiveWriter(identity) }
+    }
+
+    /// Reads the folder's notes into the document. Called again whenever the
+    /// folder's children change, and deliberately in place: the storage the
+    /// text view is attached to is the same object either way, so a note
+    /// added somewhere else doesn't tear the notebook down and rebuild it.
     func load(_ notes: [FolderNode]) async {
+        if loaded { await flushNow() }
         var built: [NotebookDocument.Section] = []
         var next: [String: Section] = [:]
 
@@ -300,8 +373,51 @@ final class FolderNotebookCore {
 
         document.rebuild(built)
         sections = next
+        dirty = []
+        pending = nil
         loaded = true
     }
+
+    // MARK: - Editing
+
+    /// Ask the document whose text this is while it can still answer.
+    func willChange(in range: NSRange) {
+        guard loaded else { return }
+        pending = document.target(forEditIn: range).map {
+            PendingEdit(
+                url: $0.url,
+                isTitle: $0.isTitle,
+                location: range.location,
+                removed: range.length,
+                lengthBefore: document.storage.length
+            )
+        }
+    }
+
+    func didChange() {
+        defer { pending = nil }
+        guard loaded else { return }
+        guard let edit = pending else {
+            // Something changed the text without going past `willChange` —
+            // an undo, most likely. Nothing says what moved, so everything is
+            // suspect.
+            dirty.formUnion(document.order)
+            scheduleSave()
+            return
+        }
+        let inserted = document.storage.length - edit.lengthBefore + edit.removed
+        if inserted > 0 {
+            document.claim(
+                NSRange(location: edit.location, length: inserted),
+                for: edit.url,
+                asTitle: edit.isTitle
+            )
+        }
+        dirty.insert(edit.url)
+        scheduleSave()
+    }
+
+    // MARK: - Writing
 
     func scheduleSave() {
         guard loaded else { return }
@@ -309,22 +425,61 @@ final class FolderNotebookCore {
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
-            await self?.saveNow()
+            self?.saveTask = nil
+            self?.beginWrite()
         }
     }
 
-    /// Write each note back against the heads it was loaded at, so a note
-    /// edited elsewhere in the meantime conflicts rather than being clobbered.
-    func saveNow() async {
+    /// Give up the debounce and start writing. Returns straight away: the
+    /// synchronous termination paths have nowhere to await, and
+    /// `flushPendingWrites` comes along behind to wait.
+    func pushNow() {
         guard loaded else { return }
         saveTask?.cancel()
         saveTask = nil
+        beginWrite()
+    }
+
+    func flushNow() async {
+        guard loaded else { return }
+        saveTask?.cancel()
+        saveTask = nil
+        await beginWrite().value
+    }
+
+    /// One write at a time. Two overlapping passes would both read the heads
+    /// the first hasn't written back yet, and the second would land against a
+    /// base the note has already moved off — a fork of the note rather than
+    /// the next edit to it.
+    @discardableResult
+    private func beginWrite() -> Task<Void, Never> {
+        let previous = writeTask
+        let task = Task { [weak self] in
+            _ = await previous?.value
+            await self?.write()
+        }
+        writeTask = task
+        return task
+    }
+
+    /// Write each touched note back against the heads it was loaded at, so a
+    /// note edited elsewhere in the meantime merges rather than being
+    /// clobbered.
+    private func write() async {
+        guard loaded, !dirty.isEmpty else { return }
+        let touched = dirty
+        dirty = []
+        var retry = false
 
         let bodies = document.bodies()
         let titles = document.titles()
 
-        for url in document.order {
+        for url in document.order where touched.contains(url) {
             if let name = titles[url]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               // A name typed down to nothing is not a rename. The boundary
+               // rule keeps the run alive so there is somewhere to type; a
+               // note called "" would be just as unreachable.
+               !name.isEmpty,
                name != sections[url]?.lastName,
                let node = model.node(for: url) {
                 sections[url]?.lastName = name
@@ -334,7 +489,6 @@ final class FolderNotebookCore {
             let spans = RichText.spans(from: text)
             let json = SpanNode.encodeList(spans)
             guard json != section.lastJSON else { continue }
-            sections[url]?.lastJSON = json
             let written = await model.updateDocument(
                 url,
                 json: json,
@@ -342,8 +496,23 @@ final class FolderNotebookCore {
                 heads: section.heads.isEmpty ? nil : section.heads,
                 origin: origin
             )
-            if let written { sections[url]?.heads = written }
+            guard let written else {
+                // The write didn't land, so the note is still dirty — marking
+                // it clean here is how an edit disappears for good, since
+                // nothing else is writing this note. Drop the base it refused
+                // and let the retry go in against the doc as it stands, which
+                // is what every other snapshot writer does and the one thing
+                // that can't fail the same way twice. Once that has been
+                // tried, wait for the next edit rather than spinning.
+                if !section.heads.isEmpty { retry = true }
+                sections[url]?.heads = []
+                dirty.insert(url)
+                continue
+            }
+            sections[url]?.lastJSON = json
+            sections[url]?.heads = written
         }
+        if retry { scheduleSave() }
     }
 }
 
@@ -387,10 +556,22 @@ struct FolderNotebook: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: notes.map(\.url)) {
-            let core = FolderNotebookCore(model: model)
-            self.core = core
-            await core.load(notes)
+        // One core for as long as the folder is on screen, reloaded in
+        // place when its notes change. Replacing it would take the debounced
+        // save down with it and blink the whole notebook back to a spinner
+        // over one note being added somewhere else entirely.
+        .task {
+            let notebook = core ?? FolderNotebookCore(model: model)
+            self.core = notebook
+            await notebook.load(notes)
+        }
+        .onChange(of: notes.map(\.url)) {
+            guard let core else { return }
+            Task { await core.load(notes) }
+        }
+        .onDisappear {
+            guard let core else { return }
+            Task { await core.flushNow() }
         }
     }
 }
@@ -489,14 +670,16 @@ struct FolderNotebookText: NSViewRepresentable {
             shouldChangeTextIn affectedCharRange: NSRange,
             replacementString: String?
         ) -> Bool {
-            core.document.allowsEdit(
+            guard core.document.allowsEdit(
                 in: affectedCharRange,
                 replacement: replacementString ?? ""
-            )
+            ) else { return false }
+            core.willChange(in: affectedCharRange)
+            return true
         }
 
         func textDidChange(_ notification: Notification) {
-            core.scheduleSave()
+            core.didChange()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -594,11 +777,13 @@ struct FolderNotebookText: UIViewRepresentable {
             shouldChangeTextIn range: NSRange,
             replacementText text: String
         ) -> Bool {
-            core.document.allowsEdit(in: range, replacement: text)
+            guard core.document.allowsEdit(in: range, replacement: text) else { return false }
+            core.willChange(in: range)
+            return true
         }
 
         func textViewDidChange(_ textView: UITextView) {
-            core.scheduleSave()
+            core.didChange()
             textView.setNeedsDisplay()
         }
 

@@ -17,6 +17,18 @@ func reordered<T: Equatable>(_ items: [T], moving item: T, adjacentTo target: T,
     return next
 }
 
+/// Something holding typed text that hasn't reached the doc yet. Both halves
+/// matter at suspend: `pushNow` starts every writer at once from the
+/// synchronous termination paths, `flushNow` is what waits for them.
+@MainActor
+protocol LiveWriter: AnyObject {
+    /// Give up whatever debounce is running and start writing. Returns
+    /// immediately.
+    func pushNow()
+    /// The same, and wait for it to land.
+    func flushNow() async
+}
+
 @Observable @MainActor
 final class NotesModel {
     static let shared = NotesModel()
@@ -1343,8 +1355,8 @@ final class NotesModel {
     /// only in memory — behind the editor's 300ms push debounce, then behind
     /// the core's save debounce — and a kill in that window loses it.
     func flushPendingWrites() async {
-        for editor in liveEditors {
-            await editor.core?.flushNow()
+        for writer in liveWriters {
+            await writer.flushNow()
         }
         for task in Array(noteWriteTasks.values) {
             _ = await task.value
@@ -2136,47 +2148,48 @@ final class NotesModel {
 
     // Editor support -----------------------------------------------------
 
-    private struct LiveEditorBox {
-        weak var controller: EditorController?
+    private struct LiveWriterBox {
+        weak var writer: (any LiveWriter)?
     }
 
-    /// Every editor holding a live view, not just the focused one. A folder
-    /// shows many at once, and `flushNow` is per-editor: flushing only
-    /// `activeEditor` leaves every other card's edit behind its own push
-    /// debounce, which a suspend-time kill then loses.
-    @ObservationIgnored private var liveEditorBoxes: [ObjectIdentifier: LiveEditorBox] = [:]
+    /// Everything holding an edit behind a debounce, not just the focused
+    /// editor. A folder shows many editors at once, the notebook is a writer
+    /// in its own right, and each keeps its own debounce for a suspend-time
+    /// kill to lose.
+    @ObservationIgnored private var liveWriterBoxes: [ObjectIdentifier: LiveWriterBox] = [:]
 
-    /// Keyed by the core, not the controller: a view rebuild can hand a new
-    /// core the same controller, and keying by controller would let the old
-    /// core's deinit unregister the live one.
-    func registerLiveEditor(_ controller: EditorController, id: ObjectIdentifier) {
-        liveEditorBoxes[id] = LiveEditorBox(controller: controller)
+    /// Keyed and held by the writer itself rather than by anything pointing
+    /// at it. A view rebuild can hand a new core the same controller, and
+    /// reaching writers through `controller.core` would then flush the new
+    /// core twice and the old one — the one still holding the edit — never.
+    func registerLiveWriter(_ writer: any LiveWriter) {
+        liveWriterBoxes[ObjectIdentifier(writer)] = LiveWriterBox(writer: writer)
     }
 
-    func unregisterLiveEditor(_ id: ObjectIdentifier) {
-        liveEditorBoxes[id] = nil
+    func unregisterLiveWriter(_ id: ObjectIdentifier) {
+        liveWriterBoxes[id] = nil
     }
 
     /// Focused editor first: if the suspend window closes early, the note
     /// being typed in is the one that had to reach disk.
-    var liveEditors: [EditorController] {
+    var liveWriters: [any LiveWriter] {
         var seen: Set<ObjectIdentifier> = []
-        var result: [EditorController] = []
-        if let activeEditor {
-            seen.insert(ObjectIdentifier(activeEditor))
-            result.append(activeEditor)
+        var result: [any LiveWriter] = []
+        if let core = activeEditor?.core {
+            seen.insert(ObjectIdentifier(core))
+            result.append(core)
         }
-        for box in liveEditorBoxes.values {
-            guard let controller = box.controller,
-                  seen.insert(ObjectIdentifier(controller)).inserted
+        for box in liveWriterBoxes.values {
+            guard let writer = box.writer,
+                  seen.insert(ObjectIdentifier(writer)).inserted
             else { continue }
-            result.append(controller)
+            result.append(writer)
         }
         return result
     }
 
     func pushLiveEditors() {
-        for editor in liveEditors { editor.core?.pushNow() }
+        for writer in liveWriters { writer.pushNow() }
     }
 
     private var memoryPressureSource: DispatchSourceMemoryPressure?

@@ -177,6 +177,10 @@ struct FolderSketchpad: View {
         .contextMenu { NoteContextMenu(node: node) }
     }
 
+    private func isSibling(_ url: String) -> Bool {
+        notes.contains { $0.url == url }
+    }
+
     private func card(for node: FolderNode) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             header(for: node)
@@ -192,9 +196,13 @@ struct FolderSketchpad: View {
                     lineWidth: dropTarget == node.url ? 2 : 1
                 )
         }
+        // A card is a text editor with a drop target wrapped round it, so
+        // what lands here is as likely to be a word dragged out of the note
+        // next to it as another card. Only a note of this folder's own is a
+        // reorder; anything else falls through to the editor underneath.
         .dropDestination(for: String.self) { urls, _ in
             dropTarget = nil
-            guard let dragged = urls.first else { return false }
+            guard let dragged = urls.first, isSibling(dragged) else { return false }
             model.reorderChild(dragged, adjacentTo: node.url, after: false)
             return true
         } isTargeted: { targeted in
