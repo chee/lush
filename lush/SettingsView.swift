@@ -311,7 +311,7 @@ struct SyncSettingsPane: View {
                 Button("Force Resync") {
                     model.forceSync()
                 }
-                Button(compacting ? "Reclaiming…" : "Reclaim Loose Commits") {
+                Button(compacting ? "Reclaiming…" : "Reclaim Absorbed Records") {
                     compacting = true
                     Task {
                         compactionResult = await model.reclaimLooseCommits()
@@ -343,7 +343,7 @@ struct SyncSettingsPane: View {
             } header: {
                 Text("Diagnostics")
             } footer: {
-                Text("Reclaim Loose Commits drops commits that a fragment already covers, this should happen automatically but i am not good at computer programming. Force Resync re-fetches all notebooks from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend codes still works. You'll still be logged out tho")
+                Text("Reclaim Absorbed Records drops loose commits and old fragments that a bigger fragment already covers — this also happens automatically on save and open. Force Resync re-fetches all notebooks from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend codes still works. You'll still be logged out tho")
             }
             if !model.syncLog.isEmpty {
                 Section("Sync Log") {

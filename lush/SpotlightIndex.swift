@@ -9,11 +9,8 @@ actor SpotlightIndex {
     private let domainIdentifier = "party.chee.patchwork.lush.notes"
     private var indexedDigests: [String: String] = [:]
 
-    func index(url: String, title: String, spansJson: String) {
-        let spans = SpanNode.decodeList(spansJson)
-        let noteTitle = RichText.title(from: spans)
-        let displayTitle = noteTitle.isEmpty ? (title.isEmpty ? "Untitled" : title) : noteTitle
-        let body = Self.plainText(from: spans)
+    func index(url: String, title: String, body: String, eventStart: Date?, eventEnd: Date?) {
+        let displayTitle = title.isEmpty ? "Untitled" : title
         let digest = "\(displayTitle)\n\(body)"
         guard indexedDigests[url] != digest else { return }
 
@@ -23,13 +20,10 @@ actor SpotlightIndex {
         attributes.contentDescription = body.isEmpty ? nil : Self.snippet(from: body, limit: 900)
         attributes.textContent = body
         attributes.keywords = ["Lush", "note"]
-        if let event = spans.lazy.compactMap({ span -> BlockValue? in
-            guard case .block(let block) = span, block.calendarEventTitle != nil else { return nil }
-            return block
-        }).first {
+        if let eventStart {
             attributes.keywords?.append(contentsOf: ["calendar", "event"])
-            attributes.startDate = event.calendarEventStart
-            attributes.endDate = event.calendarEventEnd
+            attributes.startDate = eventStart
+            attributes.endDate = eventEnd
         }
 
         var components = URLComponents()
@@ -57,24 +51,6 @@ actor SpotlightIndex {
         indexedDigests.removeAll()
     }
 
-    private static func plainText(from spans: [SpanNode]) -> String {
-        var parts: [String] = []
-        for span in spans {
-            switch span {
-            case .block(let block):
-                if block.isEmbedBlock, let html = block.htmlSource {
-                    parts.append(html)
-                }
-                if let event = block.calendarEventSearchText {
-                    parts.append(event)
-                }
-            case .text(let text, _):
-                parts.append(text)
-            }
-        }
-        return parts.joined(separator: "\n")
-    }
-
     private static func snippet(from text: String, limit: Int) -> String {
         var snippet = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
         if snippet.count > limit {
@@ -85,7 +61,7 @@ actor SpotlightIndex {
 }
 #else
 actor SpotlightIndex {
-    func index(url: String, title: String, spansJson: String) {}
+    func index(url: String, title: String, body: String, eventStart: Date?, eventEnd: Date?) {}
     func remove(url: String) {}
 }
 #endif

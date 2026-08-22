@@ -828,6 +828,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func moveEntry(fromFolder: String, toFolder: String, url: String) throws 
     
     /**
+     * The extracted content of a note's search-index row — what
+     * `on_doc_indexed` says is fresh. Reading this costs a SELECT, not a
+     * doc open.
+     */
+    func noteContent(url: String) async  -> IndexedNoteContent?
+    
+    /**
      * Digest of the text a note's stored embeddings were built from.
      */
     func noteEmbeddingDigest(url: String)  -> String?
@@ -900,11 +907,15 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     /**
      * Start tracking + syncing docs without waiting for them to arrive,
-     * recursing into subfolders. Once a doc lands, its legacy scalar
-     * strings are normalized to Text.
-     * Walks breadth-first. Every doc in a level is asked for before any of
-     * them is waited on, so one doc the server doesn't have costs the level
-     * one timeout rather than costing every doc behind it thirty seconds.
+     * recursing into subfolders. Once a doc lands, its legacy scalar strings
+     * are normalized to Text.
+     *
+     * Walks breadth-first. A whole level is tracked before any of it is waited
+     * on, so one doc the server doesn't have costs the level one timeout
+     * rather than costing every doc behind it thirty seconds. Tracking is a
+     * subscription, not a load; materializing happens inside the buffered
+     * stage, so the memory this holds is bounded by `PREFETCH_CONCURRENCY`
+     * rather than by the width of the level.
      */
     func prefetchNotes(urls: [String]) 
     
@@ -1890,6 +1901,29 @@ open func moveEntry(fromFolder: String, toFolder: String, url: String)throws   {
 }
     
     /**
+     * The extracted content of a note's search-index row — what
+     * `on_doc_indexed` says is fresh. Reading this costs a SELECT, not a
+     * doc open.
+     */
+open func noteContent(url: String)async  -> IndexedNoteContent?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_note_content(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeIndexedNoteContent.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
      * Digest of the text a note's stored embeddings were built from.
      */
 open func noteEmbeddingDigest(url: String) -> String?  {
@@ -2152,11 +2186,15 @@ open func pinnedDocUrl(url: String, heads: [String])throws  -> String  {
     
     /**
      * Start tracking + syncing docs without waiting for them to arrive,
-     * recursing into subfolders. Once a doc lands, its legacy scalar
-     * strings are normalized to Text.
-     * Walks breadth-first. Every doc in a level is asked for before any of
-     * them is waited on, so one doc the server doesn't have costs the level
-     * one timeout rather than costing every doc behind it thirty seconds.
+     * recursing into subfolders. Once a doc lands, its legacy scalar strings
+     * are normalized to Text.
+     *
+     * Walks breadth-first. A whole level is tracked before any of it is waited
+     * on, so one doc the server doesn't have costs the level one timeout
+     * rather than costing every doc behind it thirty seconds. Tracking is a
+     * subscription, not a load; materializing happens inside the buffered
+     * stage, so the memory this holds is bounded by `PREFETCH_CONCURRENCY`
+     * rather than by the width of the level.
      */
 open func prefetchNotes(urls: [String])  {try! rustCall() {
     uniffi_lush_core_fn_method_core_prefetch_notes(self.uniffiClonePointer(),
@@ -4067,6 +4105,198 @@ public func FfiConverterTypeIndexedNote_lower(_ value: IndexedNote) -> RustBuffe
 
 
 /**
+ * One note's extracted content, as the indexer wrote it: the single source
+ * consumers read instead of opening the doc.
+ */
+public struct IndexedNoteContent {
+    public var url: String
+    public var kind: String
+    public var title: String
+    public var body: String
+    /**
+     * Loglines as embedding-friendly prose; prepend to `body` for semantic
+     * indexing, skip for display.
+     */
+    public var context: String
+    public var modified: Int64
+    public var created: Int64
+    public var whenDay: String
+    public var tags: [String]
+    public var weather: [String]
+    public var locations: [String]
+    /**
+     * First calendar event's window, epoch seconds, 0 when absent.
+     */
+    public var eventStart: Int64
+    public var eventEnd: Int64
+    public var eventIds: [String]
+    public var heads: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, kind: String, title: String, body: String, 
+        /**
+         * Loglines as embedding-friendly prose; prepend to `body` for semantic
+         * indexing, skip for display.
+         */context: String, modified: Int64, created: Int64, whenDay: String, tags: [String], weather: [String], locations: [String], 
+        /**
+         * First calendar event's window, epoch seconds, 0 when absent.
+         */eventStart: Int64, eventEnd: Int64, eventIds: [String], heads: String) {
+        self.url = url
+        self.kind = kind
+        self.title = title
+        self.body = body
+        self.context = context
+        self.modified = modified
+        self.created = created
+        self.whenDay = whenDay
+        self.tags = tags
+        self.weather = weather
+        self.locations = locations
+        self.eventStart = eventStart
+        self.eventEnd = eventEnd
+        self.eventIds = eventIds
+        self.heads = heads
+    }
+}
+
+#if compiler(>=6)
+extension IndexedNoteContent: Sendable {}
+#endif
+
+
+extension IndexedNoteContent: Equatable, Hashable {
+    public static func ==(lhs: IndexedNoteContent, rhs: IndexedNoteContent) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.body != rhs.body {
+            return false
+        }
+        if lhs.context != rhs.context {
+            return false
+        }
+        if lhs.modified != rhs.modified {
+            return false
+        }
+        if lhs.created != rhs.created {
+            return false
+        }
+        if lhs.whenDay != rhs.whenDay {
+            return false
+        }
+        if lhs.tags != rhs.tags {
+            return false
+        }
+        if lhs.weather != rhs.weather {
+            return false
+        }
+        if lhs.locations != rhs.locations {
+            return false
+        }
+        if lhs.eventStart != rhs.eventStart {
+            return false
+        }
+        if lhs.eventEnd != rhs.eventEnd {
+            return false
+        }
+        if lhs.eventIds != rhs.eventIds {
+            return false
+        }
+        if lhs.heads != rhs.heads {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(kind)
+        hasher.combine(title)
+        hasher.combine(body)
+        hasher.combine(context)
+        hasher.combine(modified)
+        hasher.combine(created)
+        hasher.combine(whenDay)
+        hasher.combine(tags)
+        hasher.combine(weather)
+        hasher.combine(locations)
+        hasher.combine(eventStart)
+        hasher.combine(eventEnd)
+        hasher.combine(eventIds)
+        hasher.combine(heads)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIndexedNoteContent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IndexedNoteContent {
+        return
+            try IndexedNoteContent(
+                url: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                body: FfiConverterString.read(from: &buf), 
+                context: FfiConverterString.read(from: &buf), 
+                modified: FfiConverterInt64.read(from: &buf), 
+                created: FfiConverterInt64.read(from: &buf), 
+                whenDay: FfiConverterString.read(from: &buf), 
+                tags: FfiConverterSequenceString.read(from: &buf), 
+                weather: FfiConverterSequenceString.read(from: &buf), 
+                locations: FfiConverterSequenceString.read(from: &buf), 
+                eventStart: FfiConverterInt64.read(from: &buf), 
+                eventEnd: FfiConverterInt64.read(from: &buf), 
+                eventIds: FfiConverterSequenceString.read(from: &buf), 
+                heads: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IndexedNoteContent, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.body, into: &buf)
+        FfiConverterString.write(value.context, into: &buf)
+        FfiConverterInt64.write(value.modified, into: &buf)
+        FfiConverterInt64.write(value.created, into: &buf)
+        FfiConverterString.write(value.whenDay, into: &buf)
+        FfiConverterSequenceString.write(value.tags, into: &buf)
+        FfiConverterSequenceString.write(value.weather, into: &buf)
+        FfiConverterSequenceString.write(value.locations, into: &buf)
+        FfiConverterInt64.write(value.eventStart, into: &buf)
+        FfiConverterInt64.write(value.eventEnd, into: &buf)
+        FfiConverterSequenceString.write(value.eventIds, into: &buf)
+        FfiConverterString.write(value.heads, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexedNoteContent_lift(_ buf: RustBuffer) throws -> IndexedNoteContent {
+    return try FfiConverterTypeIndexedNoteContent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIndexedNoteContent_lower(_ value: IndexedNoteContent) -> RustBuffer {
+    return FfiConverterTypeIndexedNoteContent.lower(value)
+}
+
+
+/**
  * An iroh peer. `added` peers are dialed on launch; the rest dialed us and
  * are offered as suggestions.
  */
@@ -5100,6 +5330,12 @@ public protocol CoreDelegate: AnyObject, Sendable {
     
     func onDocChanged(url: String) 
     
+    /**
+     * The doc's extracted row in the search index was rewritten — read it
+     * with `indexed_note` instead of opening the doc.
+     */
+    func onDocIndexed(url: String) 
+    
     func onConnectionChanged(connected: Bool) 
     
     func onSyncEvent(message: String) 
@@ -5144,6 +5380,30 @@ fileprivate struct UniffiCallbackInterfaceCoreDelegate {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
                 return uniffiObj.onDocChanged(
+                     url: try FfiConverterString.lift(url)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onDocIndexed: { (
+            uniffiHandle: UInt64,
+            url: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCoreDelegate.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onDocIndexed(
                      url: try FfiConverterString.lift(url)
                 )
             }
@@ -5604,6 +5864,30 @@ fileprivate struct FfiConverterOptionTypeDraftState: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeDraftState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeIndexedNoteContent: FfiConverterRustBuffer {
+    typealias SwiftType = IndexedNoteContent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeIndexedNoteContent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeIndexedNoteContent.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -6354,6 +6638,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_move_entry() != 40698) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_note_content() != 2552) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_note_embedding_digest() != 34797) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6414,7 +6701,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_pinned_doc_url() != 53180) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 18043) {
+    if (uniffi_lush_core_checksum_method_core_prefetch_notes() != 24613) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_publish_ephemeral() != 11927) {
@@ -6537,22 +6824,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_coredelegate_on_doc_changed() != 53266) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_coredelegate_on_connection_changed() != 65433) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_doc_indexed() != 40613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_coredelegate_on_sync_event() != 24982) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_connection_changed() != 16127) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_coredelegate_on_ephemeral_message() != 44822) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_sync_event() != 64560) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_coredelegate_on_peers_changed() != 58468) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_ephemeral_message() != 25620) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_coredelegate_on_notes_prefetched() != 51051) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_peers_changed() != 57207) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_coredelegate_on_storage_loaded() != 48471) {
+    if (uniffi_lush_core_checksum_method_coredelegate_on_notes_prefetched() != 54439) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_coredelegate_on_storage_loaded() != 5076) {
         return InitializationResult.apiChecksumMismatch
     }
 

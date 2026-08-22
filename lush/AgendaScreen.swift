@@ -20,6 +20,10 @@ struct AgendaScreen: View {
     @State private var assertedAt = Date.distantPast
     @State private var scroller: ScrollViewProxy?
     @State private var visibleDays: Set<Date> = []
+    @ScaledMetric(relativeTo: .largeTitle) private var monthTitleSize: CGFloat = 34
+    @ScaledMetric(relativeTo: .title3) private var monthYearSize: CGFloat = 20
+    @ScaledMetric(relativeTo: .title) private var dayNumberSize: CGFloat = 30
+    @ScaledMetric(relativeTo: .body) private var dayNameSize: CGFloat = 17
 
     var body: some View {
         Group {
@@ -249,10 +253,10 @@ struct AgendaScreen: View {
     private func monthHeader(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text(day.formatted(.dateTime.month(.wide)))
-                .font(.system(size: 34, weight: .bold))
+                .font(.system(size: monthTitleSize, weight: .bold))
                 .foregroundStyle(.primary)
             Text(day.formatted(.dateTime.year()))
-                .font(.system(size: 20, weight: .semibold))
+                .font(.system(size: monthYearSize, weight: .semibold))
                 .foregroundStyle(.secondary)
         }
         .padding(.top, 46)
@@ -261,13 +265,13 @@ struct AgendaScreen: View {
     private func header(_ day: Date) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("\(Calendar.current.component(.day, from: day))")
-                .font(.system(size: 30, weight: .bold))
+                .font(.system(size: dayNumberSize, weight: .bold))
                 .foregroundStyle(
                     Calendar.current.isDateInToday(day)
                         ? AnyShapeStyle(.tint) : AnyShapeStyle(.primary)
                 )
             Text(Agenda.dayName(day))
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: dayNameSize, weight: .semibold))
                 .foregroundStyle(.secondary)
             VStack { Divider() }
                 .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 13 }
@@ -317,14 +321,15 @@ struct DayGroup: Identifiable {
 
 private struct MonthChip: View {
     @Binding var days: Set<Date>
+    @ScaledMetric(relativeTo: .caption) private var chipSize: CGFloat = 12
 
     var body: some View {
         if let top = days.min() {
             HStack(spacing: 4) {
                 Text(top.formatted(.dateTime.month(.abbreviated)))
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: chipSize, weight: .semibold))
                 Text(top.formatted(.dateTime.year()))
-                    .font(.system(size: 12, weight: .regular))
+                    .font(.system(size: chipSize, weight: .regular))
                     .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 10)
@@ -346,18 +351,22 @@ private struct AgendaRow: View {
 
     @Environment(NotesModel.self) private var model
     @State private var hovering = false
+    @State private var confirmingDelete = false
+    @ScaledMetric(relativeTo: .subheadline) private var titleSize: CGFloat = 15
+    @ScaledMetric(relativeTo: .caption) private var detailSize: CGFloat = 12
+    @ScaledMetric(relativeTo: .subheadline) private var arrowSize: CGFloat = 14
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(item.title)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: titleSize, weight: .semibold))
                         .underline(hovering)
                         .lineLimit(1)
                     if noteUrl != nil {
                         Image(systemName: "doc.richtext")
-                            .font(.system(size: 12))
+                            .font(.system(size: detailSize))
                     }
                 }
                 HStack(spacing: 4) {
@@ -372,7 +381,7 @@ private struct AgendaRow: View {
                         Text("· \(item.listName)").lineLimit(1)
                     }
                 }
-                .font(.system(size: 12))
+                .font(.system(size: detailSize))
                 .opacity(0.75)
             }
             Spacer(minLength: 8)
@@ -380,7 +389,7 @@ private struct AgendaRow: View {
                 item.openExternally()
             } label: {
                 Image(systemName: "arrow.up.forward")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: arrowSize, weight: .semibold))
                     .frame(width: 32, height: 32)
                     .background(
                         RoundedRectangle(cornerRadius: 7)
@@ -414,6 +423,13 @@ private struct AgendaRow: View {
         .pointerStyle(.link)
         #endif
         .onTapGesture { openOrCreate() }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint(noteUrl == nil ? "Creates a note for this item" : "Opens the note")
+        .accessibilityAction { openOrCreate() }
+        .accessibilityAction(named: item.kind == .reminder ? "Open in Reminders" : "Open in Calendar") {
+            item.openExternally()
+        }
         .contextMenu {
             if let noteUrl {
                 Button("Open Note") { open(noteUrl) }
@@ -423,7 +439,13 @@ private struct AgendaRow: View {
                     Button("New Note for the Whole Series") { create(item, true) }
                 }
                 Divider()
-                Button("Delete Note", role: .destructive) { model.deleteNote(noteUrl) }
+                Button("Delete Note", role: .destructive) {
+                    if let parent = model.node(for: noteUrl)?.parentUrl {
+                        model.removeEntry(parentUrl: parent, url: noteUrl)
+                    } else {
+                        confirmingDelete = true
+                    }
+                }
             } else {
                 Button("New Note") { create(item, false) }
                 if item.isRecurring {
@@ -441,6 +463,18 @@ private struct AgendaRow: View {
                 Text(item.listName)
             }
             Text(item.rangeText)
+        }
+        .confirmationDialog(
+            "Delete this note permanently?",
+            isPresented: $confirmingDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Note", role: .destructive) {
+                if let noteUrl { model.deleteNote(noteUrl) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The note isn't in any folder, so deleting it can't be undone.")
         }
     }
 

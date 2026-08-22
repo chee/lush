@@ -53,6 +53,13 @@ pub struct IndexedDoc {
     pub facets: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
+    /// Loglines rendered as embedding-friendly prose; not fed to FTS.
+    pub context: String,
+    /// First calendar event's window as epoch seconds, 0 when absent.
+    pub event_start: i64,
+    pub event_end: i64,
+    /// EventKit ids of the doc's calendar-event blocks.
+    pub event_ids: Vec<String>,
     /// The doc state this row was built from. An upsert whose heads match what
     /// is already stored is a no-op, so a re-crawl costs a read instead of a
     /// full FTS rewrite.
@@ -68,6 +75,17 @@ fn encode_tags(tags: &[String]) -> String {
     format!(" {} ", tags.join(" "))
 }
 
+fn decode_tags(encoded: &str) -> Vec<String> {
+    encoded.split_whitespace().map(str::to_string).collect()
+}
+
+fn decode_lines(encoded: &str) -> Vec<String> {
+    if encoded.is_empty() {
+        return Vec::new();
+    }
+    encoded.split('\n').map(str::to_string).collect()
+}
+
 /// Places ride as one JSON array rather than a delimited line each: a place
 /// name is free text and would collide with any separator worth reading back.
 fn encode_places(places: &[ContextPlace]) -> String {
@@ -75,6 +93,13 @@ fn encode_places(places: &[ContextPlace]) -> String {
         return String::new();
     }
     serde_json::to_string(places).unwrap_or_default()
+}
+
+fn decode_places(encoded: &str) -> Vec<ContextPlace> {
+    if encoded.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str(encoded).unwrap_or_default()
 }
 
 /// Open the db and touch its schema so a corrupt file surfaces here rather
@@ -227,6 +252,22 @@ impl SearchIndex {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN context TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN event_start INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN event_end INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN event_ids TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE search_docs ADD COLUMN places TEXT NOT NULL DEFAULT ''",
             [],
         );
@@ -257,14 +298,18 @@ impl SearchIndex {
         .filter(|created| *created > 0)
     }
 
-    pub fn upsert(&self, doc: IndexedDoc) -> Result<()> {
+    /// Returns whether the row was actually written; matching heads and
+    /// matching late-added columns make it a no-op.
+    pub fn upsert(&self, doc: IndexedDoc) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         if !doc.heads.is_empty() {
             // A row written before `created` existed has to be rewritten even
-            // though its heads still match, or it never gets one.
-            let stored: Option<(String, i64, String, String, String, String)> = conn
-                .query_row(
-                    "SELECT heads, created, weather, locations, facets, places FROM search_docs WHERE url = ?1",
+            // though its heads still match, or it never gets one. The same
+            // holds for every column added after `heads`.
+            let stored: Option<(String, i64, String, String, String, String, i64, i64, String, String)> =
+                conn.query_row(
+                    "SELECT heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places
+                     FROM search_docs WHERE url = ?1",
                     params![doc.url],
                     |row| {
                         Ok((
@@ -274,26 +319,46 @@ impl SearchIndex {
                             row.get(3)?,
                             row.get(4)?,
                             row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((heads, created, weather, locations, facets, places)) = stored {
+            if let Some((
+                heads,
+                created,
+                weather,
+                locations,
+                facets,
+                context,
+                event_start,
+                event_end,
+                event_ids,
+                places,
+            )) = stored
+            {
                 if heads == doc.heads
                     && (created != 0 || doc.created == 0)
                     && weather == doc.weather.join("\n")
                     && locations == doc.locations.join("\n")
                     && facets == encode_tags(&doc.facets)
+                    && context == doc.context
+                    && event_start == doc.event_start
+                    && event_end == doc.event_end
+                    && event_ids == doc.event_ids.join("\n")
                     && places == encode_places(&doc.places)
                 {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, places)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -307,6 +372,10 @@ impl SearchIndex {
                 weather = excluded.weather,
                 locations = excluded.locations,
                 facets = excluded.facets,
+                context = excluded.context,
+                event_start = excluded.event_start,
+                event_end = excluded.event_end,
+                event_ids = excluded.event_ids,
                 places = excluded.places",
             params![
                 doc.url,
@@ -322,6 +391,10 @@ impl SearchIndex {
                 doc.weather.join("\n"),
                 doc.locations.join("\n"),
                 encode_tags(&doc.facets),
+                doc.context,
+                doc.event_start,
+                doc.event_end,
+                doc.event_ids.join("\n"),
                 encode_places(&doc.places)
             ],
         )?;
@@ -347,7 +420,45 @@ impl SearchIndex {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// The extracted row content consumers read instead of re-opening the
+    /// doc: previews, Spotlight, and the embedding index all feed off this.
+    pub fn indexed_note(&self, url: &str) -> Result<Option<IndexedDoc>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT kind, title, body, modified, created, has_vision, tags, when_day, heads,
+                        weather, locations, facets, context, event_start, event_end, event_ids, places
+                 FROM search_docs WHERE url = ?1",
+                params![url],
+                |row| {
+                    Ok(IndexedDoc {
+                        url: url.to_string(),
+                        kind: row.get(0)?,
+                        title: row.get(1)?,
+                        body: row.get(2)?,
+                        links: Vec::new(),
+                        modified: row.get(3)?,
+                        created: row.get(4)?,
+                        has_vision: row.get(5)?,
+                        tags: decode_tags(&row.get::<_, String>(6)?),
+                        when: row.get(7)?,
+                        heads: row.get(8)?,
+                        weather: decode_lines(&row.get::<_, String>(9)?),
+                        locations: decode_lines(&row.get::<_, String>(10)?),
+                        facets: decode_tags(&row.get::<_, String>(11)?),
+                        context: row.get(12)?,
+                        event_start: row.get(13)?,
+                        event_end: row.get(14)?,
+                        event_ids: decode_lines(&row.get::<_, String>(15)?),
+                        places: decode_places(&row.get::<_, String>(16)?),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Replaces the whole parent map in one go. Folder membership lives in the
@@ -735,9 +846,24 @@ pub fn indexed_doc(
     let kind = shapes::doc_kind(doc);
     let title = shapes::doc_title(doc);
     let body = match kind.as_str() {
-        "rich" => shapes::full_text(doc),
+        "rich" => shapes::search_text(doc),
         "file" => shapes::asset_search_text(doc),
         _ => String::new(),
+    };
+    let context = if kind == "rich" {
+        shapes::context_search_text(doc)
+    } else {
+        String::new()
+    };
+    let (event_start, event_end) = if kind == "rich" {
+        shapes::calendar_event_window(doc)
+    } else {
+        (0, 0)
+    };
+    let event_ids = if kind == "rich" {
+        shapes::calendar_event_ids(doc)
+    } else {
+        Vec::new()
     };
     let links = if kind == "rich" {
         shapes::embed_urls(doc)
@@ -764,6 +890,10 @@ pub fn indexed_doc(
         places: shapes::context_places(doc),
         facets: shapes::doc_facets(doc),
         when: shapes::doc_when(doc),
+        context,
+        event_start,
+        event_end,
+        event_ids,
         heads: heads.join(","),
     }
 }
@@ -961,8 +1091,41 @@ mod tests {
             places: Vec::new(),
             facets: Vec::new(),
             when: when.into(),
+            context: String::new(),
+            event_start: 0,
+            event_end: 0,
+            event_ids: Vec::new(),
             heads: String::new(),
         }
+    }
+
+    #[test]
+    fn indexed_note_round_trips_and_upsert_reports_noops() {
+        let index = fixture();
+        let mut doc = indexed("url-a", "Cake", &["baking"], "2026-08-21");
+        doc.context = "Logline morning".to_string();
+        doc.event_start = 100;
+        doc.event_end = 200;
+        doc.event_ids = vec!["ev1".to_string()];
+        doc.heads = "h1".to_string();
+        assert!(index.upsert(doc.clone()).unwrap());
+        assert!(!index.upsert(doc.clone()).unwrap());
+        doc.event_end = 300;
+        assert!(index.upsert(doc.clone()).unwrap());
+        assert!(!index.upsert(doc.clone()).unwrap());
+        doc.heads = "h2".to_string();
+        assert!(index.upsert(doc).unwrap());
+
+        let row = index.indexed_note("url-a").unwrap().unwrap();
+        assert_eq!(row.title, "Cake");
+        assert_eq!(row.body, "cake recipe");
+        assert_eq!(row.context, "Logline morning");
+        assert_eq!(row.event_start, 100);
+        assert_eq!(row.event_end, 300);
+        assert_eq!(row.event_ids, vec!["ev1".to_string()]);
+        assert_eq!(row.tags, vec!["baking".to_string()]);
+        assert_eq!(row.when, "2026-08-21");
+        assert!(index.indexed_note("url-missing").unwrap().is_none());
     }
 
     fn urls(hits: Vec<SearchHit>) -> Vec<String> {

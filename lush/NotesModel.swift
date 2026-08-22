@@ -817,6 +817,7 @@ final class NotesModel {
     }
 
     private func removeEntry(core: Core, parent: String, url: String, title: String) {
+        let linkedItems = CalendarLinks.itemIds(for: url)
         Task.detached { [core, weak self, parent, url, title] in
             do {
                 try core.removeEntry(folderUrl: parent, url: url)
@@ -828,8 +829,9 @@ final class NotesModel {
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                CalendarLinks.set([], for: url)
                 self.undoManager.registerUndo(withTarget: self) { model in
-                    model.restoreEntry(parent: parent, url: url, title: title)
+                    model.restoreEntry(parent: parent, url: url, title: title, linkedItems: linkedItems)
                 }
                 self.undoManager.setActionName("Remove Note")
                 self.refreshNotes()
@@ -837,7 +839,7 @@ final class NotesModel {
         }
     }
 
-    private func restoreEntry(parent: String, url: String, title: String) {
+    private func restoreEntry(parent: String, url: String, title: String, linkedItems: [String] = []) {
         guard let core else { return }
         undoManager.registerUndo(withTarget: self) { model in
             model.removeEntry(core: core, parent: parent, url: url, title: title)
@@ -852,7 +854,10 @@ final class NotesModel {
                 }
                 return
             }
-            await MainActor.run { [weak self] in self?.refreshNotes() }
+            await MainActor.run { [weak self] in
+                if !linkedItems.isEmpty { CalendarLinks.set(linkedItems, for: url) }
+                self?.refreshNotes()
+            }
         }
     }
 
@@ -1633,6 +1638,13 @@ final class NotesModel {
 
     private var pendingRefreshUrls: Set<String> = []
 
+    /// The core's indexer rewrote this doc's extracted-content row; everything
+    /// that feeds on note content reads the row from here, no doc open needed.
+    func docIndexed(url: String) {
+        scheduleSemanticIndex(url: url)
+        scheduleSpotlightIndex(url: url)
+    }
+
     func docChanged(url: String) {
         pads.docChanged(url: url)
         folderNodeCache.removeValue(forKey: url)
@@ -1670,10 +1682,6 @@ final class NotesModel {
                     self.refreshNotes()
                 }
             }
-        }
-        if node(for: url)?.isNote == true || notes.contains(where: { $0.url == url && $0.kind == "rich" }) {
-            scheduleSemanticIndex(url: url)
-            scheduleSpotlightIndex(url: url)
         }
         if startupSettled,
            smartNotebooks.contains(where: \.notifyOnChange)
@@ -2869,15 +2877,18 @@ final class NotesModel {
 
     private func indexSemantically(url: String, name: String?, token: UUID) async {
         guard let core else { return }
-        var resolvedName = name ?? node(for: url)?.displayName
-        if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
-        try? await core.openNote(url: url)
-        defer { try? core.closeNote(url: url) }
-        guard let json = try? await core.noteSpansJson(url: url) else { return }
-        let eventIds = await Task.detached { CalendarLinks.eventIds(in: SpanNode.decodeList(json)) }.value
+        guard let row = await core.noteContent(url: url), row.kind == "rich" else { return }
         guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
-        CalendarLinks.set(eventIds, for: url)
-        await semanticSearch.index(url: url, name: resolvedName ?? "", spansJson: json)
+        CalendarLinks.set(row.eventIds, for: url)
+        let resolvedName = row.title.isEmpty
+            ? (name ?? node(for: url)?.displayName ?? "")
+            : row.title
+        await semanticSearch.index(
+            url: url,
+            name: resolvedName,
+            body: row.body,
+            context: row.context
+        )
     }
 
     private func scheduleSpotlightIndex(url: String, name: String? = nil) {
@@ -2896,13 +2907,18 @@ final class NotesModel {
 
     private func indexForSpotlight(url: String, name: String?, token: UUID) async {
         guard let core else { return }
-        var resolvedName = name ?? node(for: url)?.displayName
-        if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
-        try? await core.openNote(url: url)
-        defer { try? core.closeNote(url: url) }
-        guard let json = try? await core.noteSpansJson(url: url) else { return }
+        guard let row = await core.noteContent(url: url), row.kind == "rich" else { return }
         guard spotlightIndexTokens[url] == token, !Task.isCancelled else { return }
-        await spotlightIndex.index(url: url, title: resolvedName ?? "", spansJson: json)
+        let resolvedName = row.title.isEmpty
+            ? (name ?? node(for: url)?.displayName ?? "")
+            : row.title
+        await spotlightIndex.index(
+            url: url,
+            title: resolvedName,
+            body: row.body,
+            eventStart: row.eventStart > 0 ? Date(timeIntervalSince1970: TimeInterval(row.eventStart)) : nil,
+            eventEnd: row.eventEnd > 0 ? Date(timeIntervalSince1970: TimeInterval(row.eventEnd)) : nil
+        )
     }
 
     private func schedulePreviewUpdate(url: String) {
@@ -3963,6 +3979,12 @@ private final class DelegateBridge: CoreDelegate {
     func onDocChanged(url: String) {
         Task { @MainActor [model] in
             model?.docChanged(url: url)
+        }
+    }
+
+    func onDocIndexed(url: String) {
+        Task { @MainActor [model] in
+            model?.docIndexed(url: url)
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import CoreText
 #if os(macOS)
 import AppKit
 import UniformTypeIdentifiers
@@ -141,12 +142,54 @@ enum NoteExporter {
         )
     }
 
+    static func htmlDocument(title: String, spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+        buildHTML(
+            title: title,
+            spans: spans,
+            assetResolver: inlineImages.isEmpty ? .none : .inlineImages(inlineImages)
+        )
+    }
+
     static func rtfData(from spans: [SpanNode]) throws -> Data {
         let attributed = RichText.attributed(from: spans, cache: AssetCache())
         return try attributed.data(
             from: NSRange(location: 0, length: attributed.length),
             documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
         )
+    }
+
+    enum ExportError: Error {
+        case pdfContext
+    }
+
+    static func pdfData(from spans: [SpanNode], title: String) throws -> Data {
+        let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let inset = mediaBox.insetBy(dx: 54, dy: 54)
+        let data = NSMutableData()
+        let info = [kCGPDFContextTitle as String: title] as CFDictionary
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, info)
+        else { throw ExportError.pdfContext }
+        let framesetter = CTFramesetterCreateWithAttributedString(attributed as CFAttributedString)
+        let path = CGPath(rect: inset, transform: nil)
+        var location = 0
+        repeat {
+            context.beginPDFPage(nil)
+            let frame = CTFramesetterCreateFrame(
+                framesetter,
+                CFRange(location: location, length: 0),
+                path,
+                nil
+            )
+            CTFrameDraw(frame, context)
+            context.endPDFPage()
+            let visible = CTFrameGetVisibleStringRange(frame)
+            guard visible.length > 0 else { break }
+            location += visible.length
+        } while location < attributed.length
+        context.closePDF()
+        return data as Data
     }
 
     private enum AssetResolver {
