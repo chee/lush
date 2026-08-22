@@ -141,18 +141,20 @@ jobs:
             -resultBundlePath "$RUNNER_TEMP/Lush-ios.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
-      # Signed ad hoc rather than not at all: the Mac app is sandboxed, and an
-      # unsigned bundle is refused at launch, which reads as a test failure
-      # rather than the signing problem it is.
-      - name: Build and test (macOS)
+      # Compiled, not run. The Mac app claims entitlements a provisioning
+      # profile has to grant — push, Maps, WeatherKit, Wi-Fi Aware, the app
+      # group — and launchd refuses to spawn a bundle asserting entitlements
+      # nothing backs, whatever it is signed with. Only the release workflow
+      # holds those credentials. Compiling is the part CI was missing anyway:
+      # the tests themselves are platform-agnostic and already run above.
+      - name: Build (macOS)
         run: |
-          xcodebuild test \
+          xcodebuild build-for-testing \
             -project Lush.xcodeproj \
             -scheme Lush \
             -destination "platform=macOS" \
             -resultBundlePath "$RUNNER_TEMP/Lush-macos.xcresult" \
-            CODE_SIGN_IDENTITY=- \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Upload test results
         if: failure()
