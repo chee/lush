@@ -648,6 +648,9 @@ fn short(id: DocId) -> String {
 #[derive(Debug, Clone)]
 pub enum RepoEvent {
     DocChanged(DocId),
+    /// The search index row for this doc was rewritten: extracted content is
+    /// ready to read, so consumers can feed off the row instead of the doc.
+    DocIndexed(DocId),
     Connected,
     Disconnected,
     SyncEvent(String),
@@ -1978,6 +1981,30 @@ impl Repo {
 
     pub fn announce_notes_prefetched(&self) {
         let _ = self.events.send(RepoEvent::NotesPrefetched);
+    }
+
+    pub fn announce_doc_indexed(&self, id: DocId) {
+        let _ = self.events.send(RepoEvent::DocIndexed(id));
+    }
+
+    /// Read a doc without making it resident: a resident doc is read in
+    /// place, anything else is rebuilt from the sedimentree plus the outbox
+    /// log and dropped again. The reader path for consumers that only want
+    /// the content — indexing, previews — so they stop being a reason to
+    /// keep docs in memory.
+    pub async fn read_stored<F, T>(&self, id: DocId, f: F) -> Result<T>
+    where
+        F: FnOnce(&Automerge) -> Result<T>,
+    {
+        if let Some(state) = self.docs.lock().await.get(&id).cloned() {
+            let state = state.lock().await;
+            return catching(|| f(&state.doc));
+        }
+        let mut doc = self.stored_doc(id).await?;
+        if let Ok(bytes) = std::fs::read(self.outbox_path(id)) {
+            let _ = cpu_heavy(|| merge_outbox_into(&mut doc, &bytes));
+        }
+        catching(|| f(&doc))
     }
 
     /// Reads what is on disk, then says so and dials out. Owning the order here

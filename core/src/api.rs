@@ -209,6 +209,52 @@ pub struct EmbeddingChunk {
     pub vector: Vec<f32>,
 }
 
+/// One note's extracted content, as the indexer wrote it: the single source
+/// consumers read instead of opening the doc.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct IndexedNoteContent {
+    pub url: String,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    /// Loglines as embedding-friendly prose; prepend to `body` for semantic
+    /// indexing, skip for display.
+    pub context: String,
+    pub modified: i64,
+    pub created: i64,
+    pub when_day: String,
+    pub tags: Vec<String>,
+    pub weather: Vec<String>,
+    pub locations: Vec<String>,
+    /// First calendar event's window, epoch seconds, 0 when absent.
+    pub event_start: i64,
+    pub event_end: i64,
+    pub event_ids: Vec<String>,
+    pub heads: String,
+}
+
+impl From<search::IndexedDoc> for IndexedNoteContent {
+    fn from(doc: search::IndexedDoc) -> Self {
+        Self {
+            url: doc.url,
+            kind: doc.kind,
+            title: doc.title,
+            body: doc.body,
+            context: doc.context,
+            modified: doc.modified,
+            created: doc.created,
+            when_day: doc.when,
+            tags: doc.tags,
+            weather: doc.weather,
+            locations: doc.locations,
+            event_start: doc.event_start,
+            event_end: doc.event_end,
+            event_ids: doc.event_ids,
+            heads: doc.heads,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RecentNote {
     pub url: String,
@@ -253,6 +299,9 @@ pub struct AssetML {
 #[uniffi::export(callback_interface)]
 pub trait CoreDelegate: Send + Sync {
     fn on_doc_changed(&self, url: String);
+    /// The doc's extracted row in the search index was rewritten — read it
+    /// with `indexed_note` instead of opening the doc.
+    fn on_doc_indexed(&self, url: String);
     fn on_connection_changed(&self, connected: bool);
     fn on_sync_event(&self, message: String);
     fn on_ephemeral_message(&self, url: String, payload: Vec<u8>);
@@ -464,7 +513,7 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
             .unwrap_or(None)
     };
     let indexed = match repo
-        .read_doc(id, |doc| {
+        .read_stored(id, |doc| {
             Ok(search::indexed_doc(url.clone(), doc, known_created))
         })
         .await
@@ -480,14 +529,15 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
         if searchable {
             index.upsert(indexed)
         } else {
-            index.remove(&url)
+            index.remove(&url).map(|()| false)
         }
     })
     .await;
     match written {
         Ok(Err(e)) => tracing::warn!(error = %e, "search index write failed"),
         Err(e) => tracing::warn!(error = %e, "search index task failed"),
-        Ok(Ok(())) => {}
+        Ok(Ok(true)) => repo.announce_doc_indexed(id),
+        Ok(Ok(false)) => {}
     }
 }
 
@@ -598,6 +648,7 @@ impl Core {
             loop {
                 match events.recv().await {
                     Ok(RepoEvent::DocChanged(id)) => delegate.on_doc_changed(id.to_url()),
+                    Ok(RepoEvent::DocIndexed(id)) => delegate.on_doc_indexed(id.to_url()),
                     Ok(RepoEvent::Connected) => delegate.on_connection_changed(true),
                     Ok(RepoEvent::Disconnected) => delegate.on_connection_changed(false),
                     Ok(RepoEvent::SyncEvent(msg)) => delegate.on_sync_event(msg),
@@ -2112,11 +2163,32 @@ impl Core {
             return String::new();
         };
         let repo = self.repo.clone();
-        self.run(async move { repo.read_doc(id, |doc| Ok(shapes::note_preview(doc))).await })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+        self.run(async move {
+            repo.read_stored(id, |doc| Ok(shapes::note_preview(doc)))
+                .await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+    }
+
+    /// The extracted content of a note's search-index row — what
+    /// `on_doc_indexed` says is fresh. Reading this costs a SELECT, not a
+    /// doc open.
+    pub async fn note_content(&self, url: String) -> Option<IndexedNoteContent> {
+        let index = self.index.clone();
+        self.run(async move {
+            tokio::task::spawn_blocking(move || index.indexed_note(&url))
+                .await
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .and_then(Result::ok)
+        .flatten()
+        .map(IndexedNoteContent::from)
     }
 
     /// Store binary data as a patchwork UnixFileEntry doc; returns its URL.

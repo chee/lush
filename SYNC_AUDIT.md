@@ -328,6 +328,33 @@ repeated failures would complete the loop the reference closes with
    and the footer outlived the facts. Comments that assert safety
    properties should cite the mechanism that enforces them.
 
+## Addendum: the content pipeline (2026-08-22)
+
+The indexer is now the single extraction stage the consumers feed from,
+per the author's design:
+
+- `search::indexed_doc` extracts everything once — leveled-up `body`
+  (text + calendar-event lines + HTML embeds, which FTS was silently
+  missing before), a `context` column carrying the logline enrichment the
+  semantic index used to compute privately, the first calendar event's
+  window, and the doc's EventKit ids — into new `search_docs` columns.
+- `upsert` reports no-ops; a real write emits `RepoEvent::DocIndexed`,
+  surfaced to Swift as `onDocIndexed`.
+- `Core::note_content(url)` returns the row (`IndexedNoteContent`); the
+  Spotlight and semantic indexers now react to `onDocIndexed`, read the
+  row, and never open a doc. Their private extractors (and the
+  `CalendarLinks` scan stapled to the semantic pass) are gone — the row
+  carries `event_ids`.
+- `Repo::read_stored` reads a doc without making it resident (resident →
+  in place; else sedimentree + outbox replay, then dropped). `index_doc`
+  and `note_preview` use it, so content consumption no longer touches
+  residency at all — the precondition for shrinking the resident cache to
+  "the last doc or two".
+
+Upgrade behavior: the extended no-op comparison backfills every row once
+(old rows lack the new columns), which fires `DocIndexed` across the store
+and — with the embedding digest bumped to v3 — re-embeds each note once.
+
 ## Suggested order
 
 1. ~~S1 (reclaim race)~~ — **done**.

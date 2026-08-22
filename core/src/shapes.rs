@@ -1871,6 +1871,23 @@ pub fn note_preview(doc: &Automerge) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn iso_parsing_and_weekdays_hold() {
+        assert_eq!(parse_iso_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_iso_seconds("2026-08-21T14:03:22Z"),
+            Some(1_787_321_002)
+        );
+        assert_eq!(
+            parse_iso_seconds("2026-08-21T14:03:22+02:00"),
+            Some(1_787_321_002 - 7_200)
+        );
+        assert_eq!(parse_iso_seconds("2026-08-21T14:03"), Some(1_787_321_002 - 22));
+        assert_eq!(parse_iso_seconds("garbage"), None);
+        assert_eq!(weekday_from_ymd(2026, 8, 21), "Friday");
+        assert_eq!(weekday_from_ymd(1970, 1, 1), "Thursday");
+    }
+
     use super::*;
 
     fn field_is_text(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> bool {
@@ -2157,6 +2174,294 @@ pub fn context_values(doc: &Automerge, key: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+const WEEKDAYS: [&str; 7] = [
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+];
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = ((153 * month_prime + 2) / 5 + day - 1) as i64;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn iso_ymd(value: &str) -> Option<(i64, u32, u32)> {
+    let year: i64 = value.get(0..4)?.parse().ok()?;
+    let month: u32 = value.get(5..7)?.parse().ok()?;
+    let day: u32 = value.get(8..10)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+/// The hour as written in the stamp — the writer's wall clock when the stamp
+/// carries an offset, UTC when it ends in Z.
+fn iso_hour(value: &str) -> Option<u32> {
+    let hour: u32 = value.get(11..13)?.parse().ok()?;
+    (hour < 24).then_some(hour)
+}
+
+pub fn parse_iso_seconds(value: &str) -> Option<i64> {
+    let (year, month, day) = iso_ymd(value)?;
+    let hour: i64 = value.get(11..13)?.parse().ok()?;
+    let minute: i64 = value.get(14..16)?.parse().ok()?;
+    let second: i64 = match value.as_bytes().get(16) {
+        Some(b':') => value.get(17..19).and_then(|s| s.parse().ok()).unwrap_or(0),
+        _ => 0,
+    };
+    let mut seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    let tail = value.get(16..).unwrap_or_default();
+    if let Some(index) = tail.find(['+', '-']) {
+        let offset = &tail[index..];
+        let sign: i64 = if offset.starts_with('+') { 1 } else { -1 };
+        let offset_hours: i64 = offset.get(1..3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let offset_minutes: i64 = offset.get(4..6).and_then(|s| s.parse().ok()).unwrap_or(0);
+        seconds -= sign * (offset_hours * 3_600 + offset_minutes * 60);
+    }
+    Some(seconds)
+}
+
+fn weekday_from_ymd(year: i64, month: u32, day: u32) -> &'static str {
+    WEEKDAYS[days_from_civil(year, month, day).rem_euclid(7) as usize]
+}
+
+fn event_search_line(attrs: &serde_json::Map<String, Json>) -> Option<String> {
+    let title = attrs.get("title").and_then(Json::as_str)?;
+    let mut parts = vec![title.to_string()];
+    if let Some(start) = attrs.get("start").and_then(Json::as_str) {
+        if let Some((year, month, day)) = iso_ymd(start) {
+            parts.push(format!(
+                "{} {} {} {}",
+                weekday_from_ymd(year, month, day),
+                day,
+                MONTHS[(month - 1) as usize],
+                year
+            ));
+            if attrs.get("allDay").and_then(Json::as_bool) == Some(true) {
+                parts.push("all day".to_string());
+            } else if let Some(time) = start.get(11..16) {
+                parts.push(time.to_string());
+            }
+        }
+    }
+    for key in ["location", "calendar", "repeat"] {
+        if let Some(value) = attrs.get(key).and_then(Json::as_str) {
+            parts.push(value.to_string());
+        }
+    }
+    parts.push(
+        if attrs.get("kind").and_then(Json::as_str) == Some("reminder") {
+            "reminder"
+        } else {
+            "calendar event"
+        }
+        .to_string(),
+    );
+    Some(
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+    )
+}
+
+/// The searchable text of a note: its text runs plus the lines a reader
+/// would consider part of the note but which live in block attrs — calendar
+/// events and raw HTML.
+pub fn search_text(doc: &Automerge) -> String {
+    fn push_line(out: &mut String, line: &str) {
+        if line.is_empty() {
+            return;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let Ok(spans) = spans_to_json(doc) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for span in spans {
+        match span {
+            SpanJson::Block { value } => {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                let attrs = value.get("attrs").and_then(Json::as_object);
+                if value.get("type").and_then(Json::as_str) == Some("calendar-event") {
+                    if let Some(line) = attrs.and_then(event_search_line) {
+                        push_line(&mut out, &line);
+                    }
+                }
+                if let Some(html) = attrs.and_then(|a| a.get("html")).and_then(Json::as_str) {
+                    push_line(&mut out, html);
+                }
+            }
+            SpanJson::Text { value, .. } => out.push_str(&value),
+        }
+    }
+    out
+}
+
+fn context_line(attrs: &serde_json::Map<String, Json>) -> String {
+    let mut parts = vec!["Logline".to_string()];
+    if let Some(raw) = attrs
+        .get("created")
+        .or_else(|| attrs.get("ts"))
+        .and_then(Json::as_str)
+    {
+        if let Some(hour) = iso_hour(raw) {
+            parts.push(
+                match hour {
+                    5..=11 => "morning daytime",
+                    12..=16 => "afternoon daytime",
+                    17..=20 => "evening",
+                    _ => "night nighttime",
+                }
+                .to_string(),
+            );
+        }
+        if let Some((year, month, day)) = iso_ymd(raw) {
+            parts.push(weekday_from_ymd(year, month, day).to_string());
+        }
+    }
+    if let Some(location) = attrs.get("location").and_then(Json::as_str) {
+        parts.push(location.to_string());
+    }
+    if let Some(weather) = attrs.get("weather").and_then(Json::as_str) {
+        parts.push(weather.to_string());
+        let value = weather.to_lowercase();
+        if ["rain", "drizzle", "shower", "thunder"].iter().any(|w| value.contains(w)) {
+            parts.push("wet rainy".to_string());
+        }
+        if value.contains("clear") || value.contains("sun") {
+            parts.push("sunny sunshine".to_string());
+        }
+        if value.contains("cloud") || value.contains("overcast") {
+            parts.push("cloudy".to_string());
+        }
+        if value.contains("snow") {
+            parts.push("snowy cold".to_string());
+        }
+        if value.contains("fog") || value.contains("mist") {
+            parts.push("foggy misty".to_string());
+        }
+    }
+    let reserved = ["created", "ts", "location", "lat", "lon", "weather"];
+    for (key, value) in attrs {
+        if reserved.contains(&key.as_str()) {
+            continue;
+        }
+        if let Some(text) = value.as_str() {
+            parts.push(text.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Loglines rendered as embedding-friendly prose: time-of-day and weather
+/// words a person would search by, which the raw attrs don't contain.
+pub fn context_search_text(doc: &Automerge) -> String {
+    let Ok(spans) = spans_to_json(doc) else {
+        return String::new();
+    };
+    spans
+        .into_iter()
+        .filter_map(|span| match span {
+            SpanJson::Block { value }
+                if value.get("type").and_then(Json::as_str) == Some("context") =>
+            {
+                value
+                    .get("attrs")
+                    .and_then(Json::as_object)
+                    .map(context_line)
+            }
+            _ => None,
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn calendar_event_ids(doc: &Automerge) -> Vec<String> {
+    let Ok(spans) = spans_to_json(doc) else {
+        return Vec::new();
+    };
+    spans
+        .into_iter()
+        .filter_map(|span| match span {
+            SpanJson::Block { value }
+                if value.get("type").and_then(Json::as_str) == Some("calendar-event") =>
+            {
+                value
+                    .get("attrs")
+                    .and_then(Json::as_object)
+                    .and_then(|attrs| attrs.get("event"))
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first calendar event's start and end as epoch seconds, 0 when absent.
+pub fn calendar_event_window(doc: &Automerge) -> (i64, i64) {
+    let Ok(spans) = spans_to_json(doc) else {
+        return (0, 0);
+    };
+    for span in spans {
+        if let SpanJson::Block { value } = span {
+            if value.get("type").and_then(Json::as_str) != Some("calendar-event") {
+                continue;
+            }
+            let Some(attrs) = value.get("attrs").and_then(Json::as_object) else {
+                continue;
+            };
+            let start = attrs
+                .get("start")
+                .and_then(Json::as_str)
+                .and_then(parse_iso_seconds)
+                .unwrap_or(0);
+            let end = attrs
+                .get("end")
+                .and_then(Json::as_str)
+                .and_then(parse_iso_seconds)
+                .unwrap_or(0);
+            return (start, end);
+        }
+    }
+    (0, 0)
 }
 
 pub fn doc_facets(doc: &Automerge) -> Vec<String> {
