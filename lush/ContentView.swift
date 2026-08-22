@@ -2007,7 +2007,7 @@ struct ContentView: View {
     private func detailContent(for url: String) -> some View {
         let node = model.node(for: url)
         if node?.kind == "folder" {
-            FolderDetail(folderUrl: url)
+            FolderDetail(folderUrl: url, open: open)
                 .id(url)
         } else {
             detailContentNonFolder(for: url, node: node)

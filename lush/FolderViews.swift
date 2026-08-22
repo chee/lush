@@ -47,12 +47,16 @@ enum FolderViewModes {
 
 struct FolderDetail: View {
     let folderUrl: String
+    /// Hands a note back to the window that owns the selection, the way the
+    /// calendar and map screens do.
+    let open: (String) -> Void
 
     @Environment(NotesModel.self) private var model
     @State private var mode: FolderViewMode
 
-    init(folderUrl: String) {
+    init(folderUrl: String, open: @escaping (String) -> Void) {
         self.folderUrl = folderUrl
+        self.open = open
         _mode = State(initialValue: FolderViewModes.mode(for: folderUrl))
     }
 
@@ -68,9 +72,9 @@ struct FolderDetail: View {
             case .notebook:
                 FolderNotebook(children: children)
             case .sketchpad:
-                FolderSketchpad(children: children)
+                FolderSketchpad(children: children, open: open)
             case .outline:
-                FolderOutline(children: children)
+                FolderOutline(children: children, open: open)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -165,10 +169,11 @@ struct FolderNotebook: View {
 }
 
 /// The corkboard: every note a card of the same size, editable where it sits,
-/// and draggable to reorder. The order is the folder's own, so moving a card
-/// moves it in the sidebar too.
+/// openable from its header, and draggable to reorder. The order is the
+/// folder's own, so moving a card moves it in the sidebar too.
 struct FolderSketchpad: View {
     let children: [FolderNode]
+    let open: (String) -> Void
 
     @Environment(NotesModel.self) private var model
     @State private var dropTarget: String?
@@ -192,13 +197,37 @@ struct FolderSketchpad: View {
         }
     }
 
+    /// The card's handle. Opening, dragging and the note's menu all live here
+    /// rather than on the card as a whole: the rest of it is a text editor,
+    /// where a drag means selecting words and a right click means the editor's
+    /// own menu. A button rather than a tap gesture, so VoiceOver has
+    /// something it can activate.
+    private func header(for node: FolderNode) -> some View {
+        Button {
+            open(node.url)
+        } label: {
+            HStack(spacing: 4) {
+                Text(node.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.forward")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Open \(node.displayName)")
+        .draggable(node.url)
+        .contextMenu { NoteContextMenu(node: node) }
+    }
+
     private func card(for node: FolderNode) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(node.displayName)
-                .font(.subheadline.weight(.semibold))
-                .lineLimit(1)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+            header(for: node)
             Divider()
             FolderNoteCard(noteUrl: node.url, height: 190)
         }
@@ -211,7 +240,6 @@ struct FolderSketchpad: View {
                     lineWidth: dropTarget == node.url ? 2 : 1
                 )
         }
-        .draggable(node.url)
         .dropDestination(for: String.self) { urls, _ in
             dropTarget = nil
             guard let dragged = urls.first else { return false }
@@ -229,6 +257,7 @@ struct FolderSketchpad: View {
 /// column would only fight it.
 struct FolderOutline: View {
     let children: [FolderNode]
+    let open: (String) -> Void
 
     @Environment(NotesModel.self) private var model
     @State private var selection: FolderNode.ID?
@@ -264,6 +293,15 @@ struct FolderOutline: View {
                     TableRow(node)
                         .draggable(node.url)
                 }
+            }
+            // Double click opens, right click gives the row the same menu it
+            // has everywhere else in the app.
+            .contextMenu(forSelectionType: FolderNode.ID.self) { ids in
+                if let url = ids.first, let node = model.node(for: url) {
+                    NoteContextMenu(node: node)
+                }
+            } primaryAction: { ids in
+                if let url = ids.first { open(url) }
             }
         }
     }
