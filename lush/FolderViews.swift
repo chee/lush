@@ -120,54 +120,6 @@ private struct FolderNoteCard: View {
     }
 }
 
-private struct FolderEmptyState: View {
-    let message: String
-
-    var body: some View {
-        VStack(spacing: 6) {
-            Image(systemName: "tray")
-                .font(.system(size: 26))
-                .foregroundStyle(.tertiary)
-            Text(message)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-/// The folder as one continuous document: every note's content in a single
-/// editor, one scroll view and one caret, with the boundary between two notes
-/// drawn as a heading rather than the edge of a box. The notes are rendered
-/// like any other text — not embedded editors — so nothing here nests a
-/// scroll view inside another that scrolls the same way.
-struct FolderNotebook: View {
-    let children: [FolderNode]
-
-    @Environment(NotesModel.self) private var model
-    @State private var core: FolderNotebookCore?
-
-    private var notes: [FolderNode] { children.filter(\.isNote) }
-
-    var body: some View {
-        Group {
-            if notes.isEmpty {
-                FolderEmptyState(message: "No notes in this folder")
-            } else if let core, core.loaded {
-                FolderNotebookText(core: core)
-            } else {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .task(id: notes.map(\.url)) {
-            let core = FolderNotebookCore(model: model)
-            self.core = core
-            await core.load(notes)
-        }
-    }
-}
-
 /// The corkboard: every note a card of the same size, editable where it sits,
 /// openable from its header, and draggable to reorder. The order is the
 /// folder's own, so moving a card moves it in the sidebar too.

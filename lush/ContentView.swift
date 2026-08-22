@@ -9,6 +9,8 @@ import PhotosUI
 
 enum NavRoute: Hashable {
     case folder(String)
+    /// The same folder read as one document rather than listed.
+    case folderNotebook(String)
     case note(String)
     case patchwork(String)
     case script(String)
@@ -687,6 +689,14 @@ struct ContentView: View {
             switch route {
             case .folder(let url):
                 FolderScreen(folderUrl: url, push: openMobile)
+            case .folderNotebook(let url):
+                FolderNotebook(
+                    children: model.orderedChildren(
+                        model.node(for: url)?.children ?? [],
+                        in: url
+                    )
+                )
+                .navigationTitle(model.node(for: url)?.displayName ?? "Notebook")
             case .note(let url):
                 NoteDetail(noteUrl: model.resolvedNoteUrl(url))
                     .onAppear { model.selectedNoteUrl = url }
@@ -2811,6 +2821,18 @@ struct FolderScreen: View {
             }
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarSpacer(.flexible, placement: .bottomBar)
+            // Bottom bar rather than top: the top one is already carrying
+            // more than it should, and this is a way of reading the folder
+            // rather than a thing done to it.
+            if let folderUrl, nodes.contains(where: \.isNote) {
+                ToolbarItem(placement: .bottomBar) {
+                    Button {
+                        push(.folderNotebook(folderUrl))
+                    } label: {
+                        Label("Notebook", systemImage: "doc.text")
+                    }
+                }
+            }
             ToolbarItem(placement: .bottomBar) {
                 newMenu
             }

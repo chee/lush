@@ -253,8 +253,6 @@ final class NotebookDocument {
     }
 }
 
-#if os(macOS)
-
 /// A folder read as one document: every note's content in one text view, one
 /// scroll view, one caret. The notes are not embedded editors — they are
 /// rendered like any other text, and the boundary between two of them is a
@@ -348,6 +346,56 @@ final class FolderNotebookCore {
         }
     }
 }
+
+struct FolderEmptyState: View {
+    let message: String
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "tray")
+                .font(.system(size: 26))
+                .foregroundStyle(.tertiary)
+            Text(message)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// The folder as one continuous document: every note's content in a single
+/// editor, one scroll view and one caret, with the boundary between two notes
+/// drawn as a title over a dotted rule rather than the edge of a box. The
+/// notes are rendered like any other text — not embedded editors — so nothing
+/// here nests a scroll view inside another that scrolls the same way.
+struct FolderNotebook: View {
+    let children: [FolderNode]
+
+    @Environment(NotesModel.self) private var model
+    @State private var core: FolderNotebookCore?
+
+    private var notes: [FolderNode] { children.filter(\.isNote) }
+
+    var body: some View {
+        Group {
+            if notes.isEmpty {
+                FolderEmptyState(message: "No notes in this folder")
+            } else if let core, core.loaded {
+                FolderNotebookText(core: core)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: notes.map(\.url)) {
+            let core = FolderNotebookCore(model: model)
+            self.core = core
+            await core.load(notes)
+        }
+    }
+}
+
+#if os(macOS)
 
 /// Draws the rule between two notes. It is painted rather than inserted: a
 /// character standing in for the seam would be one more thing an edit could
@@ -456,6 +504,102 @@ struct FolderNotebookText: NSViewRepresentable {
             textView.typingAttributes = core.document.typingAttributes(
                 from: textView.typingAttributes,
                 at: textView.selectedRange().location
+            )
+        }
+    }
+}
+
+#else
+
+/// The UIKit half of the same thing. The rules, the loading and the writing
+/// back are shared — only hosting the text differs.
+final class NotebookTextView: UITextView {
+    weak var document: NotebookDocument?
+
+    override func draw(_ rect: CGRect) {
+        super.draw(rect)
+        guard let document,
+              let layoutManager = textLayoutManager,
+              let contentManager = layoutManager.textContentManager,
+              let context = UIGraphicsGetCurrentContext()
+        else { return }
+
+        context.setStrokeColor(PColor.separator.cgColor)
+        context.setLineWidth(1)
+        context.setLineDash(phase: 0, lengths: [1.5, 4])
+
+        for location in document.separatorLocations() {
+            guard let start = contentManager.location(
+                contentManager.documentRange.location,
+                offsetBy: location
+            ), let fragment = layoutManager.textLayoutFragment(for: start) else { continue }
+
+            let y = (fragment.layoutFragmentFrame.minY + textContainerInset.top - 15)
+                .rounded() + 0.5
+            guard y >= rect.minY - 20, y <= rect.maxY + 20 else { continue }
+            context.move(to: CGPoint(x: textContainerInset.left, y: y))
+            context.addLine(to: CGPoint(x: bounds.width - textContainerInset.right, y: y))
+        }
+        context.strokePath()
+    }
+}
+
+struct FolderNotebookText: UIViewRepresentable {
+    let core: FolderNotebookCore
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(core: core)
+    }
+
+    func makeUIView(context: Context) -> NotebookTextView {
+        let textView = NotebookTextView(usingTextLayoutManager: true)
+        textView.document = core.document
+        textView.isEditable = true
+        textView.isScrollEnabled = true
+        textView.alwaysBounceVertical = true
+        textView.autocorrectionType = .default
+        textView.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
+        textView.delegate = context.coordinator
+        // The seam is drawn into the content, which scrolls with it; without
+        // this the strip revealed by a scroll is never asked to redraw.
+        textView.contentMode = .redraw
+        textView.textContainer.widthTracksTextView = true
+        textView.textContentStorage?.textStorage = core.document.storage
+        return textView
+    }
+
+    func updateUIView(_ textView: NotebookTextView, context: Context) {
+        textView.document = core.document
+        if textView.textContentStorage?.textStorage !== core.document.storage {
+            textView.textContentStorage?.textStorage = core.document.storage
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        let core: FolderNotebookCore
+
+        init(core: FolderNotebookCore) {
+            self.core = core
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn range: NSRange,
+            replacementText text: String
+        ) -> Bool {
+            core.document.allowsEdit(in: range, replacement: text)
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            core.scheduleSave()
+            textView.setNeedsDisplay()
+        }
+
+        func textViewDidChangeSelection(_ textView: UITextView) {
+            textView.typingAttributes = core.document.typingAttributes(
+                from: textView.typingAttributes,
+                at: textView.selectedRange.location
             )
         }
     }
