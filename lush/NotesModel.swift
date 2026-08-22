@@ -255,6 +255,8 @@ final class NotesModel {
     @ObservationIgnored private var contextMetaLoading: Set<String> = []
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
+    @ObservationIgnored private var visionBackfillToken = UUID()
+    @ObservationIgnored private var visionBackfillAllowed = true
     @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
     @ObservationIgnored private var prewarmWalkTask: Task<TreeWalk?, Never>?
     @ObservationIgnored private var deferredStartupRefresh = false
@@ -1592,6 +1594,18 @@ final class NotesModel {
             break
         }
         noteRow(for: url).contextMeta = meta
+    }
+
+    /// Every logline that carries a fix. The indexer reads each note as it
+    /// lands and keeps its placed loglines, so this is one query against the
+    /// index rather than a walk of the whole collection — and it waits for the
+    /// startup crawl, since an early answer would be a short one.
+    func noteLocations() async -> [NoteLocation] {
+        if core == nil { await start() }
+        guard let core else { return [] }
+        _ = await waitForStartup()
+        let places = await Task.detached { NoteLocation.from(core.notePlaces()) }.value
+        return places.filter { node(for: $0.noteUrl) != nil }
     }
 
     func documentHistorySummary(url: String) async -> DocumentHistorySummary {
@@ -3023,29 +3037,53 @@ final class NotesModel {
     @discardableResult
     func analyzeAssetVision(_ url: String) async -> AssetVision? {
         guard let core else { return nil }
-        defer { core.markVisionAttempted(url: url) }
-        guard let data = await assetBytes(url),
-              let result = await VisionAnalyzer.analyze(data)
-        else { return nil }
-        await updateAssetVision(url, description: result.description, ocr: result.ocr)
-        return AssetVision(description: result.description, ocr: result.ocr)
+        var vision: AssetVision?
+        if let data = await assetBytes(url),
+           let result = await VisionAnalyzer.analyze(data) {
+            await updateAssetVision(url, description: result.description, ocr: result.ocr)
+            vision = AssetVision(description: result.description, ocr: result.ocr)
+        }
+        await Task.detached { core.markVisionAttempted(url: url) }.value
+        return vision
     }
 
     /// Backfill vision for indexed assets that have none. Runs alongside the
     /// semantic backfill and stops when the core has nothing left to offer.
+    /// Parked while the app has no permission to work — every item ends in a
+    /// core write, and a write still in flight when the process suspends is
+    /// one RunningBoard kills (`0xdead10cc`).
     private func backfillAssetVision() {
-        guard visionBackfillTask == nil else { return }
+        guard visionBackfillTask == nil, visionBackfillAllowed else { return }
+        let token = UUID()
+        visionBackfillToken = token
         visionBackfillTask = Task { [weak self] in
-            defer { self?.visionBackfillTask = nil }
+            defer {
+                if let self, self.visionBackfillToken == token {
+                    self.visionBackfillTask = nil
+                }
+            }
             while !Task.isCancelled {
-                guard let self, let core = self.core else { return }
+                guard let self, self.visionBackfillAllowed, let core = self.core else { return }
                 let urls = await Task.detached { core.assetsWithoutVision(limit: 8) }.value
                 if urls.isEmpty { return }
                 for url in urls {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self.visionBackfillAllowed else { return }
                     await self.analyzeAssetVision(url)
                 }
             }
+        }
+    }
+
+    /// Mirrors the core's `setAppActive`: Swift-driven backfill loops issue
+    /// core writes the core's own parking can't see coming.
+    func setBackfillActive(_ active: Bool) {
+        guard visionBackfillAllowed != active else { return }
+        visionBackfillAllowed = active
+        if active {
+            backfillAssetVision()
+        } else {
+            visionBackfillTask?.cancel()
+            visionBackfillTask = nil
         }
     }
 

@@ -37,7 +37,9 @@ enum BackgroundSync {
     }
 
     private static func syncCoreActivity() {
-        NotesModel.shared.core?.setAppActive(active: foreground || backgroundHolds > 0)
+        let active = foreground || backgroundHolds > 0
+        NotesModel.shared.core?.setAppActive(active: active)
+        NotesModel.shared.setBackfillActive(active)
     }
 
     private static func beginBackgroundHold() {
