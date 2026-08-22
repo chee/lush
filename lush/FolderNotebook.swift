@@ -15,6 +15,10 @@ let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
 /// The editable part of a boundary — the note's name. Typing here renames the
 /// note; the newlines on either side carry no title and so cannot be typed in.
 let notebookTitle = NSAttributedString.Key("lushNotebookTitle")
+/// A child the notebook cannot edit in place — a subfolder, a patchwork doc,
+/// a script. The run is a button: activating it opens the item, and being
+/// boundary keeps the caret out of it.
+let notebookLink = NSAttributedString.Key("lushNotebookLink")
 
 /// The folder's notes concatenated into one piece of text, and the rules for
 /// reading and editing it: who owns each character, where a caret is writing,
@@ -35,6 +39,19 @@ final class NotebookDocument {
         let body: NSAttributedString
     }
 
+    struct Link {
+        let url: String
+        let title: String
+        let symbol: String
+    }
+
+    /// A folder's children in the notebook: a note is text to edit in place,
+    /// anything else is a row that opens it.
+    enum Item {
+        case note(Section)
+        case link(Link)
+    }
+
     let storage = NSTextStorage()
     private(set) var order: [String] = []
 
@@ -46,30 +63,37 @@ final class NotebookDocument {
         #endif
     }
 
-    func rebuild(_ sections: [Section]) {
+    func rebuild(_ items: [Item]) {
         let built = NSMutableAttributedString()
         var urls: [String] = []
-        for section in sections {
-            let body = NSMutableAttributedString(attributedString: section.body)
-            // An empty note still needs somewhere to put the caret.
-            if body.length == 0 {
-                body.append(NSAttributedString(
-                    string: "\n",
-                    attributes: RichText.attributes(block: .paragraph, marks: [:])
+        var first = true
+        for item in items {
+            switch item {
+            case .note(let section):
+                let body = NSMutableAttributedString(attributedString: section.body)
+                // An empty note still needs somewhere to put the caret.
+                if body.length == 0 {
+                    body.append(NSAttributedString(
+                        string: "\n",
+                        attributes: RichText.attributes(block: .paragraph, marks: [:])
+                    ))
+                }
+                body.addAttribute(
+                    notebookNote,
+                    value: section.url,
+                    range: NSRange(location: 0, length: body.length)
+                )
+                built.append(boundary(
+                    titled: section.title,
+                    url: section.url,
+                    first: first
                 ))
+                built.append(body)
+                urls.append(section.url)
+            case .link(let link):
+                built.append(linkLine(link, first: first))
             }
-            body.addAttribute(
-                notebookNote,
-                value: section.url,
-                range: NSRange(location: 0, length: body.length)
-            )
-            built.append(boundary(
-                titled: section.title,
-                url: section.url,
-                first: urls.isEmpty
-            ))
-            built.append(body)
-            urls.append(section.url)
+            first = false
         }
         storage.setAttributedString(built)
         order = urls
@@ -101,6 +125,74 @@ final class NotebookDocument {
         return line
     }
 
+    private var linkColor: PColor { .pTint }
+
+    /// A row for a child the notebook cannot edit in place. The whole line is
+    /// boundary, so the edit rules already keep the caret out; the link
+    /// attribute on the visible run is what the text views' hit tests read.
+    private func linkLine(_ link: Link, first: Bool) -> NSAttributedString {
+        var attributes = RichText.attributes(block: .paragraph, marks: [:])
+        attributes[notebookBoundary] = true
+        if !first,
+           let base = attributes[.paragraphStyle] as? NSParagraphStyle,
+           let spaced = base.mutableCopy() as? NSMutableParagraphStyle {
+            spaced.paragraphSpacingBefore = 14
+            attributes[.paragraphStyle] = spaced
+        }
+        let line = NSMutableAttributedString()
+        if !first {
+            line.append(NSAttributedString(string: "\n", attributes: attributes))
+        }
+        var linkAttributes = attributes
+        linkAttributes[notebookLink] = link.url
+        linkAttributes[.foregroundColor] = linkColor
+        #if os(macOS)
+        linkAttributes[.cursor] = NSCursor.pointingHand
+        #endif
+        if let icon = symbolAttachment(link.symbol, attributes: linkAttributes) {
+            line.append(icon)
+        }
+        line.append(NSAttributedString(string: " " + link.title, attributes: linkAttributes))
+        line.append(NSAttributedString(string: "\n", attributes: attributes))
+        return line
+    }
+
+    private func symbolAttachment(
+        _ symbol: String,
+        attributes: [NSAttributedString.Key: Any]
+    ) -> NSAttributedString? {
+        let font = attributes[.font] as? PFont
+        let attachment = NSTextAttachment()
+        #if os(macOS)
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: font?.pointSize ?? 15,
+            weight: .regular
+        ).applying(.init(paletteColors: [linkColor]))
+        guard let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(configuration)
+        else { return nil }
+        #else
+        let configuration = font.map(UIImage.SymbolConfiguration.init(font:))
+        guard let image = UIImage(systemName: symbol, withConfiguration: configuration)?
+            .withTintColor(linkColor, renderingMode: .alwaysOriginal)
+        else { return nil }
+        #endif
+        attachment.image = image
+        // On the text baseline the symbol floats too high; sink it so it sits
+        // centered against the row's lowercase letters.
+        if let font {
+            attachment.bounds = CGRect(
+                x: 0,
+                y: (font.capHeight - image.size.height) / 2,
+                width: image.size.width,
+                height: image.size.height
+            )
+        }
+        let icon = NSMutableAttributedString(attachment: attachment)
+        icon.addAttributes(attributes, range: NSRange(location: 0, length: icon.length))
+        return icon
+    }
+
     // MARK: - Ownership
 
     func owner(at location: Int) -> String? {
@@ -116,6 +208,23 @@ final class NotebookDocument {
     func isBoundary(at location: Int) -> Bool {
         guard location >= 0, location < storage.length else { return false }
         return storage.attribute(notebookBoundary, at: location, effectiveRange: nil) != nil
+    }
+
+    func link(at location: Int) -> String? {
+        guard location >= 0, location < storage.length else { return nil }
+        return storage.attribute(notebookLink, at: location, effectiveRange: nil) as? String
+    }
+
+    /// The link a click at `location` lands on, counting the position just
+    /// past the run — a click in the empty tail of the row resolves to the end
+    /// of its line, and a button whose target stops at the last glyph is a
+    /// worse button. The row's leading newline carries no link, so a click
+    /// resolving to the end of the note above stays a click in the note —
+    /// there the caret rule (`note(forCaretAt:)` looking back) applies instead.
+    func link(nearCaretAt location: Int) -> String? {
+        if let url = link(at: location) { return url }
+        if location > 0, let url = link(at: location - 1) { return url }
+        return nil
     }
 
     /// The note a caret at `location` is writing into. A caret resting at the
@@ -171,6 +280,7 @@ final class NotebookDocument {
         at location: Int
     ) -> [NSAttributedString.Key: Any] {
         var attributes = current
+        attributes[notebookLink] = nil
         if let url = title(forCaretAt: location) {
             attributes[notebookNote] = nil
             attributes[notebookBoundary] = true
@@ -257,6 +367,7 @@ final class NotebookDocument {
         storage.removeAttribute(notebookNote, range: target)
         storage.removeAttribute(notebookTitle, range: target)
         storage.removeAttribute(notebookBoundary, range: target)
+        storage.removeAttribute(notebookLink, range: target)
         if asTitle {
             storage.addAttribute(notebookBoundary, value: true, range: target)
             storage.addAttribute(notebookTitle, value: url, range: target)
@@ -351,19 +462,27 @@ final class FolderNotebookCore: LiveWriter {
     /// folder's children change, and deliberately in place: the storage the
     /// text view is attached to is the same object either way, so a note
     /// added somewhere else doesn't tear the notebook down and rebuild it.
-    func load(_ notes: [FolderNode]) async {
+    func load(_ children: [FolderNode]) async {
         if loaded { await flushNow() }
-        var built: [NotebookDocument.Section] = []
+        var built: [NotebookDocument.Item] = []
         var next: [String: Section] = [:]
 
-        for node in notes {
+        for node in children {
+            guard node.isNote else {
+                built.append(.link(NotebookDocument.Link(
+                    url: node.url,
+                    title: node.displayName,
+                    symbol: Self.symbol(for: node)
+                )))
+                continue
+            }
             guard let snapshot = await model.spansSnapshot(for: node.url) else { continue }
             let spans = SpanNode.decodeList(snapshot.spansJson)
-            built.append(NotebookDocument.Section(
+            built.append(.note(NotebookDocument.Section(
                 url: node.url,
                 title: node.displayName,
                 body: RichText.attributed(from: spans, cache: cache)
-            ))
+            )))
             next[node.url] = Section(
                 heads: snapshot.heads,
                 lastJSON: snapshot.spansJson,
@@ -376,6 +495,13 @@ final class FolderNotebookCore: LiveWriter {
         dirty = []
         pending = nil
         loaded = true
+    }
+
+    /// The icons the folder rows use for the same kinds.
+    static func symbol(for node: FolderNode) -> String {
+        node.kind == "folder" ? "folder"
+            : node.kind == "lush:script" ? "curlybraces"
+            : "doc.richtext"
     }
 
     // MARK: - Editing
@@ -538,18 +664,20 @@ struct FolderEmptyState: View {
 /// here nests a scroll view inside another that scrolls the same way.
 struct FolderNotebook: View {
     let children: [FolderNode]
+    /// Opens a child the notebook cannot edit in place — a subfolder, a
+    /// patchwork doc, a script. Notes render as text; everything else renders
+    /// as a row that hands its url back through here.
+    let open: (String) -> Void
 
     @Environment(NotesModel.self) private var model
     @State private var core: FolderNotebookCore?
 
-    private var notes: [FolderNode] { children.filter(\.isNote) }
-
     var body: some View {
         Group {
-            if notes.isEmpty {
-                FolderEmptyState(message: "No notes in this folder")
+            if children.isEmpty {
+                FolderEmptyState(message: "This folder is empty")
             } else if let core, core.loaded {
-                FolderNotebookText(core: core)
+                FolderNotebookText(core: core, open: open)
             } else {
                 ProgressView()
                     .controlSize(.small)
@@ -557,17 +685,17 @@ struct FolderNotebook: View {
             }
         }
         // One core for as long as the folder is on screen, reloaded in
-        // place when its notes change. Replacing it would take the debounced
-        // save down with it and blink the whole notebook back to a spinner
-        // over one note being added somewhere else entirely.
+        // place when its children change. Replacing it would take the
+        // debounced save down with it and blink the whole notebook back to a
+        // spinner over one note being added somewhere else entirely.
         .task {
             let notebook = core ?? FolderNotebookCore(model: model)
             self.core = notebook
-            await notebook.load(notes)
+            await notebook.load(children)
         }
-        .onChange(of: notes.map(\.url)) {
+        .onChange(of: children.map(\.url)) {
             guard let core else { return }
-            Task { await core.load(notes) }
+            Task { await core.load(children) }
         }
         .onDisappear {
             guard let core else { return }
@@ -583,6 +711,21 @@ struct FolderNotebook: View {
 /// land on, and the boundary rules exist to keep that from happening.
 final class NotebookTextView: NSTextView {
     weak var document: NotebookDocument?
+    var openLink: ((String) -> Void)?
+
+    /// A click anywhere on a link row opens it, the whole line wide — the rows
+    /// stand in for buttons, and a button's target is its row, not its glyphs.
+    override func mouseDown(with event: NSEvent) {
+        if let document, let openLink {
+            let point = convert(event.locationInWindow, from: nil)
+            let index = characterIndexForInsertion(at: point)
+            if let url = document.link(nearCaretAt: index) {
+                openLink(url)
+                return
+            }
+        }
+        super.mouseDown(with: event)
+    }
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
@@ -617,6 +760,7 @@ final class NotebookTextView: NSTextView {
 
 struct FolderNotebookText: NSViewRepresentable {
     let core: FolderNotebookCore
+    let open: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -625,6 +769,7 @@ struct FolderNotebookText: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let textView = NotebookTextView(usingTextLayoutManager: true)
         textView.document = core.document
+        textView.openLink = open
         textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         textView.allowsUndo = true
@@ -653,6 +798,7 @@ struct FolderNotebookText: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NotebookTextView else { return }
         textView.document = core.document
+        textView.openLink = open
         if textView.textContentStorage?.textStorage !== core.document.storage {
             textView.textContentStorage?.textStorage = core.document.storage
         }
@@ -735,9 +881,10 @@ final class NotebookTextView: UITextView {
 
 struct FolderNotebookText: UIViewRepresentable {
     let core: FolderNotebookCore
+    let open: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(core: core)
+        Coordinator(core: core, open: open)
     }
 
     func makeUIView(context: Context) -> NotebookTextView {
@@ -755,6 +902,15 @@ struct FolderNotebookText: UIViewRepresentable {
         textView.contentMode = .redraw
         textView.textContainer.widthTracksTextView = true
         textView.contentStorage?.textStorage = core.document.storage
+        // An editable text view spends a tap placing the caret, so the link
+        // rows need their own recognizer. Its delegate turns away any touch
+        // not over a link, which leaves every other tap exactly as it was.
+        let tap = UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.tappedLink(_:))
+        )
+        tap.delegate = context.coordinator
+        textView.addGestureRecognizer(tap)
         return textView
     }
 
@@ -765,11 +921,45 @@ struct FolderNotebookText: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    @MainActor
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         let core: FolderNotebookCore
+        let open: (String) -> Void
 
-        init(core: FolderNotebookCore) {
+        init(core: FolderNotebookCore, open: @escaping (String) -> Void) {
             self.core = core
+            self.open = open
+        }
+
+        /// The tap lands the whole row wide, like the mouse does on the Mac:
+        /// `closestPosition` resolves a touch in the row's empty tail to the
+        /// end of its line, and `link(nearCaretAt:)` counts that position.
+        private func link(in textView: NotebookTextView, at point: CGPoint) -> String? {
+            guard let position = textView.closestPosition(to: point) else { return nil }
+            let index = textView.offset(from: textView.beginningOfDocument, to: position)
+            return core.document.link(nearCaretAt: index)
+        }
+
+        @objc func tappedLink(_ recognizer: UITapGestureRecognizer) {
+            guard let textView = recognizer.view as? NotebookTextView,
+                  let url = link(in: textView, at: recognizer.location(in: textView))
+            else { return }
+            open(url)
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldReceive touch: UITouch
+        ) -> Bool {
+            guard let textView = gestureRecognizer.view as? NotebookTextView else { return false }
+            return link(in: textView, at: touch.location(in: textView)) != nil
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool {
+            true
         }
 
         func textView(
