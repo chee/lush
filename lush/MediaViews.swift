@@ -102,6 +102,7 @@ struct AudioInlineView: View {
     @State private var playing = false
     @State private var progress: Double = 0
     @State private var levels: [Float] = []
+    @ScaledMetric(relativeTo: .largeTitle) private var playButtonSize: CGFloat = 30
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -110,7 +111,7 @@ struct AudioInlineView: View {
                     togglePlayback()
                 } label: {
                     Image(systemName: playing ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 30))
+                        .font(.system(size: playButtonSize))
                         .foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.plain)
@@ -550,6 +551,7 @@ struct AudioPlayerSheet: View {
     @State private var position: TimeInterval = 0
     @State private var duration: TimeInterval = 0.01
     @State private var trimming = false
+    @ScaledMetric(relativeTo: .largeTitle) private var playButtonSize: CGFloat = 44
     @State private var trimStart: TimeInterval = 0
     @State private var trimEnd: TimeInterval = 0.01
     @State private var exporting = false
@@ -602,7 +604,7 @@ struct AudioPlayerSheet: View {
                 togglePlayback()
             } label: {
                 Image(systemName: playing ? "pause.circle.fill" : "play.circle.fill")
-                    .font(.system(size: 44))
+                    .font(.system(size: playButtonSize))
             }
             .buttonStyle(.plain)
 
@@ -889,7 +891,7 @@ struct HtmlEditorSheet: View {
 
     private var codeEditor: some View {
         TextEditor(text: $html)
-            .font(.system(size: 13, design: .monospaced))
+            .font(.system(.body, design: .monospaced))
             .autocorrectionDisabled()
             #if os(iOS)
             .textInputAutocapitalization(.never)

@@ -18,6 +18,7 @@ struct FormatMenuButton: View {
                 .frame(minWidth: 22)
         }
         .help("Format")
+        .accessibilityLabel("Format")
         .popover(isPresented: $showing, arrowEdge: .bottom) {
             FormatPopover(controller: controller)
         }
@@ -97,26 +98,26 @@ struct FormatPopover: View {
 
     private var marksRow: some View {
         HStack(spacing: 0) {
-            markButton(active: controller.strongActive, action: controller.toggleStrong) {
+            markButton("Bold", active: controller.strongActive, action: controller.toggleStrong) {
                 Text("B").font(.system(size: 14, weight: .bold))
             }
-            markButton(active: controller.emActive, action: controller.toggleEm) {
+            markButton("Italic", active: controller.emActive, action: controller.toggleEm) {
                 Text("I").font(.system(size: 14).italic())
             }
-            markButton(active: controller.underlineActive, action: controller.toggleUnderline) {
+            markButton("Underline", active: controller.underlineActive, action: controller.toggleUnderline) {
                 Text("U").font(.system(size: 14)).underline()
             }
-            markButton(active: controller.strikethroughActive, action: controller.toggleStrikethrough) {
+            markButton("Strikethrough", active: controller.strikethroughActive, action: controller.toggleStrikethrough) {
                 Text("S").font(.system(size: 14)).strikethrough()
             }
-            markButton(active: controller.linkActive != nil, action: controller.editLink) {
+            markButton("Link", active: controller.linkActive != nil, action: controller.editLink) {
                 Image(systemName: "link").font(.system(size: 12))
             }
             Divider().frame(height: 18)
-            markButton(active: controller.superscriptActive, action: controller.toggleSuperscript) {
+            markButton("Superscript", active: controller.superscriptActive, action: controller.toggleSuperscript) {
                 Image(systemName: "textformat.superscript").font(.system(size: 12))
             }
-            markButton(active: controller.subscriptActive, action: controller.toggleSubscript) {
+            markButton("Subscript", active: controller.subscriptActive, action: controller.toggleSubscript) {
                 Image(systemName: "textformat.subscript").font(.system(size: 12))
             }
         }
@@ -160,6 +161,7 @@ struct FormatPopover: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     private var highlightRow: some View {
@@ -168,6 +170,7 @@ struct FormatPopover: View {
                 .font(.system(size: 12))
                 .foregroundStyle(controller.highlightActive != nil ? Color.accentColor : Color.secondary)
                 .frame(width: 22)
+                .accessibilityHidden(true)
             ForEach(Highlight.names, id: \.self) { name in
                 Button {
                     controller.applyHighlight(controller.highlightActive == name ? nil : name)
@@ -184,6 +187,8 @@ struct FormatPopover: View {
                 }
                 .buttonStyle(.plain)
                 .help(name.capitalized)
+                .accessibilityLabel("\(name.capitalized) Highlight")
+                .accessibilityAddTraits(controller.highlightActive == name ? .isSelected : [])
             }
             Button {
                 controller.applyHighlight(nil)
@@ -194,16 +199,17 @@ struct FormatPopover: View {
             }
             .buttonStyle(.plain)
             .help("No Highlight")
+            .accessibilityLabel("No Highlight")
         }
     }
 
     private var indentRow: some View {
         HStack(spacing: 0) {
             HStack(spacing: 0) {
-                markButton(active: false, action: controller.outdentBlock) {
+                markButton("Decrease Indent", active: false, action: controller.outdentBlock) {
                     Image(systemName: "decrease.indent").font(.system(size: 12))
                 }
-                markButton(active: false, action: controller.indentBlock) {
+                markButton("Increase Indent", active: false, action: controller.indentBlock) {
                     Image(systemName: "increase.indent").font(.system(size: 12))
                 }
             }
@@ -233,6 +239,7 @@ struct FormatPopover: View {
     }
 
     private func markButton(
+        _ name: String,
         active: Bool,
         action: @escaping () -> Void,
         @ViewBuilder label: () -> some View
@@ -246,6 +253,8 @@ struct FormatPopover: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(name)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 }
 
@@ -280,6 +289,8 @@ private struct FormatStyleRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(active ? .isSelected : [])
     }
 
     private var label: String {

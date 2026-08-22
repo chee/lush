@@ -558,6 +558,7 @@ struct LushApp: App {
                     .environment(model)
                     .environment(contextTracker)
                     .interfaceFont()
+                    .statusNotice()
                     .task {
                         async let server: Void = LocalSyncServer.startIfNeeded()
                         await model.start()

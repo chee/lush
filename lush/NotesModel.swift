@@ -255,6 +255,8 @@ final class NotesModel {
     @ObservationIgnored private var contextMetaLoading: Set<String> = []
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
+    @ObservationIgnored private var visionBackfillToken = UUID()
+    @ObservationIgnored private var visionBackfillAllowed = true
     @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
     @ObservationIgnored private var prewarmWalkTask: Task<TreeWalk?, Never>?
     @ObservationIgnored private var deferredStartupRefresh = false
@@ -815,6 +817,7 @@ final class NotesModel {
     }
 
     private func removeEntry(core: Core, parent: String, url: String, title: String) {
+        let linkedItems = CalendarLinks.itemIds(for: url)
         Task.detached { [core, weak self, parent, url, title] in
             do {
                 try core.removeEntry(folderUrl: parent, url: url)
@@ -826,8 +829,9 @@ final class NotesModel {
             }
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                CalendarLinks.set([], for: url)
                 self.undoManager.registerUndo(withTarget: self) { model in
-                    model.restoreEntry(parent: parent, url: url, title: title)
+                    model.restoreEntry(parent: parent, url: url, title: title, linkedItems: linkedItems)
                 }
                 self.undoManager.setActionName("Remove Note")
                 self.refreshNotes()
@@ -835,7 +839,7 @@ final class NotesModel {
         }
     }
 
-    private func restoreEntry(parent: String, url: String, title: String) {
+    private func restoreEntry(parent: String, url: String, title: String, linkedItems: [String] = []) {
         guard let core else { return }
         undoManager.registerUndo(withTarget: self) { model in
             model.removeEntry(core: core, parent: parent, url: url, title: title)
@@ -850,7 +854,10 @@ final class NotesModel {
                 }
                 return
             }
-            await MainActor.run { [weak self] in self?.refreshNotes() }
+            await MainActor.run { [weak self] in
+                if !linkedItems.isEmpty { CalendarLinks.set(linkedItems, for: url) }
+                self?.refreshNotes()
+            }
         }
     }
 
@@ -1633,6 +1640,13 @@ final class NotesModel {
 
     private var pendingRefreshUrls: Set<String> = []
 
+    /// The core's indexer rewrote this doc's extracted-content row; everything
+    /// that feeds on note content reads the row from here, no doc open needed.
+    func docIndexed(url: String) {
+        scheduleSemanticIndex(url: url)
+        scheduleSpotlightIndex(url: url)
+    }
+
     func docChanged(url: String) {
         pads.docChanged(url: url)
         folderNodeCache.removeValue(forKey: url)
@@ -1670,10 +1684,6 @@ final class NotesModel {
                     self.refreshNotes()
                 }
             }
-        }
-        if node(for: url)?.isNote == true || notes.contains(where: { $0.url == url && $0.kind == "rich" }) {
-            scheduleSemanticIndex(url: url)
-            scheduleSpotlightIndex(url: url)
         }
         if startupSettled,
            smartNotebooks.contains(where: \.notifyOnChange)
@@ -2912,15 +2922,18 @@ final class NotesModel {
 
     private func indexSemantically(url: String, name: String?, token: UUID) async {
         guard let core else { return }
-        var resolvedName = name ?? node(for: url)?.displayName
-        if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
-        try? await core.openNote(url: url)
-        defer { try? core.closeNote(url: url) }
-        guard let json = try? await core.noteSpansJson(url: url) else { return }
-        let eventIds = await Task.detached { CalendarLinks.eventIds(in: SpanNode.decodeList(json)) }.value
+        guard let row = await core.noteContent(url: url), row.kind == "rich" else { return }
         guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
-        CalendarLinks.set(eventIds, for: url)
-        await semanticSearch.index(url: url, name: resolvedName ?? "", spansJson: json)
+        CalendarLinks.set(row.eventIds, for: url)
+        let resolvedName = row.title.isEmpty
+            ? (name ?? node(for: url)?.displayName ?? "")
+            : row.title
+        await semanticSearch.index(
+            url: url,
+            name: resolvedName,
+            body: row.body,
+            context: row.context
+        )
     }
 
     private func scheduleSpotlightIndex(url: String, name: String? = nil) {
@@ -2939,13 +2952,18 @@ final class NotesModel {
 
     private func indexForSpotlight(url: String, name: String?, token: UUID) async {
         guard let core else { return }
-        var resolvedName = name ?? node(for: url)?.displayName
-        if resolvedName == nil { resolvedName = await core.noteTitle(url: url) }
-        try? await core.openNote(url: url)
-        defer { try? core.closeNote(url: url) }
-        guard let json = try? await core.noteSpansJson(url: url) else { return }
+        guard let row = await core.noteContent(url: url), row.kind == "rich" else { return }
         guard spotlightIndexTokens[url] == token, !Task.isCancelled else { return }
-        await spotlightIndex.index(url: url, title: resolvedName ?? "", spansJson: json)
+        let resolvedName = row.title.isEmpty
+            ? (name ?? node(for: url)?.displayName ?? "")
+            : row.title
+        await spotlightIndex.index(
+            url: url,
+            title: resolvedName,
+            body: row.body,
+            eventStart: row.eventStart > 0 ? Date(timeIntervalSince1970: TimeInterval(row.eventStart)) : nil,
+            eventEnd: row.eventEnd > 0 ? Date(timeIntervalSince1970: TimeInterval(row.eventEnd)) : nil
+        )
     }
 
     private func schedulePreviewUpdate(url: String) {
@@ -3064,29 +3082,53 @@ final class NotesModel {
     @discardableResult
     func analyzeAssetVision(_ url: String) async -> AssetVision? {
         guard let core else { return nil }
-        defer { core.markVisionAttempted(url: url) }
-        guard let data = await assetBytes(url),
-              let result = await VisionAnalyzer.analyze(data)
-        else { return nil }
-        await updateAssetVision(url, description: result.description, ocr: result.ocr)
-        return AssetVision(description: result.description, ocr: result.ocr)
+        var vision: AssetVision?
+        if let data = await assetBytes(url),
+           let result = await VisionAnalyzer.analyze(data) {
+            await updateAssetVision(url, description: result.description, ocr: result.ocr)
+            vision = AssetVision(description: result.description, ocr: result.ocr)
+        }
+        await Task.detached { core.markVisionAttempted(url: url) }.value
+        return vision
     }
 
     /// Backfill vision for indexed assets that have none. Runs alongside the
     /// semantic backfill and stops when the core has nothing left to offer.
+    /// Parked while the app has no permission to work — every item ends in a
+    /// core write, and a write still in flight when the process suspends is
+    /// one RunningBoard kills (`0xdead10cc`).
     private func backfillAssetVision() {
-        guard visionBackfillTask == nil else { return }
+        guard visionBackfillTask == nil, visionBackfillAllowed else { return }
+        let token = UUID()
+        visionBackfillToken = token
         visionBackfillTask = Task { [weak self] in
-            defer { self?.visionBackfillTask = nil }
+            defer {
+                if let self, self.visionBackfillToken == token {
+                    self.visionBackfillTask = nil
+                }
+            }
             while !Task.isCancelled {
-                guard let self, let core = self.core else { return }
+                guard let self, self.visionBackfillAllowed, let core = self.core else { return }
                 let urls = await Task.detached { core.assetsWithoutVision(limit: 8) }.value
                 if urls.isEmpty { return }
                 for url in urls {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self.visionBackfillAllowed else { return }
                     await self.analyzeAssetVision(url)
                 }
             }
+        }
+    }
+
+    /// Mirrors the core's `setAppActive`: Swift-driven backfill loops issue
+    /// core writes the core's own parking can't see coming.
+    func setBackfillActive(_ active: Bool) {
+        guard visionBackfillAllowed != active else { return }
+        visionBackfillAllowed = active
+        if active {
+            backfillAssetVision()
+        } else {
+            visionBackfillTask?.cancel()
+            visionBackfillTask = nil
         }
     }
 
@@ -3982,6 +4024,12 @@ private final class DelegateBridge: CoreDelegate {
     func onDocChanged(url: String) {
         Task { @MainActor [model] in
             model?.docChanged(url: url)
+        }
+    }
+
+    func onDocIndexed(url: String) {
+        Task { @MainActor [model] in
+            model?.docIndexed(url: url)
         }
     }
 
