@@ -49,18 +49,24 @@ enum FolderSettingsStore {
                 url: entry.key,
                 showCount: entry.value["showCount"] ?? false,
                 recursiveCount: entry.value["recursiveCount"] ?? false,
-                notifyOnChange: entry.value["notifyOnChange"] ?? false
+                notifyOnChange: entry.value["notifyOnChange"] ?? false,
+                newNotesAtTop: entry.value["newNotesAtTop"]
             )
         }
     }
 
     static func save(_ settings: [String: FolderSettings]) {
-        let raw = settings.mapValues {
-            [
-                "showCount": $0.showCount,
-                "recursiveCount": $0.recursiveCount,
-                "notifyOnChange": $0.notifyOnChange,
+        let raw = settings.mapValues { folder -> [String: Bool] in
+            var row = [
+                "showCount": folder.showCount,
+                "recursiveCount": folder.recursiveCount,
+                "notifyOnChange": folder.notifyOnChange,
             ]
+            // Absent rather than false: a folder with no answer follows the
+            // setting for every folder, which is not the same as one that has
+            // been told to put new notes at the bottom.
+            row["newNotesAtTop"] = folder.newNotesAtTop
+            return row
         }
         UserDefaults.standard.set(raw, forKey: key)
     }
@@ -72,12 +78,24 @@ extension NotesModel {
             url: url,
             showCount: false,
             recursiveCount: false,
-            notifyOnChange: false
+            notifyOnChange: false,
+            newNotesAtTop: nil
         )
     }
 
+    /// Which end of a folder a new note lands at: the folder's own answer when
+    /// it has one, otherwise the reader's answer for every folder. Out of the
+    /// box that is the bottom, so a folder reads in the order it was written.
+    func newNoteAtTop(in folderUrl: String?) -> Bool {
+        if let folderUrl, let folder = folderSettings[folderUrl]?.newNotesAtTop {
+            return folder
+        }
+        return UserDefaults.standard.bool(forKey: NotesModel.newNoteAtTopKey)
+    }
+
     func setFolderSettings(_ settings: FolderSettings) {
-        if settings.showCount || settings.recursiveCount || settings.notifyOnChange {
+        if settings.showCount || settings.recursiveCount || settings.notifyOnChange
+            || settings.newNotesAtTop != nil {
             folderSettings[settings.url] = settings
         } else {
             folderSettings.removeValue(forKey: settings.url)

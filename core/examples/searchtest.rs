@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
         .ensure_folder(None)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let note1 = core
-        .create_note("surface note".into())
+        .create_note("surface note".into(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     core.update_note_spans(
         note1.clone(),
@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     core.ensure_folder(Some(sub.clone()))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let note2 = core
-        .create_note("hidden note".into())
+        .create_note("hidden note".into(), false)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     core.update_note_spans(
         note2.clone(),

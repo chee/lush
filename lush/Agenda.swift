@@ -847,9 +847,11 @@ extension NotesModel {
             return nil
         }
         let pending = snap != nil && ContextTracker.stampsContext
+        let atTop = newNoteAtTop(in: folder)
         do {
-            let url = try await Task.detached { [core, folder, item, series, snap, pending] () -> String in
-                let url = try core.createNoteIn(folderUrl: folder, title: item.title)
+            let url = try await Task.detached {
+                [core, folder, item, series, snap, pending, atTop] () -> String in
+                let url = try core.createNoteIn(folderUrl: folder, title: item.title, atTop: atTop)
                 let initial: [SpanNode] = [
                     .block(.creationBlock(snap: snap, pending: pending)),
                     .block(.calendarEventBlock(item, series: series)),

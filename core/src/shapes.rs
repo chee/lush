@@ -600,7 +600,10 @@ pub fn folder_entries(doc: &Automerge) -> anyhow::Result<Vec<DocLink>> {
     Ok(out)
 }
 
-pub fn add_folder_entry(doc: &mut Automerge, link: &DocLink) -> anyhow::Result<()> {
+/// Link a doc into a folder. `at_top` decides which end it lands at — a
+/// newly written note goes wherever the reader asked new notes to go, and
+/// everything else keeps the head of the list it has always had.
+pub fn add_folder_entry(doc: &mut Automerge, link: &DocLink, at_top: bool) -> anyhow::Result<()> {
     tx(doc.transact_with(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
@@ -608,7 +611,8 @@ pub fn add_folder_entry(doc: &mut Automerge, link: &DocLink) -> anyhow::Result<(
                 Some((_, id)) => id,
                 None => t.put_object(ROOT, "docs", ObjType::List)?,
             };
-            let entry = t.insert_object(&docs, 0, ObjType::Map)?;
+            let index = if at_top { 0 } else { t.length(&docs) };
+            let entry = t.insert_object(&docs, index, ObjType::Map)?;
             put_text(t, &entry, "name", &link.name)?;
             put_text(t, &entry, "type", &link.kind)?;
             put_text(t, &entry, "url", &link.url)?;
@@ -921,6 +925,10 @@ pub struct FolderSettings {
     pub show_count: bool,
     pub recursive_count: bool,
     pub notify_on_change: bool,
+    /// Where a new note goes in this folder, or `None` to follow whatever the
+    /// reader set for every folder. Absent from the doc until a folder is
+    /// asked to differ.
+    pub new_notes_at_top: Option<bool>,
 }
 
 pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
@@ -936,6 +944,7 @@ pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
                 show_count: bool_at(doc, &item, "showCount").unwrap_or(false),
                 recursive_count: bool_at(doc, &item, "recursiveCount").unwrap_or(false),
                 notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
+                new_notes_at_top: bool_at(doc, &item, "newNotesAtTop"),
             })
         })
         .collect();
@@ -969,6 +978,14 @@ pub fn config_set_folder_settings(
                 t.put(&item, "showCount", s.show_count)?;
                 t.put(&item, "recursiveCount", s.recursive_count)?;
                 t.put(&item, "notifyOnChange", s.notify_on_change)?;
+                match s.new_notes_at_top {
+                    Some(at_top) => t.put(&item, "newNotesAtTop", at_top)?,
+                    None => {
+                        if t.get(&item, "newNotesAtTop")?.is_some() {
+                            t.delete(&item, "newNotesAtTop")?;
+                        }
+                    }
+                }
             }
             Ok(())
         },
@@ -1899,6 +1916,74 @@ mod tests {
     }
 
     use super::*;
+
+    fn link(name: &str) -> DocLink {
+        DocLink {
+            name: name.into(),
+            kind: "rich".into(),
+            url: format!("automerge:{name}"),
+            lush: None,
+        }
+    }
+
+    #[test]
+    fn an_entry_lands_at_whichever_end_it_was_asked_for() {
+        let mut doc = Automerge::new();
+        init_folder(&mut doc, "folder").unwrap();
+        add_folder_entry(&mut doc, &link("first"), true).unwrap();
+        add_folder_entry(&mut doc, &link("onto the top"), true).unwrap();
+        add_folder_entry(&mut doc, &link("onto the bottom"), false).unwrap();
+        let names: Vec<String> = folder_entries(&doc)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["onto the top", "first", "onto the bottom"]);
+    }
+
+    /// A folder with no opinion carries no key at all, so it reads back as
+    /// "follow the setting for every folder" rather than as "the bottom".
+    #[test]
+    fn a_folder_without_a_placement_reads_back_as_none() {
+        let mut doc = Automerge::new();
+        let settings = FolderSettings {
+            url: "automerge:folder".into(),
+            show_count: true,
+            recursive_count: false,
+            notify_on_change: false,
+            new_notes_at_top: None,
+        };
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        assert_eq!(config_folder_settings(&doc), vec![settings]);
+    }
+
+    #[test]
+    fn a_placement_round_trips_and_can_be_taken_back_off() {
+        let mut doc = Automerge::new();
+        let mut settings = FolderSettings {
+            url: "automerge:folder".into(),
+            show_count: false,
+            recursive_count: false,
+            notify_on_change: false,
+            new_notes_at_top: Some(true),
+        };
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        assert_eq!(
+            config_folder_settings(&doc)[0].new_notes_at_top,
+            Some(true)
+        );
+
+        settings.new_notes_at_top = Some(false);
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        assert_eq!(
+            config_folder_settings(&doc)[0].new_notes_at_top,
+            Some(false)
+        );
+
+        settings.new_notes_at_top = None;
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        assert_eq!(config_folder_settings(&doc)[0].new_notes_at_top, None);
+    }
 
     fn field_is_text(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> bool {
         matches!(

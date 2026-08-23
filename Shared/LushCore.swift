@@ -652,7 +652,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func createDraftDoc(parentUrl: String, isMain: Bool) throws  -> String
     
-    func createNote(title: String) throws  -> String
+    func createNote(title: String, atTop: Bool) throws  -> String
     
     /**
      * Create a note doc immediately without waiting for the folder to be in
@@ -663,7 +663,7 @@ public protocol CoreProtocol: AnyObject, Sendable {
     /**
      * Create a note inside a specific folder doc.
      */
-    func createNoteIn(folderUrl: String, title: String) throws  -> String
+    func createNoteIn(folderUrl: String, title: String, atTop: Bool) throws  -> String
     
     /**
      * A pad with nothing pointing at it yet — for a device with no account,
@@ -789,9 +789,9 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * caller has none — picker-created patchwork docs arrive here with no
      * title, and their type is whatever their datatype says, not "rich".
      */
-    func linkNoteToFolder(noteUrl: String, title: String) async throws 
+    func linkNoteToFolder(noteUrl: String, title: String, atTop: Bool) async throws 
     
-    func linkNoteToFolderIn(folderUrl: String, noteUrl: String, title: String) throws 
+    func linkNoteToFolderIn(folderUrl: String, noteUrl: String, title: String, atTop: Bool) throws 
     
     func listNotes() async  -> [NoteInfo]
     
@@ -1371,10 +1371,11 @@ open func createDraftDoc(parentUrl: String, isMain: Bool)throws  -> String  {
 })
 }
     
-open func createNote(title: String)throws  -> String  {
+open func createNote(title: String, atTop: Bool)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_create_note(self.uniffiClonePointer(),
-        FfiConverterString.lower(title),$0
+        FfiConverterString.lower(title),
+        FfiConverterBool.lower(atTop),$0
     )
 })
 }
@@ -1394,11 +1395,12 @@ open func createNoteDoc(title: String)throws  -> String  {
     /**
      * Create a note inside a specific folder doc.
      */
-open func createNoteIn(folderUrl: String, title: String)throws  -> String  {
+open func createNoteIn(folderUrl: String, title: String, atTop: Bool)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_create_note_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
-        FfiConverterString.lower(title),$0
+        FfiConverterString.lower(title),
+        FfiConverterBool.lower(atTop),$0
     )
 })
 }
@@ -1766,13 +1768,13 @@ open func isSendingChanges() -> Bool  {
      * caller has none — picker-created patchwork docs arrive here with no
      * title, and their type is whatever their datatype says, not "rich".
      */
-open func linkNoteToFolder(noteUrl: String, title: String)async throws   {
+open func linkNoteToFolder(noteUrl: String, title: String, atTop: Bool)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_lush_core_fn_method_core_link_note_to_folder(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(noteUrl),FfiConverterString.lower(title)
+                    FfiConverterString.lower(noteUrl),FfiConverterString.lower(title),FfiConverterBool.lower(atTop)
                 )
             },
             pollFunc: ffi_lush_core_rust_future_poll_void,
@@ -1783,11 +1785,12 @@ open func linkNoteToFolder(noteUrl: String, title: String)async throws   {
         )
 }
     
-open func linkNoteToFolderIn(folderUrl: String, noteUrl: String, title: String)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+open func linkNoteToFolderIn(folderUrl: String, noteUrl: String, title: String, atTop: Bool)throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_link_note_to_folder_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(noteUrl),
-        FfiConverterString.lower(title),$0
+        FfiConverterString.lower(title),
+        FfiConverterBool.lower(atTop),$0
     )
 }
 }
@@ -3866,14 +3869,26 @@ public struct FolderSettings {
     public var showCount: Bool
     public var recursiveCount: Bool
     public var notifyOnChange: Bool
+    /**
+     * Where a new note goes in this folder, or `None` to follow whatever the
+     * reader set for every folder. Absent from the doc until a folder is
+     * asked to differ.
+     */
+    public var newNotesAtTop: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(url: String, showCount: Bool, recursiveCount: Bool, notifyOnChange: Bool) {
+    public init(url: String, showCount: Bool, recursiveCount: Bool, notifyOnChange: Bool, 
+        /**
+         * Where a new note goes in this folder, or `None` to follow whatever the
+         * reader set for every folder. Absent from the doc until a folder is
+         * asked to differ.
+         */newNotesAtTop: Bool?) {
         self.url = url
         self.showCount = showCount
         self.recursiveCount = recursiveCount
         self.notifyOnChange = notifyOnChange
+        self.newNotesAtTop = newNotesAtTop
     }
 }
 
@@ -3896,6 +3911,9 @@ extension FolderSettings: Equatable, Hashable {
         if lhs.notifyOnChange != rhs.notifyOnChange {
             return false
         }
+        if lhs.newNotesAtTop != rhs.newNotesAtTop {
+            return false
+        }
         return true
     }
 
@@ -3904,6 +3922,7 @@ extension FolderSettings: Equatable, Hashable {
         hasher.combine(showCount)
         hasher.combine(recursiveCount)
         hasher.combine(notifyOnChange)
+        hasher.combine(newNotesAtTop)
     }
 }
 
@@ -3919,7 +3938,8 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
                 url: FfiConverterString.read(from: &buf), 
                 showCount: FfiConverterBool.read(from: &buf), 
                 recursiveCount: FfiConverterBool.read(from: &buf), 
-                notifyOnChange: FfiConverterBool.read(from: &buf)
+                notifyOnChange: FfiConverterBool.read(from: &buf), 
+                newNotesAtTop: FfiConverterOptionBool.read(from: &buf)
         )
     }
 
@@ -3928,6 +3948,7 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
         FfiConverterBool.write(value.showCount, into: &buf)
         FfiConverterBool.write(value.recursiveCount, into: &buf)
         FfiConverterBool.write(value.notifyOnChange, into: &buf)
+        FfiConverterOptionBool.write(value.newNotesAtTop, into: &buf)
     }
 }
 
@@ -5680,6 +5701,30 @@ fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
+    typealias SwiftType = Bool?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterBool.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterBool.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -6503,13 +6548,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_create_draft_doc() != 25147) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_create_note() != 43728) {
+    if (uniffi_lush_core_checksum_method_core_create_note() != 24080) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_note_doc() != 48812) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_create_note_in() != 47187) {
+    if (uniffi_lush_core_checksum_method_core_create_note_in() != 38187) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_pad() != 4007) {
@@ -6608,10 +6653,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_is_sending_changes() != 41426) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 43907) {
+    if (uniffi_lush_core_checksum_method_core_link_note_to_folder() != 1522) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_link_note_to_folder_in() != 48471) {
+    if (uniffi_lush_core_checksum_method_core_link_note_to_folder_in() != 6858) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_list_notes() != 11889) {
