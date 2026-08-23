@@ -5373,10 +5373,20 @@ class EditorTextView: NSTextView, EditorTextViewLike {
     /// it are read off the main actor.
     private func consumeAttachment(from pasteboard: NSPasteboard) -> Bool {
         guard let core else { return false }
-        let files = pasteboard.readObjects(
+        // A folder, or an alias to a volume that isn't mounted, reads as a file
+        // URL with no bytes behind it. The answer here is synchronous and the
+        // read is not, so anything that cannot be embedded has to be ruled out
+        // by a stat — claiming the pasteboard for it would swallow the drop
+        // instead of letting it fall through to the text branches.
+        let files = (pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL] ?? []
+        ) as? [URL] ?? []).filter { url in
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard FileManager.default.isReadableFile(atPath: url.path) else { return false }
+            return (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile != false
+        }
         let imageType = pasteboard.availableType(from: [
             .png,
             .tiff,

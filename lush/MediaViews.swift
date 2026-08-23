@@ -101,6 +101,7 @@ struct AudioInlineView: View {
     @State private var player: AVAudioPlayer?
     @State private var playing = false
     @State private var loading = false
+    @State private var pendingSeek: Double?
     @State private var progress: Double = 0
     @State private var levels: [Float] = []
     @ScaledMetric(relativeTo: .largeTitle) private var playButtonSize: CGFloat = 30
@@ -206,10 +207,15 @@ struct AudioInlineView: View {
 
     private func seekTo(_ fraction: Double) {
         guard let player else {
+            // A scrub is a stream of ticks and the first one starts the read;
+            // the rest would be dropped by `loading`, so the bar follows the
+            // finger from here and the last position seen is the one played.
+            progress = fraction
+            pendingSeek = fraction
             Task {
                 guard let loaded = await loadPlayer() else { return }
-                loaded.currentTime = fraction * loaded.duration
-                progress = fraction
+                loaded.currentTime = (pendingSeek ?? fraction) * loaded.duration
+                pendingSeek = nil
                 loaded.play()
                 playing = true
             }

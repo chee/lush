@@ -73,16 +73,16 @@ struct IncomingContent: Identifiable {
         journal?.snapshot.createdUrls[operationKey]
     }
 
-    func markHandoffItemsCompleted(_ indexes: Set<Int>) -> Bool {
-        journal?.mutate { $0.completed.formUnion(indexes) } ?? true
+    func markHandoffItemsCompleted(_ indexes: Set<Int>) async -> Bool {
+        await journal?.mutate { $0.completed.formUnion(indexes) } ?? true
     }
 
-    func markHandoffChildCompleted(index: Int, relativePath: String) -> Bool {
-        journal?.mutate { $0.completedChildren.insert("\(index):\(relativePath)") } ?? true
+    func markHandoffChildCompleted(index: Int, relativePath: String) async -> Bool {
+        await journal?.mutate { $0.completedChildren.insert("\(index):\(relativePath)") } ?? true
     }
 
-    func markHandoffCreatedUrl(_ url: String, for operationKey: String) -> Bool {
-        journal?.mutate { $0.createdUrls[operationKey] = url } ?? true
+    func markHandoffCreatedUrl(_ url: String, for operationKey: String) async -> Bool {
+        await journal?.mutate { $0.createdUrls[operationKey] = url } ?? true
     }
 
     static func sharedHandoff(id: String) -> IncomingContent? {
@@ -129,11 +129,17 @@ private final class HandoffJournal: @unchecked Sendable {
     /// The caller decides from the result whether a retry would repeat work it
     /// has already done, so the write has to land before the answer comes back
     /// — a batched flush would report the previous change's fate, not this one's.
-    func mutate(_ change: (inout SharedImportProgress) -> Void) -> Bool {
+    /// Awaited rather than blocking: the callers are all on the main actor and
+    /// a folder share writes this once per file.
+    func mutate(_ change: (inout SharedImportProgress) -> Void) async -> Bool {
         lock.lock()
-        defer { lock.unlock() }
         change(&progress)
-        return (try? JSONEncoder().encode(progress).write(to: fileUrl, options: .atomic)) != nil
+        let current = progress
+        lock.unlock()
+        let url = fileUrl
+        return await Task.detached {
+            (try? JSONEncoder().encode(current).write(to: url, options: .atomic)) != nil
+        }.value
     }
 }
 

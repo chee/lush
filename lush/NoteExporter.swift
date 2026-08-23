@@ -167,8 +167,18 @@ enum NoteExporter {
         case pdfContext
     }
 
-    static func pdfData(from spans: [SpanNode], title: String) throws -> Data {
+    /// The attributed string has to be built on the main actor — `RichText`
+    /// draws it over the asset cache — but the pagination that follows is the
+    /// slow half and CoreText is happy off it.
+    static func pdfData(from spans: [SpanNode], title: String) async throws -> Data {
         let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        return try await Task.detached { try paginate(attributed, title: title) }.value
+    }
+
+    nonisolated private static func paginate(
+        _ attributed: NSAttributedString,
+        title: String
+    ) throws -> Data {
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         let inset = mediaBox.insetBy(dx: 54, dy: 54)
         let data = NSMutableData()

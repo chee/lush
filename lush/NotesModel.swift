@@ -3744,7 +3744,7 @@ final class NotesModel {
                             folderUrl: nil,
                             existingUrl: content.handoffCreatedUrl(for: operationKey),
                             didCreate: {
-                                content.markHandoffCreatedUrl($0, for: operationKey)
+                                await content.markHandoffCreatedUrl($0, for: operationKey)
                             }
                         ))
                     } else {
@@ -3753,17 +3753,17 @@ final class NotesModel {
                             core: core,
                             completedRelativePaths: content.completedHandoffChildren(for: index),
                             didImport: {
-                                content.markHandoffChildCompleted(index: index, relativePath: $0)
+                                await content.markHandoffChildCompleted(index: index, relativePath: $0)
                             },
                             existingUrl: {
                                 content.handoffCreatedUrl(for: "file:\(index):\($0)")
                             },
                             didCreate: { relativePath, url in
-                                content.markHandoffCreatedUrl(url, for: "file:\(index):\(relativePath)")
+                                await content.markHandoffCreatedUrl(url, for: "file:\(index):\(relativePath)")
                             }
                         )
                     }
-                    guard content.markHandoffItemsCompleted([index]) else {
+                    guard await content.markHandoffItemsCompleted([index]) else {
                         throw CocoaError(.fileWriteUnknown)
                     }
                 case .batch:
@@ -3782,13 +3782,13 @@ final class NotesModel {
                         title: content.textDisplayTitle,
                         atTop: newNoteAtTop(in: folderUrl)
                     )
-                    guard content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
+                    guard await content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
                         throw CocoaError(.fileWriteUnknown)
                     }
                 }
                 _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
                 importedUrls.insert(noteUrl, at: 0)
-                guard content.markHandoffItemsCompleted(textIndexes) else {
+                guard await content.markHandoffItemsCompleted(textIndexes) else {
                     throw CocoaError(.fileWriteUnknown)
                 }
             }
@@ -3893,7 +3893,7 @@ final class NotesModel {
                             folderUrl: target,
                             existingUrl: content.handoffCreatedUrl(for: operationKey),
                             didCreate: {
-                                content.markHandoffCreatedUrl($0, for: operationKey)
+                                await content.markHandoffCreatedUrl($0, for: operationKey)
                             }
                         ))
                     } else {
@@ -3903,17 +3903,17 @@ final class NotesModel {
                             folderUrl: target,
                             completedRelativePaths: content.completedHandoffChildren(for: index),
                             didImport: {
-                                content.markHandoffChildCompleted(index: index, relativePath: $0)
+                                await content.markHandoffChildCompleted(index: index, relativePath: $0)
                             },
                             existingUrl: {
                                 content.handoffCreatedUrl(for: "file:\(index):\($0)")
                             },
                             didCreate: { relativePath, url in
-                                content.markHandoffCreatedUrl(url, for: "file:\(index):\(relativePath)")
+                                await content.markHandoffCreatedUrl(url, for: "file:\(index):\(relativePath)")
                             }
                         )
                     }
-                    if !content.markHandoffItemsCompleted([index]) {
+                    if !(await content.markHandoffItemsCompleted([index])) {
                         failures.append("\(url.lastPathComponent): couldn't record the completed import")
                     }
                 } catch {
@@ -3945,13 +3945,13 @@ final class NotesModel {
                             atTop: atTop
                         )
                     }
-                    guard content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
+                    guard await content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
                         throw CocoaError(.fileWriteUnknown)
                     }
                 }
                 _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
                 importedUrls.insert(noteUrl, at: 0)
-                if !content.markHandoffItemsCompleted(textIndexes) {
+                if !(await content.markHandoffItemsCompleted(textIndexes)) {
                     failures.append("text: couldn't record the completed import")
                 }
             } catch {
@@ -4026,7 +4026,7 @@ final class NotesModel {
         core: Core,
         folderUrl: String?,
         existingUrl: String? = nil,
-        didCreate: ((String) -> Bool)? = nil
+        didCreate: ((String) async -> Bool)? = nil
     ) async throws -> String {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -4048,7 +4048,7 @@ final class NotesModel {
                     try core.createNote(title: title, atTop: atTop)
                 }.value
             }
-            guard didCreate?(noteUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
+            guard (await didCreate?(noteUrl)) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
         if !spans.isEmpty {
             let json = SpanNode.encodeList(spans)
@@ -4088,9 +4088,9 @@ final class NotesModel {
         core: Core,
         folderUrl: String? = nil,
         completedRelativePaths: Set<String> = [],
-        didImport: ((String) -> Bool)? = nil,
+        didImport: ((String) async -> Bool)? = nil,
         existingUrl: ((String) -> String?)? = nil,
-        didCreate: ((String, String) -> Bool)? = nil
+        didCreate: ((String, String) async -> Bool)? = nil
     ) async throws -> [String] {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -4115,9 +4115,9 @@ final class NotesModel {
                     core: core,
                     folderUrl: folderUrl,
                     existingUrl: existingUrl?(relativePath),
-                    didCreate: { didCreate?(relativePath, $0) ?? true }
+                    didCreate: { (await didCreate?(relativePath, $0)) ?? true }
                 ))
-                guard didImport?(relativePath) ?? true else {
+                guard (await didImport?(relativePath)) ?? true else {
                     throw CocoaError(.fileWriteUnknown)
                 }
             }
@@ -4129,7 +4129,7 @@ final class NotesModel {
             core: core,
             folderUrl: folderUrl,
             existingUrl: existingUrl?(url.lastPathComponent),
-            didCreate: { didCreate?(url.lastPathComponent, $0) ?? true }
+            didCreate: { (await didCreate?(url.lastPathComponent, $0)) ?? true }
         )]
     }
 
@@ -4139,7 +4139,7 @@ final class NotesModel {
         core: Core,
         folderUrl: String? = nil,
         existingUrl: String? = nil,
-        didCreate: ((String) -> Bool)? = nil
+        didCreate: ((String) async -> Bool)? = nil
     ) async throws -> String {
         let ext = url.pathExtension.lowercased()
         let name = displayName.isEmpty ? url.lastPathComponent : displayName
@@ -4158,7 +4158,7 @@ final class NotesModel {
                     data: data
                 )
             }.value
-            guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
+            guard (await didCreate?(assetUrl)) ?? true else { throw CocoaError(.fileWriteUnknown) }
             return assetUrl
         }
         let assetUrl: String
@@ -4175,7 +4175,7 @@ final class NotesModel {
                     data: data
                 )
             }.value
-            guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
+            guard (await didCreate?(assetUrl)) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
         try await core.linkNoteToFolder(
             noteUrl: assetUrl,

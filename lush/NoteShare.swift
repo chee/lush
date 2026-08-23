@@ -57,7 +57,7 @@ enum NoteShare {
         case .rtf:
             data = try NoteExporter.rtfData(from: spans)
         case .pdf:
-            data = try NoteExporter.pdfData(from: spans, title: title)
+            data = try await NoteExporter.pdfData(from: spans, title: title)
         }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("lush-share-\(UUID().uuidString)", isDirectory: true)
