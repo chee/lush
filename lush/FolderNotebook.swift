@@ -699,12 +699,6 @@ struct FolderNotebookText: NSViewRepresentable {
 final class NotebookTextView: UITextView {
     weak var document: NotebookDocument?
 
-    /// UIKit has no `textContentStorage`; the content manager is the same
-    /// object under a name it doesn't advertise.
-    var contentStorage: NSTextContentStorage? {
-        textLayoutManager?.textContentManager as? NSTextContentStorage
-    }
-
     override func draw(_ rect: CGRect) {
         super.draw(rect)
         guard let document,
@@ -741,7 +735,20 @@ struct FolderNotebookText: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> NotebookTextView {
-        let textView = NotebookTextView(usingTextLayoutManager: true)
+        // UITextView caches its `textStorage` in an ivar at init (see the
+        // layoutStorage note in RichTextEditor), so the document's storage has
+        // to be in the TextKit stack before the view is created. Repointing
+        // `contentStorage.textStorage` afterwards leaves UIKit reading
+        // character indices from the laid-out storage but attributes from its
+        // stale empty one — an NSRangeException the moment DataDetectors asks
+        // about a link, or on the first tap in the text.
+        let contentStorage = NSTextContentStorage()
+        contentStorage.textStorage = core.document.storage
+        let layoutManager = NSTextLayoutManager()
+        contentStorage.addTextLayoutManager(layoutManager)
+        let container = NSTextContainer(size: CGSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+        layoutManager.textContainer = container
+        let textView = NotebookTextView(frame: .zero, textContainer: container)
         textView.document = core.document
         textView.isEditable = true
         textView.isScrollEnabled = true
@@ -754,15 +761,11 @@ struct FolderNotebookText: UIViewRepresentable {
         // this the strip revealed by a scroll is never asked to redraw.
         textView.contentMode = .redraw
         textView.textContainer.widthTracksTextView = true
-        textView.contentStorage?.textStorage = core.document.storage
         return textView
     }
 
     func updateUIView(_ textView: NotebookTextView, context: Context) {
         textView.document = core.document
-        if textView.contentStorage?.textStorage !== core.document.storage {
-            textView.contentStorage?.textStorage = core.document.storage
-        }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
