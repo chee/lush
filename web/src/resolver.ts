@@ -66,14 +66,24 @@ function waitForHeads(
 // IndexedDB cache for head-pinned (immutable) resolved content.
 const CACHE_DB = "patchwork-resolve-cache";
 const CACHE_STORE = "v1";
+// Entries written before a resolution tracked the whole link chain can hold a
+// mutable child's bytes under a pinned key, and nothing distinguishes them, so
+// the store starts again.
+const CACHE_VERSION = 2;
 
 let _db: Promise<IDBDatabase> | undefined;
 
 function resolveDB(): Promise<IDBDatabase> {
   return (_db ??= new Promise<IDBDatabase>((resolve, reject) => {
-    const req = indexedDB.open(CACHE_DB, 1);
+    const req = indexedDB.open(CACHE_DB, CACHE_VERSION);
     let settled = false;
-    req.onupgradeneeded = () => req.result.createObjectStore(CACHE_STORE);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (db.objectStoreNames.contains(CACHE_STORE)) {
+        db.deleteObjectStore(CACHE_STORE);
+      }
+      db.createObjectStore(CACHE_STORE);
+    };
     req.onsuccess = () => {
       if (settled) {
         req.result.close();
