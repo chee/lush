@@ -4295,11 +4295,15 @@ struct NoteDetail: View {
 
     private func handlePickedFile(_ result: Result<URL, Error>) {
         guard case .success(let url) = result else { return }
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer {
-            if scoped { url.stopAccessingSecurityScopedResource() }
-        }
-        if let data = try? Data(contentsOf: url) {
+        Task {
+            let data = await Task.detached { () -> Data? in
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer {
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                }
+                return try? Data(contentsOf: url)
+            }.value
+            guard let data else { return }
             editor.insertData(data, name: url.lastPathComponent)
         }
     }

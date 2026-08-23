@@ -200,6 +200,34 @@ struct PadCardEditor: NSViewRepresentable {
     }
 }
 
+/// What the pasteboard holds before anything has been read: a hover never gets
+/// further than this.
+private enum PadDroppedFile {
+    case url(URL)
+    case png(Data)
+    case tiff(Data)
+}
+
+/// The bytes behind a drop. Reading a file and re-encoding a TIFF are the slow
+/// half, so this runs off the main actor once the drop has landed.
+private func padFileBytes(_ file: PadDroppedFile) -> (Data, String, String)? {
+    switch file {
+    case .url(let url):
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
+        return (data, url.lastPathComponent, ext)
+    case .png(let data):
+        return (data, "image.png", "png")
+    case .tiff(let data):
+        guard let rep = NSBitmapImageRep(data: data),
+              let png = rep.representation(using: .png, properties: [:])
+        else { return nil }
+        return (png, "image.png", "png")
+    }
+}
+
 /// The pad takes dropped text as a new card. Text dragged out of the note
 /// leaves it: the drop answers `.move`, which is the note's cue as the drag
 /// source to remove what was dragged.
@@ -251,7 +279,7 @@ struct PadDropTarget: NSViewRepresentable {
             if let text = pasteboard.string(forType: .string), text.hasPrefix(PadDrag.prefix) {
                 return []
             }
-            if file(from: pasteboard) != nil { return .copy }
+            if hasFile(pasteboard) { return .copy }
             guard spans(from: pasteboard) != nil else { return [] }
             guard sender.draggingSource is EditorTextView else { return .copy }
             return NSEvent.modifierFlags.contains(.option) ? .copy : .move
@@ -268,27 +296,31 @@ struct PadDropTarget: NSViewRepresentable {
             return PadStore.spans(fromPlainText: text)
         }
 
-        /// An image or file lands as an asset doc of its own, the same as one
-        /// dropped in a note.
-        private func file(from pasteboard: NSPasteboard) -> (Data, String, String)? {
-            if let url = (pasteboard.readObjects(
+        private func fileURL(from pasteboard: NSPasteboard) -> URL? {
+            (pasteboard.readObjects(
                 forClasses: [NSURL.self],
                 options: [.urlReadingFileURLsOnly: true]
-            ) as? [URL])?.first {
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                if let data = try? Data(contentsOf: url) {
-                    let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
-                    return (data, url.lastPathComponent, ext)
-                }
+            ) as? [URL])?.first
+        }
+
+        /// Hover asks this and nothing more: a drag-over tick must not read a
+        /// single byte of what is being dragged.
+        private func hasFile(_ pasteboard: NSPasteboard) -> Bool {
+            fileURL(from: pasteboard) != nil
+                || pasteboard.availableType(from: [.png, .tiff]) != nil
+        }
+
+        /// An image or file lands as an asset doc of its own, the same as one
+        /// dropped in a note.
+        private func file(from pasteboard: NSPasteboard) -> PadDroppedFile? {
+            if let url = fileURL(from: pasteboard) {
+                return .url(url)
             }
             if let data = pasteboard.data(forType: .png) {
-                return (data, "image.png", "png")
+                return .png(data)
             }
-            if let data = pasteboard.data(forType: .tiff),
-               let rep = NSBitmapImageRep(data: data),
-               let png = rep.representation(using: .png, properties: [:]) {
-                return (png, "image.png", "png")
+            if let data = pasteboard.data(forType: .tiff) {
+                return .tiff(data)
             }
             return nil
         }
@@ -304,14 +336,23 @@ struct PadDropTarget: NSViewRepresentable {
         override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
             guard let store else { return false }
             let pasteboard = sender.draggingPasteboard
+            // the pasteboard only lives as long as this call, so what is on it
+            // is taken here and the bytes behind it read off the main actor
             let dropped = file(from: pasteboard)
-            let spans = dropped == nil ? spans(from: pasteboard) : nil
+            let spans = spans(from: pasteboard)
             guard dropped != nil || spans != nil else { return false }
             let point = convert(sender.draggingLocation, from: nil)
             let pad = pad
             let tab = tab
             let noteUrl = noteUrl
             Task { @MainActor in
+                let bytes: (Data, String, String)?
+                if let dropped {
+                    bytes = await Task.detached { padFileBytes(dropped) }.value
+                } else {
+                    bytes = nil
+                }
+                guard bytes != nil || spans != nil else { return }
                 let target: String?
                 if let pad {
                     target = pad
@@ -321,7 +362,7 @@ struct PadDropTarget: NSViewRepresentable {
                     target = await store.ensurePocketPad()
                 }
                 guard let target else { return }
-                if let (data, name, ext) = dropped {
+                if let (data, name, ext) = bytes {
                     await store.addFile(
                         data: data,
                         name: name,

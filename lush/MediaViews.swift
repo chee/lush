@@ -100,6 +100,7 @@ struct AudioInlineView: View {
     let onOpen: () -> Void
     @State private var player: AVAudioPlayer?
     @State private var playing = false
+    @State private var loading = false
     @State private var progress: Double = 0
     @State private var levels: [Float] = []
     @ScaledMetric(relativeTo: .largeTitle) private var playButtonSize: CGFloat = 30
@@ -169,12 +170,31 @@ struct AudioInlineView: View {
         }
     }
 
+    /// The recording is read off the main actor and handed to the player as
+    /// bytes; a memo of any length would otherwise stall the tap that starts
+    /// it. `loading` keeps a held-down scrub from starting a read per tick.
+    private func loadPlayer() async -> AVAudioPlayer? {
+        if let player { return player }
+        guard !loading else { return nil }
+        loading = true
+        let url = fileURL
+        let data = await Task.detached { try? Data(contentsOf: url, options: .mappedIfSafe) }.value
+        loading = false
+        guard let data, let loaded = try? AVAudioPlayer(data: data) else { return nil }
+        loaded.prepareToPlay()
+        player = loaded
+        return loaded
+    }
+
     private func togglePlayback() {
-        if player == nil {
-            player = try? AVAudioPlayer(contentsOf: fileURL)
-            player?.prepareToPlay()
+        guard let player else {
+            Task {
+                guard let loaded = await loadPlayer() else { return }
+                loaded.play()
+                playing = true
+            }
+            return
         }
-        guard let player else { return }
         if playing {
             player.pause()
             playing = false
@@ -185,11 +205,16 @@ struct AudioInlineView: View {
     }
 
     private func seekTo(_ fraction: Double) {
-        if player == nil {
-            player = try? AVAudioPlayer(contentsOf: fileURL)
-            player?.prepareToPlay()
+        guard let player else {
+            Task {
+                guard let loaded = await loadPlayer() else { return }
+                loaded.currentTime = fraction * loaded.duration
+                progress = fraction
+                loaded.play()
+                playing = true
+            }
+            return
         }
-        guard let player else { return }
         player.currentTime = fraction * player.duration
         progress = fraction
         if !playing {
@@ -691,12 +716,15 @@ struct AudioPlayerSheet: View {
         .frame(minWidth: 420)
         #endif
         .task {
-            let loaded = try? AVAudioPlayer(contentsOf: fileURL)
+            let url = fileURL
+            let data = await Task.detached {
+                try? Data(contentsOf: url, options: .mappedIfSafe)
+            }.value
+            let loaded = data.flatMap { try? AVAudioPlayer(data: $0) }
             loaded?.prepareToPlay()
             player = loaded
             duration = max(loaded?.duration ?? 0.01, 0.01)
             trimEnd = duration
-            let url = fileURL
             Task {
                 levels = await Task.detached { WaveformView.levels(for: url) }.value
             }
@@ -767,7 +795,7 @@ struct AudioPlayerSheet: View {
             .appendingPathComponent("trim-\(UUID().uuidString).m4a")
         do {
             try await session.export(to: out, as: .m4a)
-            let data = try Data(contentsOf: out)
+            let data = try await Task.detached { try Data(contentsOf: out) }.value
             try? FileManager.default.removeItem(at: out)
             onTrimmed(data)
             dismiss()

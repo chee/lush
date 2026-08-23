@@ -4300,10 +4300,11 @@ final class EditorCore: LiveWriter {
         panel.allowedContentTypes = imagesOnly ? [.image] : [.item]
         panel.allowsMultipleSelection = false
         panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url, let data = try? Data(contentsOf: url)
-            else { return }
+            guard response == .OK, let url = panel.url else { return }
             let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
             Task { @MainActor in
+                let data = await Task.detached { try? Data(contentsOf: url) }.value
+                guard let data else { return }
                 _ = self?.incomingData(data, fileExtension: ext, suggestedName: url.lastPathComponent)
             }
         }
@@ -5356,41 +5357,60 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         return super.writeSelection(to: pboard, type: type)
     }
 
+    nonisolated private static func attachmentBytes(
+        at url: URL
+    ) -> (data: Data, ext: String, name: String)? {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
+        return (data, ext, url.lastPathComponent)
+    }
+
     /// Files and images win over the stray strings browsers put alongside
-    /// copied images; plain text still pastes as text.
+    /// copied images; plain text still pastes as text. A drag's pasteboard
+    /// dies with the drop, so what it holds is taken here and the bytes behind
+    /// it are read off the main actor.
     private func consumeAttachment(from pasteboard: NSPasteboard) -> Bool {
         guard let core else { return false }
         let files = pasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
         ) as? [URL] ?? []
-        if !files.isEmpty {
+        let imageType = pasteboard.availableType(from: [
+            .png,
+            .tiff,
+            NSPasteboard.PasteboardType(UTType.jpeg.identifier),
+        ])
+        let imageData = imageType.flatMap { pasteboard.data(forType: $0) }
+        guard !files.isEmpty || imageData != nil else { return false }
+        Task { @MainActor in
             var embedded = false
             for url in files {
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                guard let data = try? Data(contentsOf: url) else { continue }
-                let ext = url.pathExtension.isEmpty ? "bin" : url.pathExtension.lowercased()
+                let file = await Task.detached { EditorTextView.attachmentBytes(at: url) }.value
+                guard let file else { continue }
                 embedded = core.incomingData(
-                    data,
-                    fileExtension: ext,
-                    suggestedName: url.lastPathComponent
+                    file.data,
+                    fileExtension: file.ext,
+                    suggestedName: file.name
                 ) || embedded
             }
-            if embedded { return true }
+            guard !embedded, let imageType, let imageData else { return }
+            if imageType == .tiff {
+                let png = await Task.detached {
+                    NSBitmapImageRep(data: imageData)?.representation(using: .png, properties: [:])
+                }.value
+                guard let png else { return }
+                _ = core.incomingData(png, fileExtension: "png", suggestedName: nil)
+            } else {
+                _ = core.incomingData(
+                    imageData,
+                    fileExtension: imageType == .png ? "png" : "jpg",
+                    suggestedName: nil
+                )
+            }
         }
-        if let data = pasteboard.data(forType: .png) {
-            return core.incomingData(data, fileExtension: "png", suggestedName: nil)
-        }
-        if let data = pasteboard.data(forType: .tiff),
-           let rep = NSBitmapImageRep(data: data),
-           let png = rep.representation(using: .png, properties: [:]) {
-            return core.incomingData(png, fileExtension: "png", suggestedName: nil)
-        }
-        if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier)) {
-            return core.incomingData(data, fileExtension: "jpg", suggestedName: nil)
-        }
-        return false
+        return true
     }
 
     // MARK: quick look
