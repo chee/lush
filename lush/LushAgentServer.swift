@@ -88,7 +88,7 @@ final class LushAgentServer {
     }
 
     private func route(_ request: HTTPRequest) async -> HTTPResponse {
-        guard request.authorization == "Bearer \(token)" else {
+        guard Self.matchesToken(request.authorization, "Bearer \(token)") else {
             return .json(status: 401, value: ["error": "Invalid agent token."])
         }
         guard let model, let core = model.core else {
@@ -137,7 +137,7 @@ final class LushAgentServer {
                     return .json(status: 400, value: ["error": "Missing note URL."])
                 }
                 try? await core.openNote(url: url)
-                defer { try? core.closeNote(url: url) }
+                defer { Task.detached { try? core.closeNote(url: url) } }
                 async let title = core.noteTitle(url: url)
                 async let snapshot = core.noteSpansSnapshot(url: url)
                 let value = try await snapshot
@@ -206,6 +206,18 @@ final class LushAgentServer {
         let data = try JSONSerialization.data(withJSONObject: spans)
         let json = String(decoding: data, as: UTF8.self)
         return try core.updateNoteSpans(url: url, spansJson: json, heads: heads)
+    }
+
+    /// Compares across the whole expected token so a wrong byte costs the same
+    /// wherever it falls, and a short guess costs the same as a long one.
+    private static func matchesToken(_ provided: String?, _ expected: String) -> Bool {
+        let given = Array((provided ?? "").utf8)
+        let want = Array(expected.utf8)
+        var difference: UInt8 = 0
+        for index in want.indices {
+            difference |= want[index] ^ (index < given.count ? given[index] : 0)
+        }
+        return difference == 0 && given.count == want.count
     }
 
     private static func jsonArray(_ value: String) throws -> [Any] {

@@ -4146,6 +4146,20 @@ public struct IndexedNoteContent {
     public var weather: [String]
     public var locations: [String]
     /**
+     * The first logline's own attrs, which is what a note row renders: a
+     * later logline never stands in for what that one lacks. `context_created`
+     * is its `created` (else `ts`) stamp as epoch seconds, 0 when absent; the
+     * rest are empty when absent.
+     */
+    public var contextCreated: Int64
+    public var contextLocation: String
+    public var contextWeather: String
+    public var nowPlaying: String
+    /**
+     * The body after the title line, capped for display.
+     */
+    public var preview: String
+    /**
      * First calendar event's window, epoch seconds, 0 when absent.
      */
     public var eventStart: Int64
@@ -4161,6 +4175,15 @@ public struct IndexedNoteContent {
          * indexing, skip for display.
          */context: String, modified: Int64, created: Int64, whenDay: String, tags: [String], weather: [String], locations: [String], 
         /**
+         * The first logline's own attrs, which is what a note row renders: a
+         * later logline never stands in for what that one lacks. `context_created`
+         * is its `created` (else `ts`) stamp as epoch seconds, 0 when absent; the
+         * rest are empty when absent.
+         */contextCreated: Int64, contextLocation: String, contextWeather: String, nowPlaying: String, 
+        /**
+         * The body after the title line, capped for display.
+         */preview: String, 
+        /**
          * First calendar event's window, epoch seconds, 0 when absent.
          */eventStart: Int64, eventEnd: Int64, eventIds: [String], heads: String) {
         self.url = url
@@ -4174,6 +4197,11 @@ public struct IndexedNoteContent {
         self.tags = tags
         self.weather = weather
         self.locations = locations
+        self.contextCreated = contextCreated
+        self.contextLocation = contextLocation
+        self.contextWeather = contextWeather
+        self.nowPlaying = nowPlaying
+        self.preview = preview
         self.eventStart = eventStart
         self.eventEnd = eventEnd
         self.eventIds = eventIds
@@ -4221,6 +4249,21 @@ extension IndexedNoteContent: Equatable, Hashable {
         if lhs.locations != rhs.locations {
             return false
         }
+        if lhs.contextCreated != rhs.contextCreated {
+            return false
+        }
+        if lhs.contextLocation != rhs.contextLocation {
+            return false
+        }
+        if lhs.contextWeather != rhs.contextWeather {
+            return false
+        }
+        if lhs.nowPlaying != rhs.nowPlaying {
+            return false
+        }
+        if lhs.preview != rhs.preview {
+            return false
+        }
         if lhs.eventStart != rhs.eventStart {
             return false
         }
@@ -4248,6 +4291,11 @@ extension IndexedNoteContent: Equatable, Hashable {
         hasher.combine(tags)
         hasher.combine(weather)
         hasher.combine(locations)
+        hasher.combine(contextCreated)
+        hasher.combine(contextLocation)
+        hasher.combine(contextWeather)
+        hasher.combine(nowPlaying)
+        hasher.combine(preview)
         hasher.combine(eventStart)
         hasher.combine(eventEnd)
         hasher.combine(eventIds)
@@ -4275,6 +4323,11 @@ public struct FfiConverterTypeIndexedNoteContent: FfiConverterRustBuffer {
                 tags: FfiConverterSequenceString.read(from: &buf), 
                 weather: FfiConverterSequenceString.read(from: &buf), 
                 locations: FfiConverterSequenceString.read(from: &buf), 
+                contextCreated: FfiConverterInt64.read(from: &buf), 
+                contextLocation: FfiConverterString.read(from: &buf), 
+                contextWeather: FfiConverterString.read(from: &buf), 
+                nowPlaying: FfiConverterString.read(from: &buf), 
+                preview: FfiConverterString.read(from: &buf), 
                 eventStart: FfiConverterInt64.read(from: &buf), 
                 eventEnd: FfiConverterInt64.read(from: &buf), 
                 eventIds: FfiConverterSequenceString.read(from: &buf), 
@@ -4294,6 +4347,11 @@ public struct FfiConverterTypeIndexedNoteContent: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.tags, into: &buf)
         FfiConverterSequenceString.write(value.weather, into: &buf)
         FfiConverterSequenceString.write(value.locations, into: &buf)
+        FfiConverterInt64.write(value.contextCreated, into: &buf)
+        FfiConverterString.write(value.contextLocation, into: &buf)
+        FfiConverterString.write(value.contextWeather, into: &buf)
+        FfiConverterString.write(value.nowPlaying, into: &buf)
+        FfiConverterString.write(value.preview, into: &buf)
         FfiConverterInt64.write(value.eventStart, into: &buf)
         FfiConverterInt64.write(value.eventEnd, into: &buf)
         FfiConverterSequenceString.write(value.eventIds, into: &buf)

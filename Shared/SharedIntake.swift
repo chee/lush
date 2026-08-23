@@ -109,9 +109,6 @@ private final class HandoffJournal: @unchecked Sendable {
     private let fileUrl: URL
     private let lock = NSLock()
     private var progress: SharedImportProgress
-    private var dirty = false
-    private var writing = false
-    private var failed = false
 
     init(directory: URL) {
         fileUrl = directory.appendingPathComponent("progress.json")
@@ -129,36 +126,14 @@ private final class HandoffJournal: @unchecked Sendable {
         return progress
     }
 
+    /// The caller decides from the result whether a retry would repeat work it
+    /// has already done, so the write has to land before the answer comes back
+    /// — a batched flush would report the previous change's fate, not this one's.
     func mutate(_ change: (inout SharedImportProgress) -> Void) -> Bool {
         lock.lock()
+        defer { lock.unlock() }
         change(&progress)
-        dirty = true
-        let ok = !failed
-        let startFlush = !writing
-        if startFlush { writing = true }
-        lock.unlock()
-        if startFlush {
-            Task.detached(priority: .utility) { self.flush() }
-        }
-        return ok
-    }
-
-    private func flush() {
-        while true {
-            lock.lock()
-            guard dirty else {
-                writing = false
-                lock.unlock()
-                return
-            }
-            dirty = false
-            let current = progress
-            lock.unlock()
-            let wrote = (try? JSONEncoder().encode(current).write(to: fileUrl, options: .atomic)) != nil
-            lock.lock()
-            failed = !wrote
-            lock.unlock()
-        }
+        return (try? JSONEncoder().encode(progress).write(to: fileUrl, options: .atomic)) != nil
     }
 }
 

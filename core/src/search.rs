@@ -50,6 +50,14 @@ pub struct IndexedDoc {
     pub locations: Vec<String>,
     /// Every logline that carried a fix, in document order.
     pub places: Vec<ContextPlace>,
+    /// The note's second line in the sidebar, read off its first logline
+    /// alone — a later logline never stands in for what that one lacks.
+    pub context_created: i64,
+    pub context_location: String,
+    pub context_weather: String,
+    pub now_playing: String,
+    /// The note's body after its title line, capped for display.
+    pub preview: String,
     pub facets: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
@@ -64,6 +72,28 @@ pub struct IndexedDoc {
     /// is already stored is a no-op, so a re-crawl costs a read instead of a
     /// full FTS rewrite.
     pub heads: String,
+}
+
+/// A stored row's columns in the form they were written, for the no-op check:
+/// an upsert whose heads match still has to run when one of the columns added
+/// after `heads` differs, or a row written before that column existed never
+/// gets a value.
+struct StoredRow {
+    heads: String,
+    created: i64,
+    weather: String,
+    locations: String,
+    facets: String,
+    context: String,
+    event_start: i64,
+    event_end: i64,
+    event_ids: String,
+    places: String,
+    context_created: i64,
+    context_location: String,
+    context_weather: String,
+    now_playing: String,
+    preview: String,
 }
 
 /// Tags are stored as one space-delimited string wrapped in spaces, so
@@ -120,6 +150,27 @@ fn remove_db_files(db_path: &Path) {
         sidecar.push(suffix);
         let _ = std::fs::remove_file(sidecar);
     }
+}
+
+/// Add a column an older database does not have. Every open runs all of these,
+/// so the second run's "duplicate column name" is the expected outcome — but a
+/// busy or full database is not, and swallowing that would leave the column
+/// missing and every later upsert failing for the life of the process.
+fn add_column(conn: &Connection, column: &str) -> Result<()> {
+    match conn.execute(&format!("ALTER TABLE search_docs ADD COLUMN {column}"), []) {
+        Ok(_) => Ok(()),
+        Err(err) if is_duplicate_column(&err) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn is_duplicate_column(err: &rusqlite::Error) -> bool {
+    let rusqlite::Error::SqliteFailure(code, Some(message)) = err else {
+        return false;
+    };
+    // SQLite reports it as a plain SQLITE_ERROR, so the message is the only
+    // thing that tells it apart from a statement that is simply wrong.
+    code.code == ErrorCode::Unknown && message.contains("duplicate column name")
 }
 
 impl SearchIndex {
@@ -206,71 +257,31 @@ impl SearchIndex {
                  COMMIT;",
             )?;
         }
-        // Pre-existing databases were created without `modified`; the error on
-        // a second run is "duplicate column name" and is the expected outcome.
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN modified INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN has_vision INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        // Pre-existing databases predate every column from `modified` down, so
+        // each one arrives by ALTER TABLE on open.
+        add_column(&conn, "modified INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "has_vision INTEGER NOT NULL DEFAULT 0")?;
         // Deliberately never written by `upsert`: an asset the analyzer already
         // looked at and got nothing from must stay skipped across reindexes,
         // or the backfill retries the same audio files forever.
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN vision_attempted INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN when_day TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN heads TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN created INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN weather TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN locations TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN facets TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN context TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN event_start INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN event_end INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN event_ids TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE search_docs ADD COLUMN places TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+        add_column(&conn, "vision_attempted INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "tags TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "when_day TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "heads TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "created INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "weather TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "locations TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "facets TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "context TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "event_start INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "event_end INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "event_ids TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "places TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "context_created INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "context_location TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "context_weather TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "now_playing TEXT NOT NULL DEFAULT ''")?;
+        add_column(&conn, "preview TEXT NOT NULL DEFAULT ''")?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS search_docs_modified
                 ON search_docs(modified DESC);
@@ -306,50 +317,49 @@ impl SearchIndex {
             // A row written before `created` existed has to be rewritten even
             // though its heads still match, or it never gets one. The same
             // holds for every column added after `heads`.
-            let stored: Option<(String, i64, String, String, String, String, i64, i64, String, String)> =
-                conn.query_row(
-                    "SELECT heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places
+            let stored = conn
+                .query_row(
+                    "SELECT heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places,
+                            context_created, context_location, context_weather, now_playing, preview
                      FROM search_docs WHERE url = ?1",
                     params![doc.url],
                     |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                            row.get(8)?,
-                            row.get(9)?,
-                        ))
+                        Ok(StoredRow {
+                            heads: row.get(0)?,
+                            created: row.get(1)?,
+                            weather: row.get(2)?,
+                            locations: row.get(3)?,
+                            facets: row.get(4)?,
+                            context: row.get(5)?,
+                            event_start: row.get(6)?,
+                            event_end: row.get(7)?,
+                            event_ids: row.get(8)?,
+                            places: row.get(9)?,
+                            context_created: row.get(10)?,
+                            context_location: row.get(11)?,
+                            context_weather: row.get(12)?,
+                            now_playing: row.get(13)?,
+                            preview: row.get(14)?,
+                        })
                     },
                 )
                 .optional()?;
-            if let Some((
-                heads,
-                created,
-                weather,
-                locations,
-                facets,
-                context,
-                event_start,
-                event_end,
-                event_ids,
-                places,
-            )) = stored
-            {
-                if heads == doc.heads
-                    && (created != 0 || doc.created == 0)
-                    && weather == doc.weather.join("\n")
-                    && locations == doc.locations.join("\n")
-                    && facets == encode_tags(&doc.facets)
-                    && context == doc.context
-                    && event_start == doc.event_start
-                    && event_end == doc.event_end
-                    && event_ids == doc.event_ids.join("\n")
-                    && places == encode_places(&doc.places)
+            if let Some(stored) = stored {
+                if stored.heads == doc.heads
+                    && (stored.created != 0 || doc.created == 0)
+                    && stored.weather == doc.weather.join("\n")
+                    && stored.locations == doc.locations.join("\n")
+                    && stored.facets == encode_tags(&doc.facets)
+                    && stored.context == doc.context
+                    && stored.event_start == doc.event_start
+                    && stored.event_end == doc.event_end
+                    && stored.event_ids == doc.event_ids.join("\n")
+                    && stored.places == encode_places(&doc.places)
+                    && stored.context_created == doc.context_created
+                    && stored.context_location == doc.context_location
+                    && stored.context_weather == doc.context_weather
+                    && stored.now_playing == doc.now_playing
+                    && stored.preview == doc.preview
                 {
                     return Ok(false);
                 }
@@ -357,8 +367,8 @@ impl SearchIndex {
         }
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places, context_created, context_location, context_weather, now_playing, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -376,7 +386,12 @@ impl SearchIndex {
                 event_start = excluded.event_start,
                 event_end = excluded.event_end,
                 event_ids = excluded.event_ids,
-                places = excluded.places",
+                places = excluded.places,
+                context_created = excluded.context_created,
+                context_location = excluded.context_location,
+                context_weather = excluded.context_weather,
+                now_playing = excluded.now_playing,
+                preview = excluded.preview",
             params![
                 doc.url,
                 doc.kind,
@@ -395,7 +410,12 @@ impl SearchIndex {
                 doc.event_start,
                 doc.event_end,
                 doc.event_ids.join("\n"),
-                encode_places(&doc.places)
+                encode_places(&doc.places),
+                doc.context_created,
+                doc.context_location,
+                doc.context_weather,
+                doc.now_playing,
+                doc.preview
             ],
         )?;
         tx.execute(
@@ -430,7 +450,8 @@ impl SearchIndex {
         let row = conn
             .query_row(
                 "SELECT kind, title, body, modified, created, has_vision, tags, when_day, heads,
-                        weather, locations, facets, context, event_start, event_end, event_ids, places
+                        weather, locations, facets, context, event_start, event_end, event_ids, places,
+                        context_created, context_location, context_weather, now_playing, preview
                  FROM search_docs WHERE url = ?1",
                 params![url],
                 |row| {
@@ -454,6 +475,11 @@ impl SearchIndex {
                         event_end: row.get(14)?,
                         event_ids: decode_lines(&row.get::<_, String>(15)?),
                         places: decode_places(&row.get::<_, String>(16)?),
+                        context_created: row.get(17)?,
+                        context_location: row.get(18)?,
+                        context_weather: row.get(19)?,
+                        now_playing: row.get(20)?,
+                        preview: row.get(21)?,
                     })
                 },
             )
@@ -870,6 +896,12 @@ pub fn indexed_doc(
     } else {
         Vec::new()
     };
+    let preview = if kind == "rich" {
+        shapes::note_preview(doc)
+    } else {
+        String::new()
+    };
+    let first_context = shapes::first_context(doc);
     let has_vision = kind == "file" && shapes::asset_vision(doc).is_some();
     let mut heads: Vec<String> = doc.get_heads().iter().map(ToString::to_string).collect();
     heads.sort();
@@ -888,6 +920,11 @@ pub fn indexed_doc(
         weather: shapes::context_values(doc, "weather"),
         locations: shapes::context_values(doc, "location"),
         places: shapes::context_places(doc),
+        context_created: first_context.created,
+        context_location: first_context.location,
+        context_weather: first_context.weather,
+        now_playing: first_context.now_playing,
+        preview,
         facets: shapes::doc_facets(doc),
         when: shapes::doc_when(doc),
         context,
@@ -1089,6 +1126,11 @@ mod tests {
             weather: Vec::new(),
             locations: Vec::new(),
             places: Vec::new(),
+            context_created: 0,
+            context_location: String::new(),
+            context_weather: String::new(),
+            now_playing: String::new(),
+            preview: String::new(),
             facets: Vec::new(),
             when: when.into(),
             context: String::new(),
@@ -1302,6 +1344,32 @@ mod tests {
         assert_eq!(index.stored_created("note"), Some(123));
     }
 
+    /// What a note row renders comes off the first logline and is read back
+    /// from the index, so it has to survive the round trip and it has to keep
+    /// a row written before the columns existed from staying blank.
+    #[test]
+    fn first_logline_fields_round_trip_and_backfill() {
+        let index = fixture();
+        let mut doc = indexed("url-b", "Cake", &[], "");
+        doc.heads = "h1".to_string();
+        doc.preview = "the second line".to_string();
+        assert!(index.upsert(doc.clone()).unwrap());
+        assert!(!index.upsert(doc.clone()).unwrap());
+        doc.context_created = 1_787_321_002;
+        doc.context_location = "Cork".to_string();
+        doc.context_weather = "Rain".to_string();
+        doc.now_playing = "Aphex Twin".to_string();
+        assert!(index.upsert(doc.clone()).unwrap());
+        assert!(!index.upsert(doc).unwrap());
+
+        let row = index.indexed_note("url-b").unwrap().unwrap();
+        assert_eq!(row.context_created, 1_787_321_002);
+        assert_eq!(row.context_location, "Cork");
+        assert_eq!(row.context_weather, "Rain");
+        assert_eq!(row.now_playing, "Aphex Twin");
+        assert_eq!(row.preview, "the second line");
+    }
+
     #[test]
     fn indexed_doc_reuses_a_known_created() {
         use automerge::transaction::{CommitOptions, Transactable};
@@ -1314,6 +1382,26 @@ mod tests {
         assert_eq!(indexed_doc("u".into(), &doc, None).created, 111);
         assert_eq!(indexed_doc("u".into(), &doc, Some(42)).created, 42);
         assert_eq!(indexed_doc("u".into(), &doc, Some(0)).created, 111);
+    }
+
+    /// The migrations run on every open, so the second run's duplicate column
+    /// has to be tolerated — and nothing else, or a column that failed to
+    /// appear takes every later upsert down with it, silently.
+    #[test]
+    fn only_a_duplicate_column_is_tolerated_by_a_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "lush-search-add-column-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        SearchIndex::open(&dir).unwrap();
+        let index = SearchIndex::open(&dir).unwrap();
+        let conn = index.conn.lock().unwrap();
+        add_column(&conn, "now_playing TEXT NOT NULL DEFAULT ''").unwrap();
+        let unrelated = conn
+            .execute("ALTER TABLE nothing_here ADD COLUMN x TEXT", [])
+            .unwrap_err();
+        assert!(!is_duplicate_column(&unrelated));
     }
 
     #[test]

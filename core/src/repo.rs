@@ -715,6 +715,9 @@ impl DocState {
 struct SyncSlot {
     running: bool,
     again: bool,
+    /// The server heads whose announcement asked for this round. A round that
+    /// ends in failure forgets them so the next identical announcement retries.
+    announced: Option<BTreeSet<CommitId>>,
 }
 
 struct PendingSave {
@@ -1778,7 +1781,9 @@ impl Repo {
             tokio::spawn(async move {
                 while let Some(batch) = stored_rx.recv().await {
                     let id = DocId::from_sedimentree_id(batch.sedimentree_id);
-                    if !repo.apply_incoming.load(Ordering::Relaxed) && repo.doc_has_heads(id).await
+                    if !repo.apply_incoming.load(Ordering::Relaxed)
+                        && repo.doc_has_heads(id).await
+                        && !repo.batch_is_echo(id, &batch).await
                     {
                         repo.deferred_applies.lock().await.insert(id);
                         let _ = repo.events.send(RepoEvent::SyncEvent(format!(
@@ -2190,10 +2195,7 @@ impl Repo {
                         });
                 if !matches!(outcome, Ok(SyncOutcome::Succeeded { .. })) {
                     // Forget the heads so the server's next announcement retries.
-                    let mut last = repo.last_server_heads.lock().await;
-                    if last.get(&id) == Some(&heads_set) {
-                        last.remove(&id);
-                    }
+                    repo.forget_announced_heads(id, &heads_set).await;
                 }
             });
             return;
@@ -2217,8 +2219,8 @@ impl Repo {
             return;
         }
         if !self.apply_incoming.load(Ordering::Relaxed) && self.doc_has_heads(id).await {
-            self.last_server_heads.lock().await.insert(id, heads_set);
-            self.request_sync_forced(id).await;
+            self.last_server_heads.lock().await.insert(id, heads_set.clone());
+            self.request_sync_announced(id, heads_set).await;
             return;
         }
         let _ = self.apply_missing_blobs(id).await;
@@ -2229,9 +2231,9 @@ impl Repo {
             let state = state.lock().await;
             !state.doc.get_missing_deps(&hashes).is_empty()
         };
-        self.last_server_heads.lock().await.insert(id, heads_set);
+        self.last_server_heads.lock().await.insert(id, heads_set.clone());
         if still_missing {
-            self.request_sync_forced(id).await;
+            self.request_sync_announced(id, heads_set).await;
         }
     }
 
@@ -2282,6 +2284,37 @@ impl Repo {
 
     async fn request_sync_forced(self: &Arc<Self>, id: DocId) {
         self.request_sync_inner(id, true).await;
+    }
+
+    /// A forced round on behalf of a server head announcement. The heads are
+    /// only remembered as handled for as long as the round that was supposed
+    /// to fetch them keeps succeeding; a round that fails — or one a guard
+    /// dropped before it started — forgets them, so the server's next
+    /// announcement of the same heads is acted on rather than deduplicated
+    /// away.
+    async fn request_sync_announced(self: &Arc<Self>, id: DocId, announced: BTreeSet<CommitId>) {
+        {
+            let mut syncs = self.syncs.lock().await;
+            syncs.entry(id).or_default().announced = Some(announced);
+        }
+        self.request_sync_forced(id).await;
+        let dropped = {
+            let mut syncs = self.syncs.lock().await;
+            match syncs.get_mut(&id) {
+                Some(slot) if !slot.running => slot.announced.take(),
+                _ => None,
+            }
+        };
+        if let Some(heads) = dropped {
+            self.forget_announced_heads(id, &heads).await;
+        }
+    }
+
+    async fn forget_announced_heads(&self, id: DocId, heads: &BTreeSet<CommitId>) {
+        let mut last = self.last_server_heads.lock().await;
+        if last.get(&id) == Some(heads) {
+            last.remove(&id);
+        }
     }
 
     async fn request_sync_inner(self: &Arc<Self>, id: DocId, force: bool) {
@@ -2363,6 +2396,13 @@ impl Repo {
                 let slot = syncs.entry(id).or_default();
                 if !slot.again {
                     slot.running = false;
+                    let announced = slot.announced.take();
+                    drop(syncs);
+                    if failed {
+                        if let Some(heads) = announced {
+                            repo.forget_announced_heads(id, &heads).await;
+                        }
+                    }
                     return;
                 }
                 slot.again = false;
@@ -2508,6 +2548,27 @@ impl Repo {
             )));
             let _ = self.events.send(RepoEvent::DocChanged(id));
         }
+    }
+
+    /// Whether a stored batch holds nothing the resident doc has not already
+    /// taken in. The observer echoes every local save back through the apply
+    /// loop, and with `apply_incoming` off those echoes would otherwise be
+    /// filed as incoming work: phantom "changes waiting in the future" events,
+    /// and a `deferred_applies` entry that keeps every edited doc resident.
+    async fn batch_is_echo(&self, id: DocId, batch: &StoredBatch) -> bool {
+        let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+            return false;
+        };
+        let state = state.lock().await;
+        batch
+            .commits
+            .iter()
+            .map(|record| &record.blob)
+            .chain(batch.fragments.iter().map(|record| &record.blob))
+            .all(|blob| {
+                let digest = BlobMeta::new(blob).digest();
+                state.applied.contains(&digest) || state.failed.contains(&digest)
+            })
     }
 
     async fn apply_stored_batch(&self, batch: StoredBatch) -> Result<bool> {
@@ -2697,8 +2758,12 @@ impl Repo {
     pub async fn ensure_doc(self: &Arc<Self>, id: DocId) -> Result<()> {
         self.tracked.lock().await.insert(id);
         let fresh = !self.docs.lock().await.contains_key(&id);
-        self.open_local(id).await;
-        if fresh {
+        // A doc storage would not give up is neither open nor empty: the heal
+        // below still runs, since the server may hold what this disk withheld,
+        // but nothing announces a change — an empty shell announced as changed
+        // is a note the indexer drops every row for.
+        let opened = self.open_local(id).await;
+        if fresh && opened.is_ok() {
             if self.doc_has_heads(id).await {
                 match self.save_doc_now(id).await {
                     Ok(true) => {
@@ -2745,7 +2810,14 @@ impl Repo {
                 }
             }
         });
-        Ok(())
+        opened
+    }
+
+    /// Whether the doc is already in memory. A resident doc is the only one
+    /// that can be mid-edit, so it is the only one whose search-index row may
+    /// be behind what the doc holds.
+    pub async fn is_resident(&self, id: DocId) -> bool {
+        self.docs.lock().await.contains_key(&id)
     }
 
     async fn doc_has_heads(&self, id: DocId) -> bool {
@@ -2906,7 +2978,7 @@ impl Repo {
     where
         F: FnOnce(&Automerge) -> Result<T>,
     {
-        self.open_local(id).await;
+        self.open_local(id).await?;
         let state = self.doc_state(id).await?;
         let state = state.lock().await;
         f(&state.doc)
@@ -2983,16 +3055,17 @@ impl Repo {
     /// Track a doc and populate it from local storage. The fresh doc's lock is
     /// held across the initial load so concurrent reads wait for the loaded doc
     /// instead of observing an empty one.
-    async fn open_local(self: &Arc<Self>, id: DocId) {
-        let mut guard = {
+    async fn open_local(self: &Arc<Self>, id: DocId) -> Result<()> {
+        let (shared, mut guard) = {
             let mut docs = self.docs.lock().await;
             if docs.contains_key(&id) {
-                return;
+                return Ok(());
             }
             let state = DocState::shared(Automerge::new());
             docs.insert(id, state.clone());
             self.touch(id);
-            state.try_lock_owned().expect("fresh doc lock")
+            let guard = state.clone().try_lock_owned().expect("fresh doc lock");
+            (state, guard)
         };
         self.ephemeral
             .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
@@ -3004,8 +3077,22 @@ impl Repo {
                 (count, advanced, failed)
             }
             Err(e) => {
+                // A doc that could not be read is not a doc that is empty.
+                // Leaving the shell resident would have every reader — the
+                // search indexer above all — take it for a note whose content
+                // is gone and drop the rows that describe what is still on
+                // disk. Undo the open instead, so the next one tries again.
                 tracing::warn!(doc = %id.to_url(), error = %e, "local load failed");
-                (0, false, false)
+                drop(guard);
+                let mut docs = self.docs.lock().await;
+                if docs.get(&id).is_some_and(|state| Arc::ptr_eq(state, &shared)) {
+                    docs.remove(&id);
+                }
+                drop(docs);
+                self.ephemeral
+                    .unsubscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
+                    .await;
+                return Err(e);
             }
         };
         let replay = cpu_heavy(|| {
@@ -3056,6 +3143,7 @@ impl Repo {
         // in-memory and the deletes are no-ops when there's nothing to drop.
         self.reclaim_doc(id).await;
         self.request_sync(id).await;
+        Ok(())
     }
 
     /// Remove a doc from in-memory tracking so the next `ensure_doc` call
@@ -4153,6 +4241,32 @@ mod tests {
         assert!(has_remote);
         assert_eq!(repo.pending_change_count(id).await, 0);
         assert!(repo.deferred_applies.lock().await.is_empty());
+    }
+
+    /// The observer echoes every local save back through the apply loop. With
+    /// applying paused those echoes must not read as incoming work: they would
+    /// announce changes nobody made and pin every edited doc in memory.
+    #[tokio::test]
+    async fn a_docs_own_saves_are_not_deferred_incoming_work() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "first");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.set_apply_incoming(false).await;
+        repo.change_doc(id, |doc| {
+            put(doc, "value", "second");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        repo.save_doc(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(repo.deferred_applies.lock().await.is_empty());
+        assert_eq!(repo.pending_change_count(id).await, 0);
     }
 
     #[tokio::test]

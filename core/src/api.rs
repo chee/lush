@@ -226,6 +226,16 @@ pub struct IndexedNoteContent {
     pub tags: Vec<String>,
     pub weather: Vec<String>,
     pub locations: Vec<String>,
+    /// The first logline's own attrs, which is what a note row renders: a
+    /// later logline never stands in for what that one lacks. `context_created`
+    /// is its `created` (else `ts`) stamp as epoch seconds, 0 when absent; the
+    /// rest are empty when absent.
+    pub context_created: i64,
+    pub context_location: String,
+    pub context_weather: String,
+    pub now_playing: String,
+    /// The body after the title line, capped for display.
+    pub preview: String,
     /// First calendar event's window, epoch seconds, 0 when absent.
     pub event_start: i64,
     pub event_end: i64,
@@ -247,6 +257,11 @@ impl From<search::IndexedDoc> for IndexedNoteContent {
             tags: doc.tags,
             weather: doc.weather,
             locations: doc.locations,
+            context_created: doc.context_created,
+            context_location: doc.context_location,
+            context_weather: doc.context_weather,
+            now_playing: doc.now_playing,
+            preview: doc.preview,
             event_start: doc.event_start,
             event_end: doc.event_end,
             event_ids: doc.event_ids,
@@ -337,6 +352,7 @@ pub struct Core {
     index_slots: Arc<IndexSlots>,
     folder: std::sync::Mutex<Option<DocId>>,
     history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
+    delegate_forwarding: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -556,6 +572,26 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
     }
 }
 
+/// The doc's index row, when the row is as current as the doc: a resident doc
+/// can be mid-edit and its row only catches up once the indexer has run, so
+/// that one is answered from the doc itself. Everything else then costs a
+/// SELECT rather than a rebuild — or, worse, an open that keeps the doc.
+async fn settled_row(
+    repo: &Arc<Repo>,
+    index: &Arc<SearchIndex>,
+    id: DocId,
+) -> Option<search::IndexedDoc> {
+    if repo.is_resident(id).await {
+        return None;
+    }
+    let index = index.clone();
+    let url = id.to_url();
+    tokio::task::spawn_blocking(move || index.indexed_note(&url))
+        .await
+        .ok()?
+        .ok()?
+}
+
 /// Sends tracing lines to the unified log, so the core's own boot timings sit
 /// alongside the app's rather than vanishing into a stdout nobody reads.
 struct OsLogWriter;
@@ -648,6 +684,7 @@ impl Core {
             index_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
             folder: std::sync::Mutex::new(None),
             history_cache: std::sync::Mutex::new(HashMap::new()),
+            delegate_forwarding: std::sync::Mutex::new(None),
         });
         core.start_index_updates();
         tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "core constructed");
@@ -659,7 +696,7 @@ impl Core {
 impl Core {
     pub fn set_delegate(&self, delegate: Box<dyn CoreDelegate>) {
         let mut events = self.repo.subscribe();
-        self.runtime.spawn(async move {
+        let forwarding = self.runtime.spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(RepoEvent::DocChanged(id)) => delegate.on_doc_changed(id.to_url()),
@@ -683,6 +720,13 @@ impl Core {
                 }
             }
         });
+        // A scene reconnect calls this again: without dropping the loop the
+        // last delegate is on, every event arrives twice and that delegate's
+        // whole object graph stays alive behind it.
+        let previous = self.delegate_forwarding.lock().unwrap().replace(forwarding);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
     }
 
     pub async fn resync_doc(&self, url: String) -> Result<(), CoreError> {
@@ -2192,7 +2236,11 @@ impl Core {
             return String::new();
         };
         let repo = self.repo.clone();
+        let index = self.index.clone();
         self.run(async move {
+            if let Some(row) = settled_row(&repo, &index, id).await {
+                return Ok(row.preview);
+            }
             repo.read_stored(id, |doc| Ok(shapes::note_preview(doc)))
                 .await
         })
@@ -2360,11 +2408,17 @@ impl Core {
             return String::new();
         };
         let repo = self.repo.clone();
-        self.run(async move { repo.read_doc(id, |doc| Ok(shapes::doc_title(doc))).await })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+        let index = self.index.clone();
+        self.run(async move {
+            if let Some(row) = settled_row(&repo, &index, id).await {
+                return Ok(row.title);
+            }
+            repo.read_stored(id, |doc| Ok(shapes::doc_title(doc))).await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
     }
 
     pub async fn note_spans_json(&self, url: String) -> Result<String, CoreError> {
@@ -2712,9 +2766,16 @@ impl Core {
         let Ok(id) = DocId::from_url(&url) else {
             return 0;
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::doc_modified(doc))))
-            .unwrap_or(0)
+        let repo = self.repo.clone();
+        let index = self.index.clone();
+        self.runtime.block_on(async move {
+            if let Some(row) = settled_row(&repo, &index, id).await {
+                return row.modified;
+            }
+            repo.read_stored(id, |doc| Ok(shapes::doc_modified(doc)))
+                .await
+                .unwrap_or(0)
+        })
     }
 
     /// Create a note inside a specific folder doc.

@@ -161,7 +161,7 @@ final class OpenRouterAuthentication {
             let code = isCallback ? target?.queryItems?.first(where: { $0.name == "code" })?.value : nil
             let state = isCallback ? target?.queryItems?.first(where: { $0.name == "state" })?.value : nil
             Task { @MainActor in
-                guard isCallback, let code, state == nil || state == self.expectedState else {
+                guard isCallback, let code, let expected = self.expectedState, state == expected else {
                     // browser preconnect, favicon, or a split segment — keep the
                     // listener bound and wait for the real redirect
                     self.respond(connection, status: "404 Not Found", body: "Waiting for OpenRouter sign-in.")

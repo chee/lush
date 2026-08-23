@@ -272,6 +272,9 @@ final class NotesModel {
     /// must not re-read the whole tree; docChanged drops the entries it stales.
     @ObservationIgnored private var metaFetched: Set<String> = []
     @ObservationIgnored private var contextMetaLoading: Set<String> = []
+    /// Rows a view has actually asked about, so `docIndexed` knows which ones
+    /// are worth re-reading and which are just notes that once scrolled past.
+    @ObservationIgnored private var contextMetaWanted: Set<String> = []
     @ObservationIgnored private var sharedIntakeDrain: Task<Void, Never>?
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
@@ -1035,6 +1038,7 @@ final class NotesModel {
         if !row.preview.isEmpty { row.preview = "" }
         if row.thumbnail != nil { row.thumbnail = nil }
         if row.contextMeta != nil { row.contextMeta = nil }
+        contextMetaWanted.remove(url)
     }
 
     private func pruneRows(to liveUrls: Set<String>) {
@@ -1603,25 +1607,27 @@ final class NotesModel {
         }
     }
 
-    func loadContextMeta(url: String) async {
-        guard noteRow(for: url).contextMeta == nil,
+    /// The first logline's fields ride on the index row, so a sidebar of note
+    /// rows costs a query each instead of a doc open each. `contextCreated`
+    /// and friends are that one block's own attrs — `created`, `weather` and
+    /// `locations` on the same row are different values and would render
+    /// different text.
+    func loadContextMeta(url: String, force: Bool = false) async {
+        guard force || noteRow(for: url).contextMeta == nil,
               !contextMetaLoading.contains(url),
               let core
         else { return }
+        contextMetaWanted.insert(url)
         contextMetaLoading.insert(url)
         defer { contextMetaLoading.remove(url) }
-        guard let json = try? await core.noteSpansJson(url: url) else { return }
-        let spans = await Task.detached { SpanNode.decodeList(json) }.value
-        let fmt = ISO8601DateFormatter()
+        guard let row = await core.noteContent(url: url) else { return }
         var meta = NoteContextMeta()
-        for span in spans {
-            guard case .block(let b) = span, b.type == "context" else { continue }
-            if let s = (b.attrs["created"] ?? b.attrs["ts"])?.stringValue { meta.created = fmt.date(from: s) }
-            meta.location = b.attrs["location"]?.stringValue
-            meta.weather = b.attrs["weather"]?.stringValue
-            meta.nowPlaying = b.attrs["nowPlaying"]?.stringValue
-            break
+        if row.contextCreated > 0 {
+            meta.created = Date(timeIntervalSince1970: TimeInterval(row.contextCreated))
         }
+        meta.location = row.contextLocation.isEmpty ? nil : row.contextLocation
+        meta.weather = row.contextWeather.isEmpty ? nil : row.contextWeather
+        meta.nowPlaying = row.nowPlaying.isEmpty ? nil : row.nowPlaying
         noteRow(for: url).contextMeta = meta
     }
 
@@ -1672,6 +1678,12 @@ final class NotesModel {
     func docIndexed(url: String) {
         scheduleSemanticIndex(url: url)
         scheduleSpotlightIndex(url: url)
+        // A location fix, the weather, or an edit synced from another device
+        // rewrites the first logline long after the row's view appeared, and
+        // its `.task` will not run a second time.
+        if contextMetaWanted.contains(url) {
+            Task { [weak self] in await self?.loadContextMeta(url: url, force: true) }
+        }
     }
 
     func docChanged(url: String) {
@@ -4185,6 +4197,10 @@ final class NotesModel {
         case "jpg", "jpeg": return "image/jpeg"
         case "png": return "image/png"
         case "gif": return "image/gif"
+        case "heic", "heif": return "image/heic"
+        case "webp": return "image/webp"
+        case "tiff", "tif": return "image/tiff"
+        case "avif": return "image/avif"
         case "pdf": return "application/pdf"
         case "mp4": return "video/mp4"
         case "mov": return "video/quicktime"

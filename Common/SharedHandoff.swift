@@ -60,13 +60,20 @@ enum SharedHandoffError: LocalizedError {
 extension SharedHandoff {
     static func write(from context: NSExtensionContext) async throws -> URL? {
         let (id, directory) = try prepareDirectory()
-        let items = try await loadItems(from: context, into: directory)
-        guard !items.isEmpty else {
+        // Anything thrown before the payload lands leaves half-copied items the
+        // app can never import, so the directory goes with the error.
+        do {
+            let items = try await loadItems(from: context, into: directory)
+            guard !items.isEmpty else {
+                try? FileManager.default.removeItem(at: directory)
+                return nil
+            }
+            let data = try JSONEncoder().encode(SharedHandoff(createdAt: Date(), items: items))
+            try data.write(to: directory.appendingPathComponent("payload.json"), options: .atomic)
+        } catch {
             try? FileManager.default.removeItem(at: directory)
-            return nil
+            throw error
         }
-        let data = try JSONEncoder().encode(SharedHandoff(createdAt: Date(), items: items))
-        try data.write(to: directory.appendingPathComponent("payload.json"), options: .atomic)
 
         var components = URLComponents()
         components.scheme = "lush"
@@ -102,7 +109,7 @@ extension SharedHandoff {
                     items.append(.text(url.absoluteString))
                 }
             } else if let image = try await loadImage(from: provider) {
-                let name = "image-\(items.count + 1).png"
+                let name = "image-\(items.count + 1).\(imageExtension(for: image, from: provider))"
                 try image.write(to: directory.appendingPathComponent(name), options: .atomic)
                 items.append(.file(relativePath: name, suggestedName: name))
             } else if let text = try await loadText(from: provider) {
@@ -141,6 +148,37 @@ extension SharedHandoff {
         if let data = item as? Data { return data }
         if let url = item as? URL { return try Data(contentsOf: url) }
         return nil
+    }
+
+    /// The provider hands over its own bytes untouched — JPEG, HEIC, whatever
+    /// the camera wrote — and the app derives an asset's MIME type from the
+    /// name we give it, so the name has to describe the bytes.
+    private static func imageExtension(for data: Data, from provider: NSItemProvider) -> String {
+        if let sniffed = sniffedImageExtension(data) { return sniffed }
+        let registered = provider.registeredTypeIdentifiers.first { candidate in
+            guard let type = UTType(candidate), type != .image else { return false }
+            return type.conforms(to: .image) && type.preferredFilenameExtension != nil
+        }
+        guard let registered, let ext = UTType(registered)?.preferredFilenameExtension else { return "png" }
+        return ext
+    }
+
+    private static func sniffedImageExtension(_ data: Data) -> String? {
+        let bytes = [UInt8](data.prefix(12))
+        guard bytes.count >= 4 else { return nil }
+        let head: [UInt8] = Array(bytes[0..<4])
+        if head == [0x89, 0x50, 0x4E, 0x47] { return "png" }
+        if head[0] == 0xFF, head[1] == 0xD8, head[2] == 0xFF { return "jpg" }
+        if head == [0x47, 0x49, 0x46, 0x38] { return "gif" }
+        if head == [0x49, 0x49, 0x2A, 0x00] || head == [0x4D, 0x4D, 0x00, 0x2A] { return "tiff" }
+        guard bytes.count >= 12 else { return nil }
+        if head == [0x52, 0x49, 0x46, 0x46], Array(bytes[8..<12]) == [0x57, 0x45, 0x42, 0x50] { return "webp" }
+        guard Array(bytes[4..<8]) == [0x66, 0x74, 0x79, 0x70] else { return nil }
+        switch String(decoding: bytes[8..<12], as: UTF8.self) {
+        case "avif", "avis": return "avif"
+        case "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs", "mif1", "msf1": return "heic"
+        default: return nil
+        }
     }
 
     private static func copyFileLikeItem(from source: URL, into directory: URL) throws -> SharedHandoffItem {

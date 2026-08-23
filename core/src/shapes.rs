@@ -2519,6 +2519,57 @@ pub fn context_search_text(doc: &Automerge) -> String {
         .join("\n")
 }
 
+/// The note's first logline, exactly as the sidebar reads it: whatever that
+/// one block carries, with no later logline standing in for what it lacks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FirstContext {
+    /// The block's `created` stamp (else its `ts`) as epoch seconds; 0 when it
+    /// carries neither, or one that is not an instant.
+    pub created: i64,
+    pub location: String,
+    pub weather: String,
+    pub now_playing: String,
+}
+
+pub fn first_context(doc: &Automerge) -> FirstContext {
+    let Ok(spans) = spans_to_json(doc) else {
+        return FirstContext::default();
+    };
+    spans
+        .into_iter()
+        .find_map(|span| {
+            let SpanJson::Block { value } = span else {
+                return None;
+            };
+            if value.get("type").and_then(Json::as_str) != Some("context") {
+                return None;
+            }
+            let attrs = value.get("attrs").and_then(Json::as_object);
+            let text = |key: &str| {
+                attrs
+                    .and_then(|attrs| attrs.get(key))
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let stamp = {
+                let created = text("created");
+                if created.is_empty() {
+                    text("ts")
+                } else {
+                    created
+                }
+            };
+            Some(FirstContext {
+                created: parse_iso_seconds(&stamp).unwrap_or_default(),
+                location: text("location"),
+                weather: text("weather"),
+                now_playing: text("nowPlaying"),
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// A logline that carried a fix. The stamp stays the string the block was
 /// written with — whoever reads it back knows the format it went in as.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2754,6 +2805,41 @@ mod context_place_tests {
             ]"#,
         );
         assert!(context_places(&doc).is_empty());
+    }
+
+    /// The sidebar renders one logline, the first, and reads every field off
+    /// that block alone.
+    #[test]
+    fn the_first_logline_never_borrows_from_a_later_one() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"words"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-08-21T14:03:22Z","weather":"Rain",
+                         "nowPlaying":"Aphex Twin"}}},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"ts":"2026-08-22T09:00:00Z","location":"Cork"}}}
+            ]"#,
+        );
+        let first = first_context(&doc);
+        assert_eq!(first.created, 1_787_321_002);
+        assert_eq!(first.weather, "Rain");
+        assert_eq!(first.now_playing, "Aphex Twin");
+        assert_eq!(first.location, "");
+        assert_eq!(context_values(&doc, "location"), vec!["Cork".to_string()]);
+    }
+
+    #[test]
+    fn a_logline_stamped_only_with_ts_still_reports_a_created() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"ts":"2026-08-21T14:03:22Z"}}}
+            ]"#,
+        );
+        assert_eq!(first_context(&doc).created, 1_787_321_002);
+        assert_eq!(first_context(&Automerge::new()), FirstContext::default());
     }
 
     #[test]

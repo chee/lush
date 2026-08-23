@@ -187,6 +187,7 @@ final class SpanDocTests: XCTestCase {
 
         XCTAssertEqual(saved.attrs["location"]?.stringValue, "Glasgow")
         XCTAssertEqual(saved.attrs.keys.filter { $0.hasPrefix(" ") }.count, 0)
+        XCTAssertNil(saved.attrs[""], "a trimmed-away key is still an empty row")
     }
 
     /// An attr that isn't text was never shown in the form, so a save must not

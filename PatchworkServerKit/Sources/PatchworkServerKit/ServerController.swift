@@ -44,9 +44,12 @@ public final class ServerController {
                 }
             }.value
             port = bound
-            peerId = serverPeerId()
-            irohNodeId = serverIrohNodeId()
-            friends = serverIrohPeers()
+            let identity = await Task.detached { () -> (String?, String?, [String]) in
+                (serverPeerId(), serverIrohNodeId(), serverIrohPeers())
+            }.value
+            peerId = identity.0
+            irohNodeId = identity.1
+            friends = identity.2
             writeServerInfo(to: dir, port: bound)
             bonjour.start(port: bound)
         } catch {
@@ -54,12 +57,16 @@ public final class ServerController {
         }
     }
 
-    public func stop() {
+    /// Async so the blocking shutdown stays off the main actor and a later
+    /// `start()` cannot bind a port the server has not given back yet.
+    public func stop() async {
         bonjour.stop()
         try? FileManager.default.removeItem(at: Self.dataDir.appendingPathComponent("server.json"))
-        serverStop()
+        await Task.detached { serverStop() }.value
         port = nil
         peerId = nil
+        irohNodeId = nil
+        friends = []
     }
 
     /// Saves a friend's iroh node id and dials them.
