@@ -688,6 +688,20 @@ impl SearchIndex {
     }
 
     /// Every doc the index holds, newest first, without its text.
+    /// Every url the index holds a row for. Cheap enough to call when the
+    /// event stream has dropped events and every row has to be treated as
+    /// suspect until it is written again.
+    pub fn indexed_urls(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT url FROM search_docs")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for url in rows {
+            out.push(url?);
+        }
+        Ok(out)
+    }
+
     pub fn indexed_notes(&self, limit: u32) -> Result<Vec<IndexedNote>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

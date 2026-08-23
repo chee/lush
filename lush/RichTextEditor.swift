@@ -5410,8 +5410,14 @@ class EditorTextView: NSTextView, EditorTextViewLike {
                 let png = await Task.detached {
                     NSBitmapImageRep(data: imageData)?.representation(using: .png, properties: [:])
                 }.value
-                guard let png else { return }
-                _ = core.incomingData(png, fileExtension: "png", suggestedName: nil)
+                // The pasteboard was claimed before the re-encode was tried, so
+                // a TIFF the bitmap rep won't take still has to land as
+                // something rather than as nothing at all.
+                _ = core.incomingData(
+                    png ?? imageData,
+                    fileExtension: png == nil ? "tiff" : "png",
+                    suggestedName: nil
+                )
             } else {
                 _ = core.incomingData(
                     imageData,

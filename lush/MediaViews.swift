@@ -187,13 +187,24 @@ struct AudioInlineView: View {
         return loaded
     }
 
+    /// Both entry points come through here while the player is still being
+    /// read, so whichever of them owns the load applies the newest scrub
+    /// position — a tap and a drag that overlap must not cancel each other.
+    private func startPlayback() {
+        Task {
+            guard let loaded = await loadPlayer() else { return }
+            if let seek = pendingSeek {
+                loaded.currentTime = seek * loaded.duration
+                pendingSeek = nil
+            }
+            loaded.play()
+            playing = true
+        }
+    }
+
     private func togglePlayback() {
         guard let player else {
-            Task {
-                guard let loaded = await loadPlayer() else { return }
-                loaded.play()
-                playing = true
-            }
+            startPlayback()
             return
         }
         if playing {
@@ -208,17 +219,11 @@ struct AudioInlineView: View {
     private func seekTo(_ fraction: Double) {
         guard let player else {
             // A scrub is a stream of ticks and the first one starts the read;
-            // the rest would be dropped by `loading`, so the bar follows the
-            // finger from here and the last position seen is the one played.
+            // the rest are dropped by `loading`, so the bar follows the finger
+            // from here and the last position seen is the one played.
             progress = fraction
             pendingSeek = fraction
-            Task {
-                guard let loaded = await loadPlayer() else { return }
-                loaded.currentTime = (pendingSeek ?? fraction) * loaded.duration
-                pendingSeek = nil
-                loaded.play()
-                playing = true
-            }
+            startPlayback()
             return
         }
         player.currentTime = fraction * player.duration

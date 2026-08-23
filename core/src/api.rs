@@ -350,6 +350,10 @@ pub struct Core {
     repo: Arc<Repo>,
     index: Arc<SearchIndex>,
     index_slots: Arc<IndexSlots>,
+    /// Docs whose index row may be behind a `DocChanged` the indexer never
+    /// received. Only a fresh row clears one; until then the doc answers for
+    /// itself.
+    unsettled_rows: Arc<std::sync::Mutex<HashSet<DocId>>>,
     folder: std::sync::Mutex<Option<DocId>>,
     history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
     delegate_forwarding: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -429,17 +433,47 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         let slots = self.index_slots.clone();
+        let unsettled = self.unsettled_rows.clone();
         self.runtime.spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(RepoEvent::DocChanged(id)) => {
-                        schedule_index_doc(repo.clone(), index.clone(), slots.clone(), id);
+                        schedule_index_doc(
+                            repo.clone(),
+                            index.clone(),
+                            slots.clone(),
+                            unsettled.clone(),
+                            id,
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("index missed {n} events; reindexing tracked docs");
+                        // The dropped events are mostly for docs nobody has
+                        // resident — that is what an eviction announcement is
+                        // — so reindexing the tracked ones does not cover it.
+                        // Every row the index holds is suspect until it is
+                        // written again; readers fall back to the doc for
+                        // those rather than trusting what could be stale.
+                        let known = {
+                            let index = index.clone();
+                            tokio::task::spawn_blocking(move || index.indexed_urls())
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .unwrap_or_default()
+                        };
+                        if let Ok(mut rows) = unsettled.lock() {
+                            rows.extend(known.iter().filter_map(|url| DocId::from_url(url).ok()));
+                        }
                         for id in repo.tracked_doc_ids().await {
-                            schedule_index_doc(repo.clone(), index.clone(), slots.clone(), id);
+                            schedule_index_doc(
+                                repo.clone(),
+                                index.clone(),
+                                slots.clone(),
+                                unsettled.clone(),
+                                id,
+                            );
                         }
                     }
                     Ok(_) => {}
@@ -471,6 +505,7 @@ impl Core {
             self.repo.clone(),
             self.index.clone(),
             self.index_slots.clone(),
+            self.unsettled_rows.clone(),
             id,
         );
     }
@@ -506,7 +541,13 @@ type IndexSlots = std::sync::Mutex<HashMap<DocId, IndexSlot>>;
 /// Serialize index updates per doc: while one runs, a new DocChanged sets
 /// `again` instead of racing a second task. The rerun reads the doc's latest
 /// state, so the newest write always lands last and the index can't go stale.
-fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<IndexSlots>, id: DocId) {
+fn schedule_index_doc(
+    repo: Arc<Repo>,
+    index: Arc<SearchIndex>,
+    slots: Arc<IndexSlots>,
+    unsettled: Arc<std::sync::Mutex<HashSet<DocId>>>,
+    id: DocId,
+) {
     {
         let mut map = slots.lock().unwrap();
         let slot = map.entry(id).or_default();
@@ -518,7 +559,7 @@ fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<Index
     }
     tokio::spawn(async move {
         loop {
-            index_doc(repo.clone(), index.clone(), id).await;
+            index_doc(repo.clone(), index.clone(), unsettled.clone(), id).await;
             let mut map = slots.lock().unwrap();
             match map.get_mut(&id) {
                 Some(slot) if slot.again => slot.again = false,
@@ -534,7 +575,12 @@ fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<Index
 /// The sqlite write runs on a blocking thread: the index is one connection
 /// behind a mutex, and a fan-out of index tasks would otherwise park that many
 /// runtime workers waiting for it.
-async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
+async fn index_doc(
+    repo: Arc<Repo>,
+    index: Arc<SearchIndex>,
+    unsettled: Arc<std::sync::Mutex<HashSet<DocId>>>,
+    id: DocId,
+) {
     let url = id.to_url();
     let known_created = {
         let index = index.clone();
@@ -567,8 +613,14 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
     match written {
         Ok(Err(e)) => tracing::warn!(error = %e, "search index write failed"),
         Err(e) => tracing::warn!(error = %e, "search index task failed"),
-        Ok(Ok(true)) => repo.announce_doc_indexed(id),
-        Ok(Ok(false)) => {}
+        Ok(Ok(advanced)) => {
+            if let Ok(mut rows) = unsettled.lock() {
+                rows.remove(&id);
+            }
+            if advanced {
+                repo.announce_doc_indexed(id);
+            }
+        }
     }
 }
 
@@ -582,9 +634,10 @@ async fn settled_row(
     repo: &Arc<Repo>,
     index: &Arc<SearchIndex>,
     slots: &Arc<IndexSlots>,
+    unsettled: &Arc<std::sync::Mutex<HashSet<DocId>>>,
     id: DocId,
 ) -> Option<search::IndexedDoc> {
-    if slots.lock().ok()?.contains_key(&id) {
+    if slots.lock().ok()?.contains_key(&id) || unsettled.lock().ok()?.contains(&id) {
         return None;
     }
     if repo.is_resident(id).await {
@@ -688,6 +741,7 @@ impl Core {
             repo,
             index,
             index_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            unsettled_rows: Arc::new(std::sync::Mutex::new(HashSet::new())),
             folder: std::sync::Mutex::new(None),
             history_cache: std::sync::Mutex::new(HashMap::new()),
             delegate_forwarding: std::sync::Mutex::new(None),
@@ -2053,6 +2107,7 @@ impl Core {
     pub async fn open_note(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
         let id = DocId::from_url(&url)?;
         repo.pin_doc(id);
         let opened = self
@@ -2064,7 +2119,7 @@ impl Core {
                 // Not awaited: the search index is one mutex, and at startup the
                 // prefetch walk holds it for every note on disk. The caller wants
                 // the document, not the search row.
-                tokio::spawn(index_doc(repo, index, id));
+                tokio::spawn(index_doc(repo, index, unsettled, id));
                 Ok::<_, anyhow::Error>(())
             })
             .await;
@@ -2139,6 +2194,7 @@ impl Core {
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
         let active = self.repo.app_active();
         self.runtime.spawn(async move {
             let mut visited = HashSet::new();
@@ -2157,6 +2213,7 @@ impl Core {
                 let found = futures::stream::iter(level.drain(..).map(|id| {
                     let repo = repo.clone();
                     let index = index.clone();
+                    let unsettled = unsettled.clone();
                     let active = active.clone();
                     async move {
                         if wait_for_active(active).await.is_err() {
@@ -2173,7 +2230,7 @@ impl Core {
                             return Vec::new();
                         }
                         let _ = repo.change_doc(id, shapes::normalize_strings).await;
-                        index_doc(repo.clone(), index, id).await;
+                        index_doc(repo.clone(), index, unsettled, id).await;
                         let mut children: Vec<String> = repo
                             .read_doc(id, shapes::folder_entries)
                             .await
@@ -2244,8 +2301,9 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         let slots = self.index_slots.clone();
+        let unsettled = self.unsettled_rows.clone();
         self.run(async move {
-            if let Some(row) = settled_row(&repo, &index, &slots, id).await {
+            if let Some(row) = settled_row(&repo, &index, &slots, &unsettled, id).await {
                 return Ok(row.preview);
             }
             repo.read_stored(id, |doc| Ok(shapes::note_preview(doc)))
@@ -2417,8 +2475,9 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         let slots = self.index_slots.clone();
+        let unsettled = self.unsettled_rows.clone();
         self.run(async move {
-            if let Some(row) = settled_row(&repo, &index, &slots, id).await {
+            if let Some(row) = settled_row(&repo, &index, &slots, &unsettled, id).await {
                 return Ok(row.title);
             }
             repo.read_stored(id, |doc| Ok(shapes::doc_title(doc))).await
@@ -2777,8 +2836,9 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         let slots = self.index_slots.clone();
+        let unsettled = self.unsettled_rows.clone();
         self.runtime.block_on(async move {
-            if let Some(row) = settled_row(&repo, &index, &slots, id).await {
+            if let Some(row) = settled_row(&repo, &index, &slots, &unsettled, id).await {
                 return row.modified;
             }
             repo.read_stored(id, |doc| Ok(shapes::doc_modified(doc)))
