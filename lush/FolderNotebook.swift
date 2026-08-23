@@ -9,12 +9,10 @@ import UIKit
 /// a stored range, so an edit anywhere moves ownership with the characters
 /// instead of invalidating an index.
 let notebookNote = NSAttributedString.Key("lushNotebookNote")
-/// Structure rather than content: the title line between two notes and the
-/// newlines that close it off. The body save pass walks straight past it.
+/// Structure rather than content: the gap between one note and the next, and
+/// the subfolder a note was found in when it was found in one. The body save
+/// pass walks straight past it.
 let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
-/// The editable part of a boundary — the note's name. Typing here renames the
-/// note; the newlines on either side carry no title and so cannot be typed in.
-let notebookTitle = NSAttributedString.Key("lushNotebookTitle")
 
 /// The folder's notes concatenated into one piece of text, and the rules for
 /// reading and editing it: who owns each character, where a caret is writing,
@@ -31,24 +29,19 @@ let notebookTitle = NSAttributedString.Key("lushNotebookTitle")
 final class NotebookDocument {
     struct Section {
         let url: String
-        let title: String
         /// The subfolders the note was found under, empty for the folder's
-        /// own. Drawn ahead of the title and owned by nobody: it is where the
+        /// own. Drawn in the gap above it and owned by nobody: it is where the
         /// note is, not what it is called.
         var path: String = ""
         let body: NSAttributedString
     }
 
+    /// The room a boundary opens above the note it introduces, with the rule
+    /// drawn across the middle of it.
+    static let gap: CGFloat = 30
+
     let storage = NSTextStorage()
     private(set) var order: [String] = []
-
-    private var boundaryColor: PColor {
-        #if os(macOS)
-        .secondaryLabelColor
-        #else
-        .secondaryLabel
-        #endif
-    }
 
     private var pathColor: PColor {
         #if os(macOS)
@@ -75,12 +68,7 @@ final class NotebookDocument {
                 value: section.url,
                 range: NSRange(location: 0, length: body.length)
             )
-            built.append(boundary(
-                titled: section.title,
-                under: section.path,
-                url: section.url,
-                first: urls.isEmpty
-            ))
+            built.append(boundary(under: section.path, first: urls.isEmpty))
             built.append(body)
             urls.append(section.url)
         }
@@ -88,41 +76,39 @@ final class NotebookDocument {
         order = urls
     }
 
-    /// The leading newline belongs to the boundary, not to the note above it.
-    /// It closes that note's last paragraph so the title does not land on the
-    /// same line, while keeping it out of the note's own slice — a trailing
-    /// newline inside the slice would save an empty paragraph onto every note.
-    private func boundary(
-        titled title: String,
-        under path: String,
-        url: String,
-        first: Bool
-    ) -> NSAttributedString {
+    /// The seam between one note and the next: a newline closing the note
+    /// above, then a line of its own.
+    ///
+    /// The leading newline belongs to the boundary rather than to the note
+    /// above it — it keeps that note's last paragraph closed while staying out
+    /// of the note's own slice, where a trailing newline would save an empty
+    /// paragraph onto every note.
+    ///
+    /// The line after it holds the subfolder a note was found in, and for the
+    /// folder's own notes nothing at all. Empty it is still the room the rule
+    /// is drawn in: a note's name is its first heading, which its content
+    /// already carries, so there is nothing else left to put here.
+    ///
+    /// The first note gets no seam — it has nothing above it to be separated
+    /// from — and none at all when it is one of the folder's own.
+    private func boundary(under path: String, first: Bool) -> NSAttributedString {
+        if first, path.isEmpty { return NSAttributedString() }
         var attributes = RichText.attributes(block: .heading(level: 2), marks: [:])
         attributes[notebookBoundary] = true
-        attributes[.foregroundColor] = boundaryColor
-        // Room above the title for the rule the text view draws there.
+        attributes[.foregroundColor] = pathColor
         if !first,
            let base = attributes[.paragraphStyle] as? NSParagraphStyle,
            let spaced = base.mutableCopy() as? NSMutableParagraphStyle {
-            spaced.paragraphSpacingBefore = 30
+            spaced.paragraphSpacingBefore = Self.gap
             attributes[.paragraphStyle] = spaced
         }
         let line = NSMutableAttributedString()
         if !first {
             line.append(NSAttributedString(string: "\n", attributes: attributes))
         }
-        // Structure rather than a name. It carries no `notebookTitle`, so the
-        // edit rules refuse it and the rename pass walks past it — typing here
-        // would otherwise rename the note to the folder it is sitting in.
         if !path.isEmpty {
-            var pathAttributes = attributes
-            pathAttributes[.foregroundColor] = pathColor
-            line.append(NSAttributedString(string: path + " / ", attributes: pathAttributes))
+            line.append(NSAttributedString(string: path, attributes: attributes))
         }
-        var titleAttributes = attributes
-        titleAttributes[notebookTitle] = url
-        line.append(NSAttributedString(string: title, attributes: titleAttributes))
         line.append(NSAttributedString(string: "\n", attributes: attributes))
         return line
     }
@@ -132,11 +118,6 @@ final class NotebookDocument {
     func owner(at location: Int) -> String? {
         guard location >= 0, location < storage.length else { return nil }
         return storage.attribute(notebookNote, at: location, effectiveRange: nil) as? String
-    }
-
-    func titleOwner(at location: Int) -> String? {
-        guard location >= 0, location < storage.length else { return nil }
-        return storage.attribute(notebookTitle, at: location, effectiveRange: nil) as? String
     }
 
     func isBoundary(at location: Int) -> Bool {
@@ -153,24 +134,16 @@ final class NotebookDocument {
         return nil
     }
 
-    /// The note whose name a caret at `location` is editing, by the same rule
-    /// bodies use: the run under the caret, else the one it sits just past.
-    func title(forCaretAt location: Int) -> String? {
-        if let url = titleOwner(at: location) { return url }
-        if location > 0, let url = titleOwner(at: location - 1) { return url }
-        return nil
-    }
-
-    func titleRange(of url: String) -> NSRange? {
+    /// Everything a note owns, boundaries excluded — where to put the caret
+    /// when the reader asks for a particular note.
+    func range(of url: String) -> NSRange? {
         var found: NSRange?
         storage.enumerateAttribute(
-            notebookTitle,
+            notebookNote,
             in: NSRange(location: 0, length: storage.length)
-        ) { value, range, stop in
-            if value as? String == url {
-                found = range
-                stop.pointee = true
-            }
+        ) { value, range, _ in
+            guard value as? String == url else { return }
+            found = found.map { NSUnionRange($0, range) } ?? range
         }
         return found
     }
@@ -180,9 +153,9 @@ final class NotebookDocument {
     /// from. One past the newline that opens it — that newline closes the line
     /// above, and the rule belongs over the line below.
     ///
-    /// Anchored to the boundary rather than to the title, which is no longer
-    /// the first thing on the line: a note found in a subfolder puts the path
-    /// there, and a rule drawn at the title would cut underneath it.
+    /// Anchored to the boundary's own line, which is where the room for it
+    /// is: the folder path when there is one, and an empty line when there
+    /// isn't.
     func separatorLocations() -> [Int] {
         var locations: [Int] = []
         let string = storage.string as NSString
@@ -199,78 +172,47 @@ final class NotebookDocument {
     }
 
     /// Typed text inherits the attributes to its left, which at the head of a
-    /// note is the boundary and at the head of a title is a bare newline.
-    /// Stamping the caret keeps new text with whatever it is being typed into.
+    /// note is the boundary above it. Stamping the caret keeps new text with
+    /// the note it is being typed into.
     func typingAttributes(
         from current: [NSAttributedString.Key: Any],
         at location: Int
     ) -> [NSAttributedString.Key: Any] {
         var attributes = current
-        if let url = title(forCaretAt: location) {
-            attributes[notebookNote] = nil
-            attributes[notebookBoundary] = true
-            attributes[notebookTitle] = url
-            return attributes
-        }
         attributes[notebookBoundary] = nil
-        attributes[notebookTitle] = nil
         if let url = note(forCaretAt: location) {
             attributes[notebookNote] = url
         }
         return attributes
     }
 
-    /// An edit stays inside one note's body or inside one note's title, and
-    /// never spans two of either or touches the newlines holding a boundary
-    /// together. That is what makes every character's owner unambiguous, and
-    /// what stops a backspace at the top of a note swallowing the one above.
-    func allowsEdit(in range: NSRange, replacement: String) -> Bool {
+    /// An edit stays inside one note, and never spans two of them or touches
+    /// the newlines holding a boundary together. That is what makes every
+    /// character's owner unambiguous, and what stops a backspace at the top of
+    /// a note swallowing the one above.
+    func allowsEdit(in range: NSRange) -> Bool {
         guard range.length > 0 else {
-            if title(forCaretAt: range.location) != nil {
-                return !replacement.contains("\n")
-            }
-            // An insertion point belonging to no note at all, which only an
-            // empty notebook has.
+            // An insertion point belonging to no note at all: the gap between
+            // two of them, or an empty notebook.
             return note(forCaretAt: range.location) != nil
         }
-
-        var titles: Set<String> = []
-        var bodies: Set<String> = []
+        var owners: Set<String> = []
         for location in range.location..<NSMaxRange(range) {
-            if let url = titleOwner(at: location) {
-                titles.insert(url)
-            } else if isBoundary(at: location) {
-                return false
-            } else if let url = owner(at: location) {
-                bodies.insert(url)
-            } else {
-                return false
-            }
-            if titles.count + bodies.count > 1 { return false }
+            guard !isBoundary(at: location), let url = owner(at: location) else { return false }
+            owners.insert(url)
+            if owners.count > 1 { return false }
         }
-
-        guard let url = titles.first else { return true }
-        // A title is one line, and retyping all of it is fine — but deleting
-        // it outright would leave nowhere to type and no way to name the note
-        // again, so the run has to survive.
-        if replacement.contains("\n") { return false }
-        return !replacement.isEmpty || range.length < (titleRange(of: url)?.length ?? 0)
+        return true
     }
 
-    /// Which note an edit over `range` belongs to, and whether it is that
-    /// note's name rather than its body. `allowsEdit` has already refused
-    /// anything spanning two of them, so there is only ever one answer — but
-    /// it has to be asked before the edit lands, while the text it is
-    /// replacing is still there to answer with.
-    func target(forEditIn range: NSRange) -> (url: String, isTitle: Bool)? {
-        guard range.length > 0 else {
-            if let url = title(forCaretAt: range.location) { return (url, true) }
-            if let url = note(forCaretAt: range.location) { return (url, false) }
-            return nil
-        }
+    /// Which note an edit over `range` belongs to. `allowsEdit` has already
+    /// refused anything spanning two of them, so there is only ever one
+    /// answer — but it has to be asked before the edit lands, while the text
+    /// it is replacing is still there to answer with.
+    func target(forEditIn range: NSRange) -> String? {
+        guard range.length > 0 else { return note(forCaretAt: range.location) }
         for location in range.location..<NSMaxRange(range) {
-            if let url = titleOwner(at: location) { return (url, true) }
-            if let url = owner(at: location) { return (url, false) }
+            if let url = owner(at: location) { return url }
         }
         return nil
     }
@@ -281,7 +223,7 @@ final class NotebookDocument {
     /// or — worse, because it reads as fine — the note it was copied out of.
     /// Either way `bodies()` would file it somewhere other than where the
     /// reader can see it.
-    func claim(_ range: NSRange, for url: String, asTitle: Bool) {
+    func claim(_ range: NSRange, for url: String) {
         guard range.location >= 0, range.location < storage.length else { return }
         let target = NSRange(
             location: range.location,
@@ -289,15 +231,8 @@ final class NotebookDocument {
         )
         guard target.length > 0 else { return }
         storage.beginEditing()
-        storage.removeAttribute(notebookNote, range: target)
-        storage.removeAttribute(notebookTitle, range: target)
         storage.removeAttribute(notebookBoundary, range: target)
-        if asTitle {
-            storage.addAttribute(notebookBoundary, value: true, range: target)
-            storage.addAttribute(notebookTitle, value: url, range: target)
-        } else {
-            storage.addAttribute(notebookNote, value: url, range: target)
-        }
+        storage.addAttribute(notebookNote, value: url, range: target)
         storage.endEditing()
     }
 
@@ -317,18 +252,6 @@ final class NotebookDocument {
             pieces[url] = piece
         }
         return pieces
-    }
-
-    func titles() -> [String: String] {
-        var names: [String: String] = [:]
-        storage.enumerateAttribute(
-            notebookTitle,
-            in: NSRange(location: 0, length: storage.length)
-        ) { value, range, _ in
-            guard let url = value as? String else { return }
-            names[url, default: ""] += storage.attributedSubstring(from: range).string
-        }
-        return names
     }
 }
 
@@ -384,14 +307,13 @@ func folderHoldsANote(_ folderUrl: String, in model: NotesModel) -> Bool {
 /// A folder read as one document: every note's content in one text view, one
 /// scroll view, one caret. The notes are not embedded editors — they are
 /// rendered like any other text, and the boundary between two of them is a
-/// title over a dotted rule rather than the edge of a box.
+/// dotted rule rather than the edge of a box.
 @MainActor
 @Observable
 final class FolderNotebookCore: LiveWriter {
     private struct Section {
         var heads: [String]
         var lastJSON: String
-        var lastName: String
     }
 
     /// Where an edit is about to land, taken down before it happens. After
@@ -399,14 +321,23 @@ final class FolderNotebookCore: LiveWriter {
     /// arrived with, and only the document as it stood knows whose it is.
     private struct PendingEdit {
         let url: String
-        let isTitle: Bool
         let location: Int
         let removed: Int
         let lengthBefore: Int
     }
 
-    @ObservationIgnored let document = NotebookDocument()
+    @ObservationIgnored private(set) var document = NotebookDocument()
     private(set) var loaded = false
+
+    /// Bumped when the caret is waiting to be put somewhere, so the text view
+    /// is asked to update and can come and collect it.
+    private(set) var focusRevision = 0
+
+    /// The note the caret is in, so a new one can be put after the note being
+    /// read rather than at the end of the folder.
+    @ObservationIgnored private(set) var focusedNote: String?
+
+    @ObservationIgnored private var focusRequest: String?
 
     @ObservationIgnored private var sections: [String: Section] = [:]
     /// The notes touched since the last write. A folder can hold a great deal
@@ -446,15 +377,10 @@ final class FolderNotebookCore: LiveWriter {
             let spans = SpanNode.decodeList(snapshot.spansJson)
             built.append(NotebookDocument.Section(
                 url: node.url,
-                title: node.displayName,
                 path: entry.path,
                 body: RichText.attributed(from: spans, cache: cache)
             ))
-            next[node.url] = Section(
-                heads: snapshot.heads,
-                lastJSON: snapshot.spansJson,
-                lastName: node.displayName
-            )
+            next[node.url] = Section(heads: snapshot.heads, lastJSON: snapshot.spansJson)
         }
 
         document.rebuild(built)
@@ -462,6 +388,44 @@ final class FolderNotebookCore: LiveWriter {
         dirty = []
         pending = nil
         loaded = true
+        // Only once the note is actually in the document: it is created
+        // before the tree walk that will find it has finished, so the first
+        // reload after asking is as likely as not to be missing it.
+        if let url = focusRequest, document.range(of: url) != nil { focusRevision += 1 }
+    }
+
+    /// Reads the folder again into a document of its own. Leaving edit mode
+    /// puts up a new text view, and on iOS a fresh one over the storage the
+    /// outgoing view is still tearing down leaves the two of them fighting
+    /// over the same observer slot.
+    func restart(_ entries: [NotebookEntry]) async {
+        if loaded { await flushNow() }
+        loaded = false
+        document = NotebookDocument()
+        await load(entries)
+    }
+
+    // MARK: - The caret
+
+    func caretMoved(to location: Int) {
+        // Only ever an answer: a caret resting in the gap between two notes
+        // belongs to neither, and forgetting where it last was would send the
+        // next new note to the bottom of the folder.
+        if let url = document.note(forCaretAt: location) { focusedNote = url }
+    }
+
+    /// Put the caret in a note once the notebook has read it. The note is not
+    /// in the document yet — it has only just been created, and the reload
+    /// that will bring it in is what this is waiting for.
+    func requestFocus(on url: String) {
+        focusRequest = url
+    }
+
+    func takeFocusTarget() -> NSRange? {
+        guard let url = focusRequest, let range = document.range(of: url) else { return nil }
+        focusRequest = nil
+        focusedNote = url
+        return NSRange(location: NSMaxRange(range), length: 0)
     }
 
     // MARK: - Editing
@@ -469,10 +433,9 @@ final class FolderNotebookCore: LiveWriter {
     /// Ask the document whose text this is while it can still answer.
     func willChange(in range: NSRange) {
         guard loaded else { return }
-        pending = document.target(forEditIn: range).map {
+        pending = document.target(forEditIn: range).map { url in
             PendingEdit(
-                url: $0.url,
-                isTitle: $0.isTitle,
+                url: url,
                 location: range.location,
                 removed: range.length,
                 lengthBefore: document.storage.length
@@ -493,11 +456,7 @@ final class FolderNotebookCore: LiveWriter {
         }
         let inserted = document.storage.length - edit.lengthBefore + edit.removed
         if inserted > 0 {
-            document.claim(
-                NSRange(location: edit.location, length: inserted),
-                for: edit.url,
-                asTitle: edit.isTitle
-            )
+            document.claim(NSRange(location: edit.location, length: inserted), for: edit.url)
         }
         dirty.insert(edit.url)
         scheduleSave()
@@ -558,19 +517,11 @@ final class FolderNotebookCore: LiveWriter {
         var retry = false
 
         let bodies = document.bodies()
-        let titles = document.titles()
 
+        // Renaming rides along with the write: `updateDocument` takes the
+        // note's first line as its name, the same way every other editor in
+        // the app does. There is nothing else here to rename it from.
         for url in document.order where touched.contains(url) {
-            if let name = titles[url]?.trimmingCharacters(in: .whitespacesAndNewlines),
-               // A name typed down to nothing is not a rename. The boundary
-               // rule keeps the run alive so there is somewhere to type; a
-               // note called "" would be just as unreachable.
-               !name.isEmpty,
-               name != sections[url]?.lastName,
-               let node = model.node(for: url) {
-                sections[url]?.lastName = name
-                model.renameNode(node, to: name)
-            }
             guard let section = sections[url], let text = bodies[url] else { continue }
             let spans = RichText.spans(from: text)
             let json = SpanNode.encodeList(spans)
@@ -619,31 +570,33 @@ struct FolderEmptyState: View {
 
 /// The folder as one continuous document: every note's content in a single
 /// editor, one scroll view and one caret, with the boundary between two notes
-/// drawn as a title over a dotted rule rather than the edge of a box. The
-/// notes are rendered like any other text — not embedded editors — so nothing
-/// here nests a scroll view inside another that scrolls the same way.
+/// drawn as a dotted rule rather than the edge of a box. The notes are
+/// rendered like any other text — not embedded editors — so nothing here
+/// nests a scroll view inside another that scrolls the same way.
 struct FolderNotebook: View {
     let folderUrl: String
 
     @Environment(NotesModel.self) private var model
+    @Environment(ContextTracker.self) private var contextTracker
     @State private var core: FolderNotebookCore?
+    #if os(iOS)
+    @Environment(\.editMode) private var editMode
+    #endif
 
     /// The whole subtree, not the direct children: a folder's notes are its
     /// notes wherever it keeps them.
     private var notes: [NotebookEntry] { notebookEntries(of: folderUrl, in: model) }
 
+    private var editing: Bool {
+        #if os(iOS)
+        editMode?.wrappedValue.isEditing == true
+        #else
+        false
+        #endif
+    }
+
     var body: some View {
-        Group {
-            if notes.isEmpty {
-                FolderEmptyState(message: "No notes in this folder")
-            } else if let core, core.loaded {
-                FolderNotebookText(core: core)
-            } else {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
+        content
         // One core for as long as the folder is on screen, reloaded in
         // place when its notes change. Replacing it would take the debounced
         // save down with it and blink the whole notebook back to a spinner
@@ -653,16 +606,147 @@ struct FolderNotebook: View {
             self.core = notebook
             await notebook.load(notes)
         }
+        // Not while the notes are being dragged around: every drop moves a
+        // note and re-reading the whole folder between two of them costs a
+        // snapshot per note for a document nobody is looking at. Leaving edit
+        // mode reads it again anyway.
         .onChange(of: notes.map(\.id)) {
-            guard let core else { return }
+            guard let core, !editing else { return }
             Task { await core.load(notes) }
+        }
+        .onChange(of: editing) { _, isEditing in
+            guard let core else { return }
+            // Nothing is typed while the notes are being dragged around, so
+            // the edit on the way in is the last one the text view took.
+            Task {
+                if isEditing {
+                    await core.flushNow()
+                } else {
+                    await core.restart(notes)
+                }
+            }
         }
         .onDisappear {
             guard let core else { return }
             Task { await core.flushNow() }
         }
+        .toolbar { notebookToolbar }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if notes.isEmpty {
+            FolderEmptyState(message: "No notes in this folder")
+        } else if editing {
+            arrangeList
+        } else if let core, core.loaded {
+            FolderNotebookText(core: core, focusRevision: core.focusRevision)
+        } else {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var arrangeList: some View {
+        #if os(iOS)
+        NotebookArrangeList(entries: notes)
+        #endif
+    }
+
+    @ToolbarContentBuilder
+    private var notebookToolbar: some ToolbarContent {
+        #if os(iOS)
+        ToolbarItem {
+            EditButton()
+        }
+        #endif
+        ToolbarItem {
+            Button(action: addNote) {
+                Label("New Note", systemImage: "square.and.pencil")
+            }
+            .help("New note after this one")
+            .disabled(editing)
+        }
+    }
+
+    /// A note straight after the one being read, in whichever folder that one
+    /// lives in — a notebook reads out of its subfolders too, and putting the
+    /// new note in the folder at the top would file it somewhere the reader
+    /// isn't looking. With no caret anywhere it goes on the end.
+    private func addNote() {
+        let after = core?.focusedNote
+        let parent = after.flatMap { model.node(for: $0)?.parentUrl } ?? folderUrl
+        Task {
+            contextTracker.start()
+            guard let url = await model.createNote(
+                inFolder: parent,
+                snap: contextTracker.snapshot
+            ) else { return }
+            if let after { model.placeChild(url, after: after, in: parent) }
+            core?.requestFocus(on: url)
+        }
     }
 }
+
+#if os(iOS)
+
+/// The notebook in edit mode: its notes as rows to be dragged into the order
+/// they should be read in. A note's place is kept by the folder holding it and
+/// there is no order spanning two folders, so a notebook reading out of
+/// subfolders gets a section each.
+private struct NotebookArrangeList: View {
+    let entries: [NotebookEntry]
+
+    @Environment(NotesModel.self) private var model
+
+    private struct Sheaf: Identifiable {
+        let folderUrl: String
+        let path: String
+        var notes: [FolderNode]
+        var id: String { folderUrl }
+    }
+
+    /// Grouped in the order the notebook reads them, so the rows are in the
+    /// same order as the text they came from.
+    private var sheaves: [Sheaf] {
+        var sheaves: [Sheaf] = []
+        for entry in entries {
+            guard let parent = entry.node.parentUrl else { continue }
+            if let index = sheaves.firstIndex(where: { $0.folderUrl == parent }) {
+                sheaves[index].notes.append(entry.node)
+            } else {
+                sheaves.append(Sheaf(folderUrl: parent, path: entry.path, notes: [entry.node]))
+            }
+        }
+        return sheaves
+    }
+
+    var body: some View {
+        List {
+            ForEach(sheaves) { sheaf in
+                Section {
+                    ForEach(sheaf.notes) { node in
+                        NoteRowView(node: node)
+                    }
+                    .onMove { from, to in
+                        model.moveNotes(
+                            in: sheaf.folderUrl,
+                            displayed: sheaf.notes.map(\.url),
+                            from: from,
+                            to: to
+                        )
+                    }
+                } header: {
+                    if !sheaf.path.isEmpty { Text(sheaf.path) }
+                }
+            }
+        }
+    }
+}
+
+#endif
 
 #if os(macOS)
 
@@ -688,9 +772,10 @@ final class NotebookTextView: NSTextView {
                 offsetBy: location
             ), let fragment = layoutManager.textLayoutFragment(for: start) else { continue }
 
-            // Half the spacing above the title, on a half pixel so a one point
-            // line lands on a device pixel instead of straddling two.
-            let y = (fragment.layoutFragmentFrame.minY + inset.height - 15).rounded() + 0.5
+            // Half the gap above the boundary line, on a half pixel so a one
+            // point line lands on a device pixel instead of straddling two.
+            let y = (fragment.layoutFragmentFrame.minY + inset.height - NotebookDocument.gap / 2)
+                .rounded() + 0.5
             guard y >= rect.minY - 20, y <= rect.maxY + 20 else { continue }
 
             let path = NSBezierPath()
@@ -705,6 +790,9 @@ final class NotebookTextView: NSTextView {
 
 struct FolderNotebookText: NSViewRepresentable {
     let core: FolderNotebookCore
+    /// Not read here: it changes when the core has a caret waiting to be
+    /// placed, which is what gets `updateNSView` called at all.
+    let focusRevision: Int
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -744,6 +832,11 @@ struct FolderNotebookText: NSViewRepresentable {
         if textView.textContentStorage?.textStorage !== core.document.storage {
             textView.textContentStorage?.textStorage = core.document.storage
         }
+        if let caret = core.takeFocusTarget() {
+            textView.setSelectedRange(caret)
+            textView.window?.makeFirstResponder(textView)
+            textView.scrollRangeToVisible(caret)
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -758,10 +851,7 @@ struct FolderNotebookText: NSViewRepresentable {
             shouldChangeTextIn affectedCharRange: NSRange,
             replacementString: String?
         ) -> Bool {
-            guard core.document.allowsEdit(
-                in: affectedCharRange,
-                replacement: replacementString ?? ""
-            ) else { return false }
+            guard core.document.allowsEdit(in: affectedCharRange) else { return false }
             core.willChange(in: affectedCharRange)
             return true
         }
@@ -772,9 +862,11 @@ struct FolderNotebookText: NSViewRepresentable {
 
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
+            let location = textView.selectedRange().location
+            core.caretMoved(to: location)
             textView.typingAttributes = core.document.typingAttributes(
                 from: textView.typingAttributes,
-                at: textView.selectedRange().location
+                at: location
             )
         }
     }
@@ -805,8 +897,9 @@ final class NotebookTextView: UITextView {
                 offsetBy: location
             ), let fragment = layoutManager.textLayoutFragment(for: start) else { continue }
 
-            let y = (fragment.layoutFragmentFrame.minY + textContainerInset.top - 15)
-                .rounded() + 0.5
+            let y = (
+                fragment.layoutFragmentFrame.minY + textContainerInset.top - NotebookDocument.gap / 2
+            ).rounded() + 0.5
             guard y >= rect.minY - 20, y <= rect.maxY + 20 else { continue }
             context.move(to: CGPoint(x: textContainerInset.left, y: y))
             context.addLine(to: CGPoint(x: bounds.width - textContainerInset.right, y: y))
@@ -817,6 +910,9 @@ final class NotebookTextView: UITextView {
 
 struct FolderNotebookText: UIViewRepresentable {
     let core: FolderNotebookCore
+    /// Not read here: it changes when the core has a caret waiting to be
+    /// placed, which is what gets `updateUIView` called at all.
+    let focusRevision: Int
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -854,6 +950,11 @@ struct FolderNotebookText: UIViewRepresentable {
 
     func updateUIView(_ textView: NotebookTextView, context: Context) {
         textView.document = core.document
+        if let caret = core.takeFocusTarget() {
+            textView.selectedRange = caret
+            textView.becomeFirstResponder()
+            textView.scrollRangeToVisible(caret)
+        }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
@@ -868,7 +969,7 @@ struct FolderNotebookText: UIViewRepresentable {
             shouldChangeTextIn range: NSRange,
             replacementText text: String
         ) -> Bool {
-            guard core.document.allowsEdit(in: range, replacement: text) else { return false }
+            guard core.document.allowsEdit(in: range) else { return false }
             core.willChange(in: range)
             return true
         }
@@ -879,9 +980,11 @@ struct FolderNotebookText: UIViewRepresentable {
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
+            let location = textView.selectedRange.location
+            core.caretMoved(to: location)
             textView.typingAttributes = core.document.typingAttributes(
                 from: textView.typingAttributes,
-                at: textView.selectedRange.location
+                at: location
             )
         }
     }

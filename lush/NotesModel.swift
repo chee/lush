@@ -2131,6 +2131,48 @@ final class NotesModel {
         childOrder[folderUrl] = urls.filter { node(for: $0)?.kind != "folder" }
     }
 
+    /// Reorders a folder's notes among themselves, leaving whatever else it
+    /// holds in the slots it already had. `moveChildren` takes the displayed
+    /// list to be the whole folder; the notebook shows only the notes, and
+    /// handing that list over would drop a script or a patchwork doc out of
+    /// the order entirely.
+    func moveNotes(in folderUrl: String, displayed: [String], from: IndexSet, to: Int) {
+        var moved = displayed
+        moved.move(fromOffsets: from, toOffset: to)
+        let shown = Set(displayed)
+        let children = orderedChildren(node(for: folderUrl)?.children ?? [], in: folderUrl)
+            .filter { $0.kind != "folder" }
+        var order: [String] = []
+        var index = 0
+        for child in children {
+            if shown.contains(child.url), index < moved.count {
+                order.append(moved[index])
+                index += 1
+            } else {
+                order.append(child.url)
+            }
+        }
+        childOrder[folderUrl] = order
+    }
+
+    /// Puts a note straight after another in its folder's order. Unlike
+    /// `reorderChild` it does not need the note to be in the tree yet: a note
+    /// is created before the walk that will find it has finished, and waiting
+    /// for that walk is what makes a new note appear at the bottom and then
+    /// jump.
+    func placeChild(_ url: String, after targetUrl: String, in folderUrl: String) {
+        var urls = orderedChildren(node(for: folderUrl)?.children ?? [], in: folderUrl)
+            .filter { $0.kind != "folder" }
+            .map(\.url)
+        urls.removeAll { $0 == url }
+        if let index = urls.firstIndex(of: targetUrl) {
+            urls.insert(url, at: index + 1)
+        } else {
+            urls.append(url)
+        }
+        childOrder[folderUrl] = urls
+    }
+
     func reorderChild(_ url: String, adjacentTo targetUrl: String, after: Bool) {
         guard url != targetUrl,
               let movingNode = node(for: url),

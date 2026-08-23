@@ -4,13 +4,14 @@ import XCTest
 
 /// A two-note notebook laid out as:
 ///
-///     0 ..< 5   title "Alpha"
-///     5         newline closing the title
-///     6 ..< 11  body "alpha"
-///     11        newline opening Beta's boundary
-///     12 ..< 16 title "Beta"
-///     16        newline closing the title
-///     17 ..< 21 body "beta"
+///     0 ..< 5   body "alpha"
+///     5         newline closing Alpha, opening Beta's boundary
+///     6         the boundary's own line, empty
+///     7 ..< 11  body "beta"
+///
+/// A note's name is its own first heading, which its content already carries,
+/// so nothing between two notes is text: the boundary is the room the rule is
+/// drawn in and nothing else.
 @MainActor
 final class FolderNotebookTests: XCTestCase {
     private let alpha = "automerge:alpha"
@@ -19,8 +20,8 @@ final class FolderNotebookTests: XCTestCase {
     private func makeDocument() -> NotebookDocument {
         let document = NotebookDocument()
         document.rebuild([
-            .init(url: alpha, title: "Alpha", body: body("alpha")),
-            .init(url: beta, title: "Beta", body: body("beta")),
+            .init(url: alpha, body: body("alpha")),
+            .init(url: beta, body: body("beta")),
         ])
         return document
     }
@@ -34,149 +35,120 @@ final class FolderNotebookTests: XCTestCase {
 
     // MARK: - Layout
 
-    func testConcatenatesTitlesAndBodiesInOrder() {
+    func testConcatenatesBodiesInOrder() {
         let document = makeDocument()
-        XCTAssertEqual(document.storage.string, "Alpha\nalpha\nBeta\nbeta")
+        XCTAssertEqual(document.storage.string, "alpha\n\nbeta")
         XCTAssertEqual(document.order, [alpha, beta])
+    }
+
+    /// The first of the folder's own notes starts the document: there is
+    /// nothing above it to be separated from.
+    func testTheFirstNoteOpensTheDocument() {
+        let document = NotebookDocument()
+        document.rebuild([.init(url: alpha, body: body("alpha"))])
+        XCTAssertEqual(document.storage.string, "alpha")
+        XCTAssertEqual(document.owner(at: 0), alpha)
     }
 
     func testEmptyNoteStillHasSomewhereToPutTheCaret() {
         let document = NotebookDocument()
-        document.rebuild([.init(url: alpha, title: "Alpha", body: NSAttributedString())])
-        XCTAssertEqual(document.note(forCaretAt: 6), alpha)
+        document.rebuild([.init(url: alpha, body: NSAttributedString())])
+        XCTAssertEqual(document.note(forCaretAt: 0), alpha)
     }
 
     // MARK: - Ownership
 
     func testBodyCharactersBelongToTheirNote() {
         let document = makeDocument()
-        XCTAssertEqual(document.owner(at: 6), alpha)
-        XCTAssertEqual(document.owner(at: 10), alpha)
-        XCTAssertEqual(document.owner(at: 17), beta)
-        XCTAssertEqual(document.owner(at: 20), beta)
+        XCTAssertEqual(document.owner(at: 0), alpha)
+        XCTAssertEqual(document.owner(at: 4), alpha)
+        XCTAssertEqual(document.owner(at: 7), beta)
+        XCTAssertEqual(document.owner(at: 10), beta)
     }
 
     func testStructureBelongsToNoNote() {
         let document = makeDocument()
-        for location in [0, 5, 11, 12, 16] {
+        for location in [5, 6] {
             XCTAssertNil(document.owner(at: location), "location \(location)")
             XCTAssertTrue(document.isBoundary(at: location), "location \(location)")
         }
-    }
-
-    func testTitleCharactersCarryTheirNote() {
-        let document = makeDocument()
-        XCTAssertEqual(document.titleOwner(at: 0), alpha)
-        XCTAssertEqual(document.titleOwner(at: 4), alpha)
-        XCTAssertEqual(document.titleOwner(at: 12), beta)
-        XCTAssertEqual(document.titleOwner(at: 15), beta)
-        XCTAssertNil(document.titleOwner(at: 5))
-        XCTAssertNil(document.titleOwner(at: 6))
     }
 
     /// A caret at the head of a note sits just past a boundary, where looking
     /// backwards alone would answer with the note above it.
     func testCaretAtTheHeadOfANoteWritesIntoThatNote() {
         let document = makeDocument()
-        XCTAssertEqual(document.note(forCaretAt: 6), alpha)
-        XCTAssertEqual(document.note(forCaretAt: 17), beta)
+        XCTAssertEqual(document.note(forCaretAt: 0), alpha)
+        XCTAssertEqual(document.note(forCaretAt: 7), beta)
     }
 
     /// Typing at the very end of a note appends to it rather than falling into
     /// the boundary that follows.
     func testCaretAtTheTailOfANoteWritesIntoThatNote() {
         let document = makeDocument()
-        XCTAssertEqual(document.note(forCaretAt: 11), alpha)
-        XCTAssertEqual(document.note(forCaretAt: 21), beta)
+        XCTAssertEqual(document.note(forCaretAt: 5), alpha)
+        XCTAssertEqual(document.note(forCaretAt: 11), beta)
     }
 
-    func testCaretInATitleEditsThatTitle() {
+    func testCaretInTheGapBetweenTwoNotesBelongsToNeither() {
         let document = makeDocument()
-        XCTAssertEqual(document.title(forCaretAt: 0), alpha)
-        XCTAssertEqual(document.title(forCaretAt: 5), alpha)
-        XCTAssertEqual(document.title(forCaretAt: 12), beta)
-        XCTAssertEqual(document.title(forCaretAt: 16), beta)
-        XCTAssertNil(document.title(forCaretAt: 8))
+        XCTAssertNil(document.note(forCaretAt: 6))
     }
 
     // MARK: - Edit rules
 
     func testTypingInsideABodyIsAllowed() {
         let document = makeDocument()
-        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 8, length: 0), replacement: "x"))
-        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 6, length: 5), replacement: "new"))
+        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 2, length: 0)))
+        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 0, length: 5)))
     }
 
     func testAnEditMayNotSpanTwoNotes() {
         let document = makeDocument()
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 6, length: 15), replacement: ""))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 0, length: 11)))
     }
 
     func testAnEditMayNotTouchABoundary() {
         let document = makeDocument()
-        // The newline that closes Alpha's title.
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 5, length: 1), replacement: ""))
-        // The newline that opens Beta's boundary.
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 11, length: 1), replacement: ""))
+        // The newline that closes Alpha.
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 5, length: 1)))
+        // The boundary's own line.
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 6, length: 1)))
     }
 
     /// The case the hard boundary exists for: backspace at the top of a note
     /// must not swallow the note above it.
     func testBackspaceAtTheTopOfANoteIsRefused() {
         let document = makeDocument()
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 16, length: 1), replacement: ""))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 6, length: 1)))
     }
 
-    func testTypingInsideATitleIsAllowed() {
+    func testTypingInTheGapIsRefused() {
         let document = makeDocument()
-        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 2, length: 0), replacement: "x"))
-        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 0, length: 2), replacement: ""))
-    }
-
-    func testATitleIsOneLine() {
-        let document = makeDocument()
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 2, length: 0), replacement: "\n"))
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 0, length: 5), replacement: "a\nb"))
-    }
-
-    /// Retyping a whole title is ordinary; emptying one would leave nowhere to
-    /// put the caret and no way to name the note again.
-    func testAWholeTitleMayBeRetypedButNotDeleted() {
-        let document = makeDocument()
-        let whole = NSRange(location: 0, length: 5)
-        XCTAssertTrue(document.allowsEdit(in: whole, replacement: "Renamed"))
-        XCTAssertFalse(document.allowsEdit(in: whole, replacement: ""))
-    }
-
-    func testAnEditMayNotSpanATitleAndItsBody() {
-        let document = makeDocument()
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 3, length: 5), replacement: ""))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 6, length: 0)))
     }
 
     // MARK: - Typing attributes
 
     func testTypingAtTheTailOfANoteStaysWithThatNote() {
         let document = makeDocument()
-        let attributes = document.typingAttributes(from: [:], at: 11)
+        let attributes = document.typingAttributes(from: [:], at: 5)
         XCTAssertEqual(attributes[notebookNote] as? String, alpha)
-        XCTAssertNil(attributes[notebookTitle])
     }
 
-    func testTypingAtTheHeadOfATitleStaysInTheTitle() {
+    func testTypingAtTheHeadOfANoteStaysWithThatNote() {
         let document = makeDocument()
-        let attributes = document.typingAttributes(from: [:], at: 12)
-        XCTAssertEqual(attributes[notebookTitle] as? String, beta)
-        XCTAssertNil(attributes[notebookNote])
+        let attributes = document.typingAttributes(from: [:], at: 7)
+        XCTAssertEqual(attributes[notebookNote] as? String, beta)
     }
 
-    /// Moving from a title into a body has to clear the title stamp, or the
-    /// body text would be saved as part of the note's name.
-    func testMovingOutOfATitleClearsTheTitleStamp() {
+    /// Text typed just past a boundary inherits the boundary's stamp, which
+    /// has to come off or `bodies()` would drop it on the floor.
+    func testTypingClearsTheBoundaryStamp() {
         let document = makeDocument()
-        let inTitle = document.typingAttributes(from: [:], at: 12)
-        let inBody = document.typingAttributes(from: inTitle, at: 18)
-        XCTAssertNil(inBody[notebookTitle])
-        XCTAssertEqual(inBody[notebookNote] as? String, beta)
+        let attributes = document.typingAttributes(from: [notebookBoundary: true], at: 7)
+        XCTAssertNil(attributes[notebookBoundary])
+        XCTAssertEqual(attributes[notebookNote] as? String, beta)
     }
 
     // MARK: - Reading back
@@ -188,38 +160,21 @@ final class FolderNotebookTests: XCTestCase {
         XCTAssertEqual(bodies[beta]?.string, "beta")
     }
 
-    /// Neither the title nor the newlines around it may reach a note's slice —
-    /// a trailing newline there would save an empty paragraph onto every note.
-    func testBodiesExcludeTitlesAndStructure() {
+    /// None of the structure may reach a note's slice — a trailing newline
+    /// there would save an empty paragraph onto every note.
+    func testBodiesExcludeStructure() {
         let document = makeDocument()
         for text in document.bodies().values {
             XCTAssertFalse(text.string.contains("\n"))
-            XCTAssertFalse(text.string.contains("Alpha"))
-            XCTAssertFalse(text.string.contains("Beta"))
         }
-    }
-
-    func testTitlesReadBackFromTheirRuns() {
-        let document = makeDocument()
-        XCTAssertEqual(document.titles(), [alpha: "Alpha", beta: "Beta"])
-    }
-
-    /// The whole rename path in miniature: the caret stamps what it is typing
-    /// into, and the title reads back with the new text in it.
-    func testTextTypedIntoATitleBecomesPartOfTheName() {
-        let document = makeDocument()
-        let attributes = document.typingAttributes(from: [:], at: 5)
-        document.storage.insert(NSAttributedString(string: "!", attributes: attributes), at: 5)
-        XCTAssertEqual(document.titles()[alpha], "Alpha!")
-        XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
     }
 
     /// The counterpart, and the property the whole ownership scheme exists
     /// for: typing at a note's tail extends that note, not the one below it.
     func testTextTypedAtTheTailOfANoteBecomesPartOfIt() {
         let document = makeDocument()
-        let attributes = document.typingAttributes(from: [:], at: 11)
-        document.storage.insert(NSAttributedString(string: "!", attributes: attributes), at: 11)
+        let attributes = document.typingAttributes(from: [:], at: 5)
+        document.storage.insert(NSAttributedString(string: "!", attributes: attributes), at: 5)
         XCTAssertEqual(document.bodies()[alpha]?.string, "alpha!")
         XCTAssertEqual(document.bodies()[beta]?.string, "beta")
     }
@@ -228,17 +183,14 @@ final class FolderNotebookTests: XCTestCase {
 
     func testAnEditKnowsWhichNoteItIsIn() {
         let document = makeDocument()
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 8, length: 0))?.url, alpha)
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 18, length: 2))?.url, beta)
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 11, length: 0))?.url, alpha)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 2, length: 0)), alpha)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 8, length: 2)), beta)
+        XCTAssertEqual(document.target(forEditIn: NSRange(location: 5, length: 0)), alpha)
     }
 
-    func testAnEditInATitleIsMarkedAsOne() {
+    func testAnEditInTheGapBelongsToNoNote() {
         let document = makeDocument()
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 2, length: 0))?.isTitle, true)
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 12, length: 3))?.url, beta)
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 12, length: 3))?.isTitle, true)
-        XCTAssertEqual(document.target(forEditIn: NSRange(location: 8, length: 0))?.isTitle, false)
+        XCTAssertNil(document.target(forEditIn: NSRange(location: 6, length: 0)))
     }
 
     // MARK: - Claiming
@@ -247,15 +199,11 @@ final class FolderNotebookTests: XCTestCase {
     /// as part of no note until it is claimed.
     func testUnstampedTextIsClaimedByTheNoteItLandedIn() {
         let document = makeDocument()
-        let target = document.target(forEditIn: NSRange(location: 8, length: 0))
-        document.storage.insert(NSAttributedString(string: "XY"), at: 8)
+        let target = document.target(forEditIn: NSRange(location: 2, length: 0))
+        document.storage.insert(NSAttributedString(string: "XY"), at: 2)
         XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
 
-        document.claim(
-            NSRange(location: 8, length: 2),
-            for: target!.url,
-            asTitle: target!.isTitle
-        )
+        document.claim(NSRange(location: 2, length: 2), for: target!)
         XCTAssertEqual(document.bodies()[alpha]?.string, "alXYpha")
     }
 
@@ -263,31 +211,25 @@ final class FolderNotebookTests: XCTestCase {
     /// so without claiming it saves into the note it came from.
     func testTextCarryingAnotherNotesStampIsReclaimed() {
         let document = makeDocument()
-        let stolen = document.storage.attributedSubstring(from: NSRange(location: 6, length: 5))
-        let target = document.target(forEditIn: NSRange(location: 21, length: 0))
-        document.storage.insert(stolen, at: 21)
+        let stolen = document.storage.attributedSubstring(from: NSRange(location: 0, length: 5))
+        let target = document.target(forEditIn: NSRange(location: 11, length: 0))
+        document.storage.insert(stolen, at: 11)
         XCTAssertEqual(document.bodies()[alpha]?.string, "alphaalpha")
 
-        document.claim(
-            NSRange(location: 21, length: stolen.length),
-            for: target!.url,
-            asTitle: target!.isTitle
-        )
+        document.claim(NSRange(location: 11, length: stolen.length), for: target!)
         XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
         XCTAssertEqual(document.bodies()[beta]?.string, "betaalpha")
     }
 
-    func testTextClaimedByATitleBecomesPartOfTheName() {
+    // MARK: - Where the caret goes
+
+    /// Adding a note puts the caret at the end of it, which for a note with
+    /// nothing in it yet is the only place there is.
+    func testANotesRangeIsAllOfItAndNoneOfTheStructure() {
         let document = makeDocument()
-        let target = document.target(forEditIn: NSRange(location: 5, length: 0))
-        document.storage.insert(NSAttributedString(string: "!"), at: 5)
-        document.claim(
-            NSRange(location: 5, length: 1),
-            for: target!.url,
-            asTitle: target!.isTitle
-        )
-        XCTAssertEqual(document.titles()[alpha], "Alpha!")
-        XCTAssertEqual(document.bodies()[alpha]?.string, "alpha")
+        XCTAssertEqual(document.range(of: alpha), NSRange(location: 0, length: 5))
+        XCTAssertEqual(document.range(of: beta), NSRange(location: 7, length: 4))
+        XCTAssertNil(document.range(of: "automerge:missing"))
     }
 
     // MARK: - Notes found in subfolders
@@ -295,60 +237,48 @@ final class FolderNotebookTests: XCTestCase {
     /// The layout a nested note gets, and the offsets the rest of these turn
     /// on:
     ///
-    ///     0 ..< 7   path "Trip / "
-    ///     7 ..< 12  title "Ferry"
-    ///     12        newline closing the title
-    ///     13 ..< 18 body "waves"
+    ///     0 ..< 4   path "Trip"
+    ///     4         newline closing it
+    ///     5 ..< 10  body "waves"
     private func makeNested() -> NotebookDocument {
         let document = NotebookDocument()
-        document.rebuild([
-            .init(url: alpha, title: "Ferry", path: "Trip", body: body("waves")),
-        ])
+        document.rebuild([.init(url: alpha, path: "Trip", body: body("waves"))])
         return document
     }
 
-    func testTheFolderPathIsDrawnAheadOfTheTitle() {
+    func testTheFolderPathIsDrawnAboveTheNote() {
         let document = makeNested()
-        XCTAssertEqual(document.storage.string, "Trip / Ferry\nwaves")
+        XCTAssertEqual(document.storage.string, "Trip\nwaves")
     }
 
     /// The path says where the note is, not what it is called, so it must not
-    /// reach the name — a rename would otherwise write the folder into it.
-    func testTheFolderPathIsNotPartOfTheName() {
+    /// reach the note's own text.
+    func testTheFolderPathIsNotPartOfTheNote() {
         let document = makeNested()
-        XCTAssertEqual(document.titles(), [alpha: "Ferry"])
         XCTAssertEqual(document.bodies()[alpha]?.string, "waves")
     }
 
     func testTheFolderPathBelongsToNoNote() {
         let document = makeNested()
-        for location in 0..<7 {
+        for location in 0..<5 {
             XCTAssertNil(document.owner(at: location), "location \(location)")
-            XCTAssertNil(document.titleOwner(at: location), "location \(location)")
             XCTAssertTrue(document.isBoundary(at: location), "location \(location)")
         }
     }
 
     func testTheFolderPathCannotBeTypedIn() {
         let document = makeNested()
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 2, length: 0), replacement: "x"))
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 0, length: 4), replacement: ""))
-        // and an edit may not reach out of the title into it
-        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 5, length: 4), replacement: ""))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 2, length: 0)))
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 0, length: 4)))
+        // and an edit may not reach out of the note into it
+        XCTAssertFalse(document.allowsEdit(in: NSRange(location: 4, length: 3)))
     }
 
-    func testTheTitleAfterAPathIsStillEditable() {
-        let document = makeNested()
-        XCTAssertTrue(document.allowsEdit(in: NSRange(location: 9, length: 0), replacement: "x"))
-        XCTAssertEqual(document.title(forCaretAt: 7), alpha)
-        XCTAssertEqual(document.title(forCaretAt: 12), alpha)
-    }
-
-    /// A folder's own notes carry no path and are laid out exactly as before.
+    /// A folder's own notes carry no path and open the document directly.
     func testANoteInTheFolderItselfGetsNoPath() {
         let document = NotebookDocument()
-        document.rebuild([.init(url: alpha, title: "Alpha", body: body("alpha"))])
-        XCTAssertEqual(document.storage.string, "Alpha\nalpha")
+        document.rebuild([.init(url: alpha, body: body("alpha"))])
+        XCTAssertEqual(document.storage.string, "alpha")
     }
 
     // MARK: - Separators
@@ -357,24 +287,31 @@ final class FolderNotebookTests: XCTestCase {
     /// nothing to be separated from.
     func testSeparatorSitsBetweenNotesOnly() {
         let document = makeDocument()
-        XCTAssertEqual(document.separatorLocations(), [12])
+        XCTAssertEqual(document.separatorLocations(), [6])
     }
 
-    /// The rule goes above the whole boundary line, path and all — drawn at
-    /// the title it would cut underneath the path.
+    /// The rule goes above the whole boundary line, path and all — drawn under
+    /// the path it would cut the note away from where it is kept.
     func testTheSeamSitsAboveTheFolderPath() {
         let document = NotebookDocument()
         document.rebuild([
-            .init(url: alpha, title: "Alpha", body: body("alpha")),
-            .init(url: beta, title: "Ferry", path: "Trip", body: body("waves")),
+            .init(url: alpha, body: body("alpha")),
+            .init(url: beta, path: "Trip", body: body("waves")),
         ])
-        XCTAssertEqual(document.storage.string, "Alpha\nalpha\nTrip / Ferry\nwaves")
-        XCTAssertEqual(document.separatorLocations(), [12])
+        XCTAssertEqual(document.storage.string, "alpha\nTrip\nwaves")
+        XCTAssertEqual(document.separatorLocations(), [6])
     }
 
     func testSingleNoteHasNoSeparator() {
         let document = NotebookDocument()
-        document.rebuild([.init(url: alpha, title: "Alpha", body: body("alpha"))])
+        document.rebuild([.init(url: alpha, body: body("alpha"))])
+        XCTAssertTrue(document.separatorLocations().isEmpty)
+    }
+
+    /// A nested note at the top of the notebook still draws its path, and
+    /// still gets no rule above it.
+    func testANestedFirstNoteHasNoSeparator() {
+        let document = makeNested()
         XCTAssertTrue(document.separatorLocations().isEmpty)
     }
 }
