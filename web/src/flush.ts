@@ -39,14 +39,22 @@ export async function flushToServer(
   if (pending().length === 0) return true;
   const nudged = new Set<string>();
   let wake = () => {};
-  const onHeads = () => wake();
+  // Latched so an announcement landing between waits isn't lost to the gap.
+  let signalled = false;
+  const onHeads = () => {
+    signalled = true;
+    wake();
+  };
   repo.on("subduction-remote-heads", onHeads);
   try {
     while (Date.now() < deadline) {
-      await new Promise<void>((resolve) => {
-        wake = resolve;
-        setTimeout(resolve, 100);
-      });
+      if (!signalled) {
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+          setTimeout(resolve, 100);
+        });
+      }
+      signalled = false;
       const rest = pending();
       if (rest.length === 0) return true;
       if (deadline - Date.now() < timeoutMs / 2) {

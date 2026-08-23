@@ -272,6 +272,7 @@ final class NotesModel {
     /// must not re-read the whole tree; docChanged drops the entries it stales.
     @ObservationIgnored private var metaFetched: Set<String> = []
     @ObservationIgnored private var contextMetaLoading: Set<String> = []
+    @ObservationIgnored private var sharedIntakeDrain: Task<Void, Never>?
     @ObservationIgnored private var prefetchedUrls: Set<String> = []
     @ObservationIgnored private var visionBackfillTask: Task<Void, Never>?
     @ObservationIgnored private var visionBackfillToken = UUID()
@@ -2080,6 +2081,9 @@ final class NotesModel {
         }
         focus.forgetDocument(url)
         CalendarLinks.set([], for: url)
+        // The transcript holds the note's own text and drafted spans; nothing
+        // else ever removes it once the note is gone.
+        NoteChatStore.clear(for: url)
         if selectedNoteUrl == url { selectedNoteUrl = nil }
     }
 
@@ -3722,7 +3726,7 @@ final class NotesModel {
                 case .file(let url):
                     if textFilesAsNotes, Self.canImportAsNote(url) {
                         let operationKey = "file-note:\(index)"
-                        importedUrls.append(try importFileAsNote(
+                        importedUrls.append(try await importFileAsNote(
                             url,
                             core: core,
                             folderUrl: nil,
@@ -3792,7 +3796,28 @@ final class NotesModel {
         spans.append(.text(text, [:]))
     }
 
+    /// Launch, both scene-phase handlers, the `lush://share` route and the
+    /// maintenance loop all call this, and on a cold-start share they overlap.
+    /// Two passes over the same entry import it twice and delete the intake
+    /// directory out from under each other, so only one runs at a time. A
+    /// request that lands mid-drain waits and then takes its own pass: the
+    /// running one may already be past the entry that request is about.
     func drainSharedIntake() async {
+        while let running = sharedIntakeDrain {
+            await running.value
+            if sharedIntakeDrain == running {
+                sharedIntakeDrain = nil
+            }
+        }
+        let drain = Task { await self.performSharedIntakeDrain() }
+        sharedIntakeDrain = drain
+        await drain.value
+        if sharedIntakeDrain == drain {
+            sharedIntakeDrain = nil
+        }
+    }
+
+    private func performSharedIntakeDrain() async {
         if core == nil {
             await start()
         }
@@ -3806,6 +3831,7 @@ final class NotesModel {
         )) ?? []
         for entry in entries {
             guard FileManager.default.fileExists(atPath: entry.appendingPathComponent("payload.json").path) else {
+                collectOrphanedIntake(entry)
                 continue
             }
             guard let content = IncomingContent.sharedHandoff(id: entry.lastPathComponent) else {
@@ -3816,6 +3842,18 @@ final class NotesModel {
                 content.cleanupHandoff()
             }
         }
+    }
+
+    /// An extension killed mid-copy leaves a directory with no `payload.json`,
+    /// and the drain has no way to import one — it would sit in the app group
+    /// forever. The payload is written last, so a young directory is a share
+    /// still in flight rather than an orphan; only old ones get swept.
+    private func collectOrphanedIntake(_ entry: URL) {
+        guard let values = try? entry.resourceValues(forKeys: [.creationDateKey]),
+              let created = values.creationDate,
+              Date().timeIntervalSince(created) > 3600
+        else { return }
+        try? FileManager.default.removeItem(at: entry)
     }
 
     @discardableResult
@@ -3837,7 +3875,7 @@ final class NotesModel {
                 do {
                     if textFilesAsNotes, Self.canImportAsNote(url) {
                         let operationKey = "file-note:\(index)"
-                        importedUrls.append(try importFileAsNote(
+                        importedUrls.append(try await importFileAsNote(
                             url,
                             core: core,
                             folderUrl: target,
@@ -3955,7 +3993,7 @@ final class NotesModel {
         for url in urls {
             do {
                 if asNotes, Self.canImportAsNote(url) {
-                    imported.append(try importFileAsNote(url, core: core, folderUrl: target))
+                    imported.append(try await importFileAsNote(url, core: core, folderUrl: target))
                 } else {
                     imported += try await importFileEntries(from: url, core: core, folderUrl: target)
                 }
@@ -3977,11 +4015,11 @@ final class NotesModel {
         folderUrl: String?,
         existingUrl: String? = nil,
         didCreate: ((String) -> Bool)? = nil
-    ) throws -> String {
+    ) async throws -> String {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let title = url.deletingPathExtension().lastPathComponent
-        let spans = Self.noteSpans(fromFile: url)
+        let spans = await Self.noteSpans(fromFile: url)
         let noteUrl: String
         if let existingUrl {
             noteUrl = existingUrl
@@ -3990,22 +4028,34 @@ final class NotesModel {
             // which is the folder `createNote` links it to.
             let atTop = newNoteAtTop(in: folderUrl ?? self.folderUrl)
             if let folderUrl {
-                noteUrl = try core.createNoteIn(folderUrl: folderUrl, title: title, atTop: atTop)
+                noteUrl = try await Task.detached {
+                    try core.createNoteIn(folderUrl: folderUrl, title: title, atTop: atTop)
+                }.value
             } else {
-                noteUrl = try core.createNote(title: title, atTop: atTop)
+                noteUrl = try await Task.detached {
+                    try core.createNote(title: title, atTop: atTop)
+                }.value
             }
             guard didCreate?(noteUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
         if !spans.isEmpty {
-            _ = try? core.updateNoteSpans(url: noteUrl, spansJson: SpanNode.encodeList(spans), heads: nil)
+            let json = SpanNode.encodeList(spans)
+            await Task.detached {
+                _ = try? core.updateNoteSpans(url: noteUrl, spansJson: json, heads: nil)
+            }.value
         }
         return noteUrl
     }
 
-    static func noteSpans(fromFile url: URL) -> [SpanNode] {
+    /// The bytes come off the main actor; the parse cannot follow them —
+    /// `RichTextClipboard` is `@MainActor` because it goes through
+    /// `NSAttributedString`.
+    static func noteSpans(fromFile url: URL) async -> [SpanNode] {
+        let bytes = try? await Task.detached { try Data(contentsOf: url) }.value
+        guard let data = bytes else { return [] }
         if url.pathExtension.lowercased() == "rtf" {
             guard let attributed = try? NSAttributedString(
-                url: url,
+                data: data,
                 options: [.documentType: NSAttributedString.DocumentType.rtf],
                 documentAttributes: nil
             ),
@@ -4017,7 +4067,7 @@ final class NotesModel {
             else { return [] }
             return RichTextClipboard.spans(fromHTML: text)
         }
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
         return RichTextClipboard.spans(fromMarkdown: text)
     }
 
@@ -4081,16 +4131,21 @@ final class NotesModel {
     ) async throws -> String {
         let ext = url.pathExtension.lowercased()
         let name = displayName.isEmpty ? url.lastPathComponent : displayName
+        let fileExtension = ext.isEmpty ? "bin" : ext
+        let mime = mimeType(for: ext)
         if let folderUrl {
             if let existingUrl { return existingUrl }
-            let data = try Data(contentsOf: url)
-            let assetUrl = try core.createAssetIn(
-                folderUrl: folderUrl,
-                name: name,
-                extension: ext.isEmpty ? "bin" : ext,
-                mimeType: mimeType(for: ext),
-                data: data
-            )
+            let assetUrl = try await Task.detached {
+                [core, url, folderUrl, name, fileExtension, mime] () -> String in
+                let data = try Data(contentsOf: url)
+                return try core.createAssetIn(
+                    folderUrl: folderUrl,
+                    name: name,
+                    extension: fileExtension,
+                    mimeType: mime,
+                    data: data
+                )
+            }.value
             guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
             return assetUrl
         }
@@ -4098,13 +4153,16 @@ final class NotesModel {
         if let existingUrl {
             assetUrl = existingUrl
         } else {
-            let data = try Data(contentsOf: url)
-            assetUrl = try core.createAsset(
-                name: name,
-                extension: ext.isEmpty ? "bin" : ext,
-                mimeType: mimeType(for: ext),
-                data: data
-            )
+            assetUrl = try await Task.detached {
+                [core, url, name, fileExtension, mime] () -> String in
+                let data = try Data(contentsOf: url)
+                return try core.createAsset(
+                    name: name,
+                    extension: fileExtension,
+                    mimeType: mime,
+                    data: data
+                )
+            }.value
             guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
         try await core.linkNoteToFolder(

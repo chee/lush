@@ -12,7 +12,12 @@ import { toBase64 } from "./bytes";
 
 const RESOLVE_TIMEOUT_MS = 20_000;
 
-type ResolveResult = { status: number; mimeType: string; base64: string };
+type ResolveResult = {
+  status: number;
+  mimeType: string;
+  base64: string;
+  immutable: boolean;
+};
 type CacheEntry = { mimeType: string; bytes: Uint8Array };
 
 function text(status: number, message: string): ResolveResult {
@@ -20,6 +25,7 @@ function text(status: number, message: string): ResolveResult {
     status,
     mimeType: "text/plain",
     base64: toBase64(new TextEncoder().encode(message)),
+    immutable: false,
   };
 }
 
@@ -122,13 +128,21 @@ function cachePut(key: string, entry: CacheEntry): void {
     .catch(() => {});
 }
 
+function urlPinned(url: AutomergeUrl): boolean {
+  try {
+    const { heads } = parseAutomergeUrl(url);
+    return !!heads && heads.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 // Head-pinned URLs are content-addressed — safe to cache indefinitely.
 export function isPinned(raw: string): boolean {
   try {
     const url = decodeURIComponent(raw.split("/")[0]) as AutomergeUrl;
     if (!isValidAutomergeUrl(url)) return false;
-    const { heads } = parseAutomergeUrl(url);
-    return !!heads && heads.length > 0;
+    return urlPinned(url);
   } catch {
     return false;
   }
@@ -161,6 +175,7 @@ export function installResolver(repo: Repo) {
             status: 200,
             mimeType: cached.mimeType,
             base64: toBase64(cached.bytes),
+            immutable: true,
           };
         }
       }
@@ -182,9 +197,14 @@ export function installResolver(repo: Repo) {
         );
       }
 
+      // A pinned folder can still link to headless children, whose bytes move
+      // under us — the whole followed chain has to be pinned to be cacheable.
+      let immutable = pinned;
       const resolvingRepo = {
-        find: (url: AutomergeUrl) =>
-          repo.find(url, { signal: controller.signal }),
+        find: (url: AutomergeUrl) => {
+          if (!urlPinned(url)) immutable = false;
+          return repo.find(url, { signal: controller.signal });
+        },
       } as unknown as Repo;
       const resolved = await resolvePath(
         resolvingRepo,
@@ -203,11 +223,16 @@ export function installResolver(repo: Repo) {
           ? resolved.content
           : new TextEncoder().encode(String(resolved.content));
 
-      if (pinned) {
+      if (immutable) {
         cachePut(raw, { mimeType: resolved.type, bytes });
       }
 
-      return { status: 200, mimeType: resolved.type, base64: toBase64(bytes) };
+      return {
+        status: 200,
+        mimeType: resolved.type,
+        base64: toBase64(bytes),
+        immutable,
+      };
     } catch (error) {
       if (controller.signal.aborted) {
         return text(

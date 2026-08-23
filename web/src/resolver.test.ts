@@ -214,6 +214,64 @@ describe("resolver", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  test("won't call a chain through a headless link immutable", async () => {
+    vi.mocked(hasHeads).mockReturnValue(true);
+    const child = generateAutomergeUrl();
+    const handle = { doc: () => ({}), view: () => ({}) };
+    const find = vi.fn().mockResolvedValue(handle);
+    vi.mocked(resolvePath).mockImplementation(async (repo) => {
+      await repo.find(child);
+      return { type: "text/plain", content: "child bytes" } as never;
+    });
+    installResolver({ find } as never);
+
+    const result = await window.__patchworkResolve!(
+      `${encodeURIComponent(pinnedUrl())}/child`,
+    );
+
+    expect(result.status).toBe(200);
+    expect(textOf(result)).toBe("child bytes");
+    expect(result.immutable).toBe(false);
+  });
+
+  test("keeps a fully head-pinned chain immutable", async () => {
+    vi.mocked(hasHeads).mockReturnValue(true);
+    const child = pinnedUrl();
+    const handle = { doc: () => ({}), view: () => ({}) };
+    const find = vi.fn().mockResolvedValue(handle);
+    vi.mocked(resolvePath).mockImplementation(async (repo) => {
+      await repo.find(child);
+      return { type: "text/plain", content: "child bytes" } as never;
+    });
+    installResolver({ find } as never);
+
+    const result = await window.__patchworkResolve!(
+      `${encodeURIComponent(pinnedUrl())}/child`,
+    );
+
+    expect(result.status).toBe(200);
+    expect(result.immutable).toBe(true);
+  });
+
+  test("never calls a headless base document immutable", async () => {
+    const handle = {
+      heads: () => ["02".repeat(32)],
+      view: vi.fn(() => ({ value: true })),
+    };
+    vi.mocked(resolvePath).mockResolvedValue({
+      type: "text/plain",
+      content: "resolved",
+    } as never);
+    installResolver({ find: vi.fn().mockResolvedValue(handle) } as never);
+
+    const result = await window.__patchworkResolve!(
+      encodeURIComponent(generateAutomergeUrl()),
+    );
+
+    expect(result.status).toBe(200);
+    expect(result.immutable).toBe(false);
+  });
+
   test("recovers from a blocked cache open and an aborted read", async () => {
     vi.mocked(hasHeads).mockReturnValue(true);
     vi.mocked(resolvePath).mockResolvedValue(undefined);

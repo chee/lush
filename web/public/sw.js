@@ -1,7 +1,7 @@
 const HANDOFF_CACHE = "patchwork-handoff-v3";
 const EXTERNAL_CACHE = "patchwork-external-v1";
 const ACTIVE_CACHES = new Set([HANDOFF_CACHE, EXTERNAL_CACHE]);
-const CACHEABLE_STATUSES = [0, 200, 203, 204];
+const CACHEABLE_STATUSES = [200, 203, 204];
 const NULL_BODY_STATUSES = new Set([204, 205, 304]);
 const EXTERNAL_CACHE_LIMIT = 128;
 const HANDOFF_CHANNEL = "@patchwork/handoff";
@@ -165,7 +165,9 @@ async function serveExternal(request) {
     }
     return response;
   } catch {
-    return cached ?? Response.error();
+    // An opaque response hides the origin's status, so a cached error page is
+    // indistinguishable from content — never serve one as the real thing.
+    return cached && cached.status !== 0 ? cached : Response.error();
   }
 }
 
