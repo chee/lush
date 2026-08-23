@@ -70,7 +70,7 @@ struct FolderDetail: View {
         Group {
             switch mode {
             case .notebook:
-                FolderNotebook(children: children)
+                FolderNotebook(folderUrl: folderUrl)
             case .sketchpad:
                 FolderSketchpad(children: children, open: open)
             case .outline:

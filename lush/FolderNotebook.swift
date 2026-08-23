@@ -32,6 +32,10 @@ final class NotebookDocument {
     struct Section {
         let url: String
         let title: String
+        /// The subfolders the note was found under, empty for the folder's
+        /// own. Drawn ahead of the title and owned by nobody: it is where the
+        /// note is, not what it is called.
+        var path: String = ""
         let body: NSAttributedString
     }
 
@@ -43,6 +47,14 @@ final class NotebookDocument {
         .secondaryLabelColor
         #else
         .secondaryLabel
+        #endif
+    }
+
+    private var pathColor: PColor {
+        #if os(macOS)
+        .tertiaryLabelColor
+        #else
+        .tertiaryLabel
         #endif
     }
 
@@ -65,6 +77,7 @@ final class NotebookDocument {
             )
             built.append(boundary(
                 titled: section.title,
+                under: section.path,
                 url: section.url,
                 first: urls.isEmpty
             ))
@@ -79,7 +92,12 @@ final class NotebookDocument {
     /// It closes that note's last paragraph so the title does not land on the
     /// same line, while keeping it out of the note's own slice — a trailing
     /// newline inside the slice would save an empty paragraph onto every note.
-    private func boundary(titled title: String, url: String, first: Bool) -> NSAttributedString {
+    private func boundary(
+        titled title: String,
+        under path: String,
+        url: String,
+        first: Bool
+    ) -> NSAttributedString {
         var attributes = RichText.attributes(block: .heading(level: 2), marks: [:])
         attributes[notebookBoundary] = true
         attributes[.foregroundColor] = boundaryColor
@@ -93,6 +111,14 @@ final class NotebookDocument {
         let line = NSMutableAttributedString()
         if !first {
             line.append(NSAttributedString(string: "\n", attributes: attributes))
+        }
+        // Structure rather than a name. It carries no `notebookTitle`, so the
+        // edit rules refuse it and the rename pass walks past it — typing here
+        // would otherwise rename the note to the folder it is sitting in.
+        if !path.isEmpty {
+            var pathAttributes = attributes
+            pathAttributes[.foregroundColor] = pathColor
+            line.append(NSAttributedString(string: path + " / ", attributes: pathAttributes))
         }
         var titleAttributes = attributes
         titleAttributes[notebookTitle] = url
@@ -150,15 +176,24 @@ final class NotebookDocument {
     }
 
     /// Where the text view draws a rule between two notes: the head of every
-    /// title but the first, which has nothing above it to be separated from.
+    /// boundary but the first, which has nothing above it to be separated
+    /// from. One past the newline that opens it — that newline closes the line
+    /// above, and the rule belongs over the line below.
+    ///
+    /// Anchored to the boundary rather than to the title, which is no longer
+    /// the first thing on the line: a note found in a subfolder puts the path
+    /// there, and a rule drawn at the title would cut underneath it.
     func separatorLocations() -> [Int] {
         var locations: [Int] = []
+        let string = storage.string as NSString
         storage.enumerateAttribute(
-            notebookTitle,
+            notebookBoundary,
             in: NSRange(location: 0, length: storage.length)
         ) { value, range, _ in
-            guard value != nil, range.location > 0 else { return }
-            locations.append(range.location)
+            guard value != nil, range.location > 0,
+                  string.character(at: range.location) == 0x0A
+            else { return }
+            locations.append(range.location + 1)
         }
         return locations
     }
@@ -297,6 +332,55 @@ final class NotebookDocument {
     }
 }
 
+/// A note the notebook is going to read, and where under the folder it was
+/// found.
+struct NotebookEntry: Equatable, Identifiable {
+    let node: FolderNode
+    /// The subfolders between the notebook's folder and this note, empty for
+    /// the folder's own notes.
+    let path: String
+
+    /// Where the note is as well as which one it is. Moving a note between
+    /// subfolders changes what the notebook draws without changing the set of
+    /// urls in it, and an identity of urls alone would miss that.
+    var id: String { "\(path)/\(node.url)" }
+}
+
+/// Every note under a folder, depth first, in the order the sidebar draws
+/// them — subfolders first, then the folder's own notes, which is what
+/// `orderedChildren` returns at each level.
+///
+/// A folder that keeps its notes in subfolders is a folder full of notes.
+/// Reading only the direct children made the notebook say such a folder was
+/// empty, which is the one thing it certainly wasn't.
+@MainActor
+func notebookEntries(of folderUrl: String, in model: NotesModel) -> [NotebookEntry] {
+    func walk(_ url: String, under prefix: [String]) -> [NotebookEntry] {
+        let children = model.orderedChildren(model.node(for: url)?.children ?? [], in: url)
+        return children.flatMap { child -> [NotebookEntry] in
+            if child.kind == "folder" {
+                return walk(child.url, under: prefix + [child.displayName])
+            }
+            guard child.isNote else { return [] }
+            return [NotebookEntry(node: child, path: prefix.joined(separator: " / "))]
+        }
+    }
+    return walk(folderUrl, under: [])
+}
+
+/// Whether a folder holds a note anywhere under it. Short-circuits, so a
+/// folder with a note near the top costs a step or two rather than a walk of
+/// everything beneath it.
+@MainActor
+func folderHoldsANote(_ folderUrl: String, in model: NotesModel) -> Bool {
+    guard let children = model.node(for: folderUrl)?.children else { return false }
+    for child in children {
+        if child.isNote { return true }
+        if child.kind == "folder", folderHoldsANote(child.url, in: model) { return true }
+    }
+    return false
+}
+
 /// A folder read as one document: every note's content in one text view, one
 /// scroll view, one caret. The notes are not embedded editors — they are
 /// rendered like any other text, and the boundary between two of them is a
@@ -351,17 +435,19 @@ final class FolderNotebookCore: LiveWriter {
     /// folder's children change, and deliberately in place: the storage the
     /// text view is attached to is the same object either way, so a note
     /// added somewhere else doesn't tear the notebook down and rebuild it.
-    func load(_ notes: [FolderNode]) async {
+    func load(_ entries: [NotebookEntry]) async {
         if loaded { await flushNow() }
         var built: [NotebookDocument.Section] = []
         var next: [String: Section] = [:]
 
-        for node in notes {
+        for entry in entries {
+            let node = entry.node
             guard let snapshot = await model.spansSnapshot(for: node.url) else { continue }
             let spans = SpanNode.decodeList(snapshot.spansJson)
             built.append(NotebookDocument.Section(
                 url: node.url,
                 title: node.displayName,
+                path: entry.path,
                 body: RichText.attributed(from: spans, cache: cache)
             ))
             next[node.url] = Section(
@@ -537,12 +623,14 @@ struct FolderEmptyState: View {
 /// notes are rendered like any other text — not embedded editors — so nothing
 /// here nests a scroll view inside another that scrolls the same way.
 struct FolderNotebook: View {
-    let children: [FolderNode]
+    let folderUrl: String
 
     @Environment(NotesModel.self) private var model
     @State private var core: FolderNotebookCore?
 
-    private var notes: [FolderNode] { children.filter(\.isNote) }
+    /// The whole subtree, not the direct children: a folder's notes are its
+    /// notes wherever it keeps them.
+    private var notes: [NotebookEntry] { notebookEntries(of: folderUrl, in: model) }
 
     var body: some View {
         Group {
@@ -565,7 +653,7 @@ struct FolderNotebook: View {
             self.core = notebook
             await notebook.load(notes)
         }
-        .onChange(of: notes.map(\.url)) {
+        .onChange(of: notes.map(\.id)) {
             guard let core else { return }
             Task { await core.load(notes) }
         }
