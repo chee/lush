@@ -153,11 +153,12 @@ final class LushAgentServer {
                 let body = try request.jsonBody()
                 let title = body["title"] as? String ?? ""
                 let folder = body["folder_url"] as? String
+                let atTop = model.newNoteAtTop(in: folder)
                 let url = try await Task.detached {
                     if let folder, !folder.isEmpty {
-                        return try core.createNoteIn(folderUrl: folder, title: title)
+                        return try core.createNoteIn(folderUrl: folder, title: title, atTop: atTop)
                     }
-                    return try core.createNote(title: title)
+                    return try core.createNote(title: title, atTop: atTop)
                 }.value
                 if let spans = body["spans"] as? [Any] {
                     _ = try await Task.detached {

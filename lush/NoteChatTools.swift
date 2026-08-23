@@ -79,15 +79,16 @@ enum NoteChatAction: Codable, Equatable {
                 [.block(.heading(level: 1)), .text(title, [:])]
                     + RichTextClipboard.spans(fromMarkdown: markdown)
             )
+            let atTop = model.newNoteAtTop(in: folderUrl)
             do {
-                _ = try await Task.detached { [core, folderUrl, title, spans] () -> String in
+                _ = try await Task.detached { [core, folderUrl, title, spans, atTop] () -> String in
                     let url = if let folderUrl, !folderUrl.isEmpty {
-                        try core.createNoteIn(folderUrl: folderUrl, title: title)
+                        try core.createNoteIn(folderUrl: folderUrl, title: title, atTop: atTop)
                     } else {
                         try core.createNoteDoc(title: title)
                     }
                     if folderUrl == nil || folderUrl?.isEmpty == true {
-                        try await core.linkNoteToFolder(noteUrl: url, title: title)
+                        try await core.linkNoteToFolder(noteUrl: url, title: title, atTop: atTop)
                     }
                     _ = try? core.updateNoteSpans(url: url, spansJson: spans, heads: nil)
                     return url

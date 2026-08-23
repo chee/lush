@@ -810,9 +810,10 @@ final class NotesModel {
     func addDocToCurrentFolder(url: String) {
         guard let core else { return }
         patchworkDocUrls.insert(url)
-        Task.detached { [core, weak self, url] in
+        let atTop = newNoteAtTop(in: folderUrl)
+        Task.detached { [core, weak self, url, atTop] in
             do {
-                try await core.linkNoteToFolder(noteUrl: url, title: "")
+                try await core.linkNoteToFolder(noteUrl: url, title: "", atTop: atTop)
             } catch {
                 await MainActor.run { [weak self] in
                     self?.patchworkDocUrls.remove(url)
@@ -864,9 +865,15 @@ final class NotesModel {
             model.removeEntry(core: core, parent: parent, url: url, title: title)
         }
         undoManager.setActionName("Remove Note")
-        Task.detached { [core, weak self, parent, url, title] in
+        let atTop = newNoteAtTop(in: parent)
+        Task.detached { [core, weak self, parent, url, title, atTop] in
             do {
-                try core.linkNoteToFolderIn(folderUrl: parent, noteUrl: url, title: title)
+                try core.linkNoteToFolderIn(
+                    folderUrl: parent,
+                    noteUrl: url,
+                    title: title,
+                    atTop: atTop
+                )
             } catch {
                 await MainActor.run { [weak self] in
                     self?.status = "Couldn't restore note: \(error.localizedDescription)"
@@ -1764,15 +1771,16 @@ final class NotesModel {
         }
         guard let core else { return nil }
         let pending = snap != nil && ContextTracker.stampsContext
+        let atTop = newNoteAtTop(in: folderUrl)
         do {
-            let url = try await Task.detached { [core, snap, pending] () -> String in
+            let url = try await Task.detached { [core, snap, pending, atTop] () -> String in
                 let url = try core.createNoteDoc(title: "")
                 let initial: [SpanNode] = [
                     .block(.creationBlock(snap: snap, pending: pending)),
                     .block(.heading(level: 1)),
                 ]
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
-                try await core.linkNoteToFolder(noteUrl: url, title: "")
+                try await core.linkNoteToFolder(noteUrl: url, title: "", atTop: atTop)
                 return url
             }.value
             pendingFocusUrl = url
@@ -1789,9 +1797,10 @@ final class NotesModel {
     func createNote(inFolder folderUrl: String, snap: ContextSnapshot? = nil) async -> String? {
         guard let core else { return nil }
         let pending = snap != nil && ContextTracker.stampsContext
+        let atTop = newNoteAtTop(in: folderUrl)
         do {
-            let url = try await Task.detached { [core, folderUrl, snap, pending] () -> String in
-                let url = try core.createNoteIn(folderUrl: folderUrl, title: "")
+            let url = try await Task.detached { [core, folderUrl, snap, pending, atTop] () -> String in
+                let url = try core.createNoteIn(folderUrl: folderUrl, title: "", atTop: atTop)
                 let initial: [SpanNode] = [
                     .block(.creationBlock(snap: snap, pending: pending)),
                     .block(.heading(level: 1)),
@@ -1822,9 +1831,10 @@ final class NotesModel {
         guard let target else { return nil }
         let noteTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let noteText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let atTop = newNoteAtTop(in: target)
         do {
             let url = try await Task.detached {
-                let url = try core.createNoteIn(folderUrl: target, title: noteTitle)
+                let url = try core.createNoteIn(folderUrl: target, title: noteTitle, atTop: atTop)
                 var initial: [SpanNode] = [.block(.creationBlock(snap: nil)), .block(.heading(level: 1))]
                 if !noteTitle.isEmpty {
                     initial.append(.text(noteTitle, [:]))
@@ -1929,13 +1939,19 @@ final class NotesModel {
         }
         guard let core else { return false }
         let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
+        let atTop = newNoteAtTop(in: target)
         do {
             if let target {
                 try await Task.detached {
-                    try core.linkNoteToFolderIn(folderUrl: target, noteUrl: url, title: "")
+                    try core.linkNoteToFolderIn(
+                        folderUrl: target,
+                        noteUrl: url,
+                        title: "",
+                        atTop: atTop
+                    )
                 }.value
             } else {
-                try await core.linkNoteToFolder(noteUrl: url, title: "")
+                try await core.linkNoteToFolder(noteUrl: url, title: "", atTop: atTop)
             }
             patchworkDocUrls.insert(url)
             UserDefaults.standard.set(Array(patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
@@ -1986,12 +2002,19 @@ final class NotesModel {
                 dictionary,
                 type: documentType
             )
-            if let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl {
+            let target = folderUrl ?? effectiveInboxUrl ?? self.folderUrl
+            let atTop = newNoteAtTop(in: target)
+            if let target {
                 try await Task.detached {
-                    try core.linkNoteToFolderIn(folderUrl: target, noteUrl: url, title: documentName)
+                    try core.linkNoteToFolderIn(
+                        folderUrl: target,
+                        noteUrl: url,
+                        title: documentName,
+                        atTop: atTop
+                    )
                 }.value
             } else {
-                try await core.linkNoteToFolder(noteUrl: url, title: documentName)
+                try await core.linkNoteToFolder(noteUrl: url, title: documentName, atTop: atTop)
             }
             patchworkDocUrls.insert(url)
             UserDefaults.standard.set(Array(patchworkDocUrls), forKey: Self.patchworkDocUrlsKey)
@@ -2120,15 +2143,62 @@ final class NotesModel {
         let notes = children.filter { $0.kind != "folder" }
         guard let order = childOrder[folderUrl], !order.isEmpty else { return folders + notes }
         var byUrl = Dictionary(uniqueKeysWithValues: notes.map { ($0.url, $0) })
-        var ordered: [FolderNode] = order.compactMap { byUrl.removeValue(forKey: $0) }
-        ordered += notes.filter { byUrl[$0.url] != nil }
-        return folders + ordered
+        let ordered: [FolderNode] = order.compactMap { byUrl.removeValue(forKey: $0) }
+        // Notes the stored order has never seen — made since it was written,
+        // or arrived from another device — go wherever new notes go. Pinning
+        // them to the end regardless made a folder that had once been dragged
+        // into shape ignore the setting.
+        let unplaced = notes.filter { byUrl[$0.url] != nil }
+        guard !unplaced.isEmpty else { return folders + ordered }
+        return folders + (newNoteAtTop(in: folderUrl) ? unplaced + ordered : ordered + unplaced)
     }
 
     func moveChildren(in folderUrl: String, displayed: [String], from: IndexSet, to: Int) {
         var urls = displayed
         urls.move(fromOffsets: from, toOffset: to)
         childOrder[folderUrl] = urls.filter { node(for: $0)?.kind != "folder" }
+    }
+
+    /// Reorders a folder's notes among themselves, leaving whatever else it
+    /// holds in the slots it already had. `moveChildren` takes the displayed
+    /// list to be the whole folder; the notebook shows only the notes, and
+    /// handing that list over would drop a script or a patchwork doc out of
+    /// the order entirely.
+    func moveNotes(in folderUrl: String, displayed: [String], from: IndexSet, to: Int) {
+        var moved = displayed
+        moved.move(fromOffsets: from, toOffset: to)
+        let shown = Set(displayed)
+        let children = orderedChildren(node(for: folderUrl)?.children ?? [], in: folderUrl)
+            .filter { $0.kind != "folder" }
+        var order: [String] = []
+        var index = 0
+        for child in children {
+            if shown.contains(child.url), index < moved.count {
+                order.append(moved[index])
+                index += 1
+            } else {
+                order.append(child.url)
+            }
+        }
+        childOrder[folderUrl] = order
+    }
+
+    /// Puts a note straight after another in its folder's order. Unlike
+    /// `reorderChild` it does not need the note to be in the tree yet: a note
+    /// is created before the walk that will find it has finished, and waiting
+    /// for that walk is what makes a new note appear at the bottom and then
+    /// jump.
+    func placeChild(_ url: String, after targetUrl: String, in folderUrl: String) {
+        var urls = orderedChildren(node(for: folderUrl)?.children ?? [], in: folderUrl)
+            .filter { $0.kind != "folder" }
+            .map(\.url)
+        urls.removeAll { $0 == url }
+        if let index = urls.firstIndex(of: targetUrl) {
+            urls.insert(url, at: index + 1)
+        } else {
+            urls.append(url)
+        }
+        childOrder[folderUrl] = urls
     }
 
     func reorderChild(_ url: String, adjacentTo targetUrl: String, after: Bool) {
@@ -3182,7 +3252,10 @@ final class NotesModel {
             importStatus = "Import failed: \(error.localizedDescription)"
             return
         }
-        let (done, skipped, failed) = await Task.detached { [weak self] in
+        // The subfolders are made by the import, so only the setting for every
+        // folder can have an opinion about them.
+        let atTop = newNoteAtTop(in: nil)
+        let (done, skipped, failed) = await Task.detached { [weak self, atTop] in
             var subfolders: [String: String] = [:]
             for entry in await core.folderEntriesOf(url: importFolder) where entry.kind == "folder" {
                 subfolders[entry.name] = entry.url
@@ -3208,7 +3281,7 @@ final class NotesModel {
                         skipped += 1
                         continue
                     }
-                    let url = try core.createNoteIn(folderUrl: sub, title: note.name)
+                    let url = try core.createNoteIn(folderUrl: sub, title: note.name, atTop: atTop)
                     let spans = await MainActor.run { RichTextClipboard.spans(fromHTML: note.html) }
                     if !spans.isEmpty {
                         try core.updateNoteSpansAt(
@@ -3430,13 +3503,22 @@ final class NotesModel {
             return (core, url)
         }
         let target = effectiveInboxUrl ?? folderUrl
+        let atTop = newNoteAtTop(in: target)
         do {
             let url = try await Task.detached {
                 if let target {
-                    return try core.createNoteIn(folderUrl: target, title: "Quick Note")
+                    return try core.createNoteIn(
+                        folderUrl: target,
+                        title: "Quick Note",
+                        atTop: atTop
+                    )
                 }
                 let noteUrl = try core.createNoteDoc(title: "Quick Note")
-                try await core.linkNoteToFolder(noteUrl: noteUrl, title: "Quick Note")
+                try await core.linkNoteToFolder(
+                    noteUrl: noteUrl,
+                    title: "Quick Note",
+                    atTop: atTop
+                )
                 return noteUrl
             }.value
             setQuickNote(url)
@@ -3680,7 +3762,10 @@ final class NotesModel {
                 if let existing = content.handoffCreatedUrl(for: operationKey) {
                     noteUrl = existing
                 } else {
-                    noteUrl = try core.createNote(title: content.textDisplayTitle)
+                    noteUrl = try core.createNote(
+                        title: content.textDisplayTitle,
+                        atTop: newNoteAtTop(in: folderUrl)
+                    )
                     guard content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
                         throw CocoaError(.fileWriteUnknown)
                     }
@@ -3797,10 +3882,18 @@ final class NotesModel {
                 if let existing = content.handoffCreatedUrl(for: operationKey) {
                     noteUrl = existing
                 } else {
+                    let atTop = newNoteAtTop(in: target)
                     if let target {
-                        noteUrl = try core.createNoteIn(folderUrl: target, title: content.textDisplayTitle)
+                        noteUrl = try core.createNoteIn(
+                            folderUrl: target,
+                            title: content.textDisplayTitle,
+                            atTop: atTop
+                        )
                     } else {
-                        noteUrl = try core.createNote(title: content.textDisplayTitle)
+                        noteUrl = try core.createNote(
+                            title: content.textDisplayTitle,
+                            atTop: atTop
+                        )
                     }
                     guard content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
                         throw CocoaError(.fileWriteUnknown)
@@ -3831,6 +3924,10 @@ final class NotesModel {
     static let noteImportExtensions: Set<String> = ["md", "markdown", "mdown", "txt", "text", "rtf"]
 
     nonisolated static let importAsNotesKey = "importTextFilesAsNotes"
+
+    /// Which end of a folder a new note lands at, for folders that haven't
+    /// been told otherwise. Unset means the bottom.
+    nonisolated static let newNoteAtTopKey = "newNoteAtTop"
 
     nonisolated static var importsTextFilesAsNotes: Bool {
         UserDefaults.standard.object(forKey: importAsNotesKey) as? Bool ?? true
@@ -3889,10 +3986,13 @@ final class NotesModel {
         if let existingUrl {
             noteUrl = existingUrl
         } else {
+            // With no folder of its own the note goes to the one that is open,
+            // which is the folder `createNote` links it to.
+            let atTop = newNoteAtTop(in: folderUrl ?? self.folderUrl)
             if let folderUrl {
-                noteUrl = try core.createNoteIn(folderUrl: folderUrl, title: title)
+                noteUrl = try core.createNoteIn(folderUrl: folderUrl, title: title, atTop: atTop)
             } else {
-                noteUrl = try core.createNote(title: title)
+                noteUrl = try core.createNote(title: title, atTop: atTop)
             }
             guard didCreate?(noteUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
@@ -4007,7 +4107,11 @@ final class NotesModel {
             )
             guard didCreate?(assetUrl) ?? true else { throw CocoaError(.fileWriteUnknown) }
         }
-        try await core.linkNoteToFolder(noteUrl: assetUrl, title: name)
+        try await core.linkNoteToFolder(
+            noteUrl: assetUrl,
+            title: name,
+            atTop: newNoteAtTop(in: self.folderUrl)
+        )
         return assetUrl
     }
 

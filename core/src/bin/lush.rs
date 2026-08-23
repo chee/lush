@@ -108,6 +108,9 @@ async fn main() -> Result<()> {
                         url: note_id.to_url(),
                         lush: None,
                     },
+                    // the CLI has no settings to read, so it does what the app
+                    // does out of the box
+                    false,
                 )
             })
             .await?;

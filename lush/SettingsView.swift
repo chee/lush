@@ -30,6 +30,9 @@ struct SettingsView: View {
             Tab("Editor", systemImage: "textformat") {
                 EditorSettingsPane()
             }
+            Tab("Notes", systemImage: "square.and.pencil") {
+                NoteSettingsPane()
+            }
             Tab("Machine Learning", systemImage: "sparkles.tv") {
                 MachineLearningSettingsPane()
             }
@@ -56,6 +59,11 @@ struct SettingsView: View {
                 EditorSettingsPane()
             } label: {
                 Label("Editor", systemImage: "textformat")
+            }
+            NavigationLink {
+                NoteSettingsPane()
+            } label: {
+                Label("Notes", systemImage: "square.and.pencil")
             }
             NavigationLink {
                 MachineLearningSettingsPane()
@@ -412,6 +420,29 @@ struct EditorSettingsPane: View {
         guard UIDevice.current.userInterfaceIdiom == .pad else { return ["Fonts", "Logline"] }
         #endif
         return ["Fonts", "Page", "Logline"]
+    }
+}
+
+/// Settings about the notes themselves rather than the page they are written
+/// on — where a new one goes, to start with.
+struct NoteSettingsPane: View {
+    @AppStorage(NotesModel.newNoteAtTopKey) private var newNoteAtTop = false
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("New notes go to", selection: $newNoteAtTop) {
+                    Text("The bottom of the folder").tag(false)
+                    Text("The top of the folder").tag(true)
+                }
+            } header: {
+                Text("New Notes")
+            } footer: {
+                Text("Where a note lands when it is made — the notebook's new note button, Quick Note, the share extension and Shortcuts all follow this. A folder can disagree: open its Folder Settings.")
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Notes")
     }
 }
 

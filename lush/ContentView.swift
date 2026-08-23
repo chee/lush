@@ -2309,6 +2309,30 @@ private func thumbnailImage(from data: Data) -> Image? {
     #endif
 }
 
+/// Where a new note goes in one folder: the top, the bottom, or wherever the
+/// setting for every folder says.
+enum NewNotePlacement: Hashable {
+    case settings
+    case top
+    case bottom
+
+    init(_ atTop: Bool?) {
+        switch atTop {
+        case .some(true): self = .top
+        case .some(false): self = .bottom
+        case .none: self = .settings
+        }
+    }
+
+    var atTop: Bool? {
+        switch self {
+        case .settings: nil
+        case .top: true
+        case .bottom: false
+        }
+    }
+}
+
 struct FolderSettingsEditor: View {
     let node: FolderNode
     @Environment(NotesModel.self) private var model
@@ -2318,6 +2342,7 @@ struct FolderSettingsEditor: View {
     @State private var recursiveCount = false
     @State private var notifyOnChange = false
     @State private var notificationsDenied = false
+    @State private var newNotes = NewNotePlacement.settings
 
     var body: some View {
         NavigationStack {
@@ -2331,6 +2356,13 @@ struct FolderSettingsEditor: View {
                 } footer: {
                     if notificationsDenied {
                         Text("Notifications are turned off for Lush in System Settings.")
+                    }
+                }
+                Section {
+                    Picker("New notes go to", selection: $newNotes) {
+                        Text("Wherever Settings says").tag(NewNotePlacement.settings)
+                        Text("The top").tag(NewNotePlacement.top)
+                        Text("The bottom").tag(NewNotePlacement.bottom)
                     }
                 }
             }
@@ -2349,6 +2381,7 @@ struct FolderSettingsEditor: View {
         .onAppear {
             name = node.name
             let settings = model.folderSettings(for: node.url)
+            newNotes = NewNotePlacement(settings.newNotesAtTop)
             showCount = settings.showCount
             recursiveCount = settings.recursiveCount
             notifyOnChange = settings.notifyOnChange
@@ -2358,7 +2391,7 @@ struct FolderSettingsEditor: View {
             Task { notificationsDenied = await !SmartNotebookAlerts.requestAuthorization() }
         }
         #if os(macOS)
-        .frame(minWidth: 420, minHeight: 220)
+        .frame(minWidth: 420, minHeight: 300)
         #endif
     }
 
@@ -2371,7 +2404,8 @@ struct FolderSettingsEditor: View {
             url: node.url,
             showCount: showCount,
             recursiveCount: recursiveCount,
-            notifyOnChange: notifyOnChange
+            notifyOnChange: notifyOnChange,
+            newNotesAtTop: newNotes.atTop
         ))
         dismiss()
     }

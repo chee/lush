@@ -1128,7 +1128,7 @@ impl Core {
                 })
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("entry not found in source folder"))?;
-            repo.change_doc(to, |d| shapes::add_folder_entry(d, &link))
+            repo.change_doc(to, |d| shapes::add_folder_entry(d, &link, true))
                 .await?;
             repo.change_doc(from, |d| shapes::remove_folder_entry(d, &url))
                 .await?;
@@ -1207,6 +1207,7 @@ impl Core {
                                         url: sub.to_url(),
                                         lush: None,
                                     },
+                                    true,
                                 )
                             })
                             .await?;
@@ -1359,7 +1360,7 @@ impl Core {
                     .await?;
                 for link in adopted.into_iter().rev() {
                     repo.change_doc(adopted_folder, move |doc| {
-                        shapes::add_folder_entry(doc, &link)
+                        shapes::add_folder_entry(doc, &link, true)
                     })
                     .await?;
                 }
@@ -1369,7 +1370,7 @@ impl Core {
                     url: adopted_folder.to_url(),
                     lush: None,
                 };
-                repo.change_doc(root, move |doc| shapes::add_folder_entry(doc, &link))
+                repo.change_doc(root, move |doc| shapes::add_folder_entry(doc, &link, true))
                     .await?;
                 folders.push(adopted_folder.to_url());
                 let urls = folders.clone();
@@ -1795,6 +1796,7 @@ impl Core {
                         url: sub.to_url(),
                         lush: None,
                     },
+                    true,
                 )
             })
             .await?;
@@ -1803,7 +1805,7 @@ impl Core {
         Ok(url)
     }
 
-    pub fn create_note(&self, title: String) -> Result<String, CoreError> {
+    pub fn create_note(&self, title: String, at_top: bool) -> Result<String, CoreError> {
         let folder = self
             .folder
             .lock()
@@ -1825,6 +1827,7 @@ impl Core {
                         url: note.to_url(),
                         lush: None,
                     },
+                    at_top,
                 )
             })
             .await?;
@@ -1857,6 +1860,7 @@ impl Core {
         &self,
         note_url: String,
         title: String,
+        at_top: bool,
     ) -> Result<(), CoreError> {
         let folder = self
             .folder
@@ -1896,6 +1900,7 @@ impl Core {
                         url: note_url,
                         lush: None,
                     },
+                    at_top,
                 )
             })
             .await?;
@@ -1910,6 +1915,7 @@ impl Core {
         folder_url: String,
         note_url: String,
         title: String,
+        at_top: bool,
     ) -> Result<(), CoreError> {
         let folder = DocId::from_url(&folder_url)?;
         let repo = self.repo.clone();
@@ -1943,6 +1949,7 @@ impl Core {
                         url: note_url,
                         lush: None,
                     },
+                    at_top,
                 )
             })
             .await?;
@@ -2622,6 +2629,7 @@ impl Core {
                         url: script.to_url(),
                         lush: Some("script".into()),
                     },
+                    true,
                 )
             })
             .await?;
@@ -2710,7 +2718,12 @@ impl Core {
     }
 
     /// Create a note inside a specific folder doc.
-    pub fn create_note_in(&self, folder_url: String, title: String) -> Result<String, CoreError> {
+    pub fn create_note_in(
+        &self,
+        folder_url: String,
+        title: String,
+        at_top: bool,
+    ) -> Result<String, CoreError> {
         guarded(|| {
             let repo = self.repo.clone();
             let url = self.runtime.block_on(async move {
@@ -2727,6 +2740,7 @@ impl Core {
                             url: note.to_url(),
                             lush: None,
                         },
+                        at_top,
                     )
                 })
                 .await?;
@@ -2765,6 +2779,7 @@ impl Core {
                             url: file.to_url(),
                             lush: None,
                         },
+                        true,
                     )
                 })
                 .await?;
@@ -3067,6 +3082,7 @@ impl Core {
                             url: sub.to_url(),
                             lush: None,
                         },
+                        true,
                     )
                 })
                 .await?;
