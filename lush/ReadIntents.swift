@@ -117,7 +117,7 @@ enum LushDocuments {
             )
         case .rtf:
             return IntentFile(
-                data: try NoteExporter.rtfData(from: spans),
+                data: try await NoteExporter.rtfData(from: spans),
                 filename: "\(basename).rtf",
                 type: .rtf
             )

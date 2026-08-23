@@ -3778,15 +3778,18 @@ final class NotesModel {
                 if let existing = content.handoffCreatedUrl(for: operationKey) {
                     noteUrl = existing
                 } else {
-                    noteUrl = try core.createNote(
-                        title: content.textDisplayTitle,
-                        atTop: newNoteAtTop(in: folderUrl)
-                    )
+                    let title = content.textDisplayTitle
+                    let atTop = newNoteAtTop(in: folderUrl)
+                    noteUrl = try await Task.detached {
+                        try core.createNote(title: title, atTop: atTop)
+                    }.value
                     guard await content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
                         throw CocoaError(.fileWriteUnknown)
                     }
                 }
-                _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
+                await Task.detached {
+                    _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
+                }.value
                 importedUrls.insert(noteUrl, at: 0)
                 guard await content.markHandoffItemsCompleted(textIndexes) else {
                     throw CocoaError(.fileWriteUnknown)
@@ -3933,23 +3936,23 @@ final class NotesModel {
                     noteUrl = existing
                 } else {
                     let atTop = newNoteAtTop(in: target)
+                    let title = content.textDisplayTitle
                     if let target {
-                        noteUrl = try core.createNoteIn(
-                            folderUrl: target,
-                            title: content.textDisplayTitle,
-                            atTop: atTop
-                        )
+                        noteUrl = try await Task.detached {
+                            try core.createNoteIn(folderUrl: target, title: title, atTop: atTop)
+                        }.value
                     } else {
-                        noteUrl = try core.createNote(
-                            title: content.textDisplayTitle,
-                            atTop: atTop
-                        )
+                        noteUrl = try await Task.detached {
+                            try core.createNote(title: title, atTop: atTop)
+                        }.value
                     }
                     guard await content.markHandoffCreatedUrl(noteUrl, for: operationKey) else {
                         throw CocoaError(.fileWriteUnknown)
                     }
                 }
-                _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
+                await Task.detached {
+                    _ = try? core.updateNoteSpans(url: noteUrl, spansJson: textJson, heads: nil)
+                }.value
                 importedUrls.insert(noteUrl, at: 0)
                 if !(await content.markHandoffItemsCompleted(textIndexes)) {
                     failures.append("text: couldn't record the completed import")

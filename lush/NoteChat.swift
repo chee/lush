@@ -49,14 +49,6 @@ struct NoteChatTurn: Identifiable, Codable, Equatable {
 }
 
 enum NoteChatStore {
-    /// A transcript is rewritten whole on every turn and every proposal in it
-    /// carries a copy of the note as it would look edited, so only the tail
-    /// reaches the plist — recent turns, and queued edits only while they are
-    /// recent enough to be worth applying. An open chat keeps everything it
-    /// has for as long as it is open.
-    private static let maxTurns = 40
-    private static let turnsKeepingProposals = 10
-
     static func turns(for url: String) -> [NoteChatTurn] {
         guard let data = UserDefaults.standard.data(forKey: key(for: url)),
               let turns = try? JSONDecoder().decode([NoteChatTurn].self, from: data)
@@ -65,19 +57,11 @@ enum NoteChatStore {
     }
 
     static func save(_ turns: [NoteChatTurn], for url: String) {
-        UserDefaults.standard.set(try? JSONEncoder().encode(bounded(turns)), forKey: key(for: url))
+        UserDefaults.standard.set(try? JSONEncoder().encode(turns), forKey: key(for: url))
     }
 
     static func clear(for url: String) {
         UserDefaults.standard.removeObject(forKey: key(for: url))
-    }
-
-    private static func bounded(_ turns: [NoteChatTurn]) -> [NoteChatTurn] {
-        var kept = Array(turns.suffix(maxTurns))
-        for index in 0..<max(0, kept.count - turnsKeepingProposals) {
-            kept[index].proposals = []
-        }
-        return kept
     }
 
     private static func key(for url: String) -> String {

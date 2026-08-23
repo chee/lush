@@ -296,11 +296,20 @@ struct PadDropTarget: NSViewRepresentable {
             return PadStore.spans(fromPlainText: text)
         }
 
+        /// A folder, or an alias to a volume that isn't mounted, reads as a
+        /// file URL with nothing behind it. Hover has to answer before the
+        /// bytes are read, so a stat rules those out here — otherwise the drop
+        /// is accepted and quietly produces no card.
         private func fileURL(from pasteboard: NSPasteboard) -> URL? {
             (pasteboard.readObjects(
                 forClasses: [NSURL.self],
                 options: [.urlReadingFileURLsOnly: true]
-            ) as? [URL])?.first
+            ) as? [URL])?.first(where: { url in
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                guard FileManager.default.isReadableFile(atPath: url.path) else { return false }
+                return (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile != false
+            })
         }
 
         /// Hover asks this and nothing more: a drag-over tick must not read a

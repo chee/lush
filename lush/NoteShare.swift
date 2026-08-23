@@ -55,7 +55,7 @@ enum NoteShare {
                 )
             }.value
         case .rtf:
-            data = try NoteExporter.rtfData(from: spans)
+            data = try await NoteExporter.rtfData(from: spans)
         case .pdf:
             data = try await NoteExporter.pdfData(from: spans, title: title)
         }

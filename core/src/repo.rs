@@ -690,6 +690,10 @@ struct DocState {
     /// Heads the outbox file already holds, when it holds anything. Lets a
     /// stage append the changes since instead of recompacting the whole doc.
     staged_heads: Option<Vec<ChangeHash>>,
+    /// An open whose storage read failed leaves this behind. A reader that
+    /// took the shell's `Arc` before it was pulled from the map would
+    /// otherwise read the empty doc it never got to fill.
+    abandoned: bool,
 }
 
 impl DocState {
@@ -705,6 +709,7 @@ impl DocState {
             applied: HashSet::new(),
             failed: HashSet::new(),
             staged_heads: None,
+            abandoned: false,
         }
     }
 }
@@ -2003,7 +2008,9 @@ impl Repo {
     {
         if let Some(state) = self.docs.lock().await.get(&id).cloned() {
             let state = state.lock().await;
-            return catching(|| f(&state.doc));
+            if !state.abandoned {
+                return catching(|| f(&state.doc));
+            }
         }
         let mut doc = self.stored_doc(id).await?;
         let outbox = self.outbox_path(id);
@@ -2279,11 +2286,11 @@ impl Repo {
     /// Ask for a sync round without waiting for it. Every background path goes
     /// through here so concurrent requests coalesce per doc.
     async fn request_sync(self: &Arc<Self>, id: DocId) {
-        self.request_sync_inner(id, false).await;
+        self.request_sync_inner(id, false, None).await;
     }
 
     async fn request_sync_forced(self: &Arc<Self>, id: DocId) {
-        self.request_sync_inner(id, true).await;
+        self.request_sync_inner(id, true, None).await;
     }
 
     /// A forced round on behalf of a server head announcement. The heads are
@@ -2293,19 +2300,12 @@ impl Repo {
     /// announcement of the same heads is acted on rather than deduplicated
     /// away.
     async fn request_sync_announced(self: &Arc<Self>, id: DocId, announced: BTreeSet<CommitId>) {
-        {
-            let mut syncs = self.syncs.lock().await;
-            syncs.entry(id).or_default().announced = Some(announced);
-        }
-        self.request_sync_forced(id).await;
-        let dropped = {
-            let mut syncs = self.syncs.lock().await;
-            match syncs.get_mut(&id) {
-                Some(slot) if !slot.running => slot.announced.take(),
-                _ => None,
-            }
-        };
-        if let Some(heads) = dropped {
+        let heads = announced.clone();
+        // The heads are handed to the round itself rather than parked in the
+        // slot beforehand: a round already in flight would otherwise finish in
+        // the gap, take them, and — having succeeded — drop them, leaving the
+        // round that was actually meant to fetch them with nothing to forget.
+        if !self.request_sync_inner(id, true, Some(announced)).await {
             self.forget_announced_heads(id, &heads).await;
         }
     }
@@ -2317,35 +2317,45 @@ impl Repo {
         }
     }
 
-    async fn request_sync_inner(self: &Arc<Self>, id: DocId, force: bool) {
+    /// Whether the request reached a round: false when a guard dropped it, so
+    /// an announcement has something to answer to.
+    async fn request_sync_inner(
+        self: &Arc<Self>,
+        id: DocId,
+        force: bool,
+        announced: Option<BTreeSet<CommitId>>,
+    ) -> bool {
         if !self.is_connected() {
-            return;
+            return false;
         }
         // A sync round enumerates the doc's commit and fragment directories
         // and writes whatever it pulls. None of that may happen while the
         // process has no permission to run; the round is picked back up when
         // the app returns or takes a background assertion.
         if !self.is_app_active() {
-            return;
+            return false;
         }
         if !self.send_changes.load(Ordering::Relaxed) && self.outbox_path(id).exists() {
-            return;
+            return false;
         }
         if !force {
             if let Some(heads) = self.local_heads_for_sync(id).await {
                 if !heads.is_empty()
                     && self.last_synced_local_heads.lock().await.get(&id) == Some(&heads)
                 {
-                    return;
+                    return false;
                 }
             }
         }
         {
             let mut syncs = self.syncs.lock().await;
             let slot = syncs.entry(id).or_default();
+            if let Some(heads) = announced {
+                slot.announced = Some(heads);
+            }
             if slot.running {
                 slot.again = true;
-                return;
+                return true;
             }
             slot.running = true;
         }
@@ -2414,6 +2424,7 @@ impl Repo {
                 }
             }
         });
+        true
     }
 
     /// Bring the in-memory doc up to date with local storage, applying stored
@@ -3083,6 +3094,7 @@ impl Repo {
                 // is gone and drop the rows that describe what is still on
                 // disk. Undo the open instead, so the next one tries again.
                 tracing::warn!(doc = %id.to_url(), error = %e, "local load failed");
+                guard.abandoned = true;
                 drop(guard);
                 let mut docs = self.docs.lock().await;
                 if docs.get(&id).is_some_and(|state| Arc::ptr_eq(state, &shared)) {

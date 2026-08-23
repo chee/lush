@@ -155,9 +155,16 @@ enum NoteExporter {
         )
     }
 
-    static func rtfData(from spans: [SpanNode]) throws -> Data {
+    /// Split the same way as `pdfData`: the attributed string is built on the
+    /// main actor because `RichText` draws it over the asset cache, and the
+    /// serialization — which inlines every image — follows it off.
+    static func rtfData(from spans: [SpanNode]) async throws -> Data {
         let attributed = RichText.attributed(from: spans, cache: AssetCache())
-        return try attributed.data(
+        return try await Task.detached { try serializeRTF(attributed) }.value
+    }
+
+    nonisolated private static func serializeRTF(_ attributed: NSAttributedString) throws -> Data {
+        try attributed.data(
             from: NSRange(location: 0, length: attributed.length),
             documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
         )

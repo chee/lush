@@ -573,14 +573,20 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
 }
 
 /// The doc's index row, when the row is as current as the doc: a resident doc
-/// can be mid-edit and its row only catches up once the indexer has run, so
-/// that one is answered from the doc itself. Everything else then costs a
-/// SELECT rather than a rebuild — or, worse, an open that keeps the doc.
+/// can be mid-edit and its row only catches up once the indexer has run, and a
+/// doc with an index job queued or running is behind by definition — a change
+/// synced for an evicted doc reaches storage before the row. Both are answered
+/// from the doc itself; everything else then costs a SELECT rather than a
+/// rebuild — or, worse, an open that keeps the doc.
 async fn settled_row(
     repo: &Arc<Repo>,
     index: &Arc<SearchIndex>,
+    slots: &Arc<IndexSlots>,
     id: DocId,
 ) -> Option<search::IndexedDoc> {
+    if slots.lock().ok()?.contains_key(&id) {
+        return None;
+    }
     if repo.is_resident(id).await {
         return None;
     }
@@ -2237,8 +2243,9 @@ impl Core {
         };
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let slots = self.index_slots.clone();
         self.run(async move {
-            if let Some(row) = settled_row(&repo, &index, id).await {
+            if let Some(row) = settled_row(&repo, &index, &slots, id).await {
                 return Ok(row.preview);
             }
             repo.read_stored(id, |doc| Ok(shapes::note_preview(doc)))
@@ -2409,8 +2416,9 @@ impl Core {
         };
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let slots = self.index_slots.clone();
         self.run(async move {
-            if let Some(row) = settled_row(&repo, &index, id).await {
+            if let Some(row) = settled_row(&repo, &index, &slots, id).await {
                 return Ok(row.title);
             }
             repo.read_stored(id, |doc| Ok(shapes::doc_title(doc))).await
@@ -2768,8 +2776,9 @@ impl Core {
         };
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let slots = self.index_slots.clone();
         self.runtime.block_on(async move {
-            if let Some(row) = settled_row(&repo, &index, id).await {
+            if let Some(row) = settled_row(&repo, &index, &slots, id).await {
                 return row.modified;
             }
             repo.read_stored(id, |doc| Ok(shapes::doc_modified(doc)))
