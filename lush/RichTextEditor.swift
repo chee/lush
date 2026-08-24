@@ -1455,28 +1455,56 @@ final class EditorCore: LiveWriter {
         }
     }
 
-    /// The media a copied selection stands for, so a paste outside this app
-    /// gets the picture and not a blank line where an image was.
-    func copiedMedia(in attributed: NSAttributedString) -> (images: [PImage], files: [URL]) {
-        var seen: Set<String> = []
-        var images: [PImage] = []
+    struct CopiedMedia {
+        var pictures: [Picture] = []
         var files: [URL] = []
-        attributed.enumerateAttribute(
-            .amBlock,
-            in: NSRange(location: 0, length: attributed.length)
-        ) { value, _, _ in
-            guard let box = value as? BlockBox,
-                  box.value.isEmbedBlock,
-                  let url = box.value.embedUrl,
+        /// Where each asset sits on disk, keyed by asset url. The HTML
+        /// flavour points at these rather than carrying the bytes itself.
+        var paths: [String: String] = [:]
+        /// The same assets packed as attachment files, for the RTFD flavour,
+        /// which carries them inside itself.
+        var attachments: [String: NoteExporter.Attachment] = [:]
+    }
+
+    /// The media a copied selection stands for, so a paste outside this app
+    /// gets the picture and not a blank line where an image was. Every asset
+    /// comes out as the bytes the note already holds and as a file beside
+    /// them: nothing here decodes a picture, and nothing re-encodes one.
+    ///
+    /// Read from the spans, not from the attributed string the selection is:
+    /// a table or a set of columns is one attachment character out there,
+    /// with its cells' own pictures folded away inside its box. The spans
+    /// have them laid out flat.
+    func copiedMedia(in spans: [SpanNode]) -> CopiedMedia {
+        var seen: Set<String> = []
+        var media = CopiedMedia()
+        for case .block(let block) in spans {
+            guard block.isEmbedBlock,
+                  let url = block.embedUrl,
                   seen.insert(url).inserted
-            else { return }
-            if let image = cache.fullImage(for: url) {
-                images.append(image)
+            else { continue }
+            if let picture = picture(for: url) {
+                media.pictures.append(picture)
+                if let file = picture.file() {
+                    media.paths[url] = file.absoluteString
+                }
+                let wrapper = FileWrapper(regularFileWithContents: picture.data)
+                wrapper.preferredFilename = picture.name
+                media.attachments[url] = NoteExporter.Attachment(
+                    file: wrapper,
+                    size: cache.imageSizes[url]
+                )
             } else if let file = cache.fileURLs[url] {
-                files.append(file)
+                media.files.append(file)
+                media.paths[url] = file.absoluteString
+                if let wrapper = try? FileWrapper(url: file) {
+                    let name = cache.names[url] ?? file.lastPathComponent
+                    wrapper.preferredFilename = name.replacingOccurrences(of: "/", with: "-")
+                    media.attachments[url] = NoteExporter.Attachment(file: wrapper, size: nil)
+                }
             }
         }
-        return (images, files)
+        return media
     }
 
     func isPatchworkDoc(_ url: String) -> Bool {
@@ -4030,6 +4058,14 @@ final class EditorCore: LiveWriter {
         let type: UTType
         let data: Data
 
+        /// Types any app reads without help. A picture stored as one of these
+        /// travels as its own bytes; anything else earns a PNG alongside it.
+        /// Making that PNG costs a decode of the whole picture, so it is only
+        /// worth doing for the formats that would otherwise arrive unreadable.
+        static let readEverywhere: Set<UTType> = [.png, .jpeg, .gif, .tiff, .bmp]
+
+        var needsPNGFallback: Bool { !Picture.readEverywhere.contains(type) }
+
         /// The picture on disk, for the apps that take a file rather than
         /// bytes. Written when it is asked for, not when the picture is looked
         /// up: most lookups are answering a question about the selection and
@@ -4038,16 +4074,30 @@ final class EditorCore: LiveWriter {
         func file() -> URL? {
             AssetCache.mediaFile(for: assetUrl, name: name, data: data)
         }
+
+        func pngFallback() -> Data? {
+            guard needsPNGFallback, let image = PImage(data: data) else { return nil }
+            #if os(macOS)
+            guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff)
+            else { return nil }
+            return rep.representation(using: .png, properties: [:])
+            #else
+            return image.pngData()
+            #endif
+        }
     }
 
     func picture(at charIndex: Int) -> Picture? {
         guard let storage = view?.pStorage, charIndex < storage.length,
               let box = storage.attributes(at: charIndex, effectiveRange: nil)[.amBlock] as? BlockBox,
               box.value.isEmbedBlock,
-              let url = box.value.embedUrl,
-              cache.isImage(url),
-              let data = cache.bytes(for: url)
+              let url = box.value.embedUrl
         else { return nil }
+        return picture(for: url)
+    }
+
+    func picture(for url: String) -> Picture? {
+        guard cache.isImage(url), let data = cache.bytes(for: url) else { return nil }
         let type = AssetCache.imageType(of: data) ?? .png
         let stored = (cache.names[url] ?? "").replacingOccurrences(of: "/", with: "-")
         return Picture(
@@ -4897,18 +4947,9 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
-        let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
-        var inlineImages: [String: Data] = [:]
-        for span in spans {
-            guard case .block(let block) = span,
-                  let url = block.embedUrl,
-                  let image = core?.cache.fullImage(for: url),
-                  let data = Self.pngData(image)
-            else { continue }
-            inlineImages[url] = data
-        }
+        let media = core?.copiedMedia(in: spans) ?? EditorCore.CopiedMedia()
         let attachmentLabel: (BlockValue, Int) -> String = { block, _ in
-            guard let url = block.embedUrl, inlineImages[url] != nil else { return "[attachment]" }
+            guard let url = block.embedUrl, media.paths[url] != nil else { return "[attachment]" }
             return block.altText
         }
         let markdown = RichTextClipboard.markdown(from: spans, attachmentLabel: attachmentLabel)
@@ -4916,22 +4957,38 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let plain = visibleText.isEmpty ? markdown : visibleText
         let item = NSPasteboardItem()
         item.setString(json, forType: Self.spansPasteboardType)
+        // ahead of the HTML: an app that reads both prefers this one, and
+        // this one has the pictures in it
+        if let rtfd = RichTextClipboard.rtfd(from: spans, attachments: media.attachments) {
+            item.setData(rtfd, forType: .rtfd)
+        }
         item.setString(
-            RichTextClipboard.html(from: spans, inlineImages: inlineImages),
+            RichTextClipboard.html(from: spans, assetPaths: media.paths),
             forType: Self.htmlPasteboardType
         )
         item.setString(markdown, forType: Self.markdownPasteboardType)
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item.setData(data, forType: .init(type))
         }
+        // a spreadsheet asked for one table and gets cells, not one cell
+        // with the whole table in it
+        if let grid = RichTextClipboard.singleTable(in: spans) {
+            item.setString(
+                RichTextClipboard.tsv(grid),
+                forType: .init(UTType.tabSeparatedText.identifier)
+            )
+        }
         item.setString(plain, forType: .string)
         // an app that takes none of our rich types still gets the picture,
         // and it rides on the same item so a one-image copy pastes as one
-        if let png = media.images.first.flatMap(Self.pngData) {
-            item.setData(png, forType: .png)
+        if let picture = media.pictures.first {
+            item.setData(picture.data, forType: .init(picture.type.identifier))
+            if let png = picture.pngFallback() { item.setData(png, forType: .png) }
         }
         var objects: [NSPasteboardWriting] = [item]
-        for image in media.images.dropFirst() { objects.append(image) }
+        for picture in media.pictures.dropFirst() {
+            objects.append(Self.pasteboardItem(for: picture))
+        }
         for file in media.files { objects.append(file as NSURL) }
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -4940,13 +4997,6 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             pReplace(range, with: NSAttributedString())
         }
         return true
-    }
-
-    nonisolated static func pngData(_ image: NSImage) -> Data? {
-        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else {
-            return nil
-        }
-        return rep.representation(using: .png, properties: [:])
     }
 
     override func copy(_ sender: Any?) {
@@ -5310,9 +5360,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             item.setString(file.absoluteString, forType: .fileURL)
         }
         item.setData(picture.data, forType: .init(picture.type.identifier))
-        if picture.type != .png,
-           let full = NSImage(data: picture.data),
-           let png = pngData(full) {
+        if let png = picture.pngFallback() {
             item.setData(png, forType: .png)
         }
         return item
@@ -5331,7 +5379,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
     override var writablePasteboardTypes: [NSPasteboard.PasteboardType] {
         guard let picture = selectedPicture else { return super.writablePasteboardTypes }
         var types: [NSPasteboard.PasteboardType] = [.fileURL, .init(picture.type.identifier)]
-        if picture.type != .png { types.append(.png) }
+        if picture.needsPNGFallback { types.append(.png) }
         return types + super.writablePasteboardTypes
     }
 
@@ -5350,8 +5398,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
             return pboard.setData(picture.data, forType: type)
         }
         if type == .png {
-            guard let full = NSImage(data: picture.data), let png = Self.pngData(full)
-            else { return false }
+            guard let png = picture.pngFallback() else { return false }
             return pboard.setData(png, forType: type)
         }
         return super.writeSelection(to: pboard, type: type)
@@ -5964,18 +6011,9 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
-        let media: (images: [PImage], files: [URL]) = core?.copiedMedia(in: slice) ?? (images: [], files: [])
-        var inlineImages: [String: Data] = [:]
-        for span in spans {
-            guard case .block(let block) = span,
-                  let url = block.embedUrl,
-                  let image = core?.cache.fullImage(for: url),
-                  let data = image.pngData()
-            else { continue }
-            inlineImages[url] = data
-        }
+        let media = core?.copiedMedia(in: spans) ?? EditorCore.CopiedMedia()
         let attachmentLabel: (BlockValue, Int) -> String = { block, _ in
-            guard let url = block.embedUrl, inlineImages[url] != nil else { return "[attachment]" }
+            guard let url = block.embedUrl, media.paths[url] != nil else { return "[attachment]" }
             return block.altText
         }
         let markdown = RichTextClipboard.markdown(from: spans, attachmentLabel: attachmentLabel)
@@ -5984,23 +6022,33 @@ final class EditorTextView: UITextView, EditorTextViewLike {
             Self.spansPasteboardType: json,
             RichTextClipboard.htmlTypeIdentifier: RichTextClipboard.html(
                 from: spans,
-                inlineImages: inlineImages
+                assetPaths: media.paths
             ),
             RichTextClipboard.markdownTypeIdentifier: markdown,
             UTType.utf8PlainText.identifier: visibleText.isEmpty ? markdown : visibleText,
         ]
+        if let rtfd = RichTextClipboard.rtfd(from: spans, attachments: media.attachments) {
+            item[RichTextClipboard.rtfdTypeIdentifier] = rtfd
+        }
+        // a spreadsheet asked for one table and gets cells, not one cell
+        // with the whole table in it
+        if let grid = RichTextClipboard.singleTable(in: spans) {
+            item[UTType.tabSeparatedText.identifier] = RichTextClipboard.tsv(grid)
+        }
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item[type] = data
         }
         // an app that takes none of our rich types still gets the picture,
         // and it rides on the same item so a one-image copy pastes as one
-        if let png = media.images.first?.pngData() {
-            item[UTType.png.identifier] = png
+        if let picture = media.pictures.first {
+            item[picture.type.identifier] = picture.data
+            if let png = picture.pngFallback() { item[UTType.png.identifier] = png }
         }
         var items: [[String: Any]] = [item]
-        for image in media.images.dropFirst() {
-            guard let png = image.pngData() else { continue }
-            items.append([UTType.png.identifier: png])
+        for picture in media.pictures.dropFirst() {
+            var entry: [String: Any] = [picture.type.identifier: picture.data]
+            if let png = picture.pngFallback() { entry[UTType.png.identifier] = png }
+            items.append(entry)
         }
         for file in media.files {
             guard let data = try? Data(contentsOf: file) else { continue }

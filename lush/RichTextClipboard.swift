@@ -57,8 +57,43 @@ enum RichTextClipboard {
         return [webCustomMapIdentifier: map, webCustomPayloadIdentifier: payload]
     }
 
-    static func html(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
-        NoteExporter.htmlFragment(from: spans, inlineImages: inlineImages)
+    /// Pictures go on the clipboard as files the HTML points at, never as
+    /// bytes inlined into it: a data URI is every pixel in the selection
+    /// re-encoded and then grown by a third, built on the main thread while
+    /// the user waits for a keystroke to finish.
+    static func html(from spans: [SpanNode], assetPaths: [String: String] = [:]) -> String {
+        NoteExporter.htmlFragment(from: spans, assetPaths: assetPaths)
+    }
+
+    static let rtfdTypeIdentifier = UTType.flatRTFD.identifier
+
+    /// The selection as RTFD — the rich text Cocoa's own editors read before
+    /// they look at our HTML. The pictures ride inside it as attachment
+    /// files, so a paste into Mail, Notes or TextEdit keeps them without a
+    /// data URI and without the receiving app having to reach into this app's
+    /// container for a file it has no business reading.
+    ///
+    /// Only offered for a selection whose every attachment ended up holding a
+    /// file: a table, a set of columns, a live embed or an asset whose bytes
+    /// we don't have would arrive as an empty box, and the HTML says all of
+    /// those. A selection with no assets at all is left to the HTML too —
+    /// there is nothing RTFD would carry that it doesn't say better.
+    static func rtfd(from spans: [SpanNode], attachments: [String: NoteExporter.Attachment]) -> Data? {
+        guard !attachments.isEmpty else { return nil }
+        let document = NoteExporter.documentAttributed(from: spans, attachments: attachments)
+        let whole = NSRange(location: 0, length: document.length)
+        var flattens = false
+        document.enumerateAttribute(.attachment, in: whole) { value, _, stop in
+            guard let attachment = value as? NSTextAttachment, attachment.fileWrapper == nil
+            else { return }
+            flattens = true
+            stop.pointee = true
+        }
+        guard !flattens else { return nil }
+        return try? document.data(
+            from: whole,
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]
+        )
     }
 
     static func markdown(
@@ -71,6 +106,27 @@ enum RichTextClipboard {
         while i < spans.count {
             guard case .block(let block) = spans[i] else {
                 i += 1
+                continue
+            }
+            if block.type == "table" || block.type == "columns" {
+                let root = block.type
+                var j = i + 1
+                while j < spans.count {
+                    if case .block(let child) = spans[j], child.parents.first != root { break }
+                    j += 1
+                }
+                let slice = Array(spans[i..<j])
+                if root == "table" {
+                    lines.append(markdownTable(
+                        RichText.parseTable(slice),
+                        attachmentLabel: attachmentLabel
+                    ))
+                } else {
+                    for column in RichText.parseColumns(slice) {
+                        lines.append(markdown(from: column, attachmentLabel: attachmentLabel))
+                    }
+                }
+                i = j
                 continue
             }
             var runs: [(String, [String: JSONValue])] = []
@@ -134,6 +190,81 @@ enum RichTextClipboard {
             i = j
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// A pipe table. The header rule goes in whether or not the table has a
+    /// header row: without it the rest is not a table to anything reading
+    /// markdown, just lines with pipes in them.
+    static func markdownTable(
+        _ grid: TableGrid,
+        attachmentLabel: (BlockValue, Int) -> String = { _, _ in "[attachment]" }
+    ) -> String {
+        let columns = grid.columnCount
+        guard columns > 0 else { return "" }
+        var lines: [String] = []
+        for (index, row) in grid.rows.enumerated() {
+            let cells = (0..<columns).map {
+                markdownCell(cell(row, $0), attachmentLabel: attachmentLabel)
+            }
+            lines.append("| " + cells.joined(separator: " | ") + " |")
+            if index == 0 {
+                lines.append("|" + String(repeating: " --- |", count: columns))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// A table as tab separated values, so a copied table lands in a
+    /// spreadsheet as cells instead of as one run of text in one of them.
+    static func tsv(_ grid: TableGrid) -> String {
+        let columns = grid.columnCount
+        guard columns > 0 else { return "" }
+        return grid.rows.map { row in
+            (0..<columns).map { plainCell(cell(row, $0)) }.joined(separator: "\t")
+        }.joined(separator: "\n")
+    }
+
+    /// The grid when the selection is one table and nothing else, which is
+    /// the only shape the flat formats can say.
+    static func singleTable(in spans: [SpanNode]) -> TableGrid? {
+        guard case .block(let first)? = spans.first, first.type == "table" else { return nil }
+        for case .block(let child) in spans.dropFirst() where child.parents.first != "table" {
+            return nil
+        }
+        return RichText.parseTable(spans)
+    }
+
+    private static func cell(_ row: [[SpanNode]], _ column: Int) -> [SpanNode] {
+        column < row.count ? row[column] : []
+    }
+
+    /// A cell on one line: neither a pipe table nor a TSV row has anywhere to
+    /// put the blocks a cell can hold.
+    private static func markdownCell(
+        _ cell: [SpanNode],
+        attachmentLabel: (BlockValue, Int) -> String
+    ) -> String {
+        oneLine(
+            markdown(from: cell, attachmentLabel: attachmentLabel)
+                .replacingOccurrences(of: "|", with: "\\|")
+        )
+    }
+
+    private static func plainCell(_ cell: [SpanNode]) -> String {
+        var out = ""
+        for node in cell {
+            switch node {
+            case .block: out += out.isEmpty ? "" : " "
+            case .text(let text, _): out += text
+            }
+        }
+        return oneLine(out.replacingOccurrences(of: "\t", with: " "))
+    }
+
+    private static func oneLine(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
     }
 
     static func attributed(fromSpansJSON json: String, cache: AssetCache) -> NSAttributedString? {

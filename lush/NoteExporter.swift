@@ -1,8 +1,9 @@
 import Foundation
 import CoreText
+import SwiftUI
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
-import UniformTypeIdentifiers
 #else
 import UIKit
 #endif
@@ -19,13 +20,90 @@ enum NoteExporter {
         let name: String
     }
 
-    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
+    /// What an HTML export comes out as. A note with pictures in it is either
+    /// one page carrying them or a page beside them, and only the person
+    /// exporting knows which they wanted.
+    enum HtmlExportLayout: String, CaseIterable, Identifiable {
+        case singleFile
+        case folder
+        case zip
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .singleFile: return "Single File"
+            case .folder: return "Folder"
+            case .zip: return "Zip Archive"
+            }
+        }
+
+        /// A data URI is the one thing a page that travels alone can do, and
+        /// the only kind of asset worth putting in one is a picture — nobody
+        /// wants a video base64'd into their markup.
+        func caption(hasAssets: Bool) -> String {
+            switch self {
+            case .singleFile:
+                return hasAssets
+                    ? "One page with the pictures embedded. Other attachments are left out."
+                    : "One page."
+            case .folder:
+                return "index.html with an assets folder beside it."
+            case .zip:
+                return "The same folder, zipped."
+            }
+        }
+
+        var contentTypes: [UTType] {
+            switch self {
+            case .singleFile: return [.html]
+            case .folder: return []
+            case .zip: return [.zip]
+            }
+        }
+
+        var pathExtension: String? {
+            switch self {
+            case .singleFile: return "html"
+            case .folder: return nil
+            case .zip: return "zip"
+            }
+        }
+
+        func filename(_ base: String) -> String {
+            guard let pathExtension else { return base }
+            return base + "." + pathExtension
+        }
+
+        /// Only the extension this format put there comes off. A title with a
+        /// dot in it is a title, not a name with an extension, and
+        /// deletingPathExtension would eat the end of it.
+        func typedName(in field: String) -> String {
+            guard let pathExtension, field.hasSuffix("." + pathExtension) else { return field }
+            return String(field.dropLast(pathExtension.count + 1))
+        }
+    }
+
+    private static let layoutKey = "htmlExportLayout"
+
+    private static func rememberedLayout(hasAssets: Bool) -> HtmlExportLayout {
+        if let stored = UserDefaults.standard.string(forKey: layoutKey),
+           let layout = HtmlExportLayout(rawValue: stored) {
+            return layout
+        }
+        return hasAssets ? .folder : .singleFile
+    }
+
+    /// The note and every asset in it, each named so no two collide. Holds
+    /// the spinner for as long as it is fetching; the save panel that comes
+    /// after is waiting on a person, not working.
+    private static func gathered(
+        noteUrl: String,
+        model: NotesModel
+    ) async -> (spans: [SpanNode], assets: [FetchedAsset])? {
         model.exportsInFlight += 1
         defer { model.exportsInFlight -= 1 }
-        guard let snapshot = await model.spansSnapshot(for: noteUrl) else {
-            model.status = "Couldn't export note"
-            return
-        }
+        guard let snapshot = await model.spansSnapshot(for: noteUrl) else { return nil }
         let json = snapshot.spansJson
         let spans = await Task.detached { SpanNode.decodeList(json) }.value
 
@@ -50,84 +128,178 @@ enum NoteExporter {
             usedNames.insert(name.lowercased())
             fetched.append(FetchedAsset(url: assetUrl, data: data, name: name))
         }
+        return (spans, fetched)
+    }
 
-        let safeName = title.isEmpty ? "note" : title
+    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
+        guard let (spans, assets) = await gathered(noteUrl: noteUrl, model: model) else {
+            model.status = "Couldn't export note"
+            return
+        }
 
-        if fetched.isEmpty {
-            let html = await Task.detached {
-                buildHTML(title: title, spans: spans, assetResolver: .none)
-            }.value
-            let panel = NSSavePanel()
-            panel.allowedContentTypes = [.html]
-            panel.nameFieldStringValue = safeName + ".html"
-            panel.begin { response in
-                guard response == .OK, let dest = panel.url else { return }
-                Task.detached {
-                    try? html.write(to: dest, atomically: true, encoding: .utf8)
-                }
+        let base = title.isEmpty ? "note" : title
+        var layout = rememberedLayout(hasAssets: !assets.isEmpty)
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = layout.contentTypes
+        panel.nameFieldStringValue = layout.filename(base)
+        let options = NSHostingView(rootView: ExportOptions(
+            layout: layout,
+            hasAssets: !assets.isEmpty
+        ) { [weak panel] chosen in
+            let previous = layout
+            layout = chosen
+            guard let panel else { return }
+            // the name follows the format, keeping anything typed over it
+            let typed = previous.typedName(in: panel.nameFieldStringValue)
+            panel.allowedContentTypes = chosen.contentTypes
+            panel.nameFieldStringValue = chosen.filename(typed.isEmpty ? base : typed)
+        })
+        options.frame.size = options.fittingSize
+        panel.accessoryView = options
+
+        let response = await withCheckedContinuation { continuation in
+            panel.begin { continuation.resume(returning: $0) }
+        }
+        guard response == .OK, let destination = panel.url else { return }
+        UserDefaults.standard.set(layout.rawValue, forKey: layoutKey)
+
+        let html: String
+        switch layout {
+        case .singleFile:
+            // read from the bytes, not from a name: an asset is stored with
+            // whatever name it arrived with, or none at all
+            var images: [String: Data] = [:]
+            for asset in assets where AssetCache.imageType(of: asset.data) != nil {
+                images[asset.url] = asset.data
             }
-        } else {
+            html = buildHTML(
+                title: title,
+                spans: spans,
+                assetResolver: images.isEmpty ? .none : .inlineImages(images)
+            )
+        case .folder, .zip:
             var pathMap: [String: String] = [:]
-            for asset in fetched { pathMap[asset.url] = "assets/\(asset.name)" }
+            for asset in assets { pathMap[asset.url] = "assets/\(asset.name)" }
+            html = buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
+        }
 
-            let html = await Task.detached {
-                buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
-            }.value
-
-            let archive = await Task.detached { () -> URL? in
-                let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
-                let assetsDir = tmp.appendingPathComponent("assets", isDirectory: true)
-                do {
-                    try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
-                    try Data(html.utf8).write(to: tmp.appendingPathComponent("index.html"))
-                    for asset in fetched {
-                        try asset.data.write(to: assetsDir.appendingPathComponent(asset.name))
-                    }
-                } catch {
-                    try? FileManager.default.removeItem(at: tmp)
-                    return nil
-                }
-
-                let zipTmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("lush-\(UUID().uuidString).zip")
-                guard zipDirectory(tmp, to: zipTmp) else {
-                    try? FileManager.default.removeItem(at: tmp)
-                    try? FileManager.default.removeItem(at: zipTmp)
-                    return nil
-                }
-                try? FileManager.default.removeItem(at: tmp)
-                return zipTmp
-            }.value
-            guard let zipTmp = archive else {
-                let alert = NSAlert()
-                alert.messageText = "Export failed"
-                alert.informativeText = "The note archive could not be created."
-                alert.runModal()
-                return
-            }
-
-            let panel = NSSavePanel()
-            panel.allowedContentTypes = [UTType(filenameExtension: "zip") ?? .data]
-            panel.nameFieldStringValue = safeName + ".zip"
-            panel.begin { response in
-                let dest = response == .OK ? panel.url : nil
-                Task.detached {
-                    defer { try? FileManager.default.removeItem(at: zipTmp) }
-                    guard let dest else { return }
-                    let fm = FileManager.default
-                    if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
-                    try? fm.moveItem(at: zipTmp, to: dest)
-                }
-            }
+        let chosen = layout
+        model.exportsInFlight += 1
+        defer { model.exportsInFlight -= 1 }
+        let written = await Task.detached {
+            write(chosen, html: html, assets: assets, to: destination)
+        }.value
+        if !written {
+            model.status = "Couldn't export note"
         }
     }
 
-    nonisolated private static func zipDirectory(_ dir: URL, to output: URL) -> Bool {
+    private struct ExportOptions: View {
+        @State private var layout: HtmlExportLayout
+        private let hasAssets: Bool
+        private let onChange: (HtmlExportLayout) -> Void
+
+        init(
+            layout: HtmlExportLayout,
+            hasAssets: Bool,
+            onChange: @escaping (HtmlExportLayout) -> Void
+        ) {
+            _layout = State(initialValue: layout)
+            self.hasAssets = hasAssets
+            self.onChange = onChange
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Export as:", selection: $layout) {
+                    ForEach(HtmlExportLayout.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.radioGroup)
+                Text(layout.caption(hasAssets: hasAssets))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    // held at two lines' worth so the panel doesn't resize
+                    // under the pointer as the choice changes
+                    .frame(height: 28, alignment: .topLeading)
+            }
+            .frame(width: 380, alignment: .leading)
+            .padding(EdgeInsets(top: 12, leading: 20, bottom: 12, trailing: 20))
+            .onChange(of: layout) { _, layout in onChange(layout) }
+        }
+    }
+
+    nonisolated private static func write(
+        _ layout: HtmlExportLayout,
+        html: String,
+        assets: [FetchedAsset],
+        to destination: URL
+    ) -> Bool {
+        switch layout {
+        case .singleFile:
+            return (try? Data(html.utf8).write(to: destination)) != nil
+        case .folder:
+            do {
+                try writeBundle(html: html, assets: assets, to: destination)
+                return true
+            } catch {
+                return false
+            }
+        case .zip:
+            let staging = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: staging) }
+            let typed = layout.typedName(in: destination.lastPathComponent)
+            let name = typed.isEmpty ? "note" : typed
+            let archive = staging.appendingPathComponent("archive.zip")
+            do {
+                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+                try writeBundle(
+                    html: html,
+                    assets: assets,
+                    to: staging.appendingPathComponent(name, isDirectory: true)
+                )
+            } catch {
+                return false
+            }
+            guard zipItem(name, in: staging, to: archive) else { return false }
+            let fm = FileManager.default
+            if fm.fileExists(atPath: destination.path) {
+                guard (try? fm.removeItem(at: destination)) != nil else { return false }
+            }
+            return (try? fm.moveItem(at: archive, to: destination)) != nil
+        }
+    }
+
+    /// index.html and the assets folder, written into `directory`. The zip
+    /// holds the same thing under one folder, so an unzip lands as a folder
+    /// rather than strewn across wherever it was unzipped.
+    nonisolated private static func writeBundle(
+        html: String,
+        assets: [FetchedAsset],
+        to directory: URL
+    ) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: directory.path) {
+            try fm.removeItem(at: directory)
+        }
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(html.utf8).write(to: directory.appendingPathComponent("index.html"))
+        guard !assets.isEmpty else { return }
+        let assetsDirectory = directory.appendingPathComponent("assets", isDirectory: true)
+        try fm.createDirectory(at: assetsDirectory, withIntermediateDirectories: true)
+        for asset in assets {
+            try asset.data.write(to: assetsDirectory.appendingPathComponent(asset.name))
+        }
+    }
+
+    /// `./` so a name beginning with a dash is a path and not a flag; zip
+    /// drops it from the stored entries.
+    nonisolated private static func zipItem(_ item: String, in directory: URL, to output: URL) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-        process.arguments = ["-r", output.path, "."]
-        process.currentDirectoryURL = dir
+        process.arguments = ["-r", output.path, "./" + item]
+        process.currentDirectoryURL = directory
         do {
             try process.run()
         } catch {
@@ -140,10 +312,13 @@ enum NoteExporter {
 
     // MARK: - HTML builder
 
-    nonisolated static func htmlFragment(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+    /// `assetPaths` maps an asset url to where its file sits, so the pictures
+    /// ride as references. Inlining their bytes is only for a document that
+    /// has to stand on its own — see `htmlDocument`.
+    static func htmlFragment(from spans: [SpanNode], assetPaths: [String: String] = [:]) -> String {
         htmlBody(
             from: spans,
-            assetResolver: inlineImages.isEmpty ? .none : .inlineImages(inlineImages)
+            assetResolver: assetPaths.isEmpty ? .none : .relativePaths(assetPaths)
         )
     }
 
@@ -155,37 +330,192 @@ enum NoteExporter {
         )
     }
 
-    /// Split the same way as `pdfData`: the attributed string is built on the
-    /// main actor because `RichText` draws it over the asset cache, and the
-    /// serialization — which inlines every image — follows it off.
-    static func rtfData(from spans: [SpanNode]) async throws -> Data {
-        let attributed = RichText.attributed(from: spans, cache: AssetCache())
-        return try await Task.detached { try serializeRTF(attributed) }.value
-    }
-
-    nonisolated private static func serializeRTF(_ attributed: NSAttributedString) throws -> Data {
-        try attributed.data(
+    static func rtfData(from spans: [SpanNode]) throws -> Data {
+        let attributed = documentAttributed(from: spans)
+        return try attributed.data(
             from: NSRange(location: 0, length: attributed.length),
             documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
         )
+    }
+
+    // MARK: - Attributed document
+
+    /// An asset packed for a rich text attachment: the file itself, and the
+    /// size the note draws it at so a photo pastes at the size it looks
+    /// rather than at its full pixel count.
+    struct Attachment {
+        let file: FileWrapper
+        let size: CGSize?
+    }
+
+    /// The spans as a document rather than as the editor's view of one. The
+    /// theme's ink and paper go — a note written in the dark should not paste
+    /// as white text on white paper — list items pick up the marker text and
+    /// the list structure Cocoa's rich text keeps them in, and any asset we
+    /// were handed becomes an attachment holding its own file.
+    static func documentAttributed(
+        from spans: [SpanNode],
+        attachments: [String: Attachment] = [:]
+    ) -> NSAttributedString {
+        let text = NSMutableAttributedString(
+            attributedString: RichText.attributed(from: spans, cache: AssetCache())
+        )
+        attach(attachments, in: text)
+        markLists(in: text)
+        documentColors(in: text)
+        return text
+    }
+
+    private static func attach(
+        _ attachments: [String: Attachment],
+        in text: NSMutableAttributedString
+    ) {
+        guard !attachments.isEmpty else { return }
+        var edits: [(NSRange, NSTextAttachment)] = []
+        text.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: text.length)
+        ) { value, range, _ in
+            guard value != nil,
+                  let box = text.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox,
+                  let url = box.value.embedUrl,
+                  let asset = attachments[url]
+            else { return }
+            let attachment = NSTextAttachment()
+            attachment.fileWrapper = asset.file
+            if let size = asset.size {
+                attachment.bounds = CGRect(origin: .zero, size: RichText.fitted(size))
+            }
+            edits.append((range, attachment))
+        }
+        for (range, attachment) in edits {
+            text.addAttribute(.attachment, value: attachment, range: range)
+        }
+    }
+
+    private static let listMarkerFormats: [String: NSTextList.MarkerFormat] = [
+        "unordered-list-item": .disc,
+        "ordered-list-item": .decimal,
+    ]
+
+    private static func todoMarker(_ state: TodoState) -> String {
+        switch state {
+        case .open: return "\u{2610}"
+        case .checked: return "\u{2611}"
+        case .canceled: return "\u{2612}"
+        case .pending: return "\u{25D0}"
+        }
+    }
+
+    /// Cocoa keeps a list item's marker in the text and the list it belongs to
+    /// in the paragraph style. The editor draws its own markers instead, so
+    /// the attributed string it builds has neither and a list would arrive
+    /// somewhere else as bare indented lines.
+    private static func markLists(in text: NSMutableAttributedString) {
+        let string = text.string as NSString
+        var items: [(paragraph: NSRange, marker: String, lists: [NSTextList])] = []
+        var ordinals: [Int: Int] = [:]
+        var location = 0
+        while location < string.length {
+            let paragraph = string.paragraphRange(for: NSRange(location: location, length: 0))
+            guard paragraph.length > 0 else { break }
+            location = NSMaxRange(paragraph)
+            guard let box = text.attribute(
+                .amBlock,
+                at: paragraph.location,
+                effectiveRange: nil
+            ) as? BlockBox else { continue }
+            let block = box.value
+            let depth = block.parents.count
+            guard listMarkerFormats[block.type] != nil || block.type == "todo-list-item" else {
+                ordinals = [:]
+                continue
+            }
+            ordinals = ordinals.filter { $0.key <= depth }
+            let marker: String
+            let format: NSTextList.MarkerFormat
+            switch block.type {
+            case "ordered-list-item":
+                let ordinal = (ordinals[depth] ?? 0) + 1
+                ordinals[depth] = ordinal
+                marker = "\(ordinal)."
+                format = .decimal
+            case "todo-list-item":
+                ordinals[depth] = 0
+                marker = todoMarker(block.todoState)
+                format = .init(marker)
+            default:
+                ordinals[depth] = 0
+                marker = "\u{2022}"
+                format = .disc
+            }
+            var lists = block.parents.map {
+                NSTextList(markerFormat: listMarkerFormats[$0] ?? .disc, options: 0)
+            }
+            lists.append(NSTextList(markerFormat: format, options: 0))
+            items.append((paragraph, marker, lists))
+        }
+        // back to front: an insert moves everything after it
+        for item in items.reversed() {
+            let style = (text.attribute(
+                .paragraphStyle,
+                at: item.paragraph.location,
+                effectiveRange: nil
+            ) as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle
+                ?? NSMutableParagraphStyle()
+            style.textLists = item.lists
+            text.addAttribute(.paragraphStyle, value: style, range: item.paragraph)
+            var attributes = text.attributes(at: item.paragraph.location, effectiveRange: nil)
+            attributes.removeValue(forKey: .link)
+            attributes.removeValue(forKey: .attachment)
+            text.insert(
+                NSAttributedString(string: "\t\(item.marker)\t", attributes: attributes),
+                at: item.paragraph.location
+            )
+        }
+    }
+
+    private static let documentLinkColor = PColor(rgb: 0x0563C1)
+    private static let documentCodePaper = PColor(rgb: 0x000000, alpha: 0.06)
+
+    /// The editor's colours are the theme's, and the theme moves with the
+    /// window. A document keeps none of that: its text lands in whatever
+    /// colour the thing reading it draws text in, and the few runs that do
+    /// need a colour of their own carry one that works on paper.
+    private static func documentColors(in text: NSMutableAttributedString) {
+        let whole = NSRange(location: 0, length: text.length)
+        text.removeAttribute(.foregroundColor, range: whole)
+        text.removeAttribute(.backgroundColor, range: whole)
+        var edits: [(NSRange, [NSAttributedString.Key: Any])] = []
+        text.enumerateAttribute(.amHighlight, in: whole) { value, range, _ in
+            guard let name = value as? String else { return }
+            let pair = Highlight.documentPair(name)
+            edits.append((range, [.foregroundColor: pair.ink, .backgroundColor: pair.paper]))
+        }
+        text.enumerateAttribute(.amCode, in: whole) { value, range, _ in
+            guard value != nil else { return }
+            edits.append((range, [.backgroundColor: documentCodePaper]))
+        }
+        // a PDF draws no link styling of its own, and the readers that do
+        // draw their own only agree on blue and underlined
+        text.enumerateAttribute(.link, in: whole) { value, range, _ in
+            guard value != nil else { return }
+            edits.append((range, [
+                .foregroundColor: documentLinkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+            ]))
+        }
+        for (range, attributes) in edits {
+            text.addAttributes(attributes, range: range)
+        }
     }
 
     enum ExportError: Error {
         case pdfContext
     }
 
-    /// The attributed string has to be built on the main actor — `RichText`
-    /// draws it over the asset cache — but the pagination that follows is the
-    /// slow half and CoreText is happy off it.
-    static func pdfData(from spans: [SpanNode], title: String) async throws -> Data {
-        let attributed = RichText.attributed(from: spans, cache: AssetCache())
-        return try await Task.detached { try paginate(attributed, title: title) }.value
-    }
-
-    nonisolated private static func paginate(
-        _ attributed: NSAttributedString,
-        title: String
-    ) throws -> Data {
+    static func pdfData(from spans: [SpanNode], title: String) throws -> Data {
+        let attributed = documentAttributed(from: spans)
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         let inset = mediaBox.insetBy(dx: 54, dy: 54)
         let data = NSMutableData()
@@ -430,7 +760,8 @@ enum NoteExporter {
             guard let data = images[url] else {
                 return block.altText.isEmpty ? "" : "<p>\(escape(block.altText))</p>"
             }
-            let src = "data:image/png;base64,\(data.base64EncodedString())"
+            let mime = AssetCache.imageType(of: data)?.preferredMIMEType ?? "image/png"
+            let src = "data:\(mime);base64,\(data.base64EncodedString())"
             return "<img src=\"\(src)\" alt=\"\(escape(block.altText))\">"
         }
     }

@@ -355,6 +355,14 @@ enum Highlight {
         return dynamic(light: PColor(rgb: entry.lightInk), dark: PColor(rgb: entry.darkInk))
     }
 
+    /// The light pair, resolved rather than dynamic. A document leaving the
+    /// app is read somewhere we know nothing about, so it carries the colours
+    /// that work on paper instead of the ones that match this window.
+    static func documentPair(_ name: String) -> (paper: PColor, ink: PColor) {
+        let entry = palette[name] ?? palette["pink"]!
+        return (PColor(rgb: entry.hue, alpha: 0.16), PColor(rgb: entry.lightInk))
+    }
+
     private static func dynamic(light: PColor, dark: PColor) -> PColor {
         #if os(macOS)
         NSColor(name: nil) { appearance in
@@ -721,9 +729,10 @@ final class AssetCache {
         imageSizes[url] != nil && (spillFiles[url] != nil || imageData[url] != nil)
     }
 
-    /// The picture at its own resolution, for the info sheet and the
-    /// clipboard. Decoded on the spot and never held: one of these is worth
-    /// tens of the bounded bitmaps the editor draws.
+    /// The picture at its own resolution, for the info sheet. Decoded on the
+    /// spot and never held: one of these is worth tens of the bounded bitmaps
+    /// the editor draws, which is why the clipboard hands over `bytes(for:)`
+    /// instead of coming through here.
     func fullImage(for url: String) -> PImage? {
         bytes(for: url).flatMap(PImage.init(data:))
     }
