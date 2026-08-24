@@ -7,7 +7,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::api::{
-    EmbeddingChunk, IndexedNote, NoteDay, NotePlace, RecentNote, SearchFilter, SearchHit,
+    EmbeddingChunk, IndexedNote, NoteDay, NotePlace, RecentNote, SearchFilter, SearchHit, TreeRow,
 };
 use crate::shapes;
 use crate::shapes::ContextPlace;
@@ -240,6 +240,14 @@ impl SearchIndex {
             );
             CREATE INDEX IF NOT EXISTS search_parents_parent
                 ON search_parents(parent);
+            CREATE TABLE IF NOT EXISTS folder_tree (
+                parent TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                PRIMARY KEY (parent, position)
+            );
             "#,
         )?;
         let parent_pk: i64 = conn.query_row(
@@ -516,6 +524,50 @@ impl SearchIndex {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The sidebar as the last real walk found it: one row per folder entry,
+    /// `parent` empty for a root, `position` the order the folder doc holds
+    /// them in. Folder membership and order live in the folder docs, and
+    /// rebuilding them means loading every folder doc off the sedimentree —
+    /// seconds on a large library, before anything can be drawn. This is that
+    /// answer, written down, so a launch can paint from a SELECT and let the
+    /// real walk correct it when it lands.
+    pub fn set_tree(&self, rows: &[TreeRow]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM folder_tree", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO folder_tree(parent, position, url, name, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            let mut position: HashMap<&str, i64> = HashMap::new();
+            for row in rows {
+                let next = position.entry(row.parent.as_str()).or_insert(0);
+                stmt.execute(params![row.parent, *next, row.url, row.name, row.kind])?;
+                *next += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn tree(&self) -> Result<Vec<TreeRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT parent, url, name, kind FROM folder_tree ORDER BY parent, position")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TreeRow {
+                    parent: row.get(0)?,
+                    url: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn remove(&self, url: &str) -> Result<()> {
@@ -1137,6 +1189,68 @@ fn snippet(body: &str, title: &str, query: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cached_tree_round_trips_in_folder_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open(dir.path()).unwrap();
+        let rows = vec![
+            TreeRow {
+                parent: String::new(),
+                url: "root".into(),
+                name: "Notes".into(),
+                kind: "folder".into(),
+            },
+            TreeRow {
+                parent: "root".into(),
+                url: "work".into(),
+                name: "Work".into(),
+                kind: "folder".into(),
+            },
+            TreeRow {
+                parent: "work".into(),
+                url: "b".into(),
+                name: "B".into(),
+                kind: "rich".into(),
+            },
+            TreeRow {
+                parent: "work".into(),
+                url: "a".into(),
+                name: "A".into(),
+                kind: "rich".into(),
+            },
+            TreeRow {
+                parent: "root".into(),
+                url: "c".into(),
+                name: "C".into(),
+                kind: "rich".into(),
+            },
+        ];
+        index.set_tree(&rows).unwrap();
+
+        let back = index.tree().unwrap();
+        let of = |parent: &str| -> Vec<String> {
+            back.iter()
+                .filter(|row| row.parent == parent)
+                .map(|row| row.url.clone())
+                .collect()
+        };
+        // order within a folder is the folder doc's order, not the url's
+        assert_eq!(of("work"), vec!["b", "a"]);
+        assert_eq!(of("root"), vec!["work", "c"]);
+        assert_eq!(of(""), vec!["root"]);
+
+        // and a second walk replaces the tree rather than merging into it
+        index
+            .set_tree(&[TreeRow {
+                parent: String::new(),
+                url: "root".into(),
+                name: "Notes".into(),
+                kind: "folder".into(),
+            }])
+            .unwrap();
+        assert_eq!(index.tree().unwrap().len(), 1);
+    }
 
     #[test]
     fn loose_words_match_by_prefix() {

@@ -62,6 +62,16 @@ pub struct SearchParent {
     pub parent: String,
 }
 
+/// One sidebar row, flattened: `parent` is empty for a root, and rows arrive
+/// and come back in the order the folder doc holds them.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TreeRow {
+    pub parent: String,
+    pub url: String,
+    pub name: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct NoteSpansSnapshot {
     pub spans_json: String,
@@ -2321,6 +2331,31 @@ impl Core {
         let _ = self.index.set_parents(&parents);
     }
 
+    /// Write the sidebar down so the next launch can draw it before a single
+    /// folder doc has been read. Called after a walk that actually read the
+    /// folder docs — never from the cached tree itself, which would just
+    /// rewrite what it was given.
+    pub fn set_folder_tree(&self, rows: Vec<TreeRow>) {
+        let index = self.index.clone();
+        self.runtime.spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || index.set_tree(&rows)).await;
+        });
+    }
+
+    /// The sidebar as of the last walk. One SELECT: no doc is opened, nothing
+    /// is loaded off the sedimentree, and an empty result just means this
+    /// library predates the cache — the walk fills it in.
+    pub async fn cached_folder_tree(&self) -> Vec<TreeRow> {
+        let index = self.index.clone();
+        self.run(async move {
+            tokio::task::spawn_blocking(move || index.tree().unwrap_or_default())
+                .await
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     pub async fn note_preview(&self, url: String) -> String {
         let Ok(id) = DocId::from_url(&url) else {
             return String::new();
@@ -3332,6 +3367,293 @@ mod tests {
 
     fn heads(core: &Core, url: &str) -> Vec<String> {
         core.runtime.block_on(core.doc_heads(url.to_string()))
+    }
+
+    /// The sedimentree keeps one file per record. A launch that rebuilds docs
+    /// from storage pays an open+read per file, which is what makes this
+    /// dominate on a real filesystem however cheap it looks on tmpfs.
+    fn storage_size(dir: &std::path::Path) -> (usize, u64) {
+        fn walk(dir: &std::path::Path, files: &mut usize, bytes: &mut u64) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    walk(&entry.path(), files, bytes);
+                } else {
+                    *files += 1;
+                    *bytes += meta.len();
+                }
+            }
+        }
+        let mut files = 0;
+        let mut bytes = 0;
+        walk(&dir.join("sedimentree"), &mut files, &mut bytes);
+        (files, bytes)
+    }
+
+    /// Build a library on disk cheaply: the repo directly, one ingest per doc
+    /// rather than one per change, so the benchmark can afford real history.
+    fn seed_library(core: &Arc<Core>, folders: usize, per_folder: usize, history: usize) -> String {
+        let repo = core.repo.clone();
+        core.runtime.block_on(async move {
+            let root = repo
+                .create_doc_now(|doc| shapes::init_folder(doc, "Notes"))
+                .await
+                .unwrap();
+            for f in 0..folders {
+                let sub = repo
+                    .create_doc_now(|doc| shapes::init_folder(doc, &format!("folder {f}")))
+                    .await
+                    .unwrap();
+                repo.change_doc_at_deferred_ingest(root, Vec::new(), |doc| {
+                    shapes::add_folder_entry(
+                        doc,
+                        &shapes::DocLink {
+                            name: format!("folder {f}"),
+                            kind: "folder".into(),
+                            url: sub.to_url(),
+                            lush: None,
+                        },
+                        false,
+                    )
+                })
+                .await
+                .unwrap();
+                for n in 0..per_folder {
+                    let name = format!("note {f}-{n}");
+                    let note = repo
+                        .create_doc_now(|doc| shapes::init_rich_note(doc, &name))
+                        .await
+                        .unwrap();
+                    // one change per edit, the way typing accumulates history
+                    let mut at = 0usize;
+                    for h in 0..history {
+                        let line = format!(
+                            "line {h} of {name}: the quick brown fox jumps over a lazy dog\n"
+                        );
+                        let width = line.chars().count();
+                        repo.change_doc_at_deferred_ingest(note, Vec::new(), |doc| {
+                            shapes::splice_note_text(doc, at, 0, &line, &name)?;
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                        at += width;
+                    }
+                    repo.save_doc_now(note).await.unwrap();
+                    repo.change_doc_at_deferred_ingest(sub, Vec::new(), |doc| {
+                        shapes::add_folder_entry(
+                            doc,
+                            &shapes::DocLink {
+                                name,
+                                kind: "rich".into(),
+                                url: note.to_url(),
+                                lush: None,
+                            },
+                            false,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                }
+                repo.save_doc_now(sub).await.unwrap();
+            }
+            repo.save_doc_now(root).await.unwrap();
+            root.to_url()
+        })
+    }
+
+    /// What the app pays between launch and a usable sidebar, and between
+    /// cmd+N and a note the editor can show. Every call is one the Swift side
+    /// makes, in the order it makes them, against a library already on disk.
+    ///
+    /// **Run this with `--release`.**
+    #[test]
+    #[ignore]
+    fn bench_cold_start_and_new_note() {
+        use std::time::Instant;
+
+        let env = |key: &str, fallback: usize| -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(fallback)
+        };
+        let folders = env("BENCH_FOLDERS", 12);
+        let per_folder = env("BENCH_NOTES", 40);
+        let history = env("BENCH_HISTORY", 60);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+
+        let build = Instant::now();
+        let root = {
+            let core = Core::new(path.clone(), Some("http://[".into())).unwrap();
+            let root = seed_library(&core, folders, per_folder, history);
+            std::thread::sleep(Duration::from_millis(500));
+            root
+        };
+        let (files, bytes) = storage_size(dir.path());
+        println!(
+            "\nlibrary: {folders} folders x {per_folder} notes x {history} changes = {} notes, built in {:?}",
+            folders * per_folder,
+            build.elapsed()
+        );
+        println!(
+            "storage: {files} files, {:.1} MiB — every one of these is an open+read on the launch crawl",
+            bytes as f64 / (1024.0 * 1024.0)
+        );
+
+        // ---- cold launch, as `prewarm` + `startOnce` drive it ----
+        let launch = Instant::now();
+        let core = Core::new(path.clone(), Some("http://[".into())).unwrap();
+        let constructed = launch.elapsed();
+        core.start_folder_url(root.clone()).unwrap();
+
+        let rt = &core.runtime;
+        rt.block_on(core.open_note(root.clone())).unwrap();
+        let opened_root = launch.elapsed();
+
+        let notes = rt.block_on(core.list_notes());
+        let _ = rt.block_on(core.folder_title());
+        let listed = launch.elapsed();
+
+        let mut folder_urls = Vec::new();
+        let mut note_urls = Vec::new();
+        {
+            fn walk(
+                core: &Arc<Core>,
+                url: String,
+                folder_urls: &mut Vec<String>,
+                note_urls: &mut Vec<String>,
+            ) {
+                let rt = &core.runtime;
+                let _ = rt.block_on(core.doc_heads(url.clone()));
+                let entries = rt.block_on(core.folder_entries_of(url.clone()));
+                folder_urls.push(url);
+                for entry in entries {
+                    if entry.kind == "folder" {
+                        walk(core, entry.url, folder_urls, note_urls);
+                    } else {
+                        note_urls.push(entry.url);
+                    }
+                }
+            }
+            let _ = rt.block_on(core.note_title(root.clone()));
+            walk(&core, root.clone(), &mut folder_urls, &mut note_urls);
+        }
+        let walked = launch.elapsed();
+
+        println!(
+            "cold launch: Core::new {constructed:?} | open_note(root) {:?} | list_notes({}) {:?} | tree walk ({} folders, {} notes) {:?}",
+            opened_root - constructed,
+            notes.len(),
+            listed - opened_root,
+            folder_urls.len(),
+            note_urls.len(),
+            walked - listed,
+        );
+        println!("TIME TO SIDEBAR (walking folder docs): {walked:?}");
+
+        println!("cmd+N (quiet core):   {}", new_note_round(&core, &root));
+
+        // opening an existing note with real history, quiet
+        let victim = note_urls[note_urls.len() / 2].clone();
+        let t = Instant::now();
+        rt.block_on(core.open_note(victim.clone())).unwrap();
+        let open_ms = t.elapsed();
+        let t = Instant::now();
+        let _ = rt
+            .block_on(core.note_spans_snapshot(victim.clone()))
+            .unwrap();
+        println!(
+            "open existing note:   open_note {open_ms:?} + note_spans_snapshot {:?}",
+            t.elapsed()
+        );
+
+        // ---- everything again while the startup prefetch crawl runs ----
+        let mut all = folder_urls.clone();
+        all.extend(note_urls.iter().cloned());
+        core.prefetch_notes(all);
+        std::thread::sleep(Duration::from_millis(300));
+        println!("cmd+N (crawl running): {}", new_note_round(&core, &root));
+        let t = Instant::now();
+        let _ = rt.block_on(core.folder_entries_of(root.clone()));
+        println!("folder_entries_of(root) under crawl: {:?}", t.elapsed());
+
+        // What a launch pays once the walk has been written down: no doc is
+        // opened at all, so the sidebar is a SELECT behind `Core::new`.
+        let rows: Vec<TreeRow> = {
+            fn flatten(core: &Arc<Core>, url: &str, out: &mut Vec<TreeRow>) {
+                let entries = core
+                    .runtime
+                    .block_on(core.folder_entries_of(url.to_string()));
+                for entry in entries {
+                    out.push(TreeRow {
+                        parent: url.to_string(),
+                        url: entry.url.clone(),
+                        name: entry.name,
+                        kind: entry.kind.clone(),
+                    });
+                    if entry.kind == "folder" {
+                        flatten(core, &entry.url, out);
+                    }
+                }
+            }
+            let mut out = vec![TreeRow {
+                parent: String::new(),
+                url: root.clone(),
+                name: "Notes".into(),
+                kind: "folder".into(),
+            }];
+            flatten(&core, &root, &mut out);
+            out
+        };
+        core.set_folder_tree(rows.clone());
+        std::thread::sleep(Duration::from_millis(400));
+        drop(core);
+
+        let launch = Instant::now();
+        let core = Core::new(path.clone(), Some("http://[".into())).unwrap();
+        let constructed = launch.elapsed();
+        core.start_folder_url(root.clone()).unwrap();
+        let cached = core.runtime.block_on(core.cached_folder_tree());
+        let ready = launch.elapsed();
+        assert_eq!(cached.len(), rows.len());
+        println!(
+            "TIME TO SIDEBAR (cached in sqlite): {ready:?}  (Core::new {constructed:?} + {} rows in {:?})",
+            cached.len(),
+            ready - constructed
+        );
+    }
+
+    /// The whole cmd+N round: what `createNote` waits for, then what the
+    /// editor waits for before it can show a caret.
+    fn new_note_round(core: &Arc<Core>, folder: &str) -> String {
+        use std::time::Instant;
+        let rt = &core.runtime;
+        let spans = r#"[{"type":"block","value":{"type":"paragraph","parents":[],"attrs":{},"isEmbed":false}}]"#;
+
+        let t = Instant::now();
+        let url = core
+            .create_note_now(Some(folder.to_string()), String::new(), false, spans.into())
+            .unwrap();
+        let created = t.elapsed();
+
+        rt.block_on(core.open_note(url.clone())).unwrap();
+        let opened = t.elapsed();
+
+        let snapshot = rt.block_on(core.note_spans_snapshot(url.clone())).unwrap();
+        let snapped = t.elapsed();
+        assert!(!snapshot.heads.is_empty());
+
+        format!(
+            "create_note_now {created:?} + open_note {:?} + note_spans_snapshot {:?} = {snapped:?}",
+            opened - created,
+            snapped - opened
+        )
     }
 
     fn full_text(core: &Core, url: &str) -> String {
