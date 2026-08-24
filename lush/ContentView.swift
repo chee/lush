@@ -2309,6 +2309,30 @@ private func thumbnailImage(from data: Data) -> Image? {
     #endif
 }
 
+/// A per-folder answer to a yes/no setting, or no answer at all — which means
+/// the folder follows whatever the reader set for every folder.
+enum FolderOverride: Hashable {
+    case settings
+    case yes
+    case no
+
+    init(_ value: Bool?) {
+        switch value {
+        case .some(true): self = .yes
+        case .some(false): self = .no
+        case .none: self = .settings
+        }
+    }
+
+    var value: Bool? {
+        switch self {
+        case .settings: nil
+        case .yes: true
+        case .no: false
+        }
+    }
+}
+
 /// Where a new note goes in one folder: the top, the bottom, or wherever the
 /// setting for every folder says.
 enum NewNotePlacement: Hashable {
@@ -2343,6 +2367,8 @@ struct FolderSettingsEditor: View {
     @State private var notifyOnChange = false
     @State private var notificationsDenied = false
     @State private var newNotes = NewNotePlacement.settings
+    @State private var newNoteLogline = FolderOverride.settings
+    @State private var newNoteFirstLine: String?
 
     var body: some View {
         NavigationStack {
@@ -2364,6 +2390,19 @@ struct FolderSettingsEditor: View {
                         Text("The top").tag(NewNotePlacement.top)
                         Text("The bottom").tag(NewNotePlacement.bottom)
                     }
+                    Picker("Start with a logline", selection: $newNoteLogline) {
+                        Text("Whatever Settings says").tag(FolderOverride.settings)
+                        Text("Yes").tag(FolderOverride.yes)
+                        Text("No").tag(FolderOverride.no)
+                    }
+                    Picker("First line", selection: $newNoteFirstLine) {
+                        Text("Whatever Settings says").tag(nil as String?)
+                        ForEach(EditorController.styles, id: \.key) { style in
+                            Text(style.label).tag(style.key as String?)
+                        }
+                    }
+                } header: {
+                    Text("New Notes")
                 }
             }
             .formStyle(.grouped)
@@ -2382,6 +2421,8 @@ struct FolderSettingsEditor: View {
             name = node.name
             let settings = model.folderSettings(for: node.url)
             newNotes = NewNotePlacement(settings.newNotesAtTop)
+            newNoteLogline = FolderOverride(settings.newNoteLogline)
+            newNoteFirstLine = settings.newNoteFirstLine
             showCount = settings.showCount
             recursiveCount = settings.recursiveCount
             notifyOnChange = settings.notifyOnChange
@@ -2405,7 +2446,9 @@ struct FolderSettingsEditor: View {
             showCount: showCount,
             recursiveCount: recursiveCount,
             notifyOnChange: notifyOnChange,
-            newNotesAtTop: newNotes.atTop
+            newNotesAtTop: newNotes.atTop,
+            newNoteLogline: newNoteLogline.value,
+            newNoteFirstLine: newNoteFirstLine
         ))
         dismiss()
     }

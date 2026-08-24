@@ -660,10 +660,18 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func createNoteDoc(title: String) throws  -> String
     
+    func createNoteIn(folderUrl: String, title: String, atTop: Bool) throws  -> String
+    
     /**
      * Create a note inside a specific folder doc.
+     * Make a note and hand back its url without waiting for disk or network.
+     * The doc, its opening spans and the folder entry all exist in memory
+     * before this returns — the editor can open it and the sidebar can list
+     * it immediately — and the outbox log makes both durable on the way
+     * through. What is deferred is the sedimentree ingest and the sync round,
+     * exactly as for a keystroke. Nothing about a new note should wait.
      */
-    func createNoteIn(folderUrl: String, title: String, atTop: Bool) throws  -> String
+    func createNoteNow(folderUrl: String?, title: String, atTop: Bool, spansJson: String) throws  -> String
     
     /**
      * A pad with nothing pointing at it yet — for a device with no account,
@@ -1392,15 +1400,32 @@ open func createNoteDoc(title: String)throws  -> String  {
 })
 }
     
-    /**
-     * Create a note inside a specific folder doc.
-     */
 open func createNoteIn(folderUrl: String, title: String, atTop: Bool)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_create_note_in(self.uniffiClonePointer(),
         FfiConverterString.lower(folderUrl),
         FfiConverterString.lower(title),
         FfiConverterBool.lower(atTop),$0
+    )
+})
+}
+    
+    /**
+     * Create a note inside a specific folder doc.
+     * Make a note and hand back its url without waiting for disk or network.
+     * The doc, its opening spans and the folder entry all exist in memory
+     * before this returns — the editor can open it and the sidebar can list
+     * it immediately — and the outbox log makes both durable on the way
+     * through. What is deferred is the sedimentree ingest and the sync round,
+     * exactly as for a keystroke. Nothing about a new note should wait.
+     */
+open func createNoteNow(folderUrl: String?, title: String, atTop: Bool, spansJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_create_note_now(self.uniffiClonePointer(),
+        FfiConverterOptionString.lower(folderUrl),
+        FfiConverterString.lower(title),
+        FfiConverterBool.lower(atTop),
+        FfiConverterString.lower(spansJson),$0
     )
 })
 }
@@ -3875,6 +3900,16 @@ public struct FolderSettings {
      * asked to differ.
      */
     public var newNotesAtTop: Bool?
+    /**
+     * Whether a new note in this folder opens with a logline, or `None` to
+     * follow the reader's answer for every folder.
+     */
+    public var newNoteLogline: Bool?
+    /**
+     * The block a new note's first line is, as a style key ("heading1",
+     * "paragraph", …), or `None` to follow the reader's answer.
+     */
+    public var newNoteFirstLine: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3883,12 +3918,22 @@ public struct FolderSettings {
          * Where a new note goes in this folder, or `None` to follow whatever the
          * reader set for every folder. Absent from the doc until a folder is
          * asked to differ.
-         */newNotesAtTop: Bool?) {
+         */newNotesAtTop: Bool?, 
+        /**
+         * Whether a new note in this folder opens with a logline, or `None` to
+         * follow the reader's answer for every folder.
+         */newNoteLogline: Bool?, 
+        /**
+         * The block a new note's first line is, as a style key ("heading1",
+         * "paragraph", …), or `None` to follow the reader's answer.
+         */newNoteFirstLine: String?) {
         self.url = url
         self.showCount = showCount
         self.recursiveCount = recursiveCount
         self.notifyOnChange = notifyOnChange
         self.newNotesAtTop = newNotesAtTop
+        self.newNoteLogline = newNoteLogline
+        self.newNoteFirstLine = newNoteFirstLine
     }
 }
 
@@ -3914,6 +3959,12 @@ extension FolderSettings: Equatable, Hashable {
         if lhs.newNotesAtTop != rhs.newNotesAtTop {
             return false
         }
+        if lhs.newNoteLogline != rhs.newNoteLogline {
+            return false
+        }
+        if lhs.newNoteFirstLine != rhs.newNoteFirstLine {
+            return false
+        }
         return true
     }
 
@@ -3923,6 +3974,8 @@ extension FolderSettings: Equatable, Hashable {
         hasher.combine(recursiveCount)
         hasher.combine(notifyOnChange)
         hasher.combine(newNotesAtTop)
+        hasher.combine(newNoteLogline)
+        hasher.combine(newNoteFirstLine)
     }
 }
 
@@ -3939,7 +3992,9 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
                 showCount: FfiConverterBool.read(from: &buf), 
                 recursiveCount: FfiConverterBool.read(from: &buf), 
                 notifyOnChange: FfiConverterBool.read(from: &buf), 
-                newNotesAtTop: FfiConverterOptionBool.read(from: &buf)
+                newNotesAtTop: FfiConverterOptionBool.read(from: &buf), 
+                newNoteLogline: FfiConverterOptionBool.read(from: &buf), 
+                newNoteFirstLine: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3949,6 +4004,8 @@ public struct FfiConverterTypeFolderSettings: FfiConverterRustBuffer {
         FfiConverterBool.write(value.recursiveCount, into: &buf)
         FfiConverterBool.write(value.notifyOnChange, into: &buf)
         FfiConverterOptionBool.write(value.newNotesAtTop, into: &buf)
+        FfiConverterOptionBool.write(value.newNoteLogline, into: &buf)
+        FfiConverterOptionString.write(value.newNoteFirstLine, into: &buf)
     }
 }
 
@@ -6612,7 +6669,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_create_note_doc() != 48812) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_create_note_in() != 38187) {
+    if (uniffi_lush_core_checksum_method_core_create_note_in() != 34572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_create_note_now() != 9712) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_create_pad() != 4007) {

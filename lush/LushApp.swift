@@ -594,11 +594,15 @@ struct LushApp: App {
 
         WindowGroup(id: "note-detail", for: String.self) { $noteUrl in
             if let url = noteUrl {
+                // statusNotice reads the model out of the environment, and a
+                // modifier reads it where it sits: applied after .environment
+                // it is the parent of the injection rather than a child of it,
+                // and the window traps on its first layout.
                 NoteDetail(noteUrl: url)
+                    .statusNotice()
                     .environment(model)
                     .environment(contextTracker)
                     .interfaceFont()
-                    .statusNotice()
                     .task {
                         async let server: Void = LocalSyncServer.startIfNeeded()
                         await model.start()

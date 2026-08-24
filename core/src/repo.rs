@@ -2885,6 +2885,35 @@ impl Repo {
         Ok(id)
     }
 
+    /// Create a doc and hand it back without waiting for disk or network.
+    /// The doc is in memory and readable before this returns, the outbox log
+    /// makes it durable on the way through, and the sedimentree ingest plus
+    /// the sync round ride the same debounce a keystroke does — the same
+    /// bargain `change_doc_at_deferred_ingest` strikes, for the same reason.
+    pub async fn create_doc_now<F>(self: &Arc<Self>, init: F) -> Result<DocId>
+    where
+        F: FnOnce(&mut Automerge) -> Result<()>,
+    {
+        let id = DocId::random();
+        let mut doc = Automerge::new();
+        catching(|| init(&mut doc))?;
+        self.docs.lock().await.insert(id, DocState::shared(doc));
+        self.touch(id);
+        self.stage_doc(id).await?;
+        self.schedule_save_doc(id).await;
+        let repo = self.clone();
+        tokio::spawn(async move {
+            repo.ephemeral
+                .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
+                .await;
+            repo.start_connect_loop_if_needed();
+            if repo.wait_connected(Duration::from_secs(15)).await {
+                repo.request_sync(id).await;
+            }
+        });
+        Ok(id)
+    }
+
     /// Run a mutation against a tracked doc, then persist + broadcast the
     /// resulting commits. Returns the mutation's value.
     pub async fn change_doc<F, T>(self: &Arc<Self>, id: DocId, f: F) -> Result<T>
@@ -3723,6 +3752,54 @@ mod tests {
         assert_eq!(parse_friend_code(node).unwrap().1, None);
         assert!(parse_friend_code(&format!("{node}:beep")).is_err());
         assert!(parse_friend_code("beep").is_err());
+    }
+
+    /// A new note must not wait on the sedimentree ingest, but it must still
+    /// survive the process: `create_doc_now` returns before the ingest and
+    /// leaves the content in the outbox log, which is what a relaunch reads.
+    #[tokio::test]
+    async fn a_doc_created_now_is_readable_at_once_and_already_durable() {
+        let (dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc_now(|doc| crate::shapes::init_rich_note(doc, "instant"))
+            .await
+            .unwrap();
+
+        let title = repo
+            .read_doc(id, |doc| Ok(crate::shapes::doc_title(doc)))
+            .await
+            .unwrap();
+        assert_eq!(title, "instant");
+        assert!(repo.is_resident(id).await);
+        assert!(
+            repo.outbox_path(id).exists(),
+            "the log is the only copy until the debounced save lands"
+        );
+        drop(dir);
+    }
+
+    /// And the deferred save does land, without anyone asking for it.
+    #[tokio::test]
+    async fn a_doc_created_now_saves_itself_shortly_after() {
+        let (dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc_now(|doc| crate::shapes::init_rich_note(doc, "instant"))
+            .await
+            .unwrap();
+
+        let saved = timeout(Duration::from_secs(5), async {
+            loop {
+                if repo.stored_doc(id).await.is_ok_and(|doc| {
+                    crate::shapes::doc_title(&doc) == "instant"
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(saved.is_ok(), "the debounced save should reach storage");
+        drop(dir);
     }
 
     async fn iroh_test_repo() -> (TempDir, Arc<Repo>) {

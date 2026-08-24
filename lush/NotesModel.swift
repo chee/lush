@@ -1777,49 +1777,41 @@ final class NotesModel {
         nodeIndex[url] != nil
     }
 
-    @discardableResult
-    func createNote(snap: ContextSnapshot? = nil) async -> String? {
-        if let folderUrl {
-            return await createNote(inFolder: folderUrl, snap: snap)
+    /// What a new note opens with: a logline when the folder asks for one, and
+    /// a first line in whatever block the folder asks for.
+    func newNoteSpans(in folderUrl: String?, snap: ContextSnapshot? = nil) -> [SpanNode] {
+        var spans: [SpanNode] = []
+        if newNoteLogline(in: folderUrl) {
+            let pending = snap != nil && ContextTracker.stampsContext
+            spans.append(.block(.creationBlock(snap: snap, pending: pending)))
         }
-        guard let core else { return nil }
-        let pending = snap != nil && ContextTracker.stampsContext
-        let atTop = newNoteAtTop(in: folderUrl)
-        do {
-            let url = try await Task.detached { [core, snap, pending, atTop] () -> String in
-                let url = try core.createNoteDoc(title: "")
-                let initial: [SpanNode] = [
-                    .block(.creationBlock(snap: snap, pending: pending)),
-                    .block(.heading(level: 1)),
-                ]
-                _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
-                try await core.linkNoteToFolder(noteUrl: url, title: "", atTop: atTop)
-                return url
-            }.value
-            pendingFocusUrl = url
-            selectedNoteUrl = url
-            refreshNotes()
-            return url
-        } catch {
-            status = "Couldn't create note: \(error.localizedDescription)"
-            return nil
-        }
+        spans.append(.block(.fromStyleKey(newNoteFirstLine(in: folderUrl))))
+        return spans
     }
 
     @discardableResult
-    func createNote(inFolder folderUrl: String, snap: ContextSnapshot? = nil) async -> String? {
+    func createNote(snap: ContextSnapshot? = nil) async -> String? {
+        await createNote(inFolder: folderUrl, snap: snap)
+    }
+
+    /// Nothing here waits on anything. The doc, its opening spans and the
+    /// folder entry are all built in memory by one call, so the note exists
+    /// the moment the menu item is chosen; the saves and the sync ride the
+    /// debounce a keystroke does. The sidebar catches up on its own.
+    @discardableResult
+    func createNote(inFolder folderUrl: String?, snap: ContextSnapshot? = nil) async -> String? {
         guard let core else { return nil }
-        let pending = snap != nil && ContextTracker.stampsContext
-        let atTop = newNoteAtTop(in: folderUrl)
+        let target = folderUrl ?? self.folderUrl
+        let atTop = newNoteAtTop(in: target)
+        let spansJson = SpanNode.encodeList(newNoteSpans(in: target, snap: snap))
         do {
-            let url = try await Task.detached { [core, folderUrl, snap, pending, atTop] () -> String in
-                let url = try core.createNoteIn(folderUrl: folderUrl, title: "", atTop: atTop)
-                let initial: [SpanNode] = [
-                    .block(.creationBlock(snap: snap, pending: pending)),
-                    .block(.heading(level: 1)),
-                ]
-                _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
-                return url
+            let url = try await Task.detached { [core, target, atTop, spansJson] () -> String in
+                try core.createNoteNow(
+                    folderUrl: target,
+                    title: "",
+                    atTop: atTop,
+                    spansJson: spansJson
+                )
             }.value
             pendingFocusUrl = url
             selectedNoteUrl = url

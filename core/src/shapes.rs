@@ -929,6 +929,12 @@ pub struct FolderSettings {
     /// reader set for every folder. Absent from the doc until a folder is
     /// asked to differ.
     pub new_notes_at_top: Option<bool>,
+    /// Whether a new note in this folder opens with a logline, or `None` to
+    /// follow the reader's answer for every folder.
+    pub new_note_logline: Option<bool>,
+    /// The block a new note's first line is, as a style key ("heading1",
+    /// "paragraph", …), or `None` to follow the reader's answer.
+    pub new_note_first_line: Option<String>,
 }
 
 pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
@@ -945,6 +951,8 @@ pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
                 recursive_count: bool_at(doc, &item, "recursiveCount").unwrap_or(false),
                 notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
                 new_notes_at_top: bool_at(doc, &item, "newNotesAtTop"),
+                new_note_logline: bool_at(doc, &item, "newNoteLogline"),
+                new_note_first_line: read_str(doc, &item, "newNoteFirstLine"),
             })
         })
         .collect();
@@ -983,6 +991,22 @@ pub fn config_set_folder_settings(
                     None => {
                         if t.get(&item, "newNotesAtTop")?.is_some() {
                             t.delete(&item, "newNotesAtTop")?;
+                        }
+                    }
+                }
+                match s.new_note_logline {
+                    Some(logline) => t.put(&item, "newNoteLogline", logline)?,
+                    None => {
+                        if t.get(&item, "newNoteLogline")?.is_some() {
+                            t.delete(&item, "newNoteLogline")?;
+                        }
+                    }
+                }
+                match &s.new_note_first_line {
+                    Some(style) => t.put(&item, "newNoteFirstLine", style.as_str())?,
+                    None => {
+                        if t.get(&item, "newNoteFirstLine")?.is_some() {
+                            t.delete(&item, "newNoteFirstLine")?;
                         }
                     }
                 }
@@ -1952,9 +1976,39 @@ mod tests {
             recursive_count: false,
             notify_on_change: false,
             new_notes_at_top: None,
+            new_note_logline: None,
+            new_note_first_line: None,
         };
         config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
         assert_eq!(config_folder_settings(&doc), vec![settings]);
+    }
+
+    /// The two new-note overrides answer the same way a placement does: absent
+    /// means follow the reader's setting, and clearing one takes the key back
+    /// off rather than writing a false or an empty string.
+    #[test]
+    fn the_new_note_overrides_round_trip_and_can_be_taken_back_off() {
+        let mut doc = Automerge::new();
+        let mut settings = FolderSettings {
+            url: "automerge:folder".into(),
+            show_count: false,
+            recursive_count: false,
+            notify_on_change: false,
+            new_notes_at_top: None,
+            new_note_logline: Some(false),
+            new_note_first_line: Some("paragraph".into()),
+        };
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        let read = &config_folder_settings(&doc)[0];
+        assert_eq!(read.new_note_logline, Some(false));
+        assert_eq!(read.new_note_first_line.as_deref(), Some("paragraph"));
+
+        settings.new_note_logline = None;
+        settings.new_note_first_line = None;
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        let read = &config_folder_settings(&doc)[0];
+        assert_eq!(read.new_note_logline, None);
+        assert_eq!(read.new_note_first_line, None);
     }
 
     #[test]
@@ -1966,6 +2020,8 @@ mod tests {
             recursive_count: false,
             notify_on_change: false,
             new_notes_at_top: Some(true),
+            new_note_logline: None,
+            new_note_first_line: None,
         };
         config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
         assert_eq!(

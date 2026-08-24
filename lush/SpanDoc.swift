@@ -1002,6 +1002,11 @@ enum EditorSettings {
     private static let handFamilyKey = "editorHandFamily"
     private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
+    private static let newNoteLoglineKey = "editorNewNoteLogline"
+    private static let newNoteFirstLineKey = "editorNewNoteFirstLine"
+    /// The style key a new note's first line carries out of the box. A note
+    /// opens as a title, which is what the sidebar reads back as its name.
+    static let defaultNewNoteFirstLine = "heading1"
     static let loglineDateFormatKey = "editorLoglineDateFormat"
     /// A skeleton, not a format: the fields wanted, in no particular order.
     /// `setLocalizedDateFormatFromTemplate` arranges them the way the reader's
@@ -1141,6 +1146,28 @@ enum EditorSettings {
 
     static func setAutoInsertLogline(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: autoInsertLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    /// Whether a new note opens with a logline above its first line. On out of
+    /// the box, so `object(forKey:)` rather than `bool(forKey:)` — an unset
+    /// key is not the same as one turned off.
+    static var newNoteLogline: Bool {
+        UserDefaults.standard.object(forKey: newNoteLoglineKey) as? Bool ?? true
+    }
+
+    static func setNewNoteLogline(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: newNoteLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static var newNoteFirstLine: String {
+        let stored = UserDefaults.standard.string(forKey: newNoteFirstLineKey) ?? ""
+        return stored.isEmpty ? defaultNewNoteFirstLine : stored
+    }
+
+    static func setNewNoteFirstLine(_ styleKey: String) {
+        UserDefaults.standard.set(styleKey, forKey: newNoteFirstLineKey)
         NotificationCenter.default.post(name: changed, object: nil)
     }
 

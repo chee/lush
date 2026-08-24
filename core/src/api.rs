@@ -2848,6 +2848,72 @@ impl Core {
     }
 
     /// Create a note inside a specific folder doc.
+    /// Make a note and hand back its url without waiting for disk or network.
+    /// The doc, its opening spans and the folder entry all exist in memory
+    /// before this returns — the editor can open it and the sidebar can list
+    /// it immediately — and the outbox log makes both durable on the way
+    /// through. What is deferred is the sedimentree ingest and the sync round,
+    /// exactly as for a keystroke. Nothing about a new note should wait.
+    pub fn create_note_now(
+        &self,
+        folder_url: Option<String>,
+        title: String,
+        at_top: bool,
+        spans_json: String,
+    ) -> Result<String, CoreError> {
+        // A note nothing links to is a note nobody can find. `create_note`
+        // refuses the same way rather than leaving one behind.
+        let target = match folder_url {
+            Some(url) if !url.is_empty() => url,
+            _ => self
+                .folder
+                .lock()
+                .unwrap()
+                .map(|id| id.to_url())
+                .ok_or_else(|| CoreError::General {
+                    msg: "no folder open".into(),
+                })?,
+        };
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let spans: Vec<shapes::SpanJson> = if spans_json.is_empty() {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(&spans_json)?
+                };
+                let note = repo
+                    .create_doc_now(|doc| {
+                        shapes::init_rich_note(doc, &title)?;
+                        if !spans.is_empty() {
+                            shapes::update_spans_from_json(doc, &spans)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                let folder = DocId::from_url(&target)?;
+                // The open folder is resident; only a link into one that is
+                // not pays for a load.
+                if !repo.is_resident(folder).await {
+                    repo.ensure_doc(folder).await?;
+                }
+                let link = shapes::DocLink {
+                    name: title.clone(),
+                    kind: "rich".into(),
+                    url: note.to_url(),
+                    lush: None,
+                };
+                repo.change_doc_at_deferred_ingest(folder, Vec::new(), |doc| {
+                    shapes::add_folder_entry(doc, &link, at_top)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(note.to_url())
+            })?;
+            self.reindex_doc(DocId::from_url(&url)?);
+            Ok(url)
+        })
+    }
+
     pub fn create_note_in(
         &self,
         folder_url: String,
