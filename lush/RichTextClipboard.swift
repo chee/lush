@@ -117,7 +117,10 @@ enum RichTextClipboard {
                 }
                 let slice = Array(spans[i..<j])
                 if root == "table" {
-                    lines.append(markdownTable(RichText.parseTable(slice)))
+                    lines.append(markdownTable(
+                        RichText.parseTable(slice),
+                        attachmentLabel: attachmentLabel
+                    ))
                 } else {
                     for column in RichText.parseColumns(slice) {
                         lines.append(markdown(from: column, attachmentLabel: attachmentLabel))
@@ -192,12 +195,17 @@ enum RichTextClipboard {
     /// A pipe table. The header rule goes in whether or not the table has a
     /// header row: without it the rest is not a table to anything reading
     /// markdown, just lines with pipes in them.
-    static func markdownTable(_ grid: TableGrid) -> String {
+    static func markdownTable(
+        _ grid: TableGrid,
+        attachmentLabel: (BlockValue, Int) -> String = { _, _ in "[attachment]" }
+    ) -> String {
         let columns = grid.columnCount
         guard columns > 0 else { return "" }
         var lines: [String] = []
         for (index, row) in grid.rows.enumerated() {
-            let cells = (0..<columns).map { markdownCell(cell(row, $0)) }
+            let cells = (0..<columns).map {
+                markdownCell(cell(row, $0), attachmentLabel: attachmentLabel)
+            }
             lines.append("| " + cells.joined(separator: " | ") + " |")
             if index == 0 {
                 lines.append("|" + String(repeating: " --- |", count: columns))
@@ -232,8 +240,14 @@ enum RichTextClipboard {
 
     /// A cell on one line: neither a pipe table nor a TSV row has anywhere to
     /// put the blocks a cell can hold.
-    private static func markdownCell(_ cell: [SpanNode]) -> String {
-        oneLine(markdown(from: cell).replacingOccurrences(of: "|", with: "\\|"))
+    private static func markdownCell(
+        _ cell: [SpanNode],
+        attachmentLabel: (BlockValue, Int) -> String
+    ) -> String {
+        oneLine(
+            markdown(from: cell, attachmentLabel: attachmentLabel)
+                .replacingOccurrences(of: "|", with: "\\|")
+        )
     }
 
     private static func plainCell(_ cell: [SpanNode]) -> String {

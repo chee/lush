@@ -1470,19 +1470,20 @@ final class EditorCore: LiveWriter {
     /// gets the picture and not a blank line where an image was. Every asset
     /// comes out as the bytes the note already holds and as a file beside
     /// them: nothing here decodes a picture, and nothing re-encodes one.
-    func copiedMedia(in attributed: NSAttributedString) -> CopiedMedia {
+    ///
+    /// Read from the spans, not from the attributed string the selection is:
+    /// a table or a set of columns is one attachment character out there,
+    /// with its cells' own pictures folded away inside its box. The spans
+    /// have them laid out flat.
+    func copiedMedia(in spans: [SpanNode]) -> CopiedMedia {
         var seen: Set<String> = []
         var media = CopiedMedia()
-        attributed.enumerateAttribute(
-            .amBlock,
-            in: NSRange(location: 0, length: attributed.length)
-        ) { value, _, _ in
-            guard let box = value as? BlockBox,
-                  box.value.isEmbedBlock,
-                  let url = box.value.embedUrl,
+        for case .block(let block) in spans {
+            guard block.isEmbedBlock,
+                  let url = block.embedUrl,
                   seen.insert(url).inserted
-            else { return }
-            if let picture = self.picture(for: url) {
+            else { continue }
+            if let picture = picture(for: url) {
                 media.pictures.append(picture)
                 if let file = picture.file() {
                     media.paths[url] = file.absoluteString
@@ -4945,7 +4946,7 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
-        let media = core?.copiedMedia(in: slice) ?? EditorCore.CopiedMedia()
+        let media = core?.copiedMedia(in: spans) ?? EditorCore.CopiedMedia()
         let attachmentLabel: (BlockValue, Int) -> String = { block, _ in
             guard let url = block.embedUrl, media.paths[url] != nil else { return "[attachment]" }
             return block.altText
@@ -5974,7 +5975,7 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         let slice = storage.attributedSubstring(from: range)
         let spans = RichText.spans(from: slice)
         let json = SpanNode.encodeList(spans)
-        let media = core?.copiedMedia(in: slice) ?? EditorCore.CopiedMedia()
+        let media = core?.copiedMedia(in: spans) ?? EditorCore.CopiedMedia()
         let attachmentLabel: (BlockValue, Int) -> String = { block, _ in
             guard let url = block.embedUrl, media.paths[url] != nil else { return "[attachment]" }
             return block.altText
