@@ -673,8 +673,8 @@ final class AssetCache {
     var patchworkDocs: Set<String> = []
     var transcripts: [String: String] = [:]
 
-    static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
-    static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
+    nonisolated static let audioExtensions: Set<String> = ["m4a", "mp3", "wav", "aac", "caf", "aiff"]
+    nonisolated static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "mpg", "mpeg"]
 
     /// The widest a picture is ever drawn, in device pixels — `RichText.fitted`
     /// caps the point size and the densest screen either platform ships is 3x.
@@ -748,17 +748,24 @@ final class AssetCache {
         guard let size = PImage(data: data)?.size, size.width > 0, size.height > 0
         else { return nil }
         imageSizes[url] = size
+        imageData[url] = data
         // Spill to the file audio and video already use and keep the mapped
         // copy. Mapped pages are clean, so the kernel can reclaim them; a heap
-        // copy of every photo in the note is what it cannot.
-        if let file = Self.mediaFile(for: url, name: "image", data: data),
-           let mapped = try? Data(contentsOf: file, options: .mappedIfSafe) {
-            spillFiles[url] = file
-            imageData[url] = mapped
-        } else {
-            imageData[url] = data
+        // copy of every photo in the note is what it cannot. Writing a photo
+        // out is far too slow to do here, so the mapped copy takes over once
+        // it lands.
+        Task.detached { [weak self] in
+            guard let file = AssetCache.mediaFile(for: url, name: "image", data: data),
+                  let mapped = try? Data(contentsOf: file, options: .mappedIfSafe)
+            else { return }
+            await self?.adoptSpill(file, mapped: mapped, for: url)
         }
         return size
+    }
+
+    private func adoptSpill(_ file: URL, mapped: Data, for url: String) {
+        spillFiles[url] = file
+        imageData[url] = mapped
     }
 
     /// Decode the bounded display bitmap off the main thread, once per url no
@@ -995,6 +1002,11 @@ enum EditorSettings {
     private static let handFamilyKey = "editorHandFamily"
     private static let adjustmentsKey = "fontAdjustments"
     private static let autoInsertLoglineKey = "editorAutoInsertLogline"
+    private static let newNoteLoglineKey = "editorNewNoteLogline"
+    private static let newNoteFirstLineKey = "editorNewNoteFirstLine"
+    /// The style key a new note's first line carries out of the box. A note
+    /// opens as a title, which is what the sidebar reads back as its name.
+    static let defaultNewNoteFirstLine = "heading1"
     static let loglineDateFormatKey = "editorLoglineDateFormat"
     /// A skeleton, not a format: the fields wanted, in no particular order.
     /// `setLocalizedDateFormatFromTemplate` arranges them the way the reader's
@@ -1134,6 +1146,28 @@ enum EditorSettings {
 
     static func setAutoInsertLogline(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: autoInsertLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    /// Whether a new note opens with a logline above its first line. On out of
+    /// the box, so `object(forKey:)` rather than `bool(forKey:)` — an unset
+    /// key is not the same as one turned off.
+    static var newNoteLogline: Bool {
+        UserDefaults.standard.object(forKey: newNoteLoglineKey) as? Bool ?? true
+    }
+
+    static func setNewNoteLogline(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: newNoteLoglineKey)
+        NotificationCenter.default.post(name: changed, object: nil)
+    }
+
+    static var newNoteFirstLine: String {
+        let stored = UserDefaults.standard.string(forKey: newNoteFirstLineKey) ?? ""
+        return stored.isEmpty ? defaultNewNoteFirstLine : stored
+    }
+
+    static func setNewNoteFirstLine(_ styleKey: String) {
+        UserDefaults.standard.set(styleKey, forKey: newNoteFirstLineKey)
         NotificationCenter.default.post(name: changed, object: nil)
     }
 

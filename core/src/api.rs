@@ -226,6 +226,16 @@ pub struct IndexedNoteContent {
     pub tags: Vec<String>,
     pub weather: Vec<String>,
     pub locations: Vec<String>,
+    /// The first logline's own attrs, which is what a note row renders: a
+    /// later logline never stands in for what that one lacks. `context_created`
+    /// is its `created` (else `ts`) stamp as epoch seconds, 0 when absent; the
+    /// rest are empty when absent.
+    pub context_created: i64,
+    pub context_location: String,
+    pub context_weather: String,
+    pub now_playing: String,
+    /// The body after the title line, capped for display.
+    pub preview: String,
     /// First calendar event's window, epoch seconds, 0 when absent.
     pub event_start: i64,
     pub event_end: i64,
@@ -247,6 +257,11 @@ impl From<search::IndexedDoc> for IndexedNoteContent {
             tags: doc.tags,
             weather: doc.weather,
             locations: doc.locations,
+            context_created: doc.context_created,
+            context_location: doc.context_location,
+            context_weather: doc.context_weather,
+            now_playing: doc.now_playing,
+            preview: doc.preview,
             event_start: doc.event_start,
             event_end: doc.event_end,
             event_ids: doc.event_ids,
@@ -350,8 +365,13 @@ pub struct Core {
     repo: Arc<Repo>,
     index: Arc<SearchIndex>,
     index_slots: Arc<IndexSlots>,
+    /// Docs whose index row may be behind a `DocChanged` the indexer never
+    /// received. Only a fresh row clears one; until then the doc answers for
+    /// itself.
+    unsettled_rows: Arc<std::sync::Mutex<HashSet<DocId>>>,
     folder: std::sync::Mutex<Option<DocId>>,
     history_cache: std::sync::Mutex<HashMap<DocId, Arc<CachedDocHistory>>>,
+    delegate_forwarding: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -428,17 +448,47 @@ impl Core {
         let repo = self.repo.clone();
         let index = self.index.clone();
         let slots = self.index_slots.clone();
+        let unsettled = self.unsettled_rows.clone();
         self.runtime.spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(RepoEvent::DocChanged(id)) => {
-                        schedule_index_doc(repo.clone(), index.clone(), slots.clone(), id);
+                        schedule_index_doc(
+                            repo.clone(),
+                            index.clone(),
+                            slots.clone(),
+                            unsettled.clone(),
+                            id,
+                        );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("index missed {n} events; reindexing tracked docs");
+                        // The dropped events are mostly for docs nobody has
+                        // resident — that is what an eviction announcement is
+                        // — so reindexing the tracked ones does not cover it.
+                        // Every row the index holds is suspect until it is
+                        // written again; readers fall back to the doc for
+                        // those rather than trusting what could be stale.
+                        let known = {
+                            let index = index.clone();
+                            tokio::task::spawn_blocking(move || index.indexed_urls())
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                                .unwrap_or_default()
+                        };
+                        if let Ok(mut rows) = unsettled.lock() {
+                            rows.extend(known.iter().filter_map(|url| DocId::from_url(url).ok()));
+                        }
                         for id in repo.tracked_doc_ids().await {
-                            schedule_index_doc(repo.clone(), index.clone(), slots.clone(), id);
+                            schedule_index_doc(
+                                repo.clone(),
+                                index.clone(),
+                                slots.clone(),
+                                unsettled.clone(),
+                                id,
+                            );
                         }
                     }
                     Ok(_) => {}
@@ -470,6 +520,7 @@ impl Core {
             self.repo.clone(),
             self.index.clone(),
             self.index_slots.clone(),
+            self.unsettled_rows.clone(),
             id,
         );
     }
@@ -505,7 +556,19 @@ type IndexSlots = std::sync::Mutex<HashMap<DocId, IndexSlot>>;
 /// Serialize index updates per doc: while one runs, a new DocChanged sets
 /// `again` instead of racing a second task. The rerun reads the doc's latest
 /// state, so the newest write always lands last and the index can't go stale.
-fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<IndexSlots>, id: DocId) {
+fn schedule_index_doc(
+    repo: Arc<Repo>,
+    index: Arc<SearchIndex>,
+    slots: Arc<IndexSlots>,
+    unsettled: Arc<std::sync::Mutex<HashSet<DocId>>>,
+    id: DocId,
+) {
+    // Unsettled from here rather than from the moment a row is known stale:
+    // a job that fails leaves the row behind the doc just as surely as one
+    // still running, and only a write that lands says otherwise.
+    if let Ok(mut rows) = unsettled.lock() {
+        rows.insert(id);
+    }
     {
         let mut map = slots.lock().unwrap();
         let slot = map.entry(id).or_default();
@@ -517,7 +580,7 @@ fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<Index
     }
     tokio::spawn(async move {
         loop {
-            index_doc(repo.clone(), index.clone(), id).await;
+            index_doc(repo.clone(), index.clone(), unsettled.clone(), id).await;
             let mut map = slots.lock().unwrap();
             match map.get_mut(&id) {
                 Some(slot) if slot.again => slot.again = false,
@@ -533,7 +596,12 @@ fn schedule_index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, slots: Arc<Index
 /// The sqlite write runs on a blocking thread: the index is one connection
 /// behind a mutex, and a fan-out of index tasks would otherwise park that many
 /// runtime workers waiting for it.
-async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
+async fn index_doc(
+    repo: Arc<Repo>,
+    index: Arc<SearchIndex>,
+    unsettled: Arc<std::sync::Mutex<HashSet<DocId>>>,
+    id: DocId,
+) {
     let url = id.to_url();
     let known_created = {
         let index = index.clone();
@@ -566,9 +634,41 @@ async fn index_doc(repo: Arc<Repo>, index: Arc<SearchIndex>, id: DocId) {
     match written {
         Ok(Err(e)) => tracing::warn!(error = %e, "search index write failed"),
         Err(e) => tracing::warn!(error = %e, "search index task failed"),
-        Ok(Ok(true)) => repo.announce_doc_indexed(id),
-        Ok(Ok(false)) => {}
+        Ok(Ok(advanced)) => {
+            if let Ok(mut rows) = unsettled.lock() {
+                rows.remove(&id);
+            }
+            if advanced {
+                repo.announce_doc_indexed(id);
+            }
+        }
     }
+}
+
+/// The doc's index row, when the row is as current as the doc: a resident doc
+/// can be mid-edit and its row only catches up once the indexer has run, and a
+/// doc with an index job queued or running is behind by definition — a change
+/// synced for an evicted doc reaches storage before the row. Both are answered
+/// from the doc itself; everything else then costs a SELECT rather than a
+/// rebuild — or, worse, an open that keeps the doc.
+async fn settled_row(
+    repo: &Arc<Repo>,
+    index: &Arc<SearchIndex>,
+    unsettled: &Arc<std::sync::Mutex<HashSet<DocId>>>,
+    id: DocId,
+) -> Option<search::IndexedDoc> {
+    if unsettled.lock().ok()?.contains(&id) {
+        return None;
+    }
+    if repo.is_resident(id).await {
+        return None;
+    }
+    let index = index.clone();
+    let url = id.to_url();
+    tokio::task::spawn_blocking(move || index.indexed_note(&url))
+        .await
+        .ok()?
+        .ok()?
 }
 
 /// Sends tracing lines to the unified log, so the core's own boot timings sit
@@ -661,8 +761,10 @@ impl Core {
             repo,
             index,
             index_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            unsettled_rows: Arc::new(std::sync::Mutex::new(HashSet::new())),
             folder: std::sync::Mutex::new(None),
             history_cache: std::sync::Mutex::new(HashMap::new()),
+            delegate_forwarding: std::sync::Mutex::new(None),
         });
         core.start_index_updates();
         tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "core constructed");
@@ -674,7 +776,7 @@ impl Core {
 impl Core {
     pub fn set_delegate(&self, delegate: Box<dyn CoreDelegate>) {
         let mut events = self.repo.subscribe();
-        self.runtime.spawn(async move {
+        let forwarding = self.runtime.spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(RepoEvent::DocChanged(id)) => delegate.on_doc_changed(id.to_url()),
@@ -698,6 +800,13 @@ impl Core {
                 }
             }
         });
+        // A scene reconnect calls this again: without dropping the loop the
+        // last delegate is on, every event arrives twice and that delegate's
+        // whole object graph stays alive behind it.
+        let previous = self.delegate_forwarding.lock().unwrap().replace(forwarding);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
     }
 
     pub async fn resync_doc(&self, url: String) -> Result<(), CoreError> {
@@ -2018,6 +2127,7 @@ impl Core {
     pub async fn open_note(&self, url: String) -> Result<(), CoreError> {
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
         let id = DocId::from_url(&url)?;
         repo.pin_doc(id);
         let opened = self
@@ -2029,7 +2139,7 @@ impl Core {
                 // Not awaited: the search index is one mutex, and at startup the
                 // prefetch walk holds it for every note on disk. The caller wants
                 // the document, not the search row.
-                tokio::spawn(index_doc(repo, index, id));
+                tokio::spawn(index_doc(repo, index, unsettled, id));
                 Ok::<_, anyhow::Error>(())
             })
             .await;
@@ -2104,6 +2214,7 @@ impl Core {
     pub fn prefetch_notes(&self, urls: Vec<String>) {
         let repo = self.repo.clone();
         let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
         let active = self.repo.app_active();
         self.runtime.spawn(async move {
             let mut visited = HashSet::new();
@@ -2122,6 +2233,7 @@ impl Core {
                 let found = futures::stream::iter(level.drain(..).map(|id| {
                     let repo = repo.clone();
                     let index = index.clone();
+                    let unsettled = unsettled.clone();
                     let active = active.clone();
                     async move {
                         if wait_for_active(active).await.is_err() {
@@ -2138,7 +2250,7 @@ impl Core {
                             return Vec::new();
                         }
                         let _ = repo.change_doc(id, shapes::normalize_strings).await;
-                        index_doc(repo.clone(), index, id).await;
+                        index_doc(repo.clone(), index, unsettled, id).await;
                         let mut children: Vec<String> = repo
                             .read_doc(id, shapes::folder_entries)
                             .await
@@ -2214,7 +2326,12 @@ impl Core {
             return String::new();
         };
         let repo = self.repo.clone();
+        let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
         self.run(async move {
+            if let Some(row) = settled_row(&repo, &index, &unsettled, id).await {
+                return Ok(row.preview);
+            }
             repo.read_stored(id, |doc| Ok(shapes::note_preview(doc)))
                 .await
         })
@@ -2382,11 +2499,18 @@ impl Core {
             return String::new();
         };
         let repo = self.repo.clone();
-        self.run(async move { repo.read_doc(id, |doc| Ok(shapes::doc_title(doc))).await })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+        let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
+        self.run(async move {
+            if let Some(row) = settled_row(&repo, &index, &unsettled, id).await {
+                return Ok(row.title);
+            }
+            repo.read_stored(id, |doc| Ok(shapes::doc_title(doc))).await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
     }
 
     pub async fn note_spans_json(&self, url: String) -> Result<String, CoreError> {
@@ -2734,9 +2858,83 @@ impl Core {
         let Ok(id) = DocId::from_url(&url) else {
             return 0;
         };
-        self.runtime
-            .block_on(self.repo.read_doc(id, |doc| Ok(shapes::doc_modified(doc))))
-            .unwrap_or(0)
+        let repo = self.repo.clone();
+        let index = self.index.clone();
+        let unsettled = self.unsettled_rows.clone();
+        self.runtime.block_on(async move {
+            if let Some(row) = settled_row(&repo, &index, &unsettled, id).await {
+                return row.modified;
+            }
+            repo.read_stored(id, |doc| Ok(shapes::doc_modified(doc)))
+                .await
+                .unwrap_or(0)
+        })
+    }
+
+    /// Make a note and hand back its url without waiting for disk or network.
+    /// The doc, its opening spans and the folder entry all exist in memory
+    /// before this returns — the editor can open it and the sidebar can list
+    /// it immediately — and the outbox log makes both durable on the way
+    /// through. What is deferred is the sedimentree ingest and the sync round,
+    /// exactly as for a keystroke. Nothing about a new note should wait.
+    pub fn create_note_now(
+        &self,
+        folder_url: Option<String>,
+        title: String,
+        at_top: bool,
+        spans_json: String,
+    ) -> Result<String, CoreError> {
+        // A note nothing links to is a note nobody can find. `create_note`
+        // refuses the same way rather than leaving one behind.
+        let target = match folder_url {
+            Some(url) if !url.is_empty() => url,
+            _ => self
+                .folder
+                .lock()
+                .unwrap()
+                .map(|id| id.to_url())
+                .ok_or_else(|| CoreError::General {
+                    msg: "no folder open".into(),
+                })?,
+        };
+        guarded(|| {
+            let repo = self.repo.clone();
+            let url = self.runtime.block_on(async move {
+                let spans: Vec<shapes::SpanJson> = if spans_json.is_empty() {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(&spans_json)?
+                };
+                let note = repo
+                    .create_doc_now(|doc| {
+                        shapes::init_rich_note(doc, &title)?;
+                        if !spans.is_empty() {
+                            shapes::update_spans_from_json(doc, &spans)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+                let folder = DocId::from_url(&target)?;
+                // The open folder is resident; only a link into one that is
+                // not pays for a load.
+                if !repo.is_resident(folder).await {
+                    repo.ensure_doc(folder).await?;
+                }
+                let link = shapes::DocLink {
+                    name: title.clone(),
+                    kind: "rich".into(),
+                    url: note.to_url(),
+                    lush: None,
+                };
+                repo.change_doc_at_deferred_ingest(folder, Vec::new(), |doc| {
+                    shapes::add_folder_entry(doc, &link, at_top)
+                })
+                .await?;
+                Ok::<_, anyhow::Error>(note.to_url())
+            })?;
+            self.reindex_doc(DocId::from_url(&url)?);
+            Ok(url)
+        })
     }
 
     /// Create a note inside a specific folder doc.

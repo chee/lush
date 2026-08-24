@@ -291,6 +291,24 @@ struct HelpCommands: Commands {
         }
     }
 }
+
+/// The sidebar is a `NavigationSplitView` column, so nothing here holds its
+/// state: AppKit answers `toggleSidebar:` on the responder chain, the same
+/// action the toolbar's own button sends.
+struct SidebarCommand: Commands {
+    var body: some Commands {
+        CommandGroup(after: .sidebar) {
+            Button("Toggle Sidebar") {
+                _ = NSApp.sendAction(
+                    #selector(NSSplitViewController.toggleSidebar(_:)),
+                    to: nil,
+                    from: nil
+                )
+            }
+            .keyboardShortcut("\\", modifiers: .command)
+        }
+    }
+}
 #endif
 
 struct ViewCommands: Commands {
@@ -586,6 +604,7 @@ struct LushApp: App {
             EditCommands()
             SearchCommands()
             ViewCommands()
+            SidebarCommand()
             FormatCommands()
             FolderCommands(model: model)
             MainWindowCommands()
@@ -594,11 +613,15 @@ struct LushApp: App {
 
         WindowGroup(id: "note-detail", for: String.self) { $noteUrl in
             if let url = noteUrl {
+                // statusNotice reads the model out of the environment, and a
+                // modifier reads it where it sits: applied after .environment
+                // it is the parent of the injection rather than a child of it,
+                // and the window traps on its first layout.
                 NoteDetail(noteUrl: url)
+                    .statusNotice()
                     .environment(model)
                     .environment(contextTracker)
                     .interfaceFont()
-                    .statusNotice()
                     .task {
                         async let server: Void = LocalSyncServer.startIfNeeded()
                         await model.start()

@@ -34,7 +34,9 @@ enum NoteShare {
         guard let snapshot = await model.spansSnapshot(for: note.url) else {
             throw ShareError.noteUnavailable
         }
-        let spans = SpanNode.decodeList(snapshot.spansJson)
+        let json = snapshot.spansJson
+        let spans = await Task.detached { SpanNode.decodeList(json) }.value
+        let title = note.displayTitle
         let data: Data
         switch format {
         case .markdown:
@@ -43,28 +45,32 @@ enum NoteShare {
             data = Data(LushDocuments.plainText(spans).utf8)
         case .html:
             let images = await inlineImages(for: spans, model: model)
-            data = Data(
-                NoteExporter.htmlDocument(
-                    title: note.displayTitle,
-                    spans: spans,
-                    inlineImages: images
-                ).utf8
-            )
+            data = await Task.detached {
+                Data(
+                    NoteExporter.htmlDocument(
+                        title: title,
+                        spans: spans,
+                        inlineImages: images
+                    ).utf8
+                )
+            }.value
         case .rtf:
-            data = try NoteExporter.rtfData(from: spans)
+            data = try await NoteExporter.rtfData(from: spans)
         case .pdf:
-            data = try NoteExporter.pdfData(from: spans, title: note.displayTitle)
+            data = try await NoteExporter.pdfData(from: spans, title: title)
         }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("lush-share-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let safe = note.displayTitle
+        let safe = title
             .components(separatedBy: CharacterSet(charactersIn: "/\\:"))
             .joined(separator: "-")
         let file = dir
             .appendingPathComponent(safe)
             .appendingPathExtension(format.fileExtension)
-        try data.write(to: file)
+        try await Task.detached {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: file)
+        }.value
         return file
     }
 

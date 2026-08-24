@@ -115,9 +115,9 @@ struct FolderContentProvider: AppIntentTimelineProvider {
                 path: "Notes",
                 totalItemCount: 3,
                 items: [
-                    LushWidgetItemSnapshot(url: "", title: "Meeting notes", preview: "Agenda and follow-ups", kind: "rich"),
-                    LushWidgetItemSnapshot(url: "", title: "Draft", preview: "Opening paragraph", kind: "rich"),
-                    LushWidgetItemSnapshot(url: "", title: "Links", preview: "References to read", kind: "rich")
+                    LushWidgetItemSnapshot(url: "placeholder-1", title: "Meeting notes", preview: "Agenda and follow-ups", kind: "rich"),
+                    LushWidgetItemSnapshot(url: "placeholder-2", title: "Draft", preview: "Opening paragraph", kind: "rich"),
+                    LushWidgetItemSnapshot(url: "placeholder-3", title: "Links", preview: "References to read", kind: "rich")
                 ]
             ),
             updatedAt: Date()

@@ -26,7 +26,8 @@ enum NoteExporter {
             model.status = "Couldn't export note"
             return
         }
-        let spans = SpanNode.decodeList(snapshot.spansJson)
+        let json = snapshot.spansJson
+        let spans = await Task.detached { SpanNode.decodeList(json) }.value
 
         var fetched: [FetchedAsset] = []
         var usedNames = Set<String>()
@@ -53,7 +54,9 @@ enum NoteExporter {
         let safeName = title.isEmpty ? "note" : title
 
         if fetched.isEmpty {
-            let html = buildHTML(title: title, spans: spans, assetResolver: .none)
+            let html = await Task.detached {
+                buildHTML(title: title, spans: spans, assetResolver: .none)
+            }.value
             let panel = NSSavePanel()
             panel.allowedContentTypes = [.html]
             panel.nameFieldStringValue = safeName + ".html"
@@ -67,7 +70,9 @@ enum NoteExporter {
             var pathMap: [String: String] = [:]
             for asset in fetched { pathMap[asset.url] = "assets/\(asset.name)" }
 
-            let html = buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
+            let html = await Task.detached {
+                buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
+            }.value
 
             let archive = await Task.detached { () -> URL? in
                 let tmp = FileManager.default.temporaryDirectory
@@ -135,14 +140,14 @@ enum NoteExporter {
 
     // MARK: - HTML builder
 
-    static func htmlFragment(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+    nonisolated static func htmlFragment(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
         htmlBody(
             from: spans,
             assetResolver: inlineImages.isEmpty ? .none : .inlineImages(inlineImages)
         )
     }
 
-    static func htmlDocument(title: String, spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+    nonisolated static func htmlDocument(title: String, spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
         buildHTML(
             title: title,
             spans: spans,
@@ -150,9 +155,16 @@ enum NoteExporter {
         )
     }
 
-    static func rtfData(from spans: [SpanNode]) throws -> Data {
+    /// Split the same way as `pdfData`: the attributed string is built on the
+    /// main actor because `RichText` draws it over the asset cache, and the
+    /// serialization — which inlines every image — follows it off.
+    static func rtfData(from spans: [SpanNode]) async throws -> Data {
         let attributed = RichText.attributed(from: spans, cache: AssetCache())
-        return try attributed.data(
+        return try await Task.detached { try serializeRTF(attributed) }.value
+    }
+
+    nonisolated private static func serializeRTF(_ attributed: NSAttributedString) throws -> Data {
+        try attributed.data(
             from: NSRange(location: 0, length: attributed.length),
             documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
         )
@@ -162,8 +174,18 @@ enum NoteExporter {
         case pdfContext
     }
 
-    static func pdfData(from spans: [SpanNode], title: String) throws -> Data {
+    /// The attributed string has to be built on the main actor — `RichText`
+    /// draws it over the asset cache — but the pagination that follows is the
+    /// slow half and CoreText is happy off it.
+    static func pdfData(from spans: [SpanNode], title: String) async throws -> Data {
         let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        return try await Task.detached { try paginate(attributed, title: title) }.value
+    }
+
+    nonisolated private static func paginate(
+        _ attributed: NSAttributedString,
+        title: String
+    ) throws -> Data {
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         let inset = mediaBox.insetBy(dx: 54, dy: 54)
         let data = NSMutableData()
@@ -198,7 +220,7 @@ enum NoteExporter {
         case inlineImages([String: Data])
     }
 
-    private static func buildHTML(title: String, spans: [SpanNode], assetResolver: AssetResolver) -> String {
+    nonisolated private static func buildHTML(title: String, spans: [SpanNode], assetResolver: AssetResolver) -> String {
         let body = htmlBody(from: spans, assetResolver: assetResolver)
         let escaped = escape(title.isEmpty ? "Untitled" : title)
         return """
@@ -225,7 +247,7 @@ enum NoteExporter {
         case columns([SpanNode])
     }
 
-    private static func segmentize(_ spans: [SpanNode]) -> [Segment] {
+    nonisolated private static func segmentize(_ spans: [SpanNode]) -> [Segment] {
         var segments: [Segment] = []
         var i = 0
         while i < spans.count {
@@ -263,7 +285,7 @@ enum NoteExporter {
         return segments
     }
 
-    private static func htmlBody(from spans: [SpanNode], assetResolver: AssetResolver) -> String {
+    nonisolated private static func htmlBody(from spans: [SpanNode], assetResolver: AssetResolver) -> String {
         let segments = segmentize(spans)
         var out = ""
         var openLists: [(tag: String, depth: Int)] = []
@@ -366,7 +388,7 @@ enum NoteExporter {
         return out
     }
 
-    private static func applyMarks(_ text: String, marks: [String: JSONValue]) -> String {
+    nonisolated private static func applyMarks(_ text: String, marks: [String: JSONValue]) -> String {
         var out = text
         if case .bool(true)? = marks["code"] { out = "<code>\(out)</code>" }
         if case .bool(true)? = marks["strong"] { out = "<strong>\(out)</strong>" }
@@ -384,7 +406,7 @@ enum NoteExporter {
         return out
     }
 
-    private static func assetTag(block: BlockValue, assetResolver: AssetResolver) -> String {
+    nonisolated private static func assetTag(block: BlockValue, assetResolver: AssetResolver) -> String {
         guard let url = block.embedUrl else { return "" }
         switch assetResolver {
         case .none:
@@ -413,7 +435,7 @@ enum NoteExporter {
         }
     }
 
-    private static func tableHTML(_ grid: TableGrid, assetResolver: AssetResolver) -> String {
+    nonisolated private static func tableHTML(_ grid: TableGrid, assetResolver: AssetResolver) -> String {
         var out = "<table>\n"
         for (rowIdx, row) in grid.rows.enumerated() {
             out += "<tr>\n"
@@ -427,7 +449,7 @@ enum NoteExporter {
         return out
     }
 
-    private static func escape(_ text: String) -> String {
+    nonisolated private static func escape(_ text: String) -> String {
         text
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")

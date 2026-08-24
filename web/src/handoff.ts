@@ -1,9 +1,12 @@
-import { isPinned } from "./resolver";
-
 const HANDOFF_CHANNEL = "@patchwork/handoff";
 const CACHEABLE_STATUSES = [200, 203, 204];
 
-type ResolveResult = { status: number; mimeType: string; base64: string };
+type ResolveResult = {
+  status: number;
+  mimeType: string;
+  base64: string;
+  immutable: boolean;
+};
 
 declare global {
   interface Window {
@@ -44,7 +47,7 @@ async function handleRequest(
     const result = await resolve(raw);
     const bytes = Uint8Array.from(atob(result.base64), (c) => c.charCodeAt(0));
 
-    if (isPinned(raw) && CACHEABLE_STATUSES.includes(result.status)) {
+    if (result.immutable && CACHEABLE_STATUSES.includes(result.status)) {
       try {
         const response = new Response(result.status === 204 ? null : bytes, {
           status: result.status,

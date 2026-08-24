@@ -210,7 +210,7 @@ describe("service worker", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  test("caches opaque external responses", async () => {
+  test("passes opaque external responses through without caching them", async () => {
     const put = vi.fn().mockResolvedValue(undefined);
     const cache = { match: vi.fn(), put, keys: vi.fn().mockResolvedValue([]) };
     const clone = { type: "opaque", status: 0 };
@@ -226,7 +226,26 @@ describe("service worker", () => {
     ) as Promise<Response>);
 
     expect(result).toBe(response);
-    expect(put).toHaveBeenCalledWith(context.request, clone);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  test("refuses to serve a cached opaque response when the network fails", async () => {
+    const cache = {
+      match: vi.fn().mockResolvedValue({ type: "opaque", status: 0 }),
+      put: vi.fn(),
+      keys: vi.fn(),
+    };
+    const fetch = vi.fn().mockRejectedValue(new Error("offline"));
+    const caches = { open: vi.fn().mockResolvedValue(cache) };
+    const { context } = serviceWorkerContext({ fetch, caches });
+    context.request = new Request("https://cdn.example/file");
+
+    const result = await (vm.runInContext(
+      "serveExternal(request)",
+      context,
+    ) as Promise<Response>);
+
+    expect(result.type).toBe("error");
   });
 
   test("trims external cache entries to its bound", async () => {

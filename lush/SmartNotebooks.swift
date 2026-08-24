@@ -43,21 +43,23 @@ enum FolderSettingsStore {
     private static let key = "folderSettings"
 
     static func load() -> [String: FolderSettings] {
-        let raw = UserDefaults.standard.dictionary(forKey: key) as? [String: [String: Bool]] ?? [:]
+        let raw = UserDefaults.standard.dictionary(forKey: key) as? [String: [String: Any]] ?? [:]
         return raw.reduce(into: [:]) { result, entry in
             result[entry.key] = FolderSettings(
                 url: entry.key,
-                showCount: entry.value["showCount"] ?? false,
-                recursiveCount: entry.value["recursiveCount"] ?? false,
-                notifyOnChange: entry.value["notifyOnChange"] ?? false,
-                newNotesAtTop: entry.value["newNotesAtTop"]
+                showCount: entry.value["showCount"] as? Bool ?? false,
+                recursiveCount: entry.value["recursiveCount"] as? Bool ?? false,
+                notifyOnChange: entry.value["notifyOnChange"] as? Bool ?? false,
+                newNotesAtTop: entry.value["newNotesAtTop"] as? Bool,
+                newNoteLogline: entry.value["newNoteLogline"] as? Bool,
+                newNoteFirstLine: entry.value["newNoteFirstLine"] as? String
             )
         }
     }
 
     static func save(_ settings: [String: FolderSettings]) {
-        let raw = settings.mapValues { folder -> [String: Bool] in
-            var row = [
+        let raw = settings.mapValues { folder -> [String: Any] in
+            var row: [String: Any] = [
                 "showCount": folder.showCount,
                 "recursiveCount": folder.recursiveCount,
                 "notifyOnChange": folder.notifyOnChange,
@@ -65,7 +67,9 @@ enum FolderSettingsStore {
             // Absent rather than false: a folder with no answer follows the
             // setting for every folder, which is not the same as one that has
             // been told to put new notes at the bottom.
-            row["newNotesAtTop"] = folder.newNotesAtTop
+            if let atTop = folder.newNotesAtTop { row["newNotesAtTop"] = atTop }
+            if let logline = folder.newNoteLogline { row["newNoteLogline"] = logline }
+            if let style = folder.newNoteFirstLine { row["newNoteFirstLine"] = style }
             return row
         }
         UserDefaults.standard.set(raw, forKey: key)
@@ -79,7 +83,9 @@ extension NotesModel {
             showCount: false,
             recursiveCount: false,
             notifyOnChange: false,
-            newNotesAtTop: nil
+            newNotesAtTop: nil,
+            newNoteLogline: nil,
+            newNoteFirstLine: nil
         )
     }
 
@@ -93,9 +99,29 @@ extension NotesModel {
         return UserDefaults.standard.bool(forKey: NotesModel.newNoteAtTopKey)
     }
 
+    /// Whether a new note in this folder opens with a logline: the folder's own
+    /// answer when it has one, otherwise the reader's answer for every folder.
+    func newNoteLogline(in folderUrl: String?) -> Bool {
+        if let folderUrl, let folder = folderSettings[folderUrl]?.newNoteLogline {
+            return folder
+        }
+        return EditorSettings.newNoteLogline
+    }
+
+    /// Which block a new note's first line is, as a style key.
+    func newNoteFirstLine(in folderUrl: String?) -> String {
+        if let folderUrl,
+           let style = folderSettings[folderUrl]?.newNoteFirstLine,
+           !style.isEmpty {
+            return style
+        }
+        return EditorSettings.newNoteFirstLine
+    }
+
     func setFolderSettings(_ settings: FolderSettings) {
         if settings.showCount || settings.recursiveCount || settings.notifyOnChange
-            || settings.newNotesAtTop != nil {
+            || settings.newNotesAtTop != nil || settings.newNoteLogline != nil
+            || settings.newNoteFirstLine != nil {
             folderSettings[settings.url] = settings
         } else {
             folderSettings.removeValue(forKey: settings.url)
