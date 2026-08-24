@@ -291,6 +291,24 @@ struct HelpCommands: Commands {
         }
     }
 }
+
+/// The sidebar is a `NavigationSplitView` column, so nothing here holds its
+/// state: AppKit answers `toggleSidebar:` on the responder chain, the same
+/// action the toolbar's own button sends.
+struct SidebarCommand: Commands {
+    var body: some Commands {
+        CommandGroup(after: .sidebar) {
+            Button("Toggle Sidebar") {
+                _ = NSApp.sendAction(
+                    #selector(NSSplitViewController.toggleSidebar(_:)),
+                    to: nil,
+                    from: nil
+                )
+            }
+            .keyboardShortcut("\\", modifiers: .command)
+        }
+    }
+}
 #endif
 
 struct ViewCommands: Commands {
@@ -586,6 +604,7 @@ struct LushApp: App {
             EditCommands()
             SearchCommands()
             ViewCommands()
+            SidebarCommand()
             FormatCommands()
             FolderCommands(model: model)
             MainWindowCommands()
