@@ -181,7 +181,16 @@ final class NotesModel {
     var exportsInFlight = 0
     @ObservationIgnored private var noteRows: [String: NoteRow] = [:]
     var rootFolderUrl: String? { rootFolderUrls.first }
-    var rootFolderUrls: [String] = []
+    // The synced config's folder list can merge the same url in twice —
+    // concurrent inserts from two devices concatenate — and a doubled root
+    // is drawn twice and walked twice.
+    var rootFolderUrls: [String] = [] {
+        didSet {
+            var seen = Set<String>()
+            let deduped = rootFolderUrls.filter { seen.insert($0).inserted }
+            if deduped.count != rootFolderUrls.count { rootFolderUrls = deduped }
+        }
+    }
     var folderTree: [FolderNode] = [] {
         didSet { rebuildNodeIndex() }
     }
@@ -937,12 +946,16 @@ final class NotesModel {
         cache: [String: (heads: [String], node: FolderNode)]
     ) async -> (tree: [FolderNode], newCache: [String: (heads: [String], node: FolderNode)]) {
         let rootUrls = Set(rootFolderUrls)
-        var visited = Set<String>()
+        var visiting = Set<String>()
         var newCache = cache
+        // The guard stops cycles, not repeats: a folder linked in two places
+        // is a full folder in both, and emptying the second is what made
+        // `node(for:)` answer with a folder that had nothing in it.
         func folderNode(url: String, name: String, parent: String?) async -> FolderNode {
-            guard visited.insert(url).inserted else {
+            guard visiting.insert(url).inserted else {
                 return FolderNode(url: url, name: name, kind: "folder", parentUrl: parent, children: [])
             }
+            defer { visiting.remove(url) }
             let currentHeads = await core.docHeads(url: url)
             if let cached = newCache[url], cached.heads == currentHeads {
                 let cachedChildren = cached.node.children ?? []
@@ -1067,7 +1080,14 @@ final class NotesModel {
         var index: [String: FolderNode] = [:]
         func walk(_ nodes: [FolderNode]) {
             for node in nodes {
-                index[node.url] = node
+                // A url can appear twice — a folder linked in two places, or
+                // the empty stub a cycle stops at. Whoever asks `node(for:)`
+                // means the occurrence with contents.
+                let existing = index[node.url]
+                if existing == nil
+                    || existing?.children?.isEmpty == true && node.children?.isEmpty == false {
+                    index[node.url] = node
+                }
                 if let children = node.children { walk(children) }
             }
         }
