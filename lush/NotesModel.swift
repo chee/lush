@@ -282,6 +282,7 @@ final class NotesModel {
     @ObservationIgnored private var visionBackfillAllowed = true
     @ObservationIgnored private var prewarmTask: Task<Core?, Never>?
     @ObservationIgnored private var prewarmWalkTask: Task<TreeWalk?, Never>?
+    @ObservationIgnored private var cachedTreeTask: Task<[FolderNode], Never>?
     @ObservationIgnored private var deferredStartupRefresh = false
 
     init() {
@@ -651,6 +652,16 @@ final class NotesModel {
         }
         prewarmTask = task
         guard let first = saved.first else { return }
+        // The sidebar the last session wrote down. One SELECT against
+        // search.sqlite3 — no folder doc is opened — so this lands while the
+        // walk below is still reading the first one off the sedimentree.
+        cachedTreeTask = Task.detached { () -> [FolderNode] in
+            guard let core = await task.value else { return [] }
+            let rows = await core.cachedFolderTree()
+            let tree = Self.assembleTree(rows: rows, roots: saved)
+            Self.bootLog("cached sidebar read rows=\(rows.count) roots=\(tree.count)")
+            return tree
+        }
         prewarmWalkTask = Task.detached { () -> TreeWalk? in
             guard let core = await task.value else { return nil }
             try? await core.openNote(url: first)
@@ -734,6 +745,13 @@ final class NotesModel {
                 persistRoots()
                 folderUrl = first
                 status = ""
+                // Draw last session's sidebar first. Rebuilding it means
+                // loading every folder doc off the sedimentree, which is
+                // seconds on a large library; the cached one is on screen
+                // before that starts and the walk corrects it below.
+                if let cached = await cachedTreeTask?.value, !cached.isEmpty {
+                    publishCachedTree(cached)
+                }
                 refreshNotes(prepared: await prewarmWalkTask?.value)
                 startPolling()
                 startMaintenancePolling()
@@ -1210,6 +1228,79 @@ final class NotesModel {
         )
     }
 
+    /// Rebuild `FolderNode`s from the flat rows the index holds. Rows come
+    /// back grouped by parent and in folder order, so one pass down from the
+    /// roots is enough; a row whose parent never appears is dropped rather
+    /// than floated to the top, and a cycle stops at the node that closes it.
+    nonisolated private static func assembleTree(rows: [TreeRow], roots: [String]) -> [FolderNode] {
+        guard !rows.isEmpty else { return [] }
+        var children: [String: [TreeRow]] = [:]
+        var named: [String: TreeRow] = [:]
+        for row in rows {
+            children[row.parent, default: []].append(row)
+            named[row.url] = row
+        }
+        // A root the last walk never saw would come back as an empty folder
+        // with no name. Better to draw nothing and wait for the walk than to
+        // draw a sidebar that is wrong about what is in it.
+        guard roots.allSatisfy({ named[$0] != nil }) else { return [] }
+        var visiting = Set<String>()
+        func node(url: String, name: String, kind: String, parent: String?) -> FolderNode {
+            guard kind == "folder", visiting.insert(url).inserted else {
+                return FolderNode(
+                    url: url,
+                    name: name,
+                    kind: kind,
+                    parentUrl: parent,
+                    children: kind == "folder" ? [] : nil
+                )
+            }
+            defer { visiting.remove(url) }
+            let kids = (children[url] ?? []).map {
+                node(url: $0.url, name: $0.name, kind: $0.kind, parent: url)
+            }
+            return FolderNode(
+                url: url,
+                name: name,
+                kind: "folder",
+                parentUrl: parent,
+                children: kids
+            )
+        }
+        return roots.map { root in
+            node(url: root, name: named[root]?.name ?? "", kind: "folder", parent: nil)
+        }
+    }
+
+    /// Flatten a tree back into index rows. Roots carry an empty parent.
+    nonisolated private static func treeRows(_ tree: [FolderNode]) -> [TreeRow] {
+        var rows: [TreeRow] = []
+        func walk(_ nodes: [FolderNode], parent: String) {
+            for node in nodes {
+                rows.append(TreeRow(parent: parent, url: node.url, name: node.name, kind: node.kind))
+                if let children = node.children { walk(children, parent: node.url) }
+            }
+        }
+        for root in tree {
+            rows.append(TreeRow(parent: "", url: root.url, name: root.name, kind: root.kind))
+            walk(root.children ?? [], parent: root.url)
+        }
+        return rows
+    }
+
+    /// Put the remembered sidebar on screen. Deliberately not a refresh: no
+    /// generation is claimed and no cache entry is seeded, so the walk that
+    /// follows overwrites this without having to argue with it.
+    private func publishCachedTree(_ tree: [FolderNode]) {
+        guard folderTree.isEmpty else { return }
+        folderTree = tree
+        if let folderUrl, let node = nodeIndex[folderUrl], let children = node.children {
+            notes = children.map { NoteInfo(url: $0.url, name: $0.name, kind: $0.kind) }
+            folderTitle = node.name
+        }
+        Self.bootLog("cached sidebar published roots=\(tree.count) notes=\(notes.count)")
+    }
+
     func refreshNotes(prepared: TreeWalk? = nil) {
         guard let core else { return }
         treeGeneration += 1
@@ -1250,6 +1341,11 @@ final class NotesModel {
         if treeGeneration == treeGen {
             folderTree = walk.tree
             folderNodeCache = walk.cache
+            // What the next launch draws before it has read a folder doc.
+            if let core {
+                let tree = walk.tree
+                Task.detached { core.setFolderTree(rows: Self.treeRows(tree)) }
+            }
         }
         if let selected = selectedNoteUrl, node(for: selected) == nil {
             selectedNoteUrl = nil
@@ -1808,6 +1904,44 @@ final class NotesModel {
         return spans
     }
 
+    /// Put a just-made item in the sidebar without waiting for the walk.
+    /// The walk still runs — it is what reconciles order, names and anything
+    /// else that moved — but a new note is on screen before it starts, and on
+    /// a large library that walk is seconds of folder docs coming off the
+    /// sedimentree.
+    private func insertCreatedNode(
+        url: String,
+        name: String,
+        kind: String,
+        into parent: String?,
+        atTop: Bool
+    ) {
+        guard let parent, nodeIndex[parent] != nil, nodeIndex[url] == nil else { return }
+        let child = FolderNode(url: url, name: name, kind: kind, parentUrl: parent, children: nil)
+        func insert(_ nodes: [FolderNode]) -> [FolderNode] {
+            nodes.map { node in
+                var node = node
+                if node.url == parent {
+                    var children = node.children ?? []
+                    // `computeTree` sorts subfolders ahead of everything else,
+                    // so the top of the list is the top of the notes, not the
+                    // top of the children.
+                    let at = atTop ? children.prefix { $0.kind == "folder" }.count : children.count
+                    children.insert(child, at: at)
+                    node.children = children
+                } else if let children = node.children {
+                    node.children = insert(children)
+                }
+                return node
+            }
+        }
+        folderTree = insert(folderTree)
+        folderNodeCache.removeValue(forKey: parent)
+        guard parent == folderUrl else { return }
+        let entry = NoteInfo(url: url, name: name, kind: kind)
+        if atTop { notes.insert(entry, at: 0) } else { notes.append(entry) }
+    }
+
     @discardableResult
     func createNote(snap: ContextSnapshot? = nil) async -> String? {
         await createNote(inFolder: folderUrl, snap: snap)
@@ -1823,6 +1957,7 @@ final class NotesModel {
         let target = folderUrl ?? self.folderUrl
         let atTop = newNoteAtTop(in: target)
         let spansJson = SpanNode.encodeList(newNoteSpans(in: target, snap: snap))
+        let start = Date()
         do {
             let url = try await Task.detached { [core, target, atTop, spansJson] () -> String in
                 try core.createNoteNow(
@@ -1832,6 +1967,10 @@ final class NotesModel {
                     spansJson: spansJson
                 )
             }.value
+            // The editor's own wait is logged by `spansSnapshot`; between them
+            // the trace accounts for every millisecond of cmd+N.
+            Self.bootLog("new note created ms=\(Int(Date().timeIntervalSince(start) * 1000))")
+            insertCreatedNode(url: url, name: "", kind: "rich", into: target, atTop: atTop)
             pendingFocusUrl = url
             selectedNoteUrl = url
             refreshNotes()
@@ -1872,6 +2011,7 @@ final class NotesModel {
                 _ = try? core.updateNoteSpans(url: url, spansJson: SpanNode.encodeList(initial), heads: nil)
                 return url
             }.value
+            insertCreatedNode(url: url, name: noteTitle, kind: "rich", into: target, atTop: atTop)
             pendingFocusUrl = url
             selectedNoteUrl = url
             refreshNotes()

@@ -2627,7 +2627,7 @@ impl Repo {
         self.save_doc_now(id).await
     }
 
-    async fn save_doc_now(&self, id: DocId) -> Result<bool> {
+    pub(crate) async fn save_doc_now(&self, id: DocId) -> Result<bool> {
         let sid = id.sedimentree_id();
         let shared = self.doc_state(id).await?;
         let muted = !self.send_changes.load(Ordering::Relaxed);
@@ -2925,13 +2925,22 @@ impl Repo {
         if !self.docs.lock().await.contains_key(&id) {
             self.ensure_doc(id).await?;
         }
-        let value = {
+        let (value, changed) = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
             Self::refuse_abandoned(&state, id)?;
-            catching(|| f(&mut state.doc))?
+            let before = state.doc.get_heads();
+            let value = catching(|| f(&mut state.doc))?;
+            let changed = state.doc.get_heads() != before;
+            (value, changed)
         };
-        if self.save_doc(id).await? {
+        // A mutation that wrote nothing has nothing to persist, and saving
+        // anyway is not free: `save_doc` cancels the debounced save the last
+        // real edit scheduled and ingests in its place. `normalize_strings`
+        // goes down this path on every note open and on every doc the launch
+        // crawl visits, and is a no-op for all but the oldest docs — so the
+        // whole library used to pay an ingest apiece for nothing.
+        if changed && self.save_doc(id).await? {
             self.request_sync(id).await;
         }
         Ok(value)
@@ -2950,11 +2959,12 @@ impl Repo {
     where
         F: FnOnce(&mut Automerge) -> Result<T>,
     {
-        let value = {
+        let (value, changed) = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
             Self::refuse_abandoned(&state, id)?;
-            catching(|| {
+            let start = state.doc.get_heads();
+            let value = catching(|| {
                 if state.doc.get_heads() == heads {
                     f(&mut state.doc)
                 } else {
@@ -2966,9 +2976,11 @@ impl Repo {
                     }
                     Ok(value)
                 }
-            })?
+            })?;
+            let changed = state.doc.get_heads() != start;
+            (value, changed)
         };
-        if self.save_doc(id).await? {
+        if changed && self.save_doc(id).await? {
             self.request_sync(id).await;
         }
         Ok(value)
@@ -2989,11 +3001,12 @@ impl Repo {
     where
         F: FnOnce(&mut Automerge) -> Result<T>,
     {
-        let value = {
+        let (value, changed) = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
             Self::refuse_abandoned(&state, id)?;
-            catching(|| {
+            let start = state.doc.get_heads();
+            let value = catching(|| {
                 if heads.is_empty() || state.doc.get_heads() == heads {
                     f(&mut state.doc)
                 } else {
@@ -3005,8 +3018,13 @@ impl Repo {
                     }
                     Ok(value)
                 }
-            })?
+            })?;
+            let changed = state.doc.get_heads() != start;
+            (value, changed)
         };
+        if !changed {
+            return Ok(value);
+        }
         // Durability is not what's deferred here — only the sedimentree
         // ingest is. The edit goes to the outbox log before this returns, so
         // there is no window where the caller has been told the change
@@ -3862,6 +3880,69 @@ mod tests {
             repo.outbox_path(id).exists(),
             "the log is the only copy until the debounced save lands"
         );
+        drop(dir);
+    }
+
+    /// A change that writes nothing must not reach storage. `change_doc` used
+    /// to save unconditionally, so `normalize_strings` — which is a no-op on
+    /// every doc this app wrote — cancelled the debounced save and ingested in
+    /// its place, once per note open and once per doc on the launch crawl.
+    #[tokio::test]
+    async fn a_no_op_change_leaves_the_scheduled_save_alone() {
+        let (dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc_now(|doc| crate::shapes::init_rich_note(doc, "quiet"))
+            .await
+            .unwrap();
+        assert!(
+            repo.pending_saves.lock().await.contains_key(&id),
+            "create_doc_now schedules the ingest"
+        );
+
+        let heads = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
+        repo.change_doc(id, crate::shapes::normalize_strings)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap(),
+            heads,
+            "normalize_strings is a no-op on a doc this app wrote"
+        );
+        assert!(
+            repo.pending_saves.lock().await.contains_key(&id),
+            "and a no-op must not pull the ingest forward"
+        );
+        drop(dir);
+    }
+
+    /// The same, for the deferred-ingest path: nothing changed means nothing
+    /// to stage, so no outbox rewrite and no fsync.
+    #[tokio::test]
+    async fn a_no_op_deferred_change_writes_no_outbox() {
+        let (dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| crate::shapes::init_rich_note(doc, "quiet"))
+            .await
+            .unwrap();
+        std::fs::remove_file(repo.outbox_path(id)).ok();
+
+        repo.change_doc_at_deferred_ingest(id, Vec::new(), crate::shapes::normalize_strings)
+            .await
+            .unwrap();
+        assert!(
+            !repo.outbox_path(id).exists(),
+            "a change that wrote nothing has nothing to log"
+        );
+
+        // and a real one still does
+        repo.change_doc_at_deferred_ingest(id, Vec::new(), |doc| {
+            crate::shapes::splice_note_text(doc, 0, 0, "hello", "quiet")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(repo.outbox_path(id).exists());
         drop(dir);
     }
 
