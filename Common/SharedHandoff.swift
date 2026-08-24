@@ -176,7 +176,8 @@ extension SharedHandoff {
         guard Array(bytes[4..<8]) == [0x66, 0x74, 0x79, 0x70] else { return nil }
         switch String(decoding: bytes[8..<12], as: UTF8.self) {
         case "avif", "avis": return "avif"
-        case "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs", "mif1", "msf1": return "heic"
+        case "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs": return "heic"
+        case "mif1", "msf1": return "heif"
         default: return nil
         }
     }
