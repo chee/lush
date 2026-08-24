@@ -6,53 +6,6 @@ on:
     tags: ["v*"]
 
 jobs:
-  # Archiving under automatic signing on a clean runner mints a throwaway
-  # "Apple Development: Created via API" certificate every run — the private
-  # key dies with the VM, so they only accumulate, and once the account hits
-  # its certificate cap every archive fails with "Choose a certificate to
-  # revoke". Revoke the accumulated ones here so the upload jobs can mint
-  # fresh. A separate job that runs to completion first, because a prune
-  # racing a sibling's archive could revoke the certificate it just signed
-  # with. Only DEVELOPMENT-type certificates named "Created via API" are
-  # touched — never the Apple Distribution certificate, and never a
-  # certificate made in Xcode on a real machine.
-  prune-dev-certs:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Revoke API-created development certificates
-        continue-on-error: true
-        env:
-          API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
-          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
-        run: |
-          printf '%s' "$API_KEY_CONTENT" > "$RUNNER_TEMP/key.p8"
-          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-          now=$(date +%s)
-          header=$(printf '{"alg":"ES256","kid":"%s","typ":"JWT"}' "$API_KEY_ID" | b64url)
-          payload=$(printf '{"iss":"%s","iat":%s,"exp":%s,"aud":"appstoreconnect-v1"}' \
-            "$API_ISSUER" "$now" "$((now + 1200))" | b64url)
-          signature=$(printf '%s.%s' "$header" "$payload" \
-            | openssl dgst -sha256 -binary -sign "$RUNNER_TEMP/key.p8" \
-            | openssl asn1parse -inform DER \
-            | awk -F: '/INTEGER/ { v = $NF; sub(/^0+/, "", v); printf "%064s", v }' \
-            | tr ' ' 0 | perl -ne 'print pack "H*", $_' | b64url)
-          jwt="$header.$payload.$signature"
-          certs=$(curl -sf -H "Authorization: Bearer $jwt" \
-            "https://api.appstoreconnect.apple.com/v1/certificates?limit=200")
-          echo "$certs" | jq -r '.data[].attributes | [.certificateType, .displayName] | @tsv'
-          echo "$certs" | jq -r '.data[]
-              | select(.attributes.certificateType == "DEVELOPMENT")
-              | select((.attributes.displayName // "") + " " + (.attributes.name // "")
-                  | contains("Created via API"))
-              | .id' \
-            | while read -r id; do
-                echo "revoking $id"
-                curl -sf -X DELETE -H "Authorization: Bearer $jwt" \
-                  "https://api.appstoreconnect.apple.com/v1/certificates/$id" \
-                  || echo "could not revoke $id"
-              done
-
   # One job per platform rather than one job doing both. Two runners means the
   # archives genuinely overlap instead of contending for three cores, and each
   # gets its own keychain and DerivedData — running two xcodebuild archives
@@ -66,7 +19,6 @@ jobs:
   # was already possible when these ran in sequence.
   upload:
     name: upload (${{ matrix.platform }})
-    needs: prune-dev-certs
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -116,10 +68,18 @@ jobs:
           pnpm install
           pnpm build
 
-      - name: Import signing certificate
+      # Two identities: Apple Distribution signs the export, and Apple
+      # Development signs the archive. Without the development one in the
+      # keychain, automatic signing cloud-mints a throwaway "Created via API"
+      # development certificate on every run — the private key dies with the
+      # VM, so they accumulate until the account hits its certificate cap and
+      # archives fail with "Choose a certificate to revoke".
+      - name: Import signing certificates
         env:
           CERT_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          DEV_CERT_BASE64: ${{ secrets.APPLE_DEV_CERTIFICATE_BASE64 }}
+          DEV_CERT_PASSWORD: ${{ secrets.APPLE_DEV_CERTIFICATE_PASSWORD }}
         run: |
           KEYCHAIN="$RUNNER_TEMP/ci.keychain-db"
           security create-keychain -p ci "$KEYCHAIN"
@@ -128,6 +88,9 @@ jobs:
           echo "$CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
             -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          echo "$DEV_CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/dev-cert.p12"
+          security import "$RUNNER_TEMP/dev-cert.p12" -k "$KEYCHAIN" \
+            -P "$DEV_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security default-keychain -s "$KEYCHAIN"
