@@ -1,5 +1,6 @@
 import Foundation
 import CoreText
+import SwiftUI
 import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
@@ -19,13 +20,90 @@ enum NoteExporter {
         let name: String
     }
 
-    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
+    /// What an HTML export comes out as. A note with pictures in it is either
+    /// one page carrying them or a page beside them, and only the person
+    /// exporting knows which they wanted.
+    enum HtmlExportLayout: String, CaseIterable, Identifiable {
+        case singleFile
+        case folder
+        case zip
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .singleFile: return "Single File"
+            case .folder: return "Folder"
+            case .zip: return "Zip Archive"
+            }
+        }
+
+        /// A data URI is the one thing a page that travels alone can do, and
+        /// the only kind of asset worth putting in one is a picture — nobody
+        /// wants a video base64'd into their markup.
+        func caption(hasAssets: Bool) -> String {
+            switch self {
+            case .singleFile:
+                return hasAssets
+                    ? "One page with the pictures embedded. Other attachments are left out."
+                    : "One page."
+            case .folder:
+                return "index.html with an assets folder beside it."
+            case .zip:
+                return "The same folder, zipped."
+            }
+        }
+
+        var contentTypes: [UTType] {
+            switch self {
+            case .singleFile: return [.html]
+            case .folder: return []
+            case .zip: return [.zip]
+            }
+        }
+
+        var pathExtension: String? {
+            switch self {
+            case .singleFile: return "html"
+            case .folder: return nil
+            case .zip: return "zip"
+            }
+        }
+
+        func filename(_ base: String) -> String {
+            guard let pathExtension else { return base }
+            return base + "." + pathExtension
+        }
+
+        /// Only the extension this format put there comes off. A title with a
+        /// dot in it is a title, not a name with an extension, and
+        /// deletingPathExtension would eat the end of it.
+        func typedName(in field: String) -> String {
+            guard let pathExtension, field.hasSuffix("." + pathExtension) else { return field }
+            return String(field.dropLast(pathExtension.count + 1))
+        }
+    }
+
+    private static let layoutKey = "htmlExportLayout"
+
+    private static func rememberedLayout(hasAssets: Bool) -> HtmlExportLayout {
+        if let stored = UserDefaults.standard.string(forKey: layoutKey),
+           let layout = HtmlExportLayout(rawValue: stored) {
+            return layout
+        }
+        return hasAssets ? .folder : .singleFile
+    }
+
+    /// The note and every asset in it, each named so no two collide. Holds
+    /// the spinner for as long as it is fetching; the save panel that comes
+    /// after is waiting on a person, not working.
+    private static func gathered(
+        noteUrl: String,
+        model: NotesModel
+    ) async -> (spans: [SpanNode], assets: [FetchedAsset])? {
         model.exportsInFlight += 1
         defer { model.exportsInFlight -= 1 }
-        guard let snapshot = await model.spansSnapshot(for: noteUrl) else {
-            model.status = "Couldn't export note"
-            return
-        }
+        guard let snapshot = await model.spansSnapshot(for: noteUrl) else { return nil }
         let spans = SpanNode.decodeList(snapshot.spansJson)
 
         var fetched: [FetchedAsset] = []
@@ -49,80 +127,178 @@ enum NoteExporter {
             usedNames.insert(name.lowercased())
             fetched.append(FetchedAsset(url: assetUrl, data: data, name: name))
         }
+        return (spans, fetched)
+    }
 
-        let safeName = title.isEmpty ? "note" : title
+    static func exportAndSave(noteUrl: String, title: String, model: NotesModel) async {
+        guard let (spans, assets) = await gathered(noteUrl: noteUrl, model: model) else {
+            model.status = "Couldn't export note"
+            return
+        }
 
-        if fetched.isEmpty {
-            let html = buildHTML(title: title, spans: spans, assetResolver: .none)
-            let panel = NSSavePanel()
-            panel.allowedContentTypes = [.html]
-            panel.nameFieldStringValue = safeName + ".html"
-            panel.begin { response in
-                guard response == .OK, let dest = panel.url else { return }
-                Task.detached {
-                    try? html.write(to: dest, atomically: true, encoding: .utf8)
-                }
+        let base = title.isEmpty ? "note" : title
+        var layout = rememberedLayout(hasAssets: !assets.isEmpty)
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = layout.contentTypes
+        panel.nameFieldStringValue = layout.filename(base)
+        let options = NSHostingView(rootView: ExportOptions(
+            layout: layout,
+            hasAssets: !assets.isEmpty
+        ) { [weak panel] chosen in
+            let previous = layout
+            layout = chosen
+            guard let panel else { return }
+            // the name follows the format, keeping anything typed over it
+            let typed = previous.typedName(in: panel.nameFieldStringValue)
+            panel.allowedContentTypes = chosen.contentTypes
+            panel.nameFieldStringValue = chosen.filename(typed.isEmpty ? base : typed)
+        })
+        options.frame.size = options.fittingSize
+        panel.accessoryView = options
+
+        let response = await withCheckedContinuation { continuation in
+            panel.begin { continuation.resume(returning: $0) }
+        }
+        guard response == .OK, let destination = panel.url else { return }
+        UserDefaults.standard.set(layout.rawValue, forKey: layoutKey)
+
+        let html: String
+        switch layout {
+        case .singleFile:
+            // read from the bytes, not from a name: an asset is stored with
+            // whatever name it arrived with, or none at all
+            var images: [String: Data] = [:]
+            for asset in assets where AssetCache.imageType(of: asset.data) != nil {
+                images[asset.url] = asset.data
             }
-        } else {
+            html = buildHTML(
+                title: title,
+                spans: spans,
+                assetResolver: images.isEmpty ? .none : .inlineImages(images)
+            )
+        case .folder, .zip:
             var pathMap: [String: String] = [:]
-            for asset in fetched { pathMap[asset.url] = "assets/\(asset.name)" }
+            for asset in assets { pathMap[asset.url] = "assets/\(asset.name)" }
+            html = buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
+        }
 
-            let html = buildHTML(title: title, spans: spans, assetResolver: .relativePaths(pathMap))
-
-            let archive = await Task.detached { () -> URL? in
-                let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
-                let assetsDir = tmp.appendingPathComponent("assets", isDirectory: true)
-                do {
-                    try FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
-                    try Data(html.utf8).write(to: tmp.appendingPathComponent("index.html"))
-                    for asset in fetched {
-                        try asset.data.write(to: assetsDir.appendingPathComponent(asset.name))
-                    }
-                } catch {
-                    try? FileManager.default.removeItem(at: tmp)
-                    return nil
-                }
-
-                let zipTmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("lush-\(UUID().uuidString).zip")
-                guard zipDirectory(tmp, to: zipTmp) else {
-                    try? FileManager.default.removeItem(at: tmp)
-                    try? FileManager.default.removeItem(at: zipTmp)
-                    return nil
-                }
-                try? FileManager.default.removeItem(at: tmp)
-                return zipTmp
-            }.value
-            guard let zipTmp = archive else {
-                let alert = NSAlert()
-                alert.messageText = "Export failed"
-                alert.informativeText = "The note archive could not be created."
-                alert.runModal()
-                return
-            }
-
-            let panel = NSSavePanel()
-            panel.allowedContentTypes = [UTType(filenameExtension: "zip") ?? .data]
-            panel.nameFieldStringValue = safeName + ".zip"
-            panel.begin { response in
-                let dest = response == .OK ? panel.url : nil
-                Task.detached {
-                    defer { try? FileManager.default.removeItem(at: zipTmp) }
-                    guard let dest else { return }
-                    let fm = FileManager.default
-                    if fm.fileExists(atPath: dest.path) { try? fm.removeItem(at: dest) }
-                    try? fm.moveItem(at: zipTmp, to: dest)
-                }
-            }
+        let chosen = layout
+        model.exportsInFlight += 1
+        defer { model.exportsInFlight -= 1 }
+        let written = await Task.detached {
+            write(chosen, html: html, assets: assets, to: destination)
+        }.value
+        if !written {
+            model.status = "Couldn't export note"
         }
     }
 
-    nonisolated private static func zipDirectory(_ dir: URL, to output: URL) -> Bool {
+    private struct ExportOptions: View {
+        @State private var layout: HtmlExportLayout
+        private let hasAssets: Bool
+        private let onChange: (HtmlExportLayout) -> Void
+
+        init(
+            layout: HtmlExportLayout,
+            hasAssets: Bool,
+            onChange: @escaping (HtmlExportLayout) -> Void
+        ) {
+            _layout = State(initialValue: layout)
+            self.hasAssets = hasAssets
+            self.onChange = onChange
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                Picker("Export as:", selection: $layout) {
+                    ForEach(HtmlExportLayout.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.radioGroup)
+                Text(layout.caption(hasAssets: hasAssets))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    // held at two lines' worth so the panel doesn't resize
+                    // under the pointer as the choice changes
+                    .frame(height: 28, alignment: .topLeading)
+            }
+            .frame(width: 380, alignment: .leading)
+            .padding(EdgeInsets(top: 12, leading: 20, bottom: 12, trailing: 20))
+            .onChange(of: layout) { _, layout in onChange(layout) }
+        }
+    }
+
+    nonisolated private static func write(
+        _ layout: HtmlExportLayout,
+        html: String,
+        assets: [FetchedAsset],
+        to destination: URL
+    ) -> Bool {
+        switch layout {
+        case .singleFile:
+            return (try? Data(html.utf8).write(to: destination)) != nil
+        case .folder:
+            do {
+                try writeBundle(html: html, assets: assets, to: destination)
+                return true
+            } catch {
+                return false
+            }
+        case .zip:
+            let staging = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lush-export-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: staging) }
+            let typed = layout.typedName(in: destination.lastPathComponent)
+            let name = typed.isEmpty ? "note" : typed
+            let archive = staging.appendingPathComponent("archive.zip")
+            do {
+                try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+                try writeBundle(
+                    html: html,
+                    assets: assets,
+                    to: staging.appendingPathComponent(name, isDirectory: true)
+                )
+            } catch {
+                return false
+            }
+            guard zipItem(name, in: staging, to: archive) else { return false }
+            let fm = FileManager.default
+            if fm.fileExists(atPath: destination.path) {
+                guard (try? fm.removeItem(at: destination)) != nil else { return false }
+            }
+            return (try? fm.moveItem(at: archive, to: destination)) != nil
+        }
+    }
+
+    /// index.html and the assets folder, written into `directory`. The zip
+    /// holds the same thing under one folder, so an unzip lands as a folder
+    /// rather than strewn across wherever it was unzipped.
+    nonisolated private static func writeBundle(
+        html: String,
+        assets: [FetchedAsset],
+        to directory: URL
+    ) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: directory.path) {
+            try fm.removeItem(at: directory)
+        }
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(html.utf8).write(to: directory.appendingPathComponent("index.html"))
+        guard !assets.isEmpty else { return }
+        let assetsDirectory = directory.appendingPathComponent("assets", isDirectory: true)
+        try fm.createDirectory(at: assetsDirectory, withIntermediateDirectories: true)
+        for asset in assets {
+            try asset.data.write(to: assetsDirectory.appendingPathComponent(asset.name))
+        }
+    }
+
+    /// `./` so a name beginning with a dash is a path and not a flag; zip
+    /// drops it from the stored entries.
+    nonisolated private static func zipItem(_ item: String, in directory: URL, to output: URL) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-        process.arguments = ["-r", output.path, "."]
-        process.currentDirectoryURL = dir
+        process.arguments = ["-r", output.path, "./" + item]
+        process.currentDirectoryURL = directory
         do {
             try process.run()
         } catch {
