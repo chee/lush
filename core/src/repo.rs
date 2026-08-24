@@ -3754,6 +3754,74 @@ mod tests {
         assert!(parse_friend_code("beep").is_err());
     }
 
+    /// What a new note costs, against what it used to. The old path saved the
+    /// note, then saved the folder — a full sedimentree ingest of a doc that
+    /// grows with every note in it — before the caller saw a url. The new one
+    /// stages both to the outbox and defers the ingest.
+    ///
+    /// **Run this with `--release`.** A debug build inflates automerge enough
+    /// to hide which half the time is in.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_new_note() {
+        use std::time::Instant;
+
+        for entries in [50usize, 1000, 5000] {
+            let (_dir, repo) = test_repo().await;
+            let folder = repo
+                .create_doc(|doc| crate::shapes::init_folder(doc, "notes"))
+                .await
+                .unwrap();
+            for at in 0..entries {
+                let link = crate::shapes::DocLink {
+                    name: format!("note {at}"),
+                    kind: "rich".into(),
+                    url: DocId::random().to_url(),
+                    lush: None,
+                };
+                repo.change_doc(folder, |doc| {
+                    crate::shapes::add_folder_entry(doc, &link, false)
+                })
+                .await
+                .unwrap();
+            }
+            repo.save_doc_now(folder).await.unwrap();
+
+            let link_for = |id: DocId| crate::shapes::DocLink {
+                name: String::new(),
+                kind: "rich".into(),
+                url: id.to_url(),
+                lush: None,
+            };
+
+            let start = Instant::now();
+            let note = repo
+                .create_doc(|doc| crate::shapes::init_rich_note(doc, ""))
+                .await
+                .unwrap();
+            repo.change_doc(folder, |doc| {
+                crate::shapes::add_folder_entry(doc, &link_for(note), false)
+            })
+            .await
+            .unwrap();
+            let was = start.elapsed();
+
+            let start = Instant::now();
+            let note = repo
+                .create_doc_now(|doc| crate::shapes::init_rich_note(doc, ""))
+                .await
+                .unwrap();
+            repo.change_doc_at_deferred_ingest(folder, Vec::new(), |doc| {
+                crate::shapes::add_folder_entry(doc, &link_for(note), false)
+            })
+            .await
+            .unwrap();
+            let now = start.elapsed();
+
+            println!("{entries:>5} entries: was {was:?}, now {now:?}");
+        }
+    }
+
     /// A new note must not wait on the sedimentree ingest, but it must still
     /// survive the process: `create_doc_now` returns before the ingest and
     /// leaves the content in the outbox log, which is what a relaunch reads.

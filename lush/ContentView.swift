@@ -56,6 +56,11 @@ struct MainWindowRoute: Codable, Hashable {
 @MainActor
 enum MainWindowTabs {
     private static var parents: [UUID: NSWindow] = [:]
+    /// Routes that asked for a window rather than a tab. AppKit merges a
+    /// window into the group its tabbing identifier names unless it is told
+    /// not to, so one of these declines for exactly as long as it takes to
+    /// appear and is then free to be tabbed by hand like any other.
+    private static var detached: Set<UUID> = []
 
     private(set) static var routedSelection: String?
 
@@ -68,6 +73,13 @@ enum MainWindowTabs {
         openWindow(id: "main", value: route)
     }
 
+    static func openDetached(selection: String?, using openWindow: OpenWindowAction) {
+        let route = MainWindowRoute(id: UUID(), selection: selection)
+        routedSelection = selection
+        detached.insert(route.id)
+        openWindow(id: "main", value: route)
+    }
+
     static func claimRoute(_ selection: String?) {
         guard let selection, routedSelection == selection else { return }
         routedSelection = nil
@@ -75,6 +87,11 @@ enum MainWindowTabs {
 
     static func attach(_ window: NSWindow, route: MainWindowRoute?) {
         window.tabbingIdentifier = "lush-main"
+        if let route, detached.remove(route.id) != nil {
+            window.tabbingMode = .disallowed
+            DispatchQueue.main.async { window.tabbingMode = .preferred }
+            return
+        }
         window.tabbingMode = .preferred
         guard let route, let parent = parents.removeValue(forKey: route.id), parent !== window else { return }
         let frame = parent.frame
@@ -1686,6 +1703,17 @@ struct ContentView: View {
 
     @ViewBuilder
     private func folderContextMenuContent(for node: FolderNode) -> some View {
+        Button {
+            MainWindowTabs.open(selection: node.url, using: openWindow)
+        } label: {
+            Label("Open in New Tab", systemImage: "plus.square.on.square")
+        }
+        Button {
+            MainWindowTabs.openDetached(selection: node.url, using: openWindow)
+        } label: {
+            Label("Open in New Window", systemImage: "macwindow.badge.plus")
+        }
+        Divider()
         Menu("New") {
             NewItemMenuItems(
                 model: model,

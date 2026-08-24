@@ -2847,7 +2847,6 @@ impl Core {
         })
     }
 
-    /// Create a note inside a specific folder doc.
     /// Make a note and hand back its url without waiting for disk or network.
     /// The doc, its opening spans and the folder entry all exist in memory
     /// before this returns — the editor can open it and the sidebar can list
@@ -2914,6 +2913,7 @@ impl Core {
         })
     }
 
+    /// Create a note inside a specific folder doc.
     pub fn create_note_in(
         &self,
         folder_url: String,

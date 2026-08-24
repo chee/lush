@@ -68,6 +68,19 @@ struct NoteContextMenu: View {
                     Label("Show in Folder", systemImage: "folder")
                 }
             }
+        } else if node.kind == "folder" {
+            #if os(macOS)
+            Button {
+                MainWindowTabs.open(selection: node.url, using: openWindow)
+            } label: {
+                Label("Open in New Tab", systemImage: "plus.square.on.square")
+            }
+            Button {
+                MainWindowTabs.openDetached(selection: node.url, using: openWindow)
+            } label: {
+                Label("Open in New Window", systemImage: "macwindow.badge.plus")
+            }
+            #endif
         } else if isPatchworkDoc {
             openInPatchwork
         }
