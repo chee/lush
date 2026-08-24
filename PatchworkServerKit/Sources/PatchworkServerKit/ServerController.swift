@@ -61,8 +61,11 @@ public final class ServerController {
     /// `start()` cannot bind a port the server has not given back yet.
     public func stop() async {
         bonjour.stop()
-        try? FileManager.default.removeItem(at: Self.dataDir.appendingPathComponent("server.json"))
-        await Task.detached { serverStop() }.value
+        let info = Self.dataDir.appendingPathComponent("server.json")
+        await Task.detached {
+            try? FileManager.default.removeItem(at: info)
+            serverStop()
+        }.value
         port = nil
         peerId = nil
         irohNodeId = nil

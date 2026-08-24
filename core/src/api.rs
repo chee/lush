@@ -563,6 +563,12 @@ fn schedule_index_doc(
     unsettled: Arc<std::sync::Mutex<HashSet<DocId>>>,
     id: DocId,
 ) {
+    // Unsettled from here rather than from the moment a row is known stale:
+    // a job that fails leaves the row behind the doc just as surely as one
+    // still running, and only a write that lands says otherwise.
+    if let Ok(mut rows) = unsettled.lock() {
+        rows.insert(id);
+    }
     {
         let mut map = slots.lock().unwrap();
         let slot = map.entry(id).or_default();
@@ -648,11 +654,10 @@ async fn index_doc(
 async fn settled_row(
     repo: &Arc<Repo>,
     index: &Arc<SearchIndex>,
-    slots: &Arc<IndexSlots>,
     unsettled: &Arc<std::sync::Mutex<HashSet<DocId>>>,
     id: DocId,
 ) -> Option<search::IndexedDoc> {
-    if slots.lock().ok()?.contains_key(&id) || unsettled.lock().ok()?.contains(&id) {
+    if unsettled.lock().ok()?.contains(&id) {
         return None;
     }
     if repo.is_resident(id).await {
@@ -2322,10 +2327,9 @@ impl Core {
         };
         let repo = self.repo.clone();
         let index = self.index.clone();
-        let slots = self.index_slots.clone();
         let unsettled = self.unsettled_rows.clone();
         self.run(async move {
-            if let Some(row) = settled_row(&repo, &index, &slots, &unsettled, id).await {
+            if let Some(row) = settled_row(&repo, &index, &unsettled, id).await {
                 return Ok(row.preview);
             }
             repo.read_stored(id, |doc| Ok(shapes::note_preview(doc)))
@@ -2496,10 +2500,9 @@ impl Core {
         };
         let repo = self.repo.clone();
         let index = self.index.clone();
-        let slots = self.index_slots.clone();
         let unsettled = self.unsettled_rows.clone();
         self.run(async move {
-            if let Some(row) = settled_row(&repo, &index, &slots, &unsettled, id).await {
+            if let Some(row) = settled_row(&repo, &index, &unsettled, id).await {
                 return Ok(row.title);
             }
             repo.read_stored(id, |doc| Ok(shapes::doc_title(doc))).await
@@ -2857,10 +2860,9 @@ impl Core {
         };
         let repo = self.repo.clone();
         let index = self.index.clone();
-        let slots = self.index_slots.clone();
         let unsettled = self.unsettled_rows.clone();
         self.runtime.block_on(async move {
-            if let Some(row) = settled_row(&repo, &index, &slots, &unsettled, id).await {
+            if let Some(row) = settled_row(&repo, &index, &unsettled, id).await {
                 return row.modified;
             }
             repo.read_stored(id, |doc| Ok(shapes::doc_modified(doc)))

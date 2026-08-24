@@ -2008,6 +2008,8 @@ impl Repo {
     {
         if let Some(state) = self.docs.lock().await.get(&id).cloned() {
             let state = state.lock().await;
+            // An abandoned shell rebuilds from storage rather than erroring:
+            // this is the one reader that must never report a note as empty.
             if !state.abandoned {
                 return catching(|| f(&state.doc));
             }
@@ -2926,6 +2928,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
+            Self::refuse_abandoned(&state, id)?;
             catching(|| f(&mut state.doc))?
         };
         if self.save_doc(id).await? {
@@ -2950,6 +2953,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
+            Self::refuse_abandoned(&state, id)?;
             catching(|| {
                 if state.doc.get_heads() == heads {
                     f(&mut state.doc)
@@ -2988,6 +2992,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
+            Self::refuse_abandoned(&state, id)?;
             catching(|| {
                 if heads.is_empty() || state.doc.get_heads() == heads {
                     f(&mut state.doc)
@@ -3021,6 +3026,7 @@ impl Repo {
         self.open_local(id).await?;
         let state = self.doc_state(id).await?;
         let state = state.lock().await;
+        Self::refuse_abandoned(&state, id)?;
         f(&state.doc)
     }
 
@@ -3039,6 +3045,19 @@ impl Repo {
     }
 
     /// The lock for one doc, without holding the map lock while it is used.
+    /// Refuse the shell `open_local` gave up on. It stays in the map until the
+    /// opener takes it out, and a caller that took its `Arc` before then waits
+    /// on the same lock the opener is holding — so the check belongs after the
+    /// lock, not before it. Reading the shell hands back an empty note whose
+    /// content is still on disk; writing to it saves that emptiness over the
+    /// note.
+    fn refuse_abandoned(state: &DocState, id: DocId) -> Result<()> {
+        if state.abandoned {
+            return Err(anyhow!("doc {} could not be read", id.to_url()));
+        }
+        Ok(())
+    }
+
     async fn doc_state(&self, id: DocId) -> Result<Arc<Mutex<DocState>>> {
         let state = self
             .docs

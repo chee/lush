@@ -132,14 +132,21 @@ private final class HandoffJournal: @unchecked Sendable {
     /// Awaited rather than blocking: the callers are all on the main actor and
     /// a folder share writes this once per file.
     func mutate(_ change: (inout SharedImportProgress) -> Void) async -> Bool {
-        lock.lock()
-        change(&progress)
-        let current = progress
-        lock.unlock()
+        let current = applying(change)
         let url = fileUrl
         return await Task.detached {
             (try? JSONEncoder().encode(current).write(to: url, options: .atomic)) != nil
         }.value
+    }
+
+    /// The change and the state it leaves behind, taken together under the
+    /// lock. Separate from `mutate` because `NSLock` cannot be held from an
+    /// async context, and nothing here needs it to be.
+    private func applying(_ change: (inout SharedImportProgress) -> Void) -> SharedImportProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        change(&progress)
+        return progress
     }
 }
 

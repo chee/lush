@@ -102,6 +102,10 @@ struct AudioInlineView: View {
     @State private var playing = false
     @State private var loading = false
     @State private var pendingSeek: Double?
+    /// Whether playback is still wanted by the time the read lands. The read
+    /// outlives the tap that started it, so without this a card scrolled away
+    /// mid-load starts playing offscreen, and a second tap has nothing to stop.
+    @State private var wantsPlayback = false
     @State private var progress: Double = 0
     @State private var levels: [Float] = []
     @ScaledMetric(relativeTo: .largeTitle) private var playButtonSize: CGFloat = 30
@@ -167,6 +171,7 @@ struct AudioInlineView: View {
             }
         }
         .onDisappear {
+            wantsPlayback = false
             player?.stop()
         }
     }
@@ -191,8 +196,9 @@ struct AudioInlineView: View {
     /// read, so whichever of them owns the load applies the newest scrub
     /// position — a tap and a drag that overlap must not cancel each other.
     private func startPlayback() {
+        wantsPlayback = true
         Task {
-            guard let loaded = await loadPlayer() else { return }
+            guard let loaded = await loadPlayer(), wantsPlayback else { return }
             if let seek = pendingSeek {
                 loaded.currentTime = seek * loaded.duration
                 pendingSeek = nil
@@ -204,12 +210,19 @@ struct AudioInlineView: View {
 
     private func togglePlayback() {
         guard let player else {
-            startPlayback()
+            // A tap while the read is still out is the one chance to call it
+            // off — there is no player yet to pause.
+            if wantsPlayback {
+                wantsPlayback = false
+            } else {
+                startPlayback()
+            }
             return
         }
         if playing {
             player.pause()
             playing = false
+            wantsPlayback = false
         } else {
             player.play()
             playing = true

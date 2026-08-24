@@ -3850,18 +3850,13 @@ final class NotesModel {
         guard core != nil else { return }
         guard let root = LushShared.container else { return }
         let intake = root.appendingPathComponent("SharedIntake", isDirectory: true)
-        let entries = (try? FileManager.default.contentsOfDirectory(
-            at: intake,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        for entry in entries {
-            guard FileManager.default.fileExists(atPath: entry.appendingPathComponent("payload.json").path) else {
-                collectOrphanedIntake(entry)
-                continue
-            }
-            guard let content = IncomingContent.sharedHandoff(id: entry.lastPathComponent) else {
-                try? FileManager.default.removeItem(at: entry)
+        // The whole survey is app-group I/O, which can block for as long as the
+        // container takes to answer, so it happens in one pass off the actor
+        // and hands back only the ids that are ready to import.
+        let ready = await Task.detached { Self.surveyIntake(at: intake) }.value
+        for id in ready {
+            guard let content = IncomingContent.sharedHandoff(id: id) else {
+                try? FileManager.default.removeItem(at: intake.appendingPathComponent(id))
                 continue
             }
             if await importToInbox(content) {
@@ -3870,16 +3865,30 @@ final class NotesModel {
         }
     }
 
+    /// Which shares are ready to import, sweeping the ones that never will be.
     /// An extension killed mid-copy leaves a directory with no `payload.json`,
     /// and the drain has no way to import one — it would sit in the app group
     /// forever. The payload is written last, so a young directory is a share
     /// still in flight rather than an orphan; only old ones get swept.
-    private func collectOrphanedIntake(_ entry: URL) {
-        guard let values = try? entry.resourceValues(forKeys: [.creationDateKey]),
-              let created = values.creationDate,
-              Date().timeIntervalSince(created) > 3600
-        else { return }
-        try? FileManager.default.removeItem(at: entry)
+    nonisolated private static func surveyIntake(at intake: URL) -> [String] {
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: intake,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        var ready: [String] = []
+        for entry in entries {
+            if FileManager.default.fileExists(atPath: entry.appendingPathComponent("payload.json").path) {
+                ready.append(entry.lastPathComponent)
+                continue
+            }
+            guard let values = try? entry.resourceValues(forKeys: [.creationDateKey]),
+                  let created = values.creationDate,
+                  Date().timeIntervalSince(created) > 3600
+            else { continue }
+            try? FileManager.default.removeItem(at: entry)
+        }
+        return ready
     }
 
     @discardableResult
