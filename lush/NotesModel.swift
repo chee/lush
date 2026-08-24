@@ -1636,6 +1636,25 @@ final class NotesModel {
         return places.filter { node(for: $0.noteUrl) != nil }
     }
 
+    /// Every note the calendar can show on a day of its own, by day. The
+    /// indexer keeps each note's logline stamps as it reads it, so this is one
+    /// query against the index rather than a walk of the whole collection —
+    /// and it waits for the startup crawl, since an early answer would be a
+    /// short one. A note kept for a calendar event is left out: it belongs to
+    /// that event's row, whether the index has caught up with its link yet or
+    /// the link was only just made.
+    func noteDays() async -> [Date: [DayNote]] {
+        if core == nil { await start() }
+        guard let core else { return [:] }
+        _ = await waitForStartup()
+        let byDay = await Task.detached { DayNote.from(core.noteDays()) }.value
+        let linked = Set(CalendarLinks.noteUrlByItem.values)
+        return byDay.compactMapValues { notes in
+            let kept = notes.filter { node(for: $0.noteUrl) != nil && !linked.contains($0.noteUrl) }
+            return kept.isEmpty ? nil : kept
+        }
+    }
+
     func documentHistorySummary(url: String) async -> DocumentHistorySummary {
         guard let core else {
             return DocumentHistorySummary(changeCount: 0, heads: [], modified: nil, entries: [], pendingEntries: [])

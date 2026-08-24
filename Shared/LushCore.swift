@@ -835,6 +835,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func noteContent(url: String) async  -> IndexedNoteContent?
     
     /**
+     * Every note the calendar can show on a day of its own, with the stamps
+     * that say which days those are. The indexer has already been through
+     * each note, so this reads its work rather than the notes themselves.
+     */
+    func noteDays()  -> [NoteDay]
+    
+    /**
      * Digest of the text a note's stored embeddings were built from.
      */
     func noteEmbeddingDigest(url: String)  -> String?
@@ -1924,6 +1931,18 @@ open func noteContent(url: String)async  -> IndexedNoteContent?  {
             errorHandler: nil
             
         )
+}
+    
+    /**
+     * Every note the calendar can show on a day of its own, with the stamps
+     * that say which days those are. The indexer has already been through
+     * each note, so this reads its work rather than the notes themselves.
+     */
+open func noteDays() -> [NoteDay]  {
+    return try!  FfiConverterSequenceTypeNoteDay.lift(try! rustCall() {
+    uniffi_lush_core_fn_method_core_note_days(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -4407,6 +4426,113 @@ public func FfiConverterTypeIrohPeer_lower(_ value: IrohPeer) -> RustBuffer {
 }
 
 
+/**
+ * One note as a day reads it: when it was made, and when each of its
+ * loglines was stamped. A note kept for a calendar event is never one of
+ * these — it belongs to that event's row instead.
+ */
+public struct NoteDay {
+    public var url: String
+    public var title: String
+    /**
+     * Unix seconds of the note's first change; 0 when its history carries none.
+     */
+    public var created: Int64
+    /**
+     * Every logline's stamp, in document order, as it was written: an ISO 8601
+     * string carrying the offset it was stamped at, so the day it reads as is
+     * the day it was written on.
+     */
+    public var stamps: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, title: String, 
+        /**
+         * Unix seconds of the note's first change; 0 when its history carries none.
+         */created: Int64, 
+        /**
+         * Every logline's stamp, in document order, as it was written: an ISO 8601
+         * string carrying the offset it was stamped at, so the day it reads as is
+         * the day it was written on.
+         */stamps: [String]) {
+        self.url = url
+        self.title = title
+        self.created = created
+        self.stamps = stamps
+    }
+}
+
+#if compiler(>=6)
+extension NoteDay: Sendable {}
+#endif
+
+
+extension NoteDay: Equatable, Hashable {
+    public static func ==(lhs: NoteDay, rhs: NoteDay) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.created != rhs.created {
+            return false
+        }
+        if lhs.stamps != rhs.stamps {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(title)
+        hasher.combine(created)
+        hasher.combine(stamps)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNoteDay: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoteDay {
+        return
+            try NoteDay(
+                url: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                created: FfiConverterInt64.read(from: &buf), 
+                stamps: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NoteDay, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterInt64.write(value.created, into: &buf)
+        FfiConverterSequenceString.write(value.stamps, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteDay_lift(_ buf: RustBuffer) throws -> NoteDay {
+    return try FfiConverterTypeNoteDay.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoteDay_lower(_ value: NoteDay) -> RustBuffer {
+    return FfiConverterTypeNoteDay.lower(value)
+}
+
+
 public struct NoteInfo {
     public var url: String
     public var name: String
@@ -6238,6 +6364,31 @@ fileprivate struct FfiConverterSequenceTypeIrohPeer: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeNoteDay: FfiConverterRustBuffer {
+    typealias SwiftType = [NoteDay]
+
+    public static func write(_ value: [NoteDay], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNoteDay.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NoteDay] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NoteDay]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNoteDay.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeNoteInfo: FfiConverterRustBuffer {
     typealias SwiftType = [NoteInfo]
 
@@ -6684,6 +6835,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_note_content() != 2552) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_note_days() != 49629) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_note_embedding_digest() != 34797) {
