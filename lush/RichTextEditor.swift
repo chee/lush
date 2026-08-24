@@ -4968,6 +4968,14 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item.setData(data, forType: .init(type))
         }
+        // a spreadsheet asked for one table and gets cells, not one cell
+        // with the whole table in it
+        if let grid = RichTextClipboard.singleTable(in: spans) {
+            item.setString(
+                RichTextClipboard.tsv(grid),
+                forType: .init(UTType.tabSeparatedText.identifier)
+            )
+        }
         item.setString(plain, forType: .string)
         // an app that takes none of our rich types still gets the picture,
         // and it rides on the same item so a one-image copy pastes as one
@@ -5984,6 +5992,11 @@ final class EditorTextView: UITextView, EditorTextViewLike {
         ]
         if let rtfd = RichTextClipboard.rtfd(from: spans, attachments: media.attachments) {
             item[RichTextClipboard.rtfdTypeIdentifier] = rtfd
+        }
+        // a spreadsheet asked for one table and gets cells, not one cell
+        // with the whole table in it
+        if let grid = RichTextClipboard.singleTable(in: spans) {
+            item[UTType.tabSeparatedText.identifier] = RichTextClipboard.tsv(grid)
         }
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item[type] = data

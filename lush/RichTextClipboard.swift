@@ -108,6 +108,24 @@ enum RichTextClipboard {
                 i += 1
                 continue
             }
+            if block.type == "table" || block.type == "columns" {
+                let root = block.type
+                var j = i + 1
+                while j < spans.count {
+                    if case .block(let child) = spans[j], child.parents.first != root { break }
+                    j += 1
+                }
+                let slice = Array(spans[i..<j])
+                if root == "table" {
+                    lines.append(markdownTable(RichText.parseTable(slice)))
+                } else {
+                    for column in RichText.parseColumns(slice) {
+                        lines.append(markdown(from: column, attachmentLabel: attachmentLabel))
+                    }
+                }
+                i = j
+                continue
+            }
             var runs: [(String, [String: JSONValue])] = []
             var j = i + 1
             while j < spans.count {
@@ -169,6 +187,70 @@ enum RichTextClipboard {
             i = j
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// A pipe table. The header rule goes in whether or not the table has a
+    /// header row: without it the rest is not a table to anything reading
+    /// markdown, just lines with pipes in them.
+    static func markdownTable(_ grid: TableGrid) -> String {
+        let columns = grid.columnCount
+        guard columns > 0 else { return "" }
+        var lines: [String] = []
+        for (index, row) in grid.rows.enumerated() {
+            let cells = (0..<columns).map { markdownCell(cell(row, $0)) }
+            lines.append("| " + cells.joined(separator: " | ") + " |")
+            if index == 0 {
+                lines.append("|" + String(repeating: " --- |", count: columns))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// A table as tab separated values, so a copied table lands in a
+    /// spreadsheet as cells instead of as one run of text in one of them.
+    static func tsv(_ grid: TableGrid) -> String {
+        let columns = grid.columnCount
+        guard columns > 0 else { return "" }
+        return grid.rows.map { row in
+            (0..<columns).map { plainCell(cell(row, $0)) }.joined(separator: "\t")
+        }.joined(separator: "\n")
+    }
+
+    /// The grid when the selection is one table and nothing else, which is
+    /// the only shape the flat formats can say.
+    static func singleTable(in spans: [SpanNode]) -> TableGrid? {
+        guard case .block(let first)? = spans.first, first.type == "table" else { return nil }
+        for case .block(let child) in spans.dropFirst() where child.parents.first != "table" {
+            return nil
+        }
+        return RichText.parseTable(spans)
+    }
+
+    private static func cell(_ row: [[SpanNode]], _ column: Int) -> [SpanNode] {
+        column < row.count ? row[column] : []
+    }
+
+    /// A cell on one line: neither a pipe table nor a TSV row has anywhere to
+    /// put the blocks a cell can hold.
+    private static func markdownCell(_ cell: [SpanNode]) -> String {
+        oneLine(markdown(from: cell).replacingOccurrences(of: "|", with: "\\|"))
+    }
+
+    private static func plainCell(_ cell: [SpanNode]) -> String {
+        var out = ""
+        for node in cell {
+            switch node {
+            case .block: out += out.isEmpty ? "" : " "
+            case .text(let text, _): out += text
+            }
+        }
+        return oneLine(out.replacingOccurrences(of: "\t", with: " "))
+    }
+
+    private static func oneLine(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespaces)
     }
 
     static func attributed(fromSpansJSON json: String, cache: AssetCache) -> NSAttributedString? {
