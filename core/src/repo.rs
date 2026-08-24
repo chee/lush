@@ -690,6 +690,10 @@ struct DocState {
     /// Heads the outbox file already holds, when it holds anything. Lets a
     /// stage append the changes since instead of recompacting the whole doc.
     staged_heads: Option<Vec<ChangeHash>>,
+    /// An open whose storage read failed leaves this behind. A reader that
+    /// took the shell's `Arc` before it was pulled from the map would
+    /// otherwise read the empty doc it never got to fill.
+    abandoned: bool,
 }
 
 impl DocState {
@@ -705,6 +709,7 @@ impl DocState {
             applied: HashSet::new(),
             failed: HashSet::new(),
             staged_heads: None,
+            abandoned: false,
         }
     }
 }
@@ -715,6 +720,9 @@ impl DocState {
 struct SyncSlot {
     running: bool,
     again: bool,
+    /// The server heads whose announcement asked for this round. A round that
+    /// ends in failure forgets them so the next identical announcement retries.
+    announced: Option<BTreeSet<CommitId>>,
 }
 
 struct PendingSave {
@@ -1778,7 +1786,9 @@ impl Repo {
             tokio::spawn(async move {
                 while let Some(batch) = stored_rx.recv().await {
                     let id = DocId::from_sedimentree_id(batch.sedimentree_id);
-                    if !repo.apply_incoming.load(Ordering::Relaxed) && repo.doc_has_heads(id).await
+                    if !repo.apply_incoming.load(Ordering::Relaxed)
+                        && repo.doc_has_heads(id).await
+                        && !repo.batch_is_echo(id, &batch).await
                     {
                         repo.deferred_applies.lock().await.insert(id);
                         let _ = repo.events.send(RepoEvent::SyncEvent(format!(
@@ -1998,7 +2008,11 @@ impl Repo {
     {
         if let Some(state) = self.docs.lock().await.get(&id).cloned() {
             let state = state.lock().await;
-            return catching(|| f(&state.doc));
+            // An abandoned shell rebuilds from storage rather than erroring:
+            // this is the one reader that must never report a note as empty.
+            if !state.abandoned {
+                return catching(|| f(&state.doc));
+            }
         }
         let mut doc = self.stored_doc(id).await?;
         let outbox = self.outbox_path(id);
@@ -2190,10 +2204,7 @@ impl Repo {
                         });
                 if !matches!(outcome, Ok(SyncOutcome::Succeeded { .. })) {
                     // Forget the heads so the server's next announcement retries.
-                    let mut last = repo.last_server_heads.lock().await;
-                    if last.get(&id) == Some(&heads_set) {
-                        last.remove(&id);
-                    }
+                    repo.forget_announced_heads(id, &heads_set).await;
                 }
             });
             return;
@@ -2217,8 +2228,8 @@ impl Repo {
             return;
         }
         if !self.apply_incoming.load(Ordering::Relaxed) && self.doc_has_heads(id).await {
-            self.last_server_heads.lock().await.insert(id, heads_set);
-            self.request_sync_forced(id).await;
+            self.last_server_heads.lock().await.insert(id, heads_set.clone());
+            self.request_sync_announced(id, heads_set).await;
             return;
         }
         let _ = self.apply_missing_blobs(id).await;
@@ -2229,9 +2240,9 @@ impl Repo {
             let state = state.lock().await;
             !state.doc.get_missing_deps(&hashes).is_empty()
         };
-        self.last_server_heads.lock().await.insert(id, heads_set);
+        self.last_server_heads.lock().await.insert(id, heads_set.clone());
         if still_missing {
-            self.request_sync_forced(id).await;
+            self.request_sync_announced(id, heads_set).await;
         }
     }
 
@@ -2277,42 +2288,76 @@ impl Repo {
     /// Ask for a sync round without waiting for it. Every background path goes
     /// through here so concurrent requests coalesce per doc.
     async fn request_sync(self: &Arc<Self>, id: DocId) {
-        self.request_sync_inner(id, false).await;
+        self.request_sync_inner(id, false, None).await;
     }
 
     async fn request_sync_forced(self: &Arc<Self>, id: DocId) {
-        self.request_sync_inner(id, true).await;
+        self.request_sync_inner(id, true, None).await;
     }
 
-    async fn request_sync_inner(self: &Arc<Self>, id: DocId, force: bool) {
+    /// A forced round on behalf of a server head announcement. The heads are
+    /// only remembered as handled for as long as the round that was supposed
+    /// to fetch them keeps succeeding; a round that fails — or one a guard
+    /// dropped before it started — forgets them, so the server's next
+    /// announcement of the same heads is acted on rather than deduplicated
+    /// away.
+    async fn request_sync_announced(self: &Arc<Self>, id: DocId, announced: BTreeSet<CommitId>) {
+        let heads = announced.clone();
+        // The heads are handed to the round itself rather than parked in the
+        // slot beforehand: a round already in flight would otherwise finish in
+        // the gap, take them, and — having succeeded — drop them, leaving the
+        // round that was actually meant to fetch them with nothing to forget.
+        if !self.request_sync_inner(id, true, Some(announced)).await {
+            self.forget_announced_heads(id, &heads).await;
+        }
+    }
+
+    async fn forget_announced_heads(&self, id: DocId, heads: &BTreeSet<CommitId>) {
+        let mut last = self.last_server_heads.lock().await;
+        if last.get(&id) == Some(heads) {
+            last.remove(&id);
+        }
+    }
+
+    /// Whether the request reached a round: false when a guard dropped it, so
+    /// an announcement has something to answer to.
+    async fn request_sync_inner(
+        self: &Arc<Self>,
+        id: DocId,
+        force: bool,
+        announced: Option<BTreeSet<CommitId>>,
+    ) -> bool {
         if !self.is_connected() {
-            return;
+            return false;
         }
         // A sync round enumerates the doc's commit and fragment directories
         // and writes whatever it pulls. None of that may happen while the
         // process has no permission to run; the round is picked back up when
         // the app returns or takes a background assertion.
         if !self.is_app_active() {
-            return;
+            return false;
         }
         if !self.send_changes.load(Ordering::Relaxed) && self.outbox_path(id).exists() {
-            return;
+            return false;
         }
         if !force {
             if let Some(heads) = self.local_heads_for_sync(id).await {
                 if !heads.is_empty()
                     && self.last_synced_local_heads.lock().await.get(&id) == Some(&heads)
                 {
-                    return;
+                    return false;
                 }
             }
         }
         {
             let mut syncs = self.syncs.lock().await;
             let slot = syncs.entry(id).or_default();
+            if let Some(heads) = announced {
+                slot.announced = Some(heads);
+            }
             if slot.running {
                 slot.again = true;
-                return;
+                return true;
             }
             slot.running = true;
         }
@@ -2363,6 +2408,13 @@ impl Repo {
                 let slot = syncs.entry(id).or_default();
                 if !slot.again {
                     slot.running = false;
+                    let announced = slot.announced.take();
+                    drop(syncs);
+                    if failed {
+                        if let Some(heads) = announced {
+                            repo.forget_announced_heads(id, &heads).await;
+                        }
+                    }
                     return;
                 }
                 slot.again = false;
@@ -2374,6 +2426,7 @@ impl Repo {
                 }
             }
         });
+        true
     }
 
     /// Bring the in-memory doc up to date with local storage, applying stored
@@ -2508,6 +2561,27 @@ impl Repo {
             )));
             let _ = self.events.send(RepoEvent::DocChanged(id));
         }
+    }
+
+    /// Whether a stored batch holds nothing the resident doc has not already
+    /// taken in. The observer echoes every local save back through the apply
+    /// loop, and with `apply_incoming` off those echoes would otherwise be
+    /// filed as incoming work: phantom "changes waiting in the future" events,
+    /// and a `deferred_applies` entry that keeps every edited doc resident.
+    async fn batch_is_echo(&self, id: DocId, batch: &StoredBatch) -> bool {
+        let Some(state) = self.docs.lock().await.get(&id).cloned() else {
+            return false;
+        };
+        let state = state.lock().await;
+        batch
+            .commits
+            .iter()
+            .map(|record| &record.blob)
+            .chain(batch.fragments.iter().map(|record| &record.blob))
+            .all(|blob| {
+                let digest = BlobMeta::new(blob).digest();
+                state.applied.contains(&digest) || state.failed.contains(&digest)
+            })
     }
 
     async fn apply_stored_batch(&self, batch: StoredBatch) -> Result<bool> {
@@ -2697,8 +2771,12 @@ impl Repo {
     pub async fn ensure_doc(self: &Arc<Self>, id: DocId) -> Result<()> {
         self.tracked.lock().await.insert(id);
         let fresh = !self.docs.lock().await.contains_key(&id);
-        self.open_local(id).await;
-        if fresh {
+        // A doc storage would not give up is neither open nor empty: the heal
+        // below still runs, since the server may hold what this disk withheld,
+        // but nothing announces a change — an empty shell announced as changed
+        // is a note the indexer drops every row for.
+        let opened = self.open_local(id).await;
+        if fresh && opened.is_ok() {
             if self.doc_has_heads(id).await {
                 match self.save_doc_now(id).await {
                     Ok(true) => {
@@ -2745,7 +2823,14 @@ impl Repo {
                 }
             }
         });
-        Ok(())
+        opened
+    }
+
+    /// Whether the doc is already in memory. A resident doc is the only one
+    /// that can be mid-edit, so it is the only one whose search-index row may
+    /// be behind what the doc holds.
+    pub async fn is_resident(&self, id: DocId) -> bool {
+        self.docs.lock().await.contains_key(&id)
     }
 
     async fn doc_has_heads(&self, id: DocId) -> bool {
@@ -2802,6 +2887,35 @@ impl Repo {
         Ok(id)
     }
 
+    /// Create a doc and hand it back without waiting for disk or network.
+    /// The doc is in memory and readable before this returns, the outbox log
+    /// makes it durable on the way through, and the sedimentree ingest plus
+    /// the sync round ride the same debounce a keystroke does — the same
+    /// bargain `change_doc_at_deferred_ingest` strikes, for the same reason.
+    pub async fn create_doc_now<F>(self: &Arc<Self>, init: F) -> Result<DocId>
+    where
+        F: FnOnce(&mut Automerge) -> Result<()>,
+    {
+        let id = DocId::random();
+        let mut doc = Automerge::new();
+        catching(|| init(&mut doc))?;
+        self.docs.lock().await.insert(id, DocState::shared(doc));
+        self.touch(id);
+        self.stage_doc(id).await?;
+        self.schedule_save_doc(id).await;
+        let repo = self.clone();
+        tokio::spawn(async move {
+            repo.ephemeral
+                .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
+                .await;
+            repo.start_connect_loop_if_needed();
+            if repo.wait_connected(Duration::from_secs(15)).await {
+                repo.request_sync(id).await;
+            }
+        });
+        Ok(id)
+    }
+
     /// Run a mutation against a tracked doc, then persist + broadcast the
     /// resulting commits. Returns the mutation's value.
     pub async fn change_doc<F, T>(self: &Arc<Self>, id: DocId, f: F) -> Result<T>
@@ -2814,6 +2928,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
+            Self::refuse_abandoned(&state, id)?;
             catching(|| f(&mut state.doc))?
         };
         if self.save_doc(id).await? {
@@ -2838,6 +2953,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
+            Self::refuse_abandoned(&state, id)?;
             catching(|| {
                 if state.doc.get_heads() == heads {
                     f(&mut state.doc)
@@ -2876,6 +2992,7 @@ impl Repo {
         let value = {
             let state = self.doc_state(id).await?;
             let mut state = state.lock().await;
+            Self::refuse_abandoned(&state, id)?;
             catching(|| {
                 if heads.is_empty() || state.doc.get_heads() == heads {
                     f(&mut state.doc)
@@ -2906,9 +3023,10 @@ impl Repo {
     where
         F: FnOnce(&Automerge) -> Result<T>,
     {
-        self.open_local(id).await;
+        self.open_local(id).await?;
         let state = self.doc_state(id).await?;
         let state = state.lock().await;
+        Self::refuse_abandoned(&state, id)?;
         f(&state.doc)
     }
 
@@ -2927,6 +3045,19 @@ impl Repo {
     }
 
     /// The lock for one doc, without holding the map lock while it is used.
+    /// Refuse the shell `open_local` gave up on. It stays in the map until the
+    /// opener takes it out, and a caller that took its `Arc` before then waits
+    /// on the same lock the opener is holding — so the check belongs after the
+    /// lock, not before it. Reading the shell hands back an empty note whose
+    /// content is still on disk; writing to it saves that emptiness over the
+    /// note.
+    fn refuse_abandoned(state: &DocState, id: DocId) -> Result<()> {
+        if state.abandoned {
+            return Err(anyhow!("doc {} could not be read", id.to_url()));
+        }
+        Ok(())
+    }
+
     async fn doc_state(&self, id: DocId) -> Result<Arc<Mutex<DocState>>> {
         let state = self
             .docs
@@ -2983,16 +3114,17 @@ impl Repo {
     /// Track a doc and populate it from local storage. The fresh doc's lock is
     /// held across the initial load so concurrent reads wait for the loaded doc
     /// instead of observing an empty one.
-    async fn open_local(self: &Arc<Self>, id: DocId) {
-        let mut guard = {
+    async fn open_local(self: &Arc<Self>, id: DocId) -> Result<()> {
+        let (shared, mut guard) = {
             let mut docs = self.docs.lock().await;
             if docs.contains_key(&id) {
-                return;
+                return Ok(());
             }
             let state = DocState::shared(Automerge::new());
             docs.insert(id, state.clone());
             self.touch(id);
-            state.try_lock_owned().expect("fresh doc lock")
+            let guard = state.clone().try_lock_owned().expect("fresh doc lock");
+            (state, guard)
         };
         self.ephemeral
             .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
@@ -3004,8 +3136,23 @@ impl Repo {
                 (count, advanced, failed)
             }
             Err(e) => {
+                // A doc that could not be read is not a doc that is empty.
+                // Leaving the shell resident would have every reader — the
+                // search indexer above all — take it for a note whose content
+                // is gone and drop the rows that describe what is still on
+                // disk. Undo the open instead, so the next one tries again.
                 tracing::warn!(doc = %id.to_url(), error = %e, "local load failed");
-                (0, false, false)
+                guard.abandoned = true;
+                drop(guard);
+                let mut docs = self.docs.lock().await;
+                if docs.get(&id).is_some_and(|state| Arc::ptr_eq(state, &shared)) {
+                    docs.remove(&id);
+                }
+                drop(docs);
+                self.ephemeral
+                    .unsubscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
+                    .await;
+                return Err(e);
             }
         };
         let replay = cpu_heavy(|| {
@@ -3056,6 +3203,7 @@ impl Repo {
         // in-memory and the deletes are no-ops when there's nothing to drop.
         self.reclaim_doc(id).await;
         self.request_sync(id).await;
+        Ok(())
     }
 
     /// Remove a doc from in-memory tracking so the next `ensure_doc` call
@@ -3625,6 +3773,122 @@ mod tests {
         assert!(parse_friend_code("beep").is_err());
     }
 
+    /// What a new note costs, against what it used to. The old path saved the
+    /// note, then saved the folder — a full sedimentree ingest of a doc that
+    /// grows with every note in it — before the caller saw a url. The new one
+    /// stages both to the outbox and defers the ingest.
+    ///
+    /// **Run this with `--release`.** A debug build inflates automerge enough
+    /// to hide which half the time is in.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_new_note() {
+        use std::time::Instant;
+
+        for entries in [50usize, 1000, 5000] {
+            let (_dir, repo) = test_repo().await;
+            let folder = repo
+                .create_doc(|doc| crate::shapes::init_folder(doc, "notes"))
+                .await
+                .unwrap();
+            for at in 0..entries {
+                let link = crate::shapes::DocLink {
+                    name: format!("note {at}"),
+                    kind: "rich".into(),
+                    url: DocId::random().to_url(),
+                    lush: None,
+                };
+                repo.change_doc(folder, |doc| {
+                    crate::shapes::add_folder_entry(doc, &link, false)
+                })
+                .await
+                .unwrap();
+            }
+            repo.save_doc_now(folder).await.unwrap();
+
+            let link_for = |id: DocId| crate::shapes::DocLink {
+                name: String::new(),
+                kind: "rich".into(),
+                url: id.to_url(),
+                lush: None,
+            };
+
+            let start = Instant::now();
+            let note = repo
+                .create_doc(|doc| crate::shapes::init_rich_note(doc, ""))
+                .await
+                .unwrap();
+            repo.change_doc(folder, |doc| {
+                crate::shapes::add_folder_entry(doc, &link_for(note), false)
+            })
+            .await
+            .unwrap();
+            let was = start.elapsed();
+
+            let start = Instant::now();
+            let note = repo
+                .create_doc_now(|doc| crate::shapes::init_rich_note(doc, ""))
+                .await
+                .unwrap();
+            repo.change_doc_at_deferred_ingest(folder, Vec::new(), |doc| {
+                crate::shapes::add_folder_entry(doc, &link_for(note), false)
+            })
+            .await
+            .unwrap();
+            let now = start.elapsed();
+
+            println!("{entries:>5} entries: was {was:?}, now {now:?}");
+        }
+    }
+
+    /// A new note must not wait on the sedimentree ingest, but it must still
+    /// survive the process: `create_doc_now` returns before the ingest and
+    /// leaves the content in the outbox log, which is what a relaunch reads.
+    #[tokio::test]
+    async fn a_doc_created_now_is_readable_at_once_and_already_durable() {
+        let (dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc_now(|doc| crate::shapes::init_rich_note(doc, "instant"))
+            .await
+            .unwrap();
+
+        let title = repo
+            .read_doc(id, |doc| Ok(crate::shapes::doc_title(doc)))
+            .await
+            .unwrap();
+        assert_eq!(title, "instant");
+        assert!(repo.is_resident(id).await);
+        assert!(
+            repo.outbox_path(id).exists(),
+            "the log is the only copy until the debounced save lands"
+        );
+        drop(dir);
+    }
+
+    /// And the deferred save does land, without anyone asking for it.
+    #[tokio::test]
+    async fn a_doc_created_now_saves_itself_shortly_after() {
+        let (dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc_now(|doc| crate::shapes::init_rich_note(doc, "instant"))
+            .await
+            .unwrap();
+
+        let saved = timeout(Duration::from_secs(5), async {
+            loop {
+                if repo.stored_doc(id).await.is_ok_and(|doc| {
+                    crate::shapes::doc_title(&doc) == "instant"
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(saved.is_ok(), "the debounced save should reach storage");
+        drop(dir);
+    }
+
     async fn iroh_test_repo() -> (TempDir, Arc<Repo>) {
         let (dir, repo) = test_repo().await;
         repo.set_iroh_enabled(true).await.unwrap();
@@ -4153,6 +4417,32 @@ mod tests {
         assert!(has_remote);
         assert_eq!(repo.pending_change_count(id).await, 0);
         assert!(repo.deferred_applies.lock().await.is_empty());
+    }
+
+    /// The observer echoes every local save back through the apply loop. With
+    /// applying paused those echoes must not read as incoming work: they would
+    /// announce changes nobody made and pin every edited doc in memory.
+    #[tokio::test]
+    async fn a_docs_own_saves_are_not_deferred_incoming_work() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "first");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        repo.set_apply_incoming(false).await;
+        repo.change_doc(id, |doc| {
+            put(doc, "value", "second");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        repo.save_doc(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(repo.deferred_applies.lock().await.is_empty());
+        assert_eq!(repo.pending_change_count(id).await, 0);
     }
 
     #[tokio::test]

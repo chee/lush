@@ -32,5 +32,14 @@ describe("byte encodings", () => {
     const input = Uint8Array.from({ length: 256 }, (_, value) => value);
     const hex = Array.from(input, (value) => value.toString(16).padStart(2, "0")).join("");
     expect(hexToBytes(hex)).toEqual(input);
+    expect(hexToBytes(hex.toUpperCase())).toEqual(input);
+    expect(hexToBytes("")).toEqual(new Uint8Array(0));
+  });
+
+  test("rejects malformed hex instead of decoding a different value", () => {
+    expect(() => hexToBytes("abc")).toThrow();
+    for (const bad of ["zz", "0z", "1z", " 1", "1 ", "+1", "0x", "ab\n", "aé"]) {
+      expect(() => hexToBytes(bad), bad).toThrow();
+    }
   });
 });

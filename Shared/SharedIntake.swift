@@ -73,16 +73,16 @@ struct IncomingContent: Identifiable {
         journal?.snapshot.createdUrls[operationKey]
     }
 
-    func markHandoffItemsCompleted(_ indexes: Set<Int>) -> Bool {
-        journal?.mutate { $0.completed.formUnion(indexes) } ?? true
+    func markHandoffItemsCompleted(_ indexes: Set<Int>) async -> Bool {
+        await journal?.mutate { $0.completed.formUnion(indexes) } ?? true
     }
 
-    func markHandoffChildCompleted(index: Int, relativePath: String) -> Bool {
-        journal?.mutate { $0.completedChildren.insert("\(index):\(relativePath)") } ?? true
+    func markHandoffChildCompleted(index: Int, relativePath: String) async -> Bool {
+        await journal?.mutate { $0.completedChildren.insert("\(index):\(relativePath)") } ?? true
     }
 
-    func markHandoffCreatedUrl(_ url: String, for operationKey: String) -> Bool {
-        journal?.mutate { $0.createdUrls[operationKey] = url } ?? true
+    func markHandoffCreatedUrl(_ url: String, for operationKey: String) async -> Bool {
+        await journal?.mutate { $0.createdUrls[operationKey] = url } ?? true
     }
 
     static func sharedHandoff(id: String) -> IncomingContent? {
@@ -109,9 +109,6 @@ private final class HandoffJournal: @unchecked Sendable {
     private let fileUrl: URL
     private let lock = NSLock()
     private var progress: SharedImportProgress
-    private var dirty = false
-    private var writing = false
-    private var failed = false
 
     init(directory: URL) {
         fileUrl = directory.appendingPathComponent("progress.json")
@@ -129,36 +126,27 @@ private final class HandoffJournal: @unchecked Sendable {
         return progress
     }
 
-    func mutate(_ change: (inout SharedImportProgress) -> Void) -> Bool {
-        lock.lock()
-        change(&progress)
-        dirty = true
-        let ok = !failed
-        let startFlush = !writing
-        if startFlush { writing = true }
-        lock.unlock()
-        if startFlush {
-            Task.detached(priority: .utility) { self.flush() }
-        }
-        return ok
+    /// The caller decides from the result whether a retry would repeat work it
+    /// has already done, so the write has to land before the answer comes back
+    /// — a batched flush would report the previous change's fate, not this one's.
+    /// Awaited rather than blocking: the callers are all on the main actor and
+    /// a folder share writes this once per file.
+    func mutate(_ change: (inout SharedImportProgress) -> Void) async -> Bool {
+        let current = applying(change)
+        let url = fileUrl
+        return await Task.detached {
+            (try? JSONEncoder().encode(current).write(to: url, options: .atomic)) != nil
+        }.value
     }
 
-    private func flush() {
-        while true {
-            lock.lock()
-            guard dirty else {
-                writing = false
-                lock.unlock()
-                return
-            }
-            dirty = false
-            let current = progress
-            lock.unlock()
-            let wrote = (try? JSONEncoder().encode(current).write(to: fileUrl, options: .atomic)) != nil
-            lock.lock()
-            failed = !wrote
-            lock.unlock()
-        }
+    /// The change and the state it leaves behind, taken together under the
+    /// lock. Separate from `mutate` because `NSLock` cannot be held from an
+    /// async context, and nothing here needs it to be.
+    private func applying(_ change: (inout SharedImportProgress) -> Void) -> SharedImportProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        change(&progress)
+        return progress
     }
 }
 

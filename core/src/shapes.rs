@@ -929,6 +929,12 @@ pub struct FolderSettings {
     /// reader set for every folder. Absent from the doc until a folder is
     /// asked to differ.
     pub new_notes_at_top: Option<bool>,
+    /// Whether a new note in this folder opens with a logline, or `None` to
+    /// follow the reader's answer for every folder.
+    pub new_note_logline: Option<bool>,
+    /// The block a new note's first line is, as a style key ("heading1",
+    /// "paragraph", …), or `None` to follow the reader's answer.
+    pub new_note_first_line: Option<String>,
 }
 
 pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
@@ -945,6 +951,8 @@ pub fn config_folder_settings(doc: &Automerge) -> Vec<FolderSettings> {
                 recursive_count: bool_at(doc, &item, "recursiveCount").unwrap_or(false),
                 notify_on_change: bool_at(doc, &item, "notifyOnChange").unwrap_or(false),
                 new_notes_at_top: bool_at(doc, &item, "newNotesAtTop"),
+                new_note_logline: bool_at(doc, &item, "newNoteLogline"),
+                new_note_first_line: read_str(doc, &item, "newNoteFirstLine"),
             })
         })
         .collect();
@@ -983,6 +991,22 @@ pub fn config_set_folder_settings(
                     None => {
                         if t.get(&item, "newNotesAtTop")?.is_some() {
                             t.delete(&item, "newNotesAtTop")?;
+                        }
+                    }
+                }
+                match s.new_note_logline {
+                    Some(logline) => t.put(&item, "newNoteLogline", logline)?,
+                    None => {
+                        if t.get(&item, "newNoteLogline")?.is_some() {
+                            t.delete(&item, "newNoteLogline")?;
+                        }
+                    }
+                }
+                match &s.new_note_first_line {
+                    Some(style) => t.put(&item, "newNoteFirstLine", style.as_str())?,
+                    None => {
+                        if t.get(&item, "newNoteFirstLine")?.is_some() {
+                            t.delete(&item, "newNoteFirstLine")?;
                         }
                     }
                 }
@@ -1952,9 +1976,39 @@ mod tests {
             recursive_count: false,
             notify_on_change: false,
             new_notes_at_top: None,
+            new_note_logline: None,
+            new_note_first_line: None,
         };
         config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
         assert_eq!(config_folder_settings(&doc), vec![settings]);
+    }
+
+    /// The two new-note overrides answer the same way a placement does: absent
+    /// means follow the reader's setting, and clearing one takes the key back
+    /// off rather than writing a false or an empty string.
+    #[test]
+    fn the_new_note_overrides_round_trip_and_can_be_taken_back_off() {
+        let mut doc = Automerge::new();
+        let mut settings = FolderSettings {
+            url: "automerge:folder".into(),
+            show_count: false,
+            recursive_count: false,
+            notify_on_change: false,
+            new_notes_at_top: None,
+            new_note_logline: Some(false),
+            new_note_first_line: Some("paragraph".into()),
+        };
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        let read = &config_folder_settings(&doc)[0];
+        assert_eq!(read.new_note_logline, Some(false));
+        assert_eq!(read.new_note_first_line.as_deref(), Some("paragraph"));
+
+        settings.new_note_logline = None;
+        settings.new_note_first_line = None;
+        config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
+        let read = &config_folder_settings(&doc)[0];
+        assert_eq!(read.new_note_logline, None);
+        assert_eq!(read.new_note_first_line, None);
     }
 
     #[test]
@@ -1966,6 +2020,8 @@ mod tests {
             recursive_count: false,
             notify_on_change: false,
             new_notes_at_top: Some(true),
+            new_note_logline: None,
+            new_note_first_line: None,
         };
         config_set_folder_settings(&mut doc, std::slice::from_ref(&settings)).unwrap();
         assert_eq!(
@@ -2519,6 +2575,57 @@ pub fn context_search_text(doc: &Automerge) -> String {
         .join("\n")
 }
 
+/// The note's first logline, exactly as the sidebar reads it: whatever that
+/// one block carries, with no later logline standing in for what it lacks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FirstContext {
+    /// The block's `created` stamp (else its `ts`) as epoch seconds; 0 when it
+    /// carries neither, or one that is not an instant.
+    pub created: i64,
+    pub location: String,
+    pub weather: String,
+    pub now_playing: String,
+}
+
+pub fn first_context(doc: &Automerge) -> FirstContext {
+    let Ok(spans) = spans_to_json(doc) else {
+        return FirstContext::default();
+    };
+    spans
+        .into_iter()
+        .find_map(|span| {
+            let SpanJson::Block { value } = span else {
+                return None;
+            };
+            if value.get("type").and_then(Json::as_str) != Some("context") {
+                return None;
+            }
+            let attrs = value.get("attrs").and_then(Json::as_object);
+            let text = |key: &str| {
+                attrs
+                    .and_then(|attrs| attrs.get(key))
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let stamp = {
+                let created = text("created");
+                if created.is_empty() {
+                    text("ts")
+                } else {
+                    created
+                }
+            };
+            Some(FirstContext {
+                created: parse_iso_seconds(&stamp).unwrap_or_default(),
+                location: text("location"),
+                weather: text("weather"),
+                now_playing: text("nowPlaying"),
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// A logline that carried a fix. The stamp stays the string the block was
 /// written with — whoever reads it back knows the format it went in as.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2802,6 +2909,41 @@ mod context_place_tests {
             ]"#,
         );
         assert!(context_places(&doc).is_empty());
+    }
+
+    /// The sidebar renders one logline, the first, and reads every field off
+    /// that block alone.
+    #[test]
+    fn the_first_logline_never_borrows_from_a_later_one() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}},
+              {"type":"text","value":"words"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-08-21T14:03:22Z","weather":"Rain",
+                         "nowPlaying":"Aphex Twin"}}},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"ts":"2026-08-22T09:00:00Z","location":"Cork"}}}
+            ]"#,
+        );
+        let first = first_context(&doc);
+        assert_eq!(first.created, 1_787_321_002);
+        assert_eq!(first.weather, "Rain");
+        assert_eq!(first.now_playing, "Aphex Twin");
+        assert_eq!(first.location, "");
+        assert_eq!(context_values(&doc, "location"), vec!["Cork".to_string()]);
+    }
+
+    #[test]
+    fn a_logline_stamped_only_with_ts_still_reports_a_created() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"ts":"2026-08-21T14:03:22Z"}}}
+            ]"#,
+        );
+        assert_eq!(first_context(&doc).created, 1_787_321_002);
+        assert_eq!(first_context(&Automerge::new()), FirstContext::default());
     }
 
     #[test]

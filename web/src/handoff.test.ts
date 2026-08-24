@@ -136,6 +136,7 @@ describe("handoff listener", () => {
       status: 200,
       mimeType: "application/octet-stream",
       base64: toBase64(body),
+      immutable: false,
     });
     installHandoffListener();
     const channel = TestBroadcastChannel.instances[0];
@@ -165,6 +166,7 @@ describe("handoff listener", () => {
       status: 200,
       mimeType: "application/octet-stream",
       base64: "%",
+      immutable: false,
     });
     installHandoffListener();
     const channel = TestBroadcastChannel.instances[0];
@@ -183,6 +185,7 @@ describe("handoff listener", () => {
       status: 204,
       mimeType: "text/plain",
       base64: "",
+      immutable: true,
     });
     installHandoffListener();
     const channel = TestBroadcastChannel.instances[0];
@@ -193,6 +196,27 @@ describe("handoff listener", () => {
     expect(channel.messages[1]).toEqual({ id: "pinned", type: "cached" });
   });
 
+  test("won't cache a pinned url whose resolved chain is mutable", async () => {
+    const put = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(caches.open).mockResolvedValue({ put } as never);
+    const body = Uint8Array.from([7, 8, 9]);
+    window.__patchworkResolve = vi.fn().mockResolvedValue({
+      status: 200,
+      mimeType: "application/octet-stream",
+      base64: toBase64(body),
+      immutable: false,
+    });
+    installHandoffListener();
+    const channel = TestBroadcastChannel.instances[0];
+    channel.emit(request("mutable-chain", `${pinnedRaw()}/child`));
+
+    await vi.waitFor(() => expect(channel.messages).toHaveLength(2));
+    expect(put).not.toHaveBeenCalled();
+    const reply = channel.messages[1] as any;
+    expect(reply.type).toBe("response");
+    expect(reply.response.body).toEqual(body);
+  });
+
   test("falls back to a direct response when a cache write fails", async () => {
     const put = vi.fn().mockRejectedValue(new Error("full"));
     vi.mocked(caches.open).mockResolvedValue({ put } as never);
@@ -201,6 +225,7 @@ describe("handoff listener", () => {
       status: 200,
       mimeType: "application/octet-stream",
       base64: toBase64(body),
+      immutable: true,
     });
     installHandoffListener();
     const channel = TestBroadcastChannel.instances[0];

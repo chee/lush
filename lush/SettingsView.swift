@@ -464,6 +464,7 @@ struct CalendarSettingsPane: View {
 
 struct FontsSettingsPane: View {
     @State private var textSize = EditorSettings.textSize
+    @State private var newNoteFirstLine = EditorSettings.newNoteFirstLine
 
     var body: some View {
         Form {
@@ -477,6 +478,20 @@ struct FontsSettingsPane: View {
                 .onChange(of: textSize) {
                     EditorSettings.setTextSize(textSize)
                 }
+            }
+            Section {
+                Picker("First line of a new note", selection: $newNoteFirstLine) {
+                    ForEach(EditorController.styles, id: \.key) { style in
+                        Text(style.label).tag(style.key)
+                    }
+                }
+                .onChange(of: newNoteFirstLine) {
+                    EditorSettings.setNewNoteFirstLine(newNoteFirstLine)
+                }
+            } header: {
+                Text("New Notes")
+            } footer: {
+                Text("The block a new note starts in. A folder can answer this for itself, in its own settings.")
             }
             FontSettingsSections()
         }
@@ -566,6 +581,7 @@ struct ImportSettingsPane: View {
 struct LoglineSettingsPane: View {
     @Environment(ContextTracker.self) private var contextTracker
     @State private var autoInsertLogline = EditorSettings.autoInsertLogline
+    @State private var newNoteLogline = EditorSettings.newNoteLogline
     @State private var dateFormat = EditorSettings.loglineDateFormat
     /// A fixed instant, so the preview reads the same every time the pane is
     /// opened and only the format is seen to change.
@@ -582,10 +598,16 @@ struct LoglineSettingsPane: View {
     var body: some View {
         Form {
             Section {
+                Toggle("Add logline at the top of new notes", isOn: $newNoteLogline)
+                    .onChange(of: newNoteLogline) {
+                        EditorSettings.setNewNoteLogline(newNoteLogline)
+                    }
                 Toggle("Add logline when context changes", isOn: $autoInsertLogline)
                     .onChange(of: autoInsertLogline) {
                         EditorSettings.setAutoInsertLogline(autoInsertLogline)
                     }
+            } footer: {
+                Text("A folder can answer the first of these for itself, in its own settings.")
             }
             Section {
                 TextField("Date format", text: $dateFormat)

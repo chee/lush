@@ -105,6 +105,11 @@ enum BackgroundSync {
         schedule()
         guard assertion == .invalid else {
             syncCoreActivity()
+            // The foreground interlude's edits are still behind the save
+            // debounce, and the stint already running would park the core
+            // without ever writing them. Restart the work under the assertion
+            // already held rather than taking a second one.
+            startAssertionWork()
             return
         }
         assertion = UIApplication.shared.beginBackgroundTask(withName: "lush.sync") {
@@ -122,9 +127,19 @@ enum BackgroundSync {
         } else {
             syncCoreActivity()
         }
+        startAssertionWork()
+    }
+
+    /// One round at a time: the round in flight is cancelled and awaited
+    /// before the new one starts, so two `syncNow`s never overlap, and only
+    /// the newest token is allowed to park the core.
+    private static func startAssertionWork() {
+        let previous = assertionWork
+        previous?.cancel()
         let token = UUID()
         assertionToken = token
-        let work = Task { @MainActor in
+        assertionWork = Task { @MainActor in
+            if let previous { await previous.value }
             // Durability first, and before the cancellation check: syncing is
             // work we can lose and pick up next launch, but an edit still held
             // by a debounce exists only in this process, and the system can
@@ -139,7 +154,6 @@ enum BackgroundSync {
             assertionToken = nil
             endAssertion()
         }
-        assertionWork = work
     }
 
     static func willEnterForeground() {

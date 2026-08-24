@@ -92,6 +92,43 @@ describe("flushToServer", () => {
     }
   });
 
+  it("uses a remote-heads event that lands between polls", async () => {
+    vi.useFakeTimers();
+    try {
+      let advertised: string[] | undefined;
+      let fire = () => {};
+      let polls = 0;
+      const handle = makeHandle({
+        getSyncInfo: () => {
+          polls++;
+          // The second poll runs in the gap between the two waits.
+          if (polls === 2) {
+            advertised = ["h1"];
+            fire();
+            return undefined;
+          }
+          return advertised ? { lastHeads: advertised } : undefined;
+        },
+      });
+      const repo = makeRepo([handle]);
+      fire = () => {
+        for (const fn of repo.listeners) fn();
+      };
+      let settled = false;
+      const result = flushToServer(repo, 3000).then((value) => {
+        settled = true;
+        return value;
+      });
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(settled).toBe(true);
+      await expect(result).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("nudges resync once per stuck doc and times out false", async () => {
     vi.useFakeTimers();
     try {

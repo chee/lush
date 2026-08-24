@@ -64,6 +64,7 @@ declare global {
       status: number;
       mimeType: string;
       base64: string;
+      immutable: boolean;
     }>;
   }
 }

@@ -100,6 +100,12 @@ struct AudioInlineView: View {
     let onOpen: () -> Void
     @State private var player: AVAudioPlayer?
     @State private var playing = false
+    @State private var loading = false
+    @State private var pendingSeek: Double?
+    /// Whether playback is still wanted by the time the read lands. The read
+    /// outlives the tap that started it, so without this a card scrolled away
+    /// mid-load starts playing offscreen, and a second tap has nothing to stop.
+    @State private var wantsPlayback = false
     @State private var progress: Double = 0
     @State private var levels: [Float] = []
     @ScaledMetric(relativeTo: .largeTitle) private var playButtonSize: CGFloat = 30
@@ -165,19 +171,58 @@ struct AudioInlineView: View {
             }
         }
         .onDisappear {
+            wantsPlayback = false
             player?.stop()
         }
     }
 
-    private func togglePlayback() {
-        if player == nil {
-            player = try? AVAudioPlayer(contentsOf: fileURL)
-            player?.prepareToPlay()
+    /// The recording is read off the main actor and handed to the player as
+    /// bytes; a memo of any length would otherwise stall the tap that starts
+    /// it. `loading` keeps a held-down scrub from starting a read per tick.
+    private func loadPlayer() async -> AVAudioPlayer? {
+        if let player { return player }
+        guard !loading else { return nil }
+        loading = true
+        let url = fileURL
+        let data = await Task.detached { try? Data(contentsOf: url, options: .mappedIfSafe) }.value
+        loading = false
+        guard let data, let loaded = try? AVAudioPlayer(data: data) else { return nil }
+        loaded.prepareToPlay()
+        player = loaded
+        return loaded
+    }
+
+    /// Both entry points come through here while the player is still being
+    /// read, so whichever of them owns the load applies the newest scrub
+    /// position — a tap and a drag that overlap must not cancel each other.
+    private func startPlayback() {
+        wantsPlayback = true
+        Task {
+            guard let loaded = await loadPlayer(), wantsPlayback else { return }
+            if let seek = pendingSeek {
+                loaded.currentTime = seek * loaded.duration
+                pendingSeek = nil
+            }
+            loaded.play()
+            playing = true
         }
-        guard let player else { return }
+    }
+
+    private func togglePlayback() {
+        guard let player else {
+            // A tap while the read is still out is the one chance to call it
+            // off — there is no player yet to pause.
+            if wantsPlayback {
+                wantsPlayback = false
+            } else {
+                startPlayback()
+            }
+            return
+        }
         if playing {
             player.pause()
             playing = false
+            wantsPlayback = false
         } else {
             player.play()
             playing = true
@@ -185,11 +230,15 @@ struct AudioInlineView: View {
     }
 
     private func seekTo(_ fraction: Double) {
-        if player == nil {
-            player = try? AVAudioPlayer(contentsOf: fileURL)
-            player?.prepareToPlay()
+        guard let player else {
+            // A scrub is a stream of ticks and the first one starts the read;
+            // the rest are dropped by `loading`, so the bar follows the finger
+            // from here and the last position seen is the one played.
+            progress = fraction
+            pendingSeek = fraction
+            startPlayback()
+            return
         }
-        guard let player else { return }
         player.currentTime = fraction * player.duration
         progress = fraction
         if !playing {
@@ -691,12 +740,15 @@ struct AudioPlayerSheet: View {
         .frame(minWidth: 420)
         #endif
         .task {
-            let loaded = try? AVAudioPlayer(contentsOf: fileURL)
+            let url = fileURL
+            let data = await Task.detached {
+                try? Data(contentsOf: url, options: .mappedIfSafe)
+            }.value
+            let loaded = data.flatMap { try? AVAudioPlayer(data: $0) }
             loaded?.prepareToPlay()
             player = loaded
             duration = max(loaded?.duration ?? 0.01, 0.01)
             trimEnd = duration
-            let url = fileURL
             Task {
                 levels = await Task.detached { WaveformView.levels(for: url) }.value
             }
@@ -767,7 +819,7 @@ struct AudioPlayerSheet: View {
             .appendingPathComponent("trim-\(UUID().uuidString).m4a")
         do {
             try await session.export(to: out, as: .m4a)
-            let data = try Data(contentsOf: out)
+            let data = try await Task.detached { try Data(contentsOf: out) }.value
             try? FileManager.default.removeItem(at: out)
             onTrimmed(data)
             dismiss()
