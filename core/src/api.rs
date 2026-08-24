@@ -298,6 +298,21 @@ pub struct NotePlace {
     pub stamped: String,
 }
 
+/// One note as a day reads it: when it was made, and when each of its
+/// loglines was stamped. A note kept for a calendar event is never one of
+/// these — it belongs to that event's row instead.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NoteDay {
+    pub url: String,
+    pub title: String,
+    /// Unix seconds of the note's first change; 0 when its history carries none.
+    pub created: i64,
+    /// Every logline's stamp, in document order, as it was written: an ISO 8601
+    /// string carrying the offset it was stamped at, so the day it reads as is
+    /// the day it was written on.
+    pub stamps: Vec<String>,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AssetVision {
     pub description: String,
@@ -2173,6 +2188,13 @@ impl Core {
     /// notes themselves.
     pub fn note_places(&self) -> Vec<NotePlace> {
         self.index.note_places().unwrap_or_default()
+    }
+
+    /// Every note the calendar can show on a day of its own, with the stamps
+    /// that say which days those are. The indexer has already been through
+    /// each note, so this reads its work rather than the notes themselves.
+    pub fn note_days(&self) -> Vec<NoteDay> {
+        self.index.note_days().unwrap_or_default()
     }
 
     /// Hands the index the folder tree as child -> parent edges, so a scoped

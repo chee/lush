@@ -37,11 +37,11 @@ struct AgendaScreen: View {
                         Task { await agenda.requestAccess() }
                     }
                 }
-            } else if agenda.items.isEmpty, agenda.isFreshWindow {
+            } else if agenda.items.isEmpty, !agenda.hasDayNotesInWindow, agenda.isFreshWindow {
                 ContentUnavailableView(
                     "Nothing Scheduled",
                     systemImage: "calendar",
-                    description: Text("No events or reminders in the next two weeks.")
+                    description: Text("No events, reminders or notes in the next two weeks.")
                 )
             } else {
                 list
@@ -55,14 +55,20 @@ struct AgendaScreen: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: CalendarLinks.changed)) { _ in
             noteUrls = CalendarLinks.noteUrlByItem
+            Task { await agenda.reloadDayNotes() }
         }
+        // A note joins a day by being written, which the tree hears about; the
+        // calendar never asks EventKit again for it.
+        .onChange(of: model.folderTree) { Task { await agenda.reloadDayNotes() } }
         .onChange(of: agenda.items, initial: true) { regroup() }
+        .onChange(of: agenda.dayNotes) { regroup() }
     }
 
     private func regroup() {
+        let notes = agenda.dayNotes
         dayGroups = Agenda
             .days(agenda.items, from: agenda.windowStart, count: agenda.windowDayCount)
-            .map(DayGroup.init)
+            .map { DayGroup($0, notes: notes[$0.day] ?? []) }
     }
 
     private var list: some View {
@@ -96,6 +102,9 @@ struct AgendaScreen: View {
                         // once and leaves a hole.
                         ForEach(group.rows) { entry in
                             row(entry.item)
+                        }
+                        ForEach(group.notes) { note in
+                            DayNoteRow(note: note, open: open)
                         }
                     }
                     .id(group.day)
@@ -304,6 +313,7 @@ struct AgendaScreen: View {
 struct DayGroup: Identifiable {
     let day: Date
     let rows: [Row]
+    let notes: [DayNote]
     var id: Date { day }
 
     struct Row: Identifiable {
@@ -311,11 +321,12 @@ struct DayGroup: Identifiable {
         let item: AgendaItem
     }
 
-    init(_ group: (day: Date, items: [AgendaItem])) {
+    init(_ group: (day: Date, items: [AgendaItem]), notes: [DayNote] = []) {
         day = group.day
         rows = group.items.map {
             Row(id: "\(group.day.timeIntervalSince1970)|\($0.rowKey)", item: $0)
         }
+        self.notes = notes
     }
 }
 
@@ -337,6 +348,69 @@ private struct MonthChip: View {
             .background(.regularMaterial, in: Capsule())
             .overlay(Capsule().strokeBorder(.separator.opacity(0.5), lineWidth: 0.5))
             .animation(.default, value: top.formatted(.dateTime.month().year()))
+        }
+    }
+}
+
+/// A note under the day it was written on. It carries the app's own pink
+/// rather than a calendar's colour: nothing about it came from EventKit, and
+/// the day is the only thing it shares with the rows above it.
+private struct DayNoteRow: View {
+    let note: DayNote
+    let open: (String) -> Void
+
+    @Environment(NotesModel.self) private var model
+    @State private var hovering = false
+    @ScaledMetric(relativeTo: .subheadline) private var titleSize: CGFloat = 15
+    @ScaledMetric(relativeTo: .caption) private var detailSize: CGFloat = 12
+
+    private var tint: Color { .lushPink }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Image(systemName: "doc.richtext")
+                        .font(.system(size: detailSize))
+                    Text(note.displayTitle)
+                        .font(.system(size: titleSize, weight: .semibold))
+                        .underline(hovering)
+                        .lineLimit(1)
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: note.isOrigin ? "square.and.pencil" : "clock")
+                    Text(note.detailText)
+                }
+                .font(.system(size: detailSize))
+                .opacity(0.75)
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .foregroundStyle(tint.mix(with: .primary, by: 0.65))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(tint.opacity(hovering ? 0.3 : 0.2))
+        )
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        #if os(macOS)
+        .pointerStyle(.link)
+        #endif
+        .onTapGesture { open(note.noteUrl) }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Opens the note")
+        .accessibilityAction { open(note.noteUrl) }
+        .contextMenu {
+            Button("Open Note") { open(note.noteUrl) }
+            if let node = model.node(for: note.noteUrl) {
+                Divider()
+                NoteContextMenu(node: node)
+            }
         }
     }
 }

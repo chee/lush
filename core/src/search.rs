@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::Result;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
-use crate::api::{EmbeddingChunk, IndexedNote, NotePlace, RecentNote, SearchFilter, SearchHit};
+use crate::api::{
+    EmbeddingChunk, IndexedNote, NoteDay, NotePlace, RecentNote, SearchFilter, SearchHit,
+};
 use crate::shapes;
 use crate::shapes::ContextPlace;
 
@@ -50,6 +52,10 @@ pub struct IndexedDoc {
     pub locations: Vec<String>,
     /// Every logline that carried a fix, in document order.
     pub places: Vec<ContextPlace>,
+    /// Every logline's stamp, in document order, as it was written. The day a
+    /// note belongs to comes off the front of one of these, in the zone it was
+    /// stamped in rather than wherever it is being read.
+    pub stamps: Vec<String>,
     pub facets: Vec<String>,
     /// The day the doc is about, `YYYY-MM-DD`, empty when it is about no day.
     pub when: String,
@@ -271,6 +277,10 @@ impl SearchIndex {
             "ALTER TABLE search_docs ADD COLUMN places TEXT NOT NULL DEFAULT ''",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE search_docs ADD COLUMN stamps TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS search_docs_modified
                 ON search_docs(modified DESC);
@@ -306,9 +316,9 @@ impl SearchIndex {
             // A row written before `created` existed has to be rewritten even
             // though its heads still match, or it never gets one. The same
             // holds for every column added after `heads`.
-            let stored: Option<(String, i64, String, String, String, String, i64, i64, String, String)> =
+            let stored: Option<(String, i64, String, String, String, String, i64, i64, String, String, String)> =
                 conn.query_row(
-                    "SELECT heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places
+                    "SELECT heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places, stamps
                      FROM search_docs WHERE url = ?1",
                     params![doc.url],
                     |row| {
@@ -323,6 +333,7 @@ impl SearchIndex {
                             row.get(7)?,
                             row.get(8)?,
                             row.get(9)?,
+                            row.get(10)?,
                         ))
                     },
                 )
@@ -338,6 +349,7 @@ impl SearchIndex {
                 event_end,
                 event_ids,
                 places,
+                stamps,
             )) = stored
             {
                 if heads == doc.heads
@@ -350,6 +362,7 @@ impl SearchIndex {
                     && event_end == doc.event_end
                     && event_ids == doc.event_ids.join("\n")
                     && places == encode_places(&doc.places)
+                    && stamps == doc.stamps.join("\n")
                 {
                     return Ok(false);
                 }
@@ -357,8 +370,8 @@ impl SearchIndex {
         }
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            "INSERT INTO search_docs(url, kind, title, body, modified, has_vision, tags, when_day, heads, created, weather, locations, facets, context, event_start, event_end, event_ids, places, stamps)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(url) DO UPDATE SET
                 kind = excluded.kind,
                 title = excluded.title,
@@ -376,7 +389,8 @@ impl SearchIndex {
                 event_start = excluded.event_start,
                 event_end = excluded.event_end,
                 event_ids = excluded.event_ids,
-                places = excluded.places",
+                places = excluded.places,
+                stamps = excluded.stamps",
             params![
                 doc.url,
                 doc.kind,
@@ -395,7 +409,8 @@ impl SearchIndex {
                 doc.event_start,
                 doc.event_end,
                 doc.event_ids.join("\n"),
-                encode_places(&doc.places)
+                encode_places(&doc.places),
+                doc.stamps.join("\n")
             ],
         )?;
         tx.execute(
@@ -430,7 +445,7 @@ impl SearchIndex {
         let row = conn
             .query_row(
                 "SELECT kind, title, body, modified, created, has_vision, tags, when_day, heads,
-                        weather, locations, facets, context, event_start, event_end, event_ids, places
+                        weather, locations, facets, context, event_start, event_end, event_ids, places, stamps
                  FROM search_docs WHERE url = ?1",
                 params![url],
                 |row| {
@@ -454,6 +469,7 @@ impl SearchIndex {
                         event_end: row.get(14)?,
                         event_ids: decode_lines(&row.get::<_, String>(15)?),
                         places: decode_places(&row.get::<_, String>(16)?),
+                        stamps: decode_lines(&row.get::<_, String>(17)?),
                     })
                 },
             )
@@ -738,6 +754,32 @@ impl SearchIndex {
         Ok(out)
     }
 
+    /// Every note a day can show on its own: when it was made, and when each
+    /// of its loglines was stamped. A note carrying a calendar event is left
+    /// out — it is a meeting note, and already shows on that event's row.
+    /// Unbounded like `note_places`: the calendar window slides anywhere, so
+    /// a limit would only decide which days come up short.
+    pub fn note_days(&self) -> Result<Vec<NoteDay>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, title, created, stamps
+             FROM search_docs
+             WHERE kind = 'rich' AND event_ids = ''
+             ORDER BY created DESC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(NoteDay {
+                url: row.get(0)?,
+                title: row.get(1)?,
+                created: row.get(2)?,
+                stamps: decode_lines(&row.get::<_, String>(3)?),
+            });
+        }
+        Ok(out)
+    }
+
     /// Everything a filter can narrow, resolved to a url set. Only worth the
     /// scan when a filter is actually set — it exists so a hit on an asset can
     /// check the notes that embed it against the same filter as the asset.
@@ -888,6 +930,7 @@ pub fn indexed_doc(
         weather: shapes::context_values(doc, "weather"),
         locations: shapes::context_values(doc, "location"),
         places: shapes::context_places(doc),
+        stamps: shapes::context_stamps(doc),
         facets: shapes::doc_facets(doc),
         when: shapes::doc_when(doc),
         context,
@@ -1089,6 +1132,7 @@ mod tests {
             weather: Vec::new(),
             locations: Vec::new(),
             places: Vec::new(),
+            stamps: Vec::new(),
             facets: Vec::new(),
             when: when.into(),
             context: String::new(),
@@ -1282,6 +1326,57 @@ mod tests {
         }];
         index.upsert(doc).unwrap();
         assert_eq!(index.note_places().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn note_days_carry_the_stamps_and_leave_meeting_notes_out() {
+        let index = fixture();
+        let mut written = indexed("written", "a day out", &[], "");
+        written.created = 900;
+        written.stamps = vec![
+            "2026-03-04T09:00:00+01:00".into(),
+            "2026-03-05T22:10:00Z".into(),
+        ];
+        index.upsert(written).unwrap();
+        let mut meeting = indexed("meeting", "standup", &[], "");
+        meeting.created = 800;
+        meeting.stamps = vec!["2026-03-04T10:00:00Z".into()];
+        meeting.event_ids = vec!["uid|2026-03-04T10:00:00Z".into()];
+        index.upsert(meeting).unwrap();
+        let mut asset = indexed("asset", "photo", &[], "");
+        asset.kind = "file".into();
+        index.upsert(asset).unwrap();
+
+        let days = index.note_days().unwrap();
+        let urls: Vec<_> = days.iter().map(|d| d.url.as_str()).collect();
+        assert_eq!(urls[0], "written");
+        assert!(!urls.contains(&"meeting"));
+        assert!(!urls.contains(&"asset"));
+        assert!(urls.contains(&"note"));
+        assert_eq!(days[0].title, "a day out");
+        assert_eq!(days[0].created, 900);
+        assert_eq!(
+            days[0].stamps,
+            ["2026-03-04T09:00:00+01:00", "2026-03-05T22:10:00Z"]
+        );
+        assert!(days[1].stamps.is_empty());
+    }
+
+    /// A row written before the column existed keeps its heads, so only the
+    /// stamps comparison can tell the upsert it is out of date.
+    #[test]
+    fn a_stampless_note_is_rewritten_when_its_loglines_arrive() {
+        let index = fixture();
+        let mut doc = indexed("late", "trip", &[], "");
+        doc.heads = "abc".into();
+        index.upsert(doc.clone()).unwrap();
+        let stored = index.indexed_note("late").unwrap().unwrap();
+        assert!(stored.stamps.is_empty());
+
+        doc.stamps = vec!["2026-03-04T09:00:00Z".into()];
+        assert!(index.upsert(doc).unwrap());
+        let stored = index.indexed_note("late").unwrap().unwrap();
+        assert_eq!(stored.stamps, ["2026-03-04T09:00:00Z"]);
     }
 
     #[test]
