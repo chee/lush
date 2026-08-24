@@ -2682,6 +2682,34 @@ pub fn context_places(doc: &Automerge) -> Vec<ContextPlace> {
         .collect()
 }
 
+/// Every logline's stamp, in document order, as it was written: an ISO 8601
+/// string carrying the offset it was stamped at, so the day it reads as is the
+/// day it was written on. A logline with no fix is nowhere on a map but still
+/// says when the note was being written, which is all a day needs.
+pub fn context_stamps(doc: &Automerge) -> Vec<String> {
+    let Ok(spans) = spans_to_json(doc) else {
+        return Vec::new();
+    };
+    spans
+        .into_iter()
+        .filter_map(|span| {
+            let SpanJson::Block { value } = span else {
+                return None;
+            };
+            if value.get("type").and_then(Json::as_str) != Some("context") {
+                return None;
+            }
+            let attrs = value.get("attrs").and_then(Json::as_object)?;
+            attrs
+                .get("created")
+                .or_else(|| attrs.get("ts"))
+                .and_then(Json::as_str)
+                .filter(|stamp| !stamp.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 pub fn calendar_event_ids(doc: &Automerge) -> Vec<String> {
     let Ok(spans) = spans_to_json(doc) else {
         return Vec::new();
@@ -2848,6 +2876,26 @@ mod context_place_tests {
             ]"#,
         );
         assert!(context_places(&doc).is_empty());
+    }
+
+    #[test]
+    fn every_logline_stamp_is_kept_whether_or_not_it_was_placed() {
+        let doc = doc_with(
+            r#"[
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"created":"2026-03-04T09:00:00+01:00","location":"Glasgow"}}},
+              {"type":"text","value":"some words"},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"ts":"2026-03-05T09:00:00Z","lat":51.5072,"lon":-0.1276}}},
+              {"type":"block","value":{"type":"context","parents":[],"isEmbed":true,
+                "attrs":{"location":"nowhen"}}},
+              {"type":"block","value":{"type":"paragraph","parents":[],"isEmbed":false,"attrs":{}}}
+            ]"#,
+        );
+        assert_eq!(
+            context_stamps(&doc),
+            ["2026-03-04T09:00:00+01:00", "2026-03-05T09:00:00Z"]
+        );
     }
 
     #[test]

@@ -198,6 +198,29 @@ enum Agenda {
         return formatter
     }()
 
+    /// The wall clock a stamp was written at, read as if it were local: a
+    /// logline is a record of a moment somewhere, so what it shows is what the
+    /// clock said there — and the day it belongs to is that day, not whichever
+    /// day the same instant falls on wherever it is being read.
+    static let stampClock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return formatter
+    }()
+
+    /// The day a logline was stamped on, as the day sections key them.
+    static func stampDay(_ stamp: String) -> Date? {
+        guard let parsed = dayFormat.date(from: String(stamp.prefix(10))) else { return nil }
+        return Calendar.current.startOfDay(for: parsed)
+    }
+
+    /// Where on its day a logline lands. A stamp carrying nothing but a date
+    /// still has a day; it just has no hour to sit at.
+    static func stampTime(_ stamp: String) -> Date? {
+        stampClock.date(from: String(stamp.prefix(19)))
+    }
+
     /// `lush://calendar?date=2026-08-10&event=<id>` — the day to scroll to and
     /// the item to pick out once it is on screen.
     static func url(day: Date?, item: String?) -> URL? {
@@ -278,6 +301,73 @@ enum Agenda {
     }
 }
 
+/// A note the calendar shows on a day of its own: the day it was made, or a
+/// day one of its loglines was stamped on. A note kept for a calendar event is
+/// never one of these — it already shows on that event's row, and the index
+/// leaves it out.
+struct DayNote: Identifiable, Equatable, Sendable {
+    var noteUrl: String
+    var title: String
+    var day: Date
+    /// Where on the day it lands, so a day reads in the order it happened.
+    /// Nothing dates a note whose only stamp is a bare date.
+    var at: Date?
+    /// The day the note was made, as against a day it was written in later.
+    var isOrigin: Bool
+
+    var id: String { "\(noteUrl)|\(Agenda.dayFormat.string(from: day))" }
+
+    var displayTitle: String { title.presence ?? "Untitled Note" }
+
+    var detailText: String {
+        let what = isOrigin ? "written" : "logline"
+        guard let at else { return what }
+        return "\(what) \(at.formatted(date: .omitted, time: .shortened))"
+    }
+}
+
+extension DayNote {
+    /// The whole collection at once, by day: the index hands every note over
+    /// in one go, and a note written across a fortnight belongs to each of the
+    /// days it was written on rather than to the stretch between them.
+    ///
+    /// Two things put a note on a day. It was made that day — the doc's first
+    /// change, which is an instant and so reads in the zone she is in now — or
+    /// a logline was stamped that day, which is the day it was written on, in
+    /// the zone it was written in: flying home doesn't move last week's
+    /// writing to another day. Either way a note is one row a day, however
+    /// many of its loglines land there.
+    static func from(_ notes: [NoteDay]) -> [Date: [DayNote]] {
+        var byDay: [Date: [DayNote]] = [:]
+        for note in notes {
+            let made = note.created > 0
+                ? Date(timeIntervalSince1970: TimeInterval(note.created))
+                : nil
+            let madeDay = made.map { Calendar.current.startOfDay(for: $0) }
+            var days: Set<Date> = []
+            for stamp in note.stamps {
+                guard let day = Agenda.stampDay(stamp), days.insert(day).inserted else { continue }
+                byDay[day, default: []].append(
+                    DayNote(
+                        noteUrl: note.url,
+                        title: note.title,
+                        day: day,
+                        at: day == madeDay ? made : Agenda.stampTime(stamp),
+                        isOrigin: day == madeDay
+                    )
+                )
+            }
+            guard let made, let madeDay, days.insert(madeDay).inserted else { continue }
+            byDay[madeDay, default: []].append(
+                DayNote(noteUrl: note.url, title: note.title, day: madeDay, at: made, isOrigin: true)
+            )
+        }
+        return byDay.mapValues { notes in
+            notes.sorted { ($0.at ?? $0.day, $0.displayTitle) < ($1.at ?? $1.day, $1.displayTitle) }
+        }
+    }
+}
+
 struct CalendarSidebarLabel: View {
     @AppStorage(Agenda.dayInIconKey) private var showsDay = false
 
@@ -329,6 +419,11 @@ final class AgendaStore {
     static let shared = AgendaStore()
 
     private(set) var items: [AgendaItem] = []
+    /// Every note a day can show on its own, by day. A note is not a calendar
+    /// item and doesn't come out of the window's fetch — the index hands the
+    /// whole collection over at once — so this is reloaded when the notes
+    /// change rather than when the window slides.
+    private(set) var dayNotes: [Date: [DayNote]] = [:]
     /// The stretch of days currently loaded. Fresh, it runs from yesterday —
     /// a little past showing above today says the list scrolls both ways — to
     /// a fortnight out. It slides as she scrolls, and once it would pass
@@ -354,6 +449,13 @@ final class AgendaStore {
 
     var isFreshWindow: Bool {
         windowStart == Self.freshStart && windowEnd == Self.freshEnd
+    }
+
+    /// Notes are held for every day there is, not just the loaded ones, so
+    /// whether the calendar has anything to show is a question about the
+    /// window rather than about the collection.
+    var hasDayNotesInWindow: Bool {
+        dayNotes.contains { day, _ in day >= windowStart && day < windowEnd }
     }
 
     func resetWindow() {
@@ -495,6 +597,11 @@ final class AgendaStore {
             reminderAccess = EKEventStore.authorizationStatus(for: .reminder)
         }
         await reload()
+        await reloadDayNotes()
+    }
+
+    func reloadDayNotes() async {
+        dayNotes = await NotesModel.shared.noteDays()
     }
 
     func requestAccess() async {
