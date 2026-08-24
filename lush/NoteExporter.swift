@@ -1,8 +1,8 @@
 import Foundation
 import CoreText
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
-import UniformTypeIdentifiers
 #else
 import UIKit
 #endif
@@ -135,10 +135,13 @@ enum NoteExporter {
 
     // MARK: - HTML builder
 
-    static func htmlFragment(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
+    /// `assetPaths` maps an asset url to where its file sits, so the pictures
+    /// ride as references. Inlining their bytes is only for a document that
+    /// has to stand on its own — see `htmlDocument`.
+    static func htmlFragment(from spans: [SpanNode], assetPaths: [String: String] = [:]) -> String {
         htmlBody(
             from: spans,
-            assetResolver: inlineImages.isEmpty ? .none : .inlineImages(inlineImages)
+            assetResolver: assetPaths.isEmpty ? .none : .relativePaths(assetPaths)
         )
     }
 
@@ -408,7 +411,8 @@ enum NoteExporter {
             guard let data = images[url] else {
                 return block.altText.isEmpty ? "" : "<p>\(escape(block.altText))</p>"
             }
-            let src = "data:image/png;base64,\(data.base64EncodedString())"
+            let mime = AssetCache.imageType(of: data)?.preferredMIMEType ?? "image/png"
+            let src = "data:\(mime);base64,\(data.base64EncodedString())"
             return "<img src=\"\(src)\" alt=\"\(escape(block.altText))\">"
         }
     }

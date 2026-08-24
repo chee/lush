@@ -57,8 +57,12 @@ enum RichTextClipboard {
         return [webCustomMapIdentifier: map, webCustomPayloadIdentifier: payload]
     }
 
-    static func html(from spans: [SpanNode], inlineImages: [String: Data] = [:]) -> String {
-        NoteExporter.htmlFragment(from: spans, inlineImages: inlineImages)
+    /// Pictures go on the clipboard as files the HTML points at, never as
+    /// bytes inlined into it: a data URI is every pixel in the selection
+    /// re-encoded and then grown by a third, built on the main thread while
+    /// the user waits for a keystroke to finish.
+    static func html(from spans: [SpanNode], assetPaths: [String: String] = [:]) -> String {
+        NoteExporter.htmlFragment(from: spans, assetPaths: assetPaths)
     }
 
     static func markdown(

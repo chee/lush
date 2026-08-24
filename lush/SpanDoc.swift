@@ -721,9 +721,10 @@ final class AssetCache {
         imageSizes[url] != nil && (spillFiles[url] != nil || imageData[url] != nil)
     }
 
-    /// The picture at its own resolution, for the info sheet and the
-    /// clipboard. Decoded on the spot and never held: one of these is worth
-    /// tens of the bounded bitmaps the editor draws.
+    /// The picture at its own resolution, for the info sheet. Decoded on the
+    /// spot and never held: one of these is worth tens of the bounded bitmaps
+    /// the editor draws, which is why the clipboard hands over `bytes(for:)`
+    /// instead of coming through here.
     func fullImage(for url: String) -> PImage? {
         bytes(for: url).flatMap(PImage.init(data:))
     }
