@@ -154,11 +154,183 @@ enum NoteExporter {
     }
 
     static func rtfData(from spans: [SpanNode]) throws -> Data {
-        let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        let attributed = documentAttributed(from: spans)
         return try attributed.data(
             from: NSRange(location: 0, length: attributed.length),
             documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
         )
+    }
+
+    // MARK: - Attributed document
+
+    /// An asset packed for a rich text attachment: the file itself, and the
+    /// size the note draws it at so a photo pastes at the size it looks
+    /// rather than at its full pixel count.
+    struct Attachment {
+        let file: FileWrapper
+        let size: CGSize?
+    }
+
+    /// The spans as a document rather than as the editor's view of one. The
+    /// theme's ink and paper go — a note written in the dark should not paste
+    /// as white text on white paper — list items pick up the marker text and
+    /// the list structure Cocoa's rich text keeps them in, and any asset we
+    /// were handed becomes an attachment holding its own file.
+    static func documentAttributed(
+        from spans: [SpanNode],
+        attachments: [String: Attachment] = [:]
+    ) -> NSAttributedString {
+        let text = NSMutableAttributedString(
+            attributedString: RichText.attributed(from: spans, cache: AssetCache())
+        )
+        attach(attachments, in: text)
+        markLists(in: text)
+        documentColors(in: text)
+        return text
+    }
+
+    private static func attach(
+        _ attachments: [String: Attachment],
+        in text: NSMutableAttributedString
+    ) {
+        guard !attachments.isEmpty else { return }
+        var edits: [(NSRange, NSTextAttachment)] = []
+        text.enumerateAttribute(
+            .attachment,
+            in: NSRange(location: 0, length: text.length)
+        ) { value, range, _ in
+            guard value != nil,
+                  let box = text.attribute(.amBlock, at: range.location, effectiveRange: nil) as? BlockBox,
+                  let url = box.value.embedUrl,
+                  let asset = attachments[url]
+            else { return }
+            let attachment = NSTextAttachment()
+            attachment.fileWrapper = asset.file
+            if let size = asset.size {
+                attachment.bounds = CGRect(origin: .zero, size: RichText.fitted(size))
+            }
+            edits.append((range, attachment))
+        }
+        for (range, attachment) in edits {
+            text.addAttribute(.attachment, value: attachment, range: range)
+        }
+    }
+
+    private static let listMarkerFormats: [String: NSTextList.MarkerFormat] = [
+        "unordered-list-item": .disc,
+        "ordered-list-item": .decimal,
+    ]
+
+    private static func todoMarker(_ state: TodoState) -> String {
+        switch state {
+        case .open: return "\u{2610}"
+        case .checked: return "\u{2611}"
+        case .canceled: return "\u{2612}"
+        case .pending: return "\u{25D0}"
+        }
+    }
+
+    /// Cocoa keeps a list item's marker in the text and the list it belongs to
+    /// in the paragraph style. The editor draws its own markers instead, so
+    /// the attributed string it builds has neither and a list would arrive
+    /// somewhere else as bare indented lines.
+    private static func markLists(in text: NSMutableAttributedString) {
+        let string = text.string as NSString
+        var items: [(paragraph: NSRange, marker: String, lists: [NSTextList])] = []
+        var ordinals: [Int: Int] = [:]
+        var location = 0
+        while location < string.length {
+            let paragraph = string.paragraphRange(for: NSRange(location: location, length: 0))
+            guard paragraph.length > 0 else { break }
+            location = NSMaxRange(paragraph)
+            guard let box = text.attribute(
+                .amBlock,
+                at: paragraph.location,
+                effectiveRange: nil
+            ) as? BlockBox else { continue }
+            let block = box.value
+            let depth = block.parents.count
+            guard listMarkerFormats[block.type] != nil || block.type == "todo-list-item" else {
+                ordinals = [:]
+                continue
+            }
+            ordinals = ordinals.filter { $0.key <= depth }
+            let marker: String
+            let format: NSTextList.MarkerFormat
+            switch block.type {
+            case "ordered-list-item":
+                let ordinal = (ordinals[depth] ?? 0) + 1
+                ordinals[depth] = ordinal
+                marker = "\(ordinal)."
+                format = .decimal
+            case "todo-list-item":
+                ordinals[depth] = 0
+                marker = todoMarker(block.todoState)
+                format = .init(marker)
+            default:
+                ordinals[depth] = 0
+                marker = "\u{2022}"
+                format = .disc
+            }
+            var lists = block.parents.map {
+                NSTextList(markerFormat: listMarkerFormats[$0] ?? .disc, options: 0)
+            }
+            lists.append(NSTextList(markerFormat: format, options: 0))
+            items.append((paragraph, marker, lists))
+        }
+        // back to front: an insert moves everything after it
+        for item in items.reversed() {
+            let style = (text.attribute(
+                .paragraphStyle,
+                at: item.paragraph.location,
+                effectiveRange: nil
+            ) as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle
+                ?? NSMutableParagraphStyle()
+            style.textLists = item.lists
+            text.addAttribute(.paragraphStyle, value: style, range: item.paragraph)
+            var attributes = text.attributes(at: item.paragraph.location, effectiveRange: nil)
+            attributes.removeValue(forKey: .link)
+            attributes.removeValue(forKey: .attachment)
+            text.insert(
+                NSAttributedString(string: "\t\(item.marker)\t", attributes: attributes),
+                at: item.paragraph.location
+            )
+        }
+    }
+
+    private static let documentLinkColor = PColor(rgb: 0x0563C1)
+    private static let documentCodePaper = PColor(rgb: 0x000000, alpha: 0.06)
+
+    /// The editor's colours are the theme's, and the theme moves with the
+    /// window. A document keeps none of that: its text lands in whatever
+    /// colour the thing reading it draws text in, and the few runs that do
+    /// need a colour of their own carry one that works on paper.
+    private static func documentColors(in text: NSMutableAttributedString) {
+        let whole = NSRange(location: 0, length: text.length)
+        text.removeAttribute(.foregroundColor, range: whole)
+        text.removeAttribute(.backgroundColor, range: whole)
+        var edits: [(NSRange, [NSAttributedString.Key: Any])] = []
+        text.enumerateAttribute(.amHighlight, in: whole) { value, range, _ in
+            guard let name = value as? String else { return }
+            let pair = Highlight.documentPair(name)
+            edits.append((range, [.foregroundColor: pair.ink, .backgroundColor: pair.paper]))
+        }
+        text.enumerateAttribute(.amCode, in: whole) { value, range, _ in
+            guard value != nil else { return }
+            edits.append((range, [.backgroundColor: documentCodePaper]))
+        }
+        // a PDF draws no link styling of its own, and the readers that do
+        // draw their own only agree on blue and underlined
+        text.enumerateAttribute(.link, in: whole) { value, range, _ in
+            guard value != nil else { return }
+            edits.append((range, [
+                .foregroundColor: documentLinkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+            ]))
+        }
+        for (range, attributes) in edits {
+            text.addAttributes(attributes, range: range)
+        }
     }
 
     enum ExportError: Error {
@@ -166,7 +338,7 @@ enum NoteExporter {
     }
 
     static func pdfData(from spans: [SpanNode], title: String) throws -> Data {
-        let attributed = RichText.attributed(from: spans, cache: AssetCache())
+        let attributed = documentAttributed(from: spans)
         var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
         let inset = mediaBox.insetBy(dx: 54, dy: 54)
         let data = NSMutableData()

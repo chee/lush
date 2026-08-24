@@ -1461,6 +1461,9 @@ final class EditorCore: LiveWriter {
         /// Where each asset sits on disk, keyed by asset url. The HTML
         /// flavour points at these rather than carrying the bytes itself.
         var paths: [String: String] = [:]
+        /// The same assets packed as attachment files, for the RTFD flavour,
+        /// which carries them inside itself.
+        var attachments: [String: NoteExporter.Attachment] = [:]
     }
 
     /// The media a copied selection stands for, so a paste outside this app
@@ -1484,9 +1487,20 @@ final class EditorCore: LiveWriter {
                 if let file = picture.file() {
                     media.paths[url] = file.absoluteString
                 }
+                let wrapper = FileWrapper(regularFileWithContents: picture.data)
+                wrapper.preferredFilename = picture.name
+                media.attachments[url] = NoteExporter.Attachment(
+                    file: wrapper,
+                    size: cache.imageSizes[url]
+                )
             } else if let file = cache.fileURLs[url] {
                 media.files.append(file)
                 media.paths[url] = file.absoluteString
+                if let wrapper = try? FileWrapper(url: file) {
+                    let name = cache.names[url] ?? file.lastPathComponent
+                    wrapper.preferredFilename = name.replacingOccurrences(of: "/", with: "-")
+                    media.attachments[url] = NoteExporter.Attachment(file: wrapper, size: nil)
+                }
             }
         }
         return media
@@ -4941,6 +4955,11 @@ class EditorTextView: NSTextView, EditorTextViewLike {
         let plain = visibleText.isEmpty ? markdown : visibleText
         let item = NSPasteboardItem()
         item.setString(json, forType: Self.spansPasteboardType)
+        // ahead of the HTML: an app that reads both prefers this one, and
+        // this one has the pictures in it
+        if let rtfd = RichTextClipboard.rtfd(from: spans, attachments: media.attachments) {
+            item.setData(rtfd, forType: .rtfd)
+        }
         item.setString(
             RichTextClipboard.html(from: spans, assetPaths: media.paths),
             forType: Self.htmlPasteboardType
@@ -5963,6 +5982,9 @@ final class EditorTextView: UITextView, EditorTextViewLike {
             RichTextClipboard.markdownTypeIdentifier: markdown,
             UTType.utf8PlainText.identifier: visibleText.isEmpty ? markdown : visibleText,
         ]
+        if let rtfd = RichTextClipboard.rtfd(from: spans, attachments: media.attachments) {
+            item[RichTextClipboard.rtfdTypeIdentifier] = rtfd
+        }
         for (type, data) in RichTextClipboard.webCustomItems(spansJSON: json) {
             item[type] = data
         }

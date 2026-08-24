@@ -355,6 +355,14 @@ enum Highlight {
         return dynamic(light: PColor(rgb: entry.lightInk), dark: PColor(rgb: entry.darkInk))
     }
 
+    /// The light pair, resolved rather than dynamic. A document leaving the
+    /// app is read somewhere we know nothing about, so it carries the colours
+    /// that work on paper instead of the ones that match this window.
+    static func documentPair(_ name: String) -> (paper: PColor, ink: PColor) {
+        let entry = palette[name] ?? palette["pink"]!
+        return (PColor(rgb: entry.hue, alpha: 0.16), PColor(rgb: entry.lightInk))
+    }
+
     private static func dynamic(light: PColor, dark: PColor) -> PColor {
         #if os(macOS)
         NSColor(name: nil) { appearance in

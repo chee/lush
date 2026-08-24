@@ -65,6 +65,37 @@ enum RichTextClipboard {
         NoteExporter.htmlFragment(from: spans, assetPaths: assetPaths)
     }
 
+    static let rtfdTypeIdentifier = UTType.flatRTFD.identifier
+
+    /// The selection as RTFD — the rich text Cocoa's own editors read before
+    /// they look at our HTML. The pictures ride inside it as attachment
+    /// files, so a paste into Mail, Notes or TextEdit keeps them without a
+    /// data URI and without the receiving app having to reach into this app's
+    /// container for a file it has no business reading.
+    ///
+    /// Only offered for a selection whose every attachment ended up holding a
+    /// file: a table, a set of columns, a live embed or an asset whose bytes
+    /// we don't have would arrive as an empty box, and the HTML says all of
+    /// those. A selection with no assets at all is left to the HTML too —
+    /// there is nothing RTFD would carry that it doesn't say better.
+    static func rtfd(from spans: [SpanNode], attachments: [String: NoteExporter.Attachment]) -> Data? {
+        guard !attachments.isEmpty else { return nil }
+        let document = NoteExporter.documentAttributed(from: spans, attachments: attachments)
+        let whole = NSRange(location: 0, length: document.length)
+        var flattens = false
+        document.enumerateAttribute(.attachment, in: whole) { value, _, stop in
+            guard let attachment = value as? NSTextAttachment, attachment.fileWrapper == nil
+            else { return }
+            flattens = true
+            stop.pointee = true
+        }
+        guard !flattens else { return nil }
+        return try? document.data(
+            from: whole,
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtfd]
+        )
+    }
+
     static func markdown(
         from spans: [SpanNode],
         attachmentLabel: (BlockValue, Int) -> String = { _, _ in "[attachment]" }
