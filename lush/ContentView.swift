@@ -2670,6 +2670,36 @@ struct FolderScreen: View {
         return "\(action) \(deleteRequest.count) items?"
     }
 
+    /// The New Note button dropped between rows. Under a note it files after
+    /// that note in that note's folder; under a folder row it goes into that
+    /// folder, at the top, which is where the drop point reads; at the very
+    /// top of a folder it leads the folder. On the home screen's own top
+    /// there is no folder yet, so the first notebook takes it.
+    private func insertNewNote(at index: Int, among rows: [FolderNode]) {
+        let above = index > 0 ? rows[min(index, rows.count) - 1] : nil
+        Task {
+            contextTracker.start()
+            let snap = contextTracker.snapshot
+            let url: String?
+            if let above, above.kind == "folder" {
+                url = await model.createNote(inFolder: above.url, snap: snap)
+                if let url { model.placeChild(url, atTopOf: above.url) }
+            } else if let above, let parent = above.parentUrl ?? folderUrl {
+                url = await model.createNote(inFolder: parent, snap: snap)
+                if let url { model.placeChild(url, after: above.url, in: parent) }
+            } else if let folderUrl {
+                url = await model.createNote(inFolder: folderUrl, snap: snap)
+                if let url { model.placeChild(url, atTopOf: folderUrl) }
+            } else if let first = rows.first, first.kind == "folder" {
+                url = await model.createNote(inFolder: first.url, snap: snap)
+                if let url { model.placeChild(url, atTopOf: first.url) }
+            } else {
+                url = await model.createNote(snap: snap)
+            }
+            if let url { push(.note(url)) }
+        }
+    }
+
     var body: some View {
         List {
             if searchText.isEmpty, folderUrl == nil {
@@ -2736,6 +2766,9 @@ struct FolderScreen: View {
                         .onDelete { indices in
                             deleteRequest = indices.map { nodes[$0] }
                         }
+                        .onInsert(of: newNoteDropTypes) { index, _ in
+                            insertNewNote(at: index, among: nodes)
+                        }
                     } header: {
                         if folderUrl == nil { Text("Notebooks") }
                     }
@@ -2772,6 +2805,9 @@ struct FolderScreen: View {
                             }
                             .padding(.leading, CGFloat(displayed.depth) * 20)
                             .contextMenu { nodeMenu(displayed.node) }
+                        }
+                        .onInsert(of: newNoteDropTypes) { index, _ in
+                            insertNewNote(at: index, among: displayedNodes.map(\.node))
                         }
                     } header: {
                         if folderUrl == nil { Text("Notebooks") }
@@ -3001,7 +3037,10 @@ struct FolderScreen: View {
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarSpacer(.flexible, placement: .bottomBar)
             ToolbarItem(placement: .bottomBar) {
+                // Draggable as well as tappable: dropped between rows, the
+                // new note lands where it was dropped.
                 newMenu
+                    .onDrag(newNoteDragProvider)
             }
         }
         // Scoped to the stack the toolbar reads: every editor window has an

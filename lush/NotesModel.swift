@@ -2388,6 +2388,18 @@ final class NotesModel {
         childOrder[folderUrl] = urls
     }
 
+    /// Puts a note at the head of a folder's order — a drop above everything
+    /// the folder shows. Same shape as `placeChild(_:after:in:)`: the note
+    /// need not be in the tree yet.
+    func placeChild(_ url: String, atTopOf folderUrl: String) {
+        var urls = orderedChildren(node(for: folderUrl)?.children ?? [], in: folderUrl)
+            .filter { $0.kind != "folder" }
+            .map(\.url)
+        urls.removeAll { $0 == url }
+        urls.insert(url, at: 0)
+        childOrder[folderUrl] = urls
+    }
+
     func reorderChild(_ url: String, adjacentTo targetUrl: String, after: Bool) {
         guard url != targetUrl,
               let movingNode = node(for: url),
