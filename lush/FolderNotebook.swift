@@ -649,7 +649,11 @@ struct FolderNotebook: View {
         } else if editing {
             arrangeList
         } else if let core, core.loaded {
+            #if os(iOS)
+            FolderNotebookText(core: core, focusRevision: core.focusRevision, addNote: addNote)
+            #else
             FolderNotebookText(core: core, focusRevision: core.focusRevision)
+            #endif
         } else {
             ProgressView()
                 .controlSize(.small)
@@ -670,7 +674,17 @@ struct FolderNotebook: View {
         ToolbarItem {
             EditButton()
         }
-        #endif
+        // The same corner it lives in on the home screen, beside the search
+        // bar there and above the format bar here.
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+        ToolbarItem(placement: .bottomBar) {
+            Button(action: addNote) {
+                Label("New Note", systemImage: "square.and.pencil")
+            }
+            .help("New note after this one")
+            .disabled(editing)
+        }
+        #else
         ToolbarItem {
             Button(action: addNote) {
                 Label("New Note", systemImage: "square.and.pencil")
@@ -678,6 +692,7 @@ struct FolderNotebook: View {
             .help("New note after this one")
             .disabled(editing)
         }
+        #endif
     }
 
     /// A note straight after the one being read, in whichever folder that one
@@ -1066,8 +1081,28 @@ final class NotebookFormatController {
 /// session behind them.
 struct NotebookFormatBar: View {
     let formatter: NotebookFormatController
+    let addNote: () -> Void
 
     var body: some View {
+        HStack(spacing: 8) {
+            formatCapsule
+            // The same corner the compose button keeps everywhere else,
+            // riding the keyboard beside the bar while the bottom bar it
+            // usually lives in is covered.
+            Button(action: addNote) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 44, height: 44)
+            }
+            .glassEffect(.regular, in: Circle())
+            .accessibilityLabel("New Note")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+
+    private var formatCapsule: some View {
         HStack(spacing: 0) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 22) {
@@ -1161,8 +1196,6 @@ struct NotebookFormatBar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(Capsule())
         .glassEffect(.regular, in: Capsule())
-        .padding(.horizontal, 12)
-        .padding(.vertical, 4)
     }
 
     private func markButton(
@@ -1184,6 +1217,7 @@ struct FolderNotebookText: UIViewRepresentable {
     /// Not read here: it changes when the core has a caret waiting to be
     /// placed, which is what gets `updateUIView` called at all.
     let focusRevision: Int
+    let addNote: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -1219,8 +1253,16 @@ struct FolderNotebookText: UIViewRepresentable {
 
         context.coordinator.formatter.textView = textView
         context.coordinator.formatter.core = core
+        context.coordinator.addNote = addNote
+        // Through the coordinator rather than captured directly: the view
+        // value the closure came from goes stale, the coordinator's copy is
+        // refreshed on every update.
+        let coordinator = context.coordinator
         let accessory = UIHostingController(
-            rootView: NotebookFormatBar(formatter: context.coordinator.formatter)
+            rootView: NotebookFormatBar(
+                formatter: coordinator.formatter,
+                addNote: { coordinator.addNote() }
+            )
         )
         accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 52)
         accessory.view.backgroundColor = .clear
@@ -1232,6 +1274,7 @@ struct FolderNotebookText: UIViewRepresentable {
     func updateUIView(_ textView: NotebookTextView, context: Context) {
         textView.document = core.document
         context.coordinator.formatter.core = core
+        context.coordinator.addNote = addNote
         if let caret = core.takeFocusTarget() {
             textView.selectedRange = caret
             textView.becomeFirstResponder()
@@ -1244,6 +1287,7 @@ struct FolderNotebookText: UIViewRepresentable {
         let core: FolderNotebookCore
         let formatter = NotebookFormatController()
         var accessory: UIHostingController<NotebookFormatBar>?
+        var addNote: () -> Void = {}
 
         init(core: FolderNotebookCore) {
             self.core = core
