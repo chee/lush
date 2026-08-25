@@ -860,6 +860,133 @@ fn config_set_url_list(doc: &mut Automerge, key: &str, urls: &[String]) -> anyho
     Ok(())
 }
 
+/// A url list as the doc stores it, unfiltered — `heads` reads a historical
+/// state, `None` the present one.
+fn raw_url_list_at(
+    doc: &Automerge,
+    key: &str,
+    heads: Option<&[automerge::ChangeHash]>,
+) -> Vec<String> {
+    let list = match heads {
+        Some(heads) => doc.get_at(ROOT, key, heads).ok().flatten(),
+        None => doc.get(ROOT, key).ok().flatten(),
+    };
+    let Some((_, list)) = list else {
+        return Vec::new();
+    };
+    let keys: Vec<String> = match heads {
+        Some(heads) => doc.keys_at(&list, heads).collect(),
+        None => doc.keys(&list).collect(),
+    };
+    let mut entries: Vec<(u64, String)> = keys
+        .into_iter()
+        .filter_map(|key| {
+            let index: u64 = key.parse().ok()?;
+            let url = match heads {
+                Some(heads) => text_at(doc, &list, &key, heads),
+                None => read_str(doc, &list, &key),
+            }?;
+            Some((index, url))
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    entries.into_iter().map(|entry| entry.1).collect()
+}
+
+fn text_at(
+    doc: &Automerge,
+    obj: &automerge::ObjId,
+    key: &str,
+    heads: &[automerge::ChangeHash],
+) -> Option<String> {
+    let (v, id) = doc.get_at(obj, key, heads).ok().flatten()?;
+    match v {
+        automerge::Value::Object(ObjType::Text) => doc.text_at(&id, heads).ok(),
+        automerge::Value::Scalar(s) => s.to_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Rebuild url fields the concurrent text diffs fused, out of the doc's own
+/// history. Every state a single device wrote holds whole urls, so for a list
+/// the most recent single-change state where every entry parses is the last
+/// good copy: what still parses in the present keeps its place, and the good
+/// copy's urls that went missing come back on the end. Single fields take
+/// their most recent parseable value. A doc with nothing wrong writes nothing.
+pub fn repair_config_urls(doc: &mut Automerge) -> anyhow::Result<()> {
+    const LISTS: [&str; 3] = ["folders", "packages", "pins"];
+    const FIELDS: [&str; 3] = ["inbox", "quickNote", "calendar"];
+
+    let broken_lists: Vec<&str> = LISTS
+        .into_iter()
+        .filter(|key| raw_url_list_at(doc, key, None).iter().any(|url| !usable_url(url)))
+        .collect();
+    let broken_fields: Vec<&str> = FIELDS
+        .into_iter()
+        .filter(|key| read_str(doc, &ROOT, key).is_some_and(|url| !usable_url(&url)))
+        .collect();
+    if broken_lists.is_empty() && broken_fields.is_empty() {
+        return Ok(());
+    }
+
+    let hashes: Vec<automerge::ChangeHash> =
+        doc.get_changes(&[]).iter().map(|change| change.hash()).collect();
+    let mut good_lists: std::collections::HashMap<&str, Vec<String>> = Default::default();
+    let mut good_fields: std::collections::HashMap<&str, String> = Default::default();
+    for hash in hashes.iter().rev() {
+        let heads = [*hash];
+        for key in &broken_lists {
+            if good_lists.contains_key(key) {
+                continue;
+            }
+            let urls = raw_url_list_at(doc, key, Some(&heads));
+            if !urls.is_empty() && urls.iter().all(|url| usable_url(url)) {
+                good_lists.insert(key, urls);
+            }
+        }
+        for key in &broken_fields {
+            if good_fields.contains_key(key) {
+                continue;
+            }
+            if let Some(url) = text_at(doc, &ROOT, key, &heads) {
+                if usable_url(&url) {
+                    good_fields.insert(key, url);
+                }
+            }
+        }
+        if good_lists.len() == broken_lists.len() && good_fields.len() == broken_fields.len() {
+            break;
+        }
+    }
+
+    for key in &broken_lists {
+        let mut repaired: Vec<String> = raw_url_list_at(doc, key, None)
+            .into_iter()
+            .filter(|url| usable_url(url))
+            .collect();
+        for url in good_lists.get(key).map(Vec::as_slice).unwrap_or_default() {
+            if !repaired.contains(url) {
+                repaired.push(url.clone());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        repaired.retain(|url| seen.insert(url.clone()));
+        config_set_url_list(doc, key, &repaired)?;
+    }
+    if !good_fields.is_empty() {
+        tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(now_seconds()),
+            |t| {
+                for (key, url) in &good_fields {
+                    set_identifier(t, &ROOT, key, url)?;
+                }
+                Ok(())
+            },
+        ))?;
+    }
+    Ok(())
+}
+
 /// A saved search. `rules` is the JSON rule tree the editor writes; the flat
 /// `query`/`kind`/`scope`/`within_days` fields carry a best-effort projection
 /// of it for clients that predate the tree, and are what those clients wrote.
@@ -3359,6 +3486,46 @@ mod pad_tests {
         let merged = config_folders(&doc);
         let unique: std::collections::HashSet<&String> = merged.iter().collect();
         assert_eq!(unique.len(), merged.len(), "duplicate urls: {merged:?}");
+    }
+
+    /// A config that already took the damage gets its urls back from its own
+    /// history: what still parses keeps its place, the fused entry's original
+    /// comes back on the end, and a second run writes nothing.
+    #[test]
+    fn a_damaged_config_repairs_from_history() {
+        use crate::repo::DocId;
+        let urls: Vec<String> = (0..3).map(|_| DocId::random().to_url()).collect();
+        let mut doc = Automerge::new();
+        init_lush_config(&mut doc).unwrap();
+        config_set_folders(&mut doc, &urls).unwrap();
+        config_set_inbox(&mut doc, &urls[0]).unwrap();
+
+        // fuse entry 1 and the inbox the way the old concurrent diffs did
+        tx(doc.transact_with(
+            |_| CommitOptions::default().with_time(now_seconds()),
+            |t| {
+                let (_, list) = t.get(ROOT, "folders")?.unwrap();
+                let (_, entry) = t.get(&list, "1")?.unwrap();
+                t.splice_text(&entry, 12, 0, "2")?;
+                let (_, inbox) = t.get(ROOT, "inbox")?.unwrap();
+                t.splice_text(&inbox, 12, 0, "2")?;
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert_eq!(config_folders(&doc), vec![urls[0].clone(), urls[2].clone()]);
+        assert_eq!(config_inbox(&doc), None);
+
+        repair_config_urls(&mut doc).unwrap();
+        assert_eq!(
+            config_folders(&doc),
+            vec![urls[0].clone(), urls[2].clone(), urls[1].clone()]
+        );
+        assert_eq!(config_inbox(&doc).as_deref(), Some(urls[0].as_str()));
+
+        let heads = doc.get_heads();
+        repair_config_urls(&mut doc).unwrap();
+        assert_eq!(doc.get_heads(), heads);
     }
 
     /// A list that already took the damage reads back healed: the chimera url

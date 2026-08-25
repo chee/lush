@@ -38,6 +38,9 @@ enum Command {
     Append { url: String, text: String },
     /// Dump a doc as raw JSON
     Json { url: String },
+    /// Repair url fields in an account's lush config that concurrent edits
+    /// fused into unparseable urls, recovering the originals from history
+    RepairConfig { account: String },
 }
 
 async fn dump(repo: &Arc<Repo>, id: DocId) -> Result<()> {
@@ -149,6 +152,38 @@ async fn main() -> Result<()> {
                 })
                 .await?;
             println!("{json}");
+        }
+        Command::RepairConfig { account } => {
+            let account_id = DocId::from_url(&account)?;
+            repo.ensure_doc(account_id).await?;
+            if !repo.wait_for_doc(account_id, Duration::from_secs(30)).await {
+                anyhow::bail!("account doc never arrived");
+            }
+            let config_url = repo
+                .read_doc(account_id, |doc| Ok(shapes::account_tools_lush(doc)))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("account has no lush config"))?;
+            let config = DocId::from_url(&config_url)?;
+            repo.ensure_doc(config).await?;
+            if !repo.wait_for_doc(config, Duration::from_secs(30)).await {
+                anyhow::bail!("config doc never arrived");
+            }
+            let before = repo
+                .read_doc(config, |doc| Ok(shapes::config_folders(doc)))
+                .await?;
+            repo.change_doc(config, shapes::repair_config_urls).await?;
+            let after = repo
+                .read_doc(config, |doc| Ok(shapes::config_folders(doc)))
+                .await?;
+            repo.flush(config).await?;
+            println!("config: {config_url}");
+            println!("folders before repair: {}", before.len());
+            for url in &after {
+                println!("  {url}");
+            }
+            if after == before {
+                println!("nothing to repair");
+            }
         }
         Command::Watch { url } => {
             let id = DocId::from_url(&url)?;
