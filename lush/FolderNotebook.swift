@@ -14,6 +14,25 @@ let notebookNote = NSAttributedString.Key("lushNotebookNote")
 /// pass walks straight past it.
 let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
 
+#if os(iOS)
+/// What the New Note button carries when dragged. A type of its own rather
+/// than text, so the text view's built-in drop never mistakes it for
+/// something to insert.
+let notebookNewNoteDragType = "party.chee.lush.new-note"
+
+func newNoteDragProvider() -> NSItemProvider {
+    let provider = NSItemProvider()
+    provider.registerDataRepresentation(
+        forTypeIdentifier: notebookNewNoteDragType,
+        visibility: .ownProcess
+    ) { completion in
+        completion(Data(), nil)
+        return nil
+    }
+    return provider
+}
+#endif
+
 /// The folder's notes concatenated into one piece of text, and the rules for
 /// reading and editing it: who owns each character, where a caret is writing,
 /// and which edits are allowed.
@@ -678,37 +697,42 @@ struct FolderNotebook: View {
         // bar there and above the format bar here.
         ToolbarSpacer(.flexible, placement: .bottomBar)
         ToolbarItem(placement: .bottomBar) {
-            Button(action: addNote) {
+            Button {
+                addNote()
+            } label: {
                 Label("New Note", systemImage: "square.and.pencil")
             }
-            .help("New note after this one")
+            .help("New note at the end — drag onto the page to place it")
             .disabled(editing)
+            .onDrag(newNoteDragProvider)
         }
         #else
         ToolbarItem {
-            Button(action: addNote) {
+            Button {
+                addNote()
+            } label: {
                 Label("New Note", systemImage: "square.and.pencil")
             }
-            .help("New note after this one")
+            .help("New note at the end of the folder")
             .disabled(editing)
         }
         #endif
     }
 
-    /// A note straight after the one being read, in whichever folder that one
-    /// lives in — a notebook reads out of its subfolders too, and putting the
-    /// new note in the folder at the top would file it somewhere the reader
-    /// isn't looking. With no caret anywhere it goes on the end.
-    private func addNote() {
-        let after = core?.focusedNote
-        let parent = after.flatMap { model.node(for: $0)?.parentUrl } ?? folderUrl
+    /// Tapped, the button files the note where the folder's setting says new
+    /// notes go — the end it always uses, top or bottom. Dragged and dropped
+    /// on a spot in the notebook, the note lands straight after the note at
+    /// that spot, in whichever folder that one lives in — a notebook reads
+    /// out of its subfolders too.
+    private func addNote(after target: String? = nil) {
+        let parent = target.flatMap { model.node(for: $0)?.parentUrl } ?? folderUrl
         Task {
             contextTracker.start()
             guard let url = await model.createNote(
                 inFolder: parent,
                 snap: contextTracker.snapshot
             ) else { return }
-            if let after { model.placeChild(url, after: after, in: parent) }
+            if let target { model.placeChild(url, after: target, in: parent) }
             core?.requestFocus(on: url)
         }
     }
@@ -1110,13 +1134,15 @@ final class NotebookFormatController {
 struct NotebookFormatBar: View {
     let formatter: NotebookFormatController
     let addNote: () -> Void
+    let dragItem: () -> NSItemProvider
 
     var body: some View {
         HStack(spacing: 8) {
             formatCapsule
             // The same corner the compose button keeps everywhere else,
             // riding the keyboard beside the bar while the bottom bar it
-            // usually lives in is covered.
+            // usually lives in is covered. Dragging it onto the page drops
+            // the new note at that spot instead of the folder's end.
             Button(action: addNote) {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 17, weight: .semibold))
@@ -1125,6 +1151,7 @@ struct NotebookFormatBar: View {
             }
             .glassEffect(.regular, in: Circle())
             .accessibilityLabel("New Note")
+            .onDrag(dragItem)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
@@ -1245,7 +1272,8 @@ struct FolderNotebookText: UIViewRepresentable {
     /// Not read here: it changes when the core has a caret waiting to be
     /// placed, which is what gets `updateUIView` called at all.
     let focusRevision: Int
-    let addNote: () -> Void
+    /// nil files the note at the folder's end; a url puts it after that note.
+    let addNote: (String?) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -1289,13 +1317,15 @@ struct FolderNotebookText: UIViewRepresentable {
         let accessory = UIHostingController(
             rootView: NotebookFormatBar(
                 formatter: coordinator.formatter,
-                addNote: { coordinator.addNote() }
+                addNote: { coordinator.addNote(nil) },
+                dragItem: newNoteDragProvider
             )
         )
         accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 52)
         accessory.view.backgroundColor = .clear
         textView.inputAccessoryView = accessory.view
         context.coordinator.accessory = accessory
+        textView.addInteraction(UIDropInteraction(delegate: coordinator))
         return textView
     }
 
@@ -1311,14 +1341,40 @@ struct FolderNotebookText: UIViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, UITextViewDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIDropInteractionDelegate {
         let core: FolderNotebookCore
         let formatter = NotebookFormatController()
         var accessory: UIHostingController<NotebookFormatBar>?
-        var addNote: () -> Void = {}
+        var addNote: (String?) -> Void = { _ in }
 
         init(core: FolderNotebookCore) {
             self.core = core
+        }
+
+        // The New Note button dropped on the page: the note goes after
+        // whichever note owns the spot it landed on. The payload is a type of
+        // its own, so the text view's own drop never bids for it.
+        func dropInteraction(
+            _ interaction: UIDropInteraction,
+            canHandle session: UIDropSession
+        ) -> Bool {
+            session.hasItemsConforming(toTypeIdentifiers: [notebookNewNoteDragType])
+        }
+
+        func dropInteraction(
+            _ interaction: UIDropInteraction,
+            sessionDidUpdate session: UIDropSession
+        ) -> UIDropProposal {
+            UIDropProposal(operation: .copy)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+            guard let textView = formatter.textView else { return }
+            let point = session.location(in: textView)
+            let target = textView.closestPosition(to: point)
+                .map { textView.offset(from: textView.beginningOfDocument, to: $0) }
+                .flatMap { core.document.note(forCaretAt: $0) }
+            addNote(target)
         }
 
         func textView(
