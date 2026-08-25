@@ -1318,6 +1318,7 @@ impl Core {
                 let config = DocId::from_url(&config_url)?;
                 repo.ensure_doc(config).await?;
                 let _ = repo.wait_for_doc(config, LINK_TIMEOUT).await;
+                repo.change_doc(config, shapes::repair_config_urls).await?;
                 let (mut folders, mut inbox) = repo
                     .read_doc(config, |doc| {
                         Ok((shapes::config_folders(doc), shapes::config_inbox(doc)))
