@@ -18,7 +18,7 @@ let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
 /// Where a new note goes: the end its folder's setting names, or a spot the
 /// New Note button was dragged to. `before` only ever means the head of the
 /// notebook, so it files at the top of that note's folder.
-enum NewNotePlacement {
+enum NoteDropPlacement {
     case end
     case after(String)
     case before(String)
@@ -735,7 +735,7 @@ struct FolderNotebook: View {
     /// notes go — the end it always uses, top or bottom. Dragged and dropped
     /// on a spot in the notebook, the note lands at that spot, in whichever
     /// folder owns it — a notebook reads out of its subfolders too.
-    private func addNote(at placement: NewNotePlacement = .end) {
+    private func addNote(at placement: NoteDropPlacement = .end) {
         let parent: String = switch placement {
         case .end: folderUrl
         case .after(let note), .before(let note):
@@ -1291,7 +1291,7 @@ struct FolderNotebookText: UIViewRepresentable {
     /// Not read here: it changes when the core has a caret waiting to be
     /// placed, which is what gets `updateUIView` called at all.
     let focusRevision: Int
-    let addNote: (NewNotePlacement) -> Void
+    let addNote: (NoteDropPlacement) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -1363,7 +1363,7 @@ struct FolderNotebookText: UIViewRepresentable {
         let core: FolderNotebookCore
         let formatter = NotebookFormatController()
         var accessory: UIHostingController<NotebookFormatBar>?
-        var addNote: (NewNotePlacement) -> Void = { _ in }
+        var addNote: (NoteDropPlacement) -> Void = { _ in }
 
         init(core: FolderNotebookCore) {
             self.core = core
