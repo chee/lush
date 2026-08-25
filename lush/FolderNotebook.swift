@@ -462,6 +462,15 @@ final class FolderNotebookCore: LiveWriter {
         scheduleSave()
     }
 
+    /// Formatting rewrites attributes without a text change, so nothing
+    /// passes the delegate that feeds `willChange` — the format bar reports
+    /// what it touched by hand.
+    func noteFormatted(_ urls: Set<String>) {
+        guard loaded, !urls.isEmpty else { return }
+        dirty.formUnion(urls)
+        scheduleSave()
+    }
+
     // MARK: - Writing
 
     func scheduleSave() {
@@ -908,6 +917,268 @@ final class NotebookTextView: UITextView {
     }
 }
 
+/// The slice of the editor's formatting the notebook can run on its own
+/// storage: block styles and inline marks, applied with the same
+/// `RichText.marks`/`RichText.attributes` round-trip the editor uses.
+/// Ownership rides on the characters, so every rewritten run keeps its note
+/// stamp, and boundary runs are never touched.
+@MainActor
+@Observable
+final class NotebookFormatController {
+    @ObservationIgnored weak var textView: NotebookTextView?
+    @ObservationIgnored weak var core: FolderNotebookCore?
+
+    var currentStyleKey = "paragraph"
+    var strongActive = false
+    var emActive = false
+    var underlineActive = false
+    var strikethroughActive = false
+    var codeActive = false
+    var highlightActive: String?
+
+    func refreshState() {
+        guard let textView, let core else { return }
+        let selection = textView.selectedRange
+        let storage = core.document.storage
+        // With a caret, the buttons must show what the next typed character
+        // will be — that's the typing attributes, not the character behind it.
+        let attrs: [NSAttributedString.Key: Any]
+        if selection.length > 0, selection.location < storage.length {
+            attrs = storage.attributes(at: selection.location, effectiveRange: nil)
+        } else {
+            attrs = textView.typingAttributes
+        }
+        let block = (attrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+        currentStyleKey = block.styleKey
+        let marks = RichText.marks(from: attrs, block: block)
+        strongActive = marks["strong"] != nil
+        emActive = marks["em"] != nil
+        underlineActive = marks["underline"] != nil
+        strikethroughActive = marks["strikethrough"] != nil
+        codeActive = marks["code"] != nil
+        if case .string(let name)? = marks["highlight"] {
+            highlightActive = name
+        } else {
+            highlightActive = nil
+        }
+    }
+
+    func applyStyle(_ key: String) {
+        guard let textView, let core else { return }
+        let block = BlockValue.fromStyleKey(key)
+        let document = core.document
+        let storage = document.storage
+        let selection = textView.selectedRange
+        guard storage.length > 0 else { return }
+        let paragraphs = (storage.string as NSString).paragraphRange(for: selection)
+        var touched: Set<String> = []
+        storage.beginEditing()
+        storage.enumerateAttributes(in: paragraphs) { runAttrs, runRange, _ in
+            guard runAttrs[notebookBoundary] == nil,
+                  let owner = runAttrs[notebookNote] as? String else { return }
+            let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+            guard !oldBlock.isAtomic, runAttrs[.amTableBox] == nil,
+                  runAttrs[.amColumnsBox] == nil,
+                  runAttrs[.attachment] == nil,
+                  runAttrs[.amDisplayOnly] == nil else { return }
+            let marks = RichText.marks(from: runAttrs, block: oldBlock)
+            var attrs = RichText.attributes(block: block, marks: marks)
+            attrs[notebookNote] = owner
+            storage.setAttributes(attrs, range: runRange)
+            touched.insert(owner)
+        }
+        storage.endEditing()
+        textView.selectedRange = selection
+        textView.typingAttributes = document.typingAttributes(
+            from: RichText.attributes(block: block, marks: [:]),
+            at: selection.location
+        )
+        textView.setNeedsDisplay()
+        core.noteFormatted(touched)
+        refreshState()
+    }
+
+    func toggleMark(_ mark: String) {
+        let active = switch mark {
+        case "strong": strongActive
+        case "em": emActive
+        case "underline": underlineActive
+        case "strikethrough": strikethroughActive
+        case "code": codeActive
+        default: false
+        }
+        setMark(mark, value: active ? nil : .bool(true))
+    }
+
+    func setHighlight(_ name: String?) {
+        setMark("highlight", value: name.map { .string($0) })
+    }
+
+    func dismissKeyboard() {
+        textView?.resignFirstResponder()
+    }
+
+    private func setMark(_ mark: String, value: JSONValue?) {
+        guard let textView, let core else { return }
+        let document = core.document
+        let storage = document.storage
+        let selection = textView.selectedRange
+        if selection.length == 0 {
+            let typing = textView.typingAttributes
+            let block = (typing[.amBlock] as? BlockBox)?.value ?? .paragraph
+            var marks = RichText.marks(from: typing, block: block)
+            marks[mark] = value
+            textView.typingAttributes = document.typingAttributes(
+                from: RichText.attributes(block: block, marks: marks),
+                at: selection.location
+            )
+            refreshState()
+            return
+        }
+        var touched: Set<String> = []
+        storage.beginEditing()
+        storage.enumerateAttributes(in: selection) { runAttrs, runRange, _ in
+            guard runAttrs[notebookBoundary] == nil,
+                  let owner = runAttrs[notebookNote] as? String else { return }
+            let block = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+            guard !block.isAtomic, runAttrs[.amTableBox] == nil,
+                  runAttrs[.amColumnsBox] == nil else { return }
+            var marks = RichText.marks(from: runAttrs, block: block)
+            marks[mark] = value
+            var attrs = RichText.attributes(block: block, marks: marks)
+            if mark != "link", let link = runAttrs[.link], marks["link"] == nil {
+                attrs[.link] = link
+            }
+            attrs[notebookNote] = owner
+            storage.setAttributes(attrs, range: runRange)
+            touched.insert(owner)
+        }
+        storage.endEditing()
+        textView.selectedRange = selection
+        core.noteFormatted(touched)
+        refreshState()
+    }
+}
+
+/// The regular format bar's notebook edition: the same capsule over the
+/// keyboard, with the pieces that make sense on concatenated notes — styles,
+/// marks and highlights, but no attachments, which need a full editor
+/// session behind them.
+struct NotebookFormatBar: View {
+    let formatter: NotebookFormatController
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 22) {
+                    Menu {
+                        ForEach(EditorController.styles, id: \.key) { style in
+                            Button {
+                                formatter.applyStyle(style.key)
+                            } label: {
+                                if formatter.currentStyleKey == style.key {
+                                    Label(style.label, systemImage: "checkmark")
+                                } else {
+                                    Text(style.label)
+                                }
+                            }
+                        }
+                    } label: {
+                        Text("Aa")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                    }
+                    .accessibilityLabel("Format")
+                    markButton("Bold", active: formatter.strongActive) {
+                        formatter.toggleMark("strong")
+                    } label: {
+                        Text("B").font(.system(size: 17, weight: .bold))
+                    }
+                    markButton("Italic", active: formatter.emActive) {
+                        formatter.toggleMark("em")
+                    } label: {
+                        Text("I").font(.system(size: 17).italic())
+                    }
+                    markButton("Underline", active: formatter.underlineActive) {
+                        formatter.toggleMark("underline")
+                    } label: {
+                        Text("U").underline().font(.system(size: 17))
+                    }
+                    markButton("Strikethrough", active: formatter.strikethroughActive) {
+                        formatter.toggleMark("strikethrough")
+                    } label: {
+                        Text("S").strikethrough().font(.system(size: 17))
+                    }
+                    markButton("Inline Code", active: formatter.codeActive) {
+                        formatter.toggleMark("code")
+                    } label: {
+                        Image(systemName: "chevron.left.forwardslash.chevron.right")
+                            .font(.system(size: 15))
+                    }
+                    Menu {
+                        ForEach(Highlight.names, id: \.self) { name in
+                            Button {
+                                formatter.setHighlight(name)
+                            } label: {
+                                if formatter.highlightActive == name {
+                                    Label(name.capitalized, systemImage: "checkmark")
+                                } else {
+                                    Text(name.capitalized)
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("None") { formatter.setHighlight(nil) }
+                    } label: {
+                        Image(systemName: "highlighter")
+                            .foregroundStyle(
+                                formatter.highlightActive != nil ? Color.accentColor : Color.primary
+                            )
+                    }
+                    .accessibilityLabel("Highlight")
+                    .accessibilityValue(formatter.highlightActive?.capitalized ?? "None")
+                    Button {
+                        formatter.applyStyle("unordered-list-item")
+                    } label: {
+                        Image(systemName: "list.bullet").foregroundStyle(Color.primary)
+                    }
+                    .accessibilityLabel("Bulleted List")
+                }
+                .padding(.horizontal, 16)
+                .frame(maxHeight: .infinity)
+            }
+            Divider()
+                .frame(height: 28)
+            Button {
+                formatter.dismissKeyboard()
+            } label: {
+                Image(systemName: "keyboard.chevron.compact.down")
+            }
+            .padding(.horizontal, 16)
+            .accessibilityLabel("Dismiss Keyboard")
+        }
+        .font(.system(size: 20))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(Capsule())
+        .glassEffect(.regular, in: Capsule())
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+
+    private func markButton(
+        _ name: String,
+        active: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> some View
+    ) -> some View {
+        Button(action: action) {
+            label().foregroundStyle(active ? Color.accentColor : Color.primary)
+        }
+        .accessibilityLabel(name)
+        .accessibilityValue(active ? "On" : "Off")
+    }
+}
+
 struct FolderNotebookText: UIViewRepresentable {
     let core: FolderNotebookCore
     /// Not read here: it changes when the core has a caret waiting to be
@@ -945,11 +1216,22 @@ struct FolderNotebookText: UIViewRepresentable {
         // this the strip revealed by a scroll is never asked to redraw.
         textView.contentMode = .redraw
         textView.textContainer.widthTracksTextView = true
+
+        context.coordinator.formatter.textView = textView
+        context.coordinator.formatter.core = core
+        let accessory = UIHostingController(
+            rootView: NotebookFormatBar(formatter: context.coordinator.formatter)
+        )
+        accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 52)
+        accessory.view.backgroundColor = .clear
+        textView.inputAccessoryView = accessory.view
+        context.coordinator.accessory = accessory
         return textView
     }
 
     func updateUIView(_ textView: NotebookTextView, context: Context) {
         textView.document = core.document
+        context.coordinator.formatter.core = core
         if let caret = core.takeFocusTarget() {
             textView.selectedRange = caret
             textView.becomeFirstResponder()
@@ -957,8 +1239,11 @@ struct FolderNotebookText: UIViewRepresentable {
         }
     }
 
+    @MainActor
     final class Coordinator: NSObject, UITextViewDelegate {
         let core: FolderNotebookCore
+        let formatter = NotebookFormatController()
+        var accessory: UIHostingController<NotebookFormatBar>?
 
         init(core: FolderNotebookCore) {
             self.core = core
@@ -977,6 +1262,7 @@ struct FolderNotebookText: UIViewRepresentable {
         func textViewDidChange(_ textView: UITextView) {
             core.didChange()
             textView.setNeedsDisplay()
+            formatter.refreshState()
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -986,6 +1272,7 @@ struct FolderNotebookText: UIViewRepresentable {
                 from: textView.typingAttributes,
                 at: location
             )
+            formatter.refreshState()
         }
     }
 }
