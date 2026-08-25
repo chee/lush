@@ -2577,6 +2577,8 @@ struct FolderScreen: View {
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
     @State private var askRequest: NoteFinderRequest?
+    /// The rows a delete gesture picked, held until the reader confirms.
+    @State private var deleteRequest: [FolderNode] = []
     /// UndoManager is not observable, so nothing would notice the redo stack
     /// filling or emptying and the toolbar would keep whatever shape it had
     /// when something else last redrew it. Its own notifications are the nudge.
@@ -2660,6 +2662,44 @@ struct FolderScreen: View {
         }
     }
 
+    private var deleteRequestTitle: String {
+        let action = folderUrl == nil ? "Remove" : "Delete"
+        if deleteRequest.count == 1, let node = deleteRequest.first {
+            return "\(action) \u{201C}\(node.displayName)\u{201D}?"
+        }
+        return "\(action) \(deleteRequest.count) items?"
+    }
+
+    /// The New Note button dropped between rows. Under a note it files after
+    /// that note in that note's folder; under a folder row it goes into that
+    /// folder, at the top, which is where the drop point reads; at the very
+    /// top of a folder it leads the folder. On the home screen's own top
+    /// there is no folder yet, so the first notebook takes it.
+    private func insertNewNote(at index: Int, among rows: [FolderNode]) {
+        let above = index > 0 ? rows[min(index, rows.count) - 1] : nil
+        Task {
+            contextTracker.start()
+            let snap = contextTracker.snapshot
+            let url: String?
+            if let above, above.kind == "folder" {
+                url = await model.createNote(inFolder: above.url, snap: snap)
+                if let url { model.placeChild(url, atTopOf: above.url) }
+            } else if let above, let parent = above.parentUrl ?? folderUrl {
+                url = await model.createNote(inFolder: parent, snap: snap)
+                if let url { model.placeChild(url, after: above.url, in: parent) }
+            } else if let folderUrl {
+                url = await model.createNote(inFolder: folderUrl, snap: snap)
+                if let url { model.placeChild(url, atTopOf: folderUrl) }
+            } else if let first = rows.first, first.kind == "folder" {
+                url = await model.createNote(inFolder: first.url, snap: snap)
+                if let url { model.placeChild(url, atTopOf: first.url) }
+            } else {
+                url = await model.createNote(snap: snap)
+            }
+            if let url { push(.note(url)) }
+        }
+    }
+
     var body: some View {
         List {
             if searchText.isEmpty, folderUrl == nil {
@@ -2723,6 +2763,12 @@ struct FolderScreen: View {
                                 .moveDisabled(node.kind == "folder" && folderUrl != nil)
                         }
                         .onMove(perform: moveNodes)
+                        .onDelete { indices in
+                            deleteRequest = indices.map { nodes[$0] }
+                        }
+                        .onInsert(of: newNoteDropTypes) { index, _ in
+                            insertNewNote(at: index, among: nodes)
+                        }
                     } header: {
                         if folderUrl == nil { Text("Notebooks") }
                     }
@@ -2759,6 +2805,9 @@ struct FolderScreen: View {
                             }
                             .padding(.leading, CGFloat(displayed.depth) * 20)
                             .contextMenu { nodeMenu(displayed.node) }
+                        }
+                        .onInsert(of: newNoteDropTypes) { index, _ in
+                            insertNewNote(at: index, among: displayedNodes.map(\.node))
                         }
                     } header: {
                         if folderUrl == nil { Text("Notebooks") }
@@ -2864,6 +2913,30 @@ struct FolderScreen: View {
             }
         }
         .navigationTitle(title)
+        .confirmationDialog(
+            deleteRequestTitle,
+            isPresented: Binding(
+                get: { !deleteRequest.isEmpty },
+                set: { if !$0 { deleteRequest = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(folderUrl == nil ? "Remove" : "Delete", role: .destructive) {
+                for node in deleteRequest {
+                    if folderUrl == nil {
+                        model.removeRootFolder(node.url)
+                    } else {
+                        model.removeEntry(parentUrl: folderUrl, url: node.url)
+                    }
+                }
+                deleteRequest = []
+            }
+            Button("Cancel", role: .cancel) { deleteRequest = [] }
+        } message: {
+            if folderUrl == nil {
+                Text("The notebook leaves the sidebar; its notes stay in the notebook.")
+            }
+        }
         .userActivity(
             LushHandoff.activityType,
             element: folderUrl.flatMap { LushHandoff.item(for: model.node(for: $0)) }
@@ -2964,7 +3037,10 @@ struct FolderScreen: View {
             DefaultToolbarItem(kind: .search, placement: .bottomBar)
             ToolbarSpacer(.flexible, placement: .bottomBar)
             ToolbarItem(placement: .bottomBar) {
+                // Draggable as well as tappable: dropped between rows, the
+                // new note lands where it was dropped.
                 newMenu
+                    .onDrag(newNoteDragProvider)
             }
         }
         // Scoped to the stack the toolbar reads: every editor window has an

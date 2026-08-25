@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if canImport(AppKit)
 import AppKit
 #else
@@ -13,6 +14,36 @@ let notebookNote = NSAttributedString.Key("lushNotebookNote")
 /// the subfolder a note was found in when it was found in one. The body save
 /// pass walks straight past it.
 let notebookBoundary = NSAttributedString.Key("lushNotebookBoundary")
+
+/// Where a new note goes: the end its folder's setting names, or a spot the
+/// New Note button was dragged to. `before` only ever means the head of the
+/// notebook, so it files at the top of that note's folder.
+enum NoteDropPlacement {
+    case end
+    case after(String)
+    case before(String)
+}
+
+#if os(iOS)
+/// What the New Note button carries when dragged. A type of its own rather
+/// than text, so a text view's built-in drop never mistakes it for something
+/// to insert.
+let newNoteDragType = "party.chee.lush.new-note"
+/// The same type for SwiftUI's drop modifiers, which speak UTType.
+let newNoteDropTypes = [UTType(exportedAs: "party.chee.lush.new-note")]
+
+func newNoteDragProvider() -> NSItemProvider {
+    let provider = NSItemProvider()
+    provider.registerDataRepresentation(
+        forTypeIdentifier: newNoteDragType,
+        visibility: .ownProcess
+    ) { completion in
+        completion(Data(), nil)
+        return nil
+    }
+    return provider
+}
+#endif
 
 /// The folder's notes concatenated into one piece of text, and the rules for
 /// reading and editing it: who owns each character, where a caret is writing,
@@ -462,6 +493,15 @@ final class FolderNotebookCore: LiveWriter {
         scheduleSave()
     }
 
+    /// Formatting rewrites attributes without a text change, so nothing
+    /// passes the delegate that feeds `willChange` — the format bar reports
+    /// what it touched by hand.
+    func noteFormatted(_ urls: Set<String>) {
+        guard loaded, !urls.isEmpty else { return }
+        dirty.formUnion(urls)
+        scheduleSave()
+    }
+
     // MARK: - Writing
 
     func scheduleSave() {
@@ -640,7 +680,11 @@ struct FolderNotebook: View {
         } else if editing {
             arrangeList
         } else if let core, core.loaded {
+            #if os(iOS)
+            FolderNotebookText(core: core, focusRevision: core.focusRevision, addNote: addNote)
+            #else
             FolderNotebookText(core: core, focusRevision: core.focusRevision)
+            #endif
         } else {
             ProgressView()
                 .controlSize(.small)
@@ -661,30 +705,53 @@ struct FolderNotebook: View {
         ToolbarItem {
             EditButton()
         }
-        #endif
-        ToolbarItem {
-            Button(action: addNote) {
+        // The same corner it lives in on the home screen, beside the search
+        // bar there and above the format bar here.
+        ToolbarSpacer(.flexible, placement: .bottomBar)
+        ToolbarItem(placement: .bottomBar) {
+            Button {
+                addNote()
+            } label: {
                 Label("New Note", systemImage: "square.and.pencil")
             }
-            .help("New note after this one")
+            .help("New note at the end — drag onto the page to place it")
+            .disabled(editing)
+            .onDrag(newNoteDragProvider)
+        }
+        #else
+        ToolbarItem {
+            Button {
+                addNote()
+            } label: {
+                Label("New Note", systemImage: "square.and.pencil")
+            }
+            .help("New note at the end of the folder")
             .disabled(editing)
         }
+        #endif
     }
 
-    /// A note straight after the one being read, in whichever folder that one
-    /// lives in — a notebook reads out of its subfolders too, and putting the
-    /// new note in the folder at the top would file it somewhere the reader
-    /// isn't looking. With no caret anywhere it goes on the end.
-    private func addNote() {
-        let after = core?.focusedNote
-        let parent = after.flatMap { model.node(for: $0)?.parentUrl } ?? folderUrl
+    /// Tapped, the button files the note where the folder's setting says new
+    /// notes go — the end it always uses, top or bottom. Dragged and dropped
+    /// on a spot in the notebook, the note lands at that spot, in whichever
+    /// folder owns it — a notebook reads out of its subfolders too.
+    private func addNote(at placement: NoteDropPlacement = .end) {
+        let parent: String = switch placement {
+        case .end: folderUrl
+        case .after(let note), .before(let note):
+            model.node(for: note)?.parentUrl ?? folderUrl
+        }
         Task {
             contextTracker.start()
             guard let url = await model.createNote(
                 inFolder: parent,
                 snap: contextTracker.snapshot
             ) else { return }
-            if let after { model.placeChild(url, after: after, in: parent) }
+            switch placement {
+            case .end: break
+            case .after(let target): model.placeChild(url, after: target, in: parent)
+            case .before: model.placeChild(url, atTopOf: parent)
+            }
             core?.requestFocus(on: url)
         }
     }
@@ -700,6 +767,8 @@ private struct NotebookArrangeList: View {
     let entries: [NotebookEntry]
 
     @Environment(NotesModel.self) private var model
+    /// The rows a delete gesture picked, held until the reader confirms.
+    @State private var deleteRequest: [FolderNode] = []
 
     private struct Sheaf: Identifiable {
         let folderUrl: String
@@ -738,11 +807,37 @@ private struct NotebookArrangeList: View {
                             to: to
                         )
                     }
+                    .onDelete { indices in
+                        deleteRequest = indices.map { sheaf.notes[$0] }
+                    }
                 } header: {
                     if !sheaf.path.isEmpty { Text(sheaf.path) }
                 }
             }
         }
+        .confirmationDialog(
+            deleteRequestTitle,
+            isPresented: Binding(
+                get: { !deleteRequest.isEmpty },
+                set: { if !$0 { deleteRequest = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                for node in deleteRequest {
+                    model.removeEntry(parentUrl: node.parentUrl, url: node.url)
+                }
+                deleteRequest = []
+            }
+            Button("Cancel", role: .cancel) { deleteRequest = [] }
+        }
+    }
+
+    private var deleteRequestTitle: String {
+        if deleteRequest.count == 1, let node = deleteRequest.first {
+            return "Delete \u{201C}\(node.displayName)\u{201D}?"
+        }
+        return "Delete \(deleteRequest.count) notes?"
     }
 }
 
@@ -908,11 +1003,295 @@ final class NotebookTextView: UITextView {
     }
 }
 
+/// The slice of the editor's formatting the notebook can run on its own
+/// storage: block styles and inline marks, applied with the same
+/// `RichText.marks`/`RichText.attributes` round-trip the editor uses.
+/// Ownership rides on the characters, so every rewritten run keeps its note
+/// stamp, and boundary runs are never touched.
+@MainActor
+@Observable
+final class NotebookFormatController {
+    @ObservationIgnored weak var textView: NotebookTextView?
+    @ObservationIgnored weak var core: FolderNotebookCore?
+
+    var currentStyleKey = "paragraph"
+    var strongActive = false
+    var emActive = false
+    var underlineActive = false
+    var strikethroughActive = false
+    var codeActive = false
+    var highlightActive: String?
+
+    func refreshState() {
+        guard let textView, let core else { return }
+        let selection = textView.selectedRange
+        let storage = core.document.storage
+        // With a caret, the buttons must show what the next typed character
+        // will be — that's the typing attributes, not the character behind it.
+        let attrs: [NSAttributedString.Key: Any]
+        if selection.length > 0, selection.location < storage.length {
+            attrs = storage.attributes(at: selection.location, effectiveRange: nil)
+        } else {
+            attrs = textView.typingAttributes
+        }
+        let block = (attrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+        currentStyleKey = block.styleKey
+        let marks = RichText.marks(from: attrs, block: block)
+        strongActive = marks["strong"] != nil
+        emActive = marks["em"] != nil
+        underlineActive = marks["underline"] != nil
+        strikethroughActive = marks["strikethrough"] != nil
+        codeActive = marks["code"] != nil
+        if case .string(let name)? = marks["highlight"] {
+            highlightActive = name
+        } else {
+            highlightActive = nil
+        }
+    }
+
+    func applyStyle(_ key: String) {
+        guard let textView, let core else { return }
+        let block = BlockValue.fromStyleKey(key)
+        let document = core.document
+        let storage = document.storage
+        let selection = textView.selectedRange
+        guard storage.length > 0 else { return }
+        let paragraphs = (storage.string as NSString).paragraphRange(for: selection)
+        var touched: Set<String> = []
+        storage.beginEditing()
+        storage.enumerateAttributes(in: paragraphs) { runAttrs, runRange, _ in
+            guard runAttrs[notebookBoundary] == nil,
+                  let owner = runAttrs[notebookNote] as? String else { return }
+            let oldBlock = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+            guard !oldBlock.isAtomic, runAttrs[.amTableBox] == nil,
+                  runAttrs[.amColumnsBox] == nil,
+                  runAttrs[.attachment] == nil,
+                  runAttrs[.amDisplayOnly] == nil else { return }
+            let marks = RichText.marks(from: runAttrs, block: oldBlock)
+            var attrs = RichText.attributes(block: block, marks: marks)
+            attrs[notebookNote] = owner
+            storage.setAttributes(attrs, range: runRange)
+            touched.insert(owner)
+        }
+        storage.endEditing()
+        textView.selectedRange = selection
+        textView.typingAttributes = document.typingAttributes(
+            from: RichText.attributes(block: block, marks: [:]),
+            at: selection.location
+        )
+        textView.setNeedsDisplay()
+        core.noteFormatted(touched)
+        refreshState()
+    }
+
+    func toggleMark(_ mark: String) {
+        let active = switch mark {
+        case "strong": strongActive
+        case "em": emActive
+        case "underline": underlineActive
+        case "strikethrough": strikethroughActive
+        case "code": codeActive
+        default: false
+        }
+        setMark(mark, value: active ? nil : .bool(true))
+    }
+
+    func setHighlight(_ name: String?) {
+        setMark("highlight", value: name.map { .string($0) })
+    }
+
+    func dismissKeyboard() {
+        textView?.resignFirstResponder()
+    }
+
+    private func setMark(_ mark: String, value: JSONValue?) {
+        guard let textView, let core else { return }
+        let document = core.document
+        let storage = document.storage
+        let selection = textView.selectedRange
+        if selection.length == 0 {
+            let typing = textView.typingAttributes
+            let block = (typing[.amBlock] as? BlockBox)?.value ?? .paragraph
+            var marks = RichText.marks(from: typing, block: block)
+            marks[mark] = value
+            textView.typingAttributes = document.typingAttributes(
+                from: RichText.attributes(block: block, marks: marks),
+                at: selection.location
+            )
+            refreshState()
+            return
+        }
+        var touched: Set<String> = []
+        storage.beginEditing()
+        storage.enumerateAttributes(in: selection) { runAttrs, runRange, _ in
+            guard runAttrs[notebookBoundary] == nil,
+                  let owner = runAttrs[notebookNote] as? String else { return }
+            let block = (runAttrs[.amBlock] as? BlockBox)?.value ?? .paragraph
+            guard !block.isAtomic, runAttrs[.amTableBox] == nil,
+                  runAttrs[.amColumnsBox] == nil else { return }
+            var marks = RichText.marks(from: runAttrs, block: block)
+            marks[mark] = value
+            var attrs = RichText.attributes(block: block, marks: marks)
+            if mark != "link", let link = runAttrs[.link], marks["link"] == nil {
+                attrs[.link] = link
+            }
+            attrs[notebookNote] = owner
+            storage.setAttributes(attrs, range: runRange)
+            touched.insert(owner)
+        }
+        storage.endEditing()
+        textView.selectedRange = selection
+        core.noteFormatted(touched)
+        refreshState()
+    }
+}
+
+/// The regular format bar's notebook edition: the same capsule over the
+/// keyboard, with the pieces that make sense on concatenated notes — styles,
+/// marks and highlights, but no attachments, which need a full editor
+/// session behind them.
+struct NotebookFormatBar: View {
+    let formatter: NotebookFormatController
+    let addNote: () -> Void
+    let dragItem: () -> NSItemProvider
+
+    var body: some View {
+        HStack(spacing: 8) {
+            formatCapsule
+            // The same corner the compose button keeps everywhere else,
+            // riding the keyboard beside the bar while the bottom bar it
+            // usually lives in is covered. Dragging it onto the page drops
+            // the new note at that spot instead of the folder's end.
+            Button(action: addNote) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 44, height: 44)
+            }
+            .glassEffect(.regular, in: Circle())
+            .accessibilityLabel("New Note")
+            .onDrag(dragItem)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+    }
+
+    private var formatCapsule: some View {
+        HStack(spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 22) {
+                    Menu {
+                        ForEach(EditorController.styles, id: \.key) { style in
+                            Button {
+                                formatter.applyStyle(style.key)
+                            } label: {
+                                if formatter.currentStyleKey == style.key {
+                                    Label(style.label, systemImage: "checkmark")
+                                } else {
+                                    Text(style.label)
+                                }
+                            }
+                        }
+                    } label: {
+                        Text("Aa")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                    }
+                    .accessibilityLabel("Format")
+                    markButton("Bold", active: formatter.strongActive) {
+                        formatter.toggleMark("strong")
+                    } label: {
+                        Text("B").font(.system(size: 17, weight: .bold))
+                    }
+                    markButton("Italic", active: formatter.emActive) {
+                        formatter.toggleMark("em")
+                    } label: {
+                        Text("I").font(.system(size: 17).italic())
+                    }
+                    markButton("Underline", active: formatter.underlineActive) {
+                        formatter.toggleMark("underline")
+                    } label: {
+                        Text("U").underline().font(.system(size: 17))
+                    }
+                    markButton("Strikethrough", active: formatter.strikethroughActive) {
+                        formatter.toggleMark("strikethrough")
+                    } label: {
+                        Text("S").strikethrough().font(.system(size: 17))
+                    }
+                    markButton("Inline Code", active: formatter.codeActive) {
+                        formatter.toggleMark("code")
+                    } label: {
+                        Image(systemName: "chevron.left.forwardslash.chevron.right")
+                            .font(.system(size: 15))
+                    }
+                    Menu {
+                        ForEach(Highlight.names, id: \.self) { name in
+                            Button {
+                                formatter.setHighlight(name)
+                            } label: {
+                                if formatter.highlightActive == name {
+                                    Label(name.capitalized, systemImage: "checkmark")
+                                } else {
+                                    Text(name.capitalized)
+                                }
+                            }
+                        }
+                        Divider()
+                        Button("None") { formatter.setHighlight(nil) }
+                    } label: {
+                        Image(systemName: "highlighter")
+                            .foregroundStyle(
+                                formatter.highlightActive != nil ? Color.accentColor : Color.primary
+                            )
+                    }
+                    .accessibilityLabel("Highlight")
+                    .accessibilityValue(formatter.highlightActive?.capitalized ?? "None")
+                    Button {
+                        formatter.applyStyle("unordered-list-item")
+                    } label: {
+                        Image(systemName: "list.bullet").foregroundStyle(Color.primary)
+                    }
+                    .accessibilityLabel("Bulleted List")
+                }
+                .padding(.horizontal, 16)
+                .frame(maxHeight: .infinity)
+            }
+            Divider()
+                .frame(height: 28)
+            Button {
+                formatter.dismissKeyboard()
+            } label: {
+                Image(systemName: "keyboard.chevron.compact.down")
+            }
+            .padding(.horizontal, 16)
+            .accessibilityLabel("Dismiss Keyboard")
+        }
+        .font(.system(size: 20))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipShape(Capsule())
+        .glassEffect(.regular, in: Capsule())
+    }
+
+    private func markButton(
+        _ name: String,
+        active: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> some View
+    ) -> some View {
+        Button(action: action) {
+            label().foregroundStyle(active ? Color.accentColor : Color.primary)
+        }
+        .accessibilityLabel(name)
+        .accessibilityValue(active ? "On" : "Off")
+    }
+}
+
 struct FolderNotebookText: UIViewRepresentable {
     let core: FolderNotebookCore
     /// Not read here: it changes when the core has a caret waiting to be
     /// placed, which is what gets `updateUIView` called at all.
     let focusRevision: Int
+    let addNote: (NoteDropPlacement) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(core: core)
@@ -945,11 +1324,33 @@ struct FolderNotebookText: UIViewRepresentable {
         // this the strip revealed by a scroll is never asked to redraw.
         textView.contentMode = .redraw
         textView.textContainer.widthTracksTextView = true
+
+        context.coordinator.formatter.textView = textView
+        context.coordinator.formatter.core = core
+        context.coordinator.addNote = addNote
+        // Through the coordinator rather than captured directly: the view
+        // value the closure came from goes stale, the coordinator's copy is
+        // refreshed on every update.
+        let coordinator = context.coordinator
+        let accessory = UIHostingController(
+            rootView: NotebookFormatBar(
+                formatter: coordinator.formatter,
+                addNote: { coordinator.addNote(.end) },
+                dragItem: newNoteDragProvider
+            )
+        )
+        accessory.view.frame = CGRect(x: 0, y: 0, width: 0, height: 52)
+        accessory.view.backgroundColor = .clear
+        textView.inputAccessoryView = accessory.view
+        context.coordinator.accessory = accessory
+        textView.addInteraction(UIDropInteraction(delegate: coordinator))
         return textView
     }
 
     func updateUIView(_ textView: NotebookTextView, context: Context) {
         textView.document = core.document
+        context.coordinator.formatter.core = core
+        context.coordinator.addNote = addNote
         if let caret = core.takeFocusTarget() {
             textView.selectedRange = caret
             textView.becomeFirstResponder()
@@ -957,11 +1358,49 @@ struct FolderNotebookText: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    @MainActor
+    final class Coordinator: NSObject, UITextViewDelegate, UIDropInteractionDelegate {
         let core: FolderNotebookCore
+        let formatter = NotebookFormatController()
+        var accessory: UIHostingController<NotebookFormatBar>?
+        var addNote: (NoteDropPlacement) -> Void = { _ in }
 
         init(core: FolderNotebookCore) {
             self.core = core
+        }
+
+        // The New Note button dropped on the page: the note goes after
+        // whichever note owns the spot it landed on. The payload is a type of
+        // its own, so the text view's own drop never bids for it.
+        func dropInteraction(
+            _ interaction: UIDropInteraction,
+            canHandle session: UIDropSession
+        ) -> Bool {
+            session.hasItemsConforming(toTypeIdentifiers: [newNoteDragType])
+        }
+
+        func dropInteraction(
+            _ interaction: UIDropInteraction,
+            sessionDidUpdate session: UIDropSession
+        ) -> UIDropProposal {
+            UIDropProposal(operation: .copy)
+        }
+
+        func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+            guard let textView = formatter.textView else { return }
+            let point = session.location(in: textView)
+            let target = textView.closestPosition(to: point)
+                .map { textView.offset(from: textView.beginningOfDocument, to: $0) }
+                .flatMap { core.document.note(forCaretAt: $0) }
+            if let target {
+                addNote(.after(target))
+            } else if let first = core.document.order.first {
+                // Above everything: the head of the notebook, so the top of
+                // the first note's folder.
+                addNote(.before(first))
+            } else {
+                addNote(.end)
+            }
         }
 
         func textView(
@@ -977,6 +1416,7 @@ struct FolderNotebookText: UIViewRepresentable {
         func textViewDidChange(_ textView: UITextView) {
             core.didChange()
             textView.setNeedsDisplay()
+            formatter.refreshState()
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
@@ -986,6 +1426,7 @@ struct FolderNotebookText: UIViewRepresentable {
                 from: textView.typingAttributes,
                 at: location
             )
+            formatter.refreshState()
         }
     }
 }
