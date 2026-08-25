@@ -69,6 +69,35 @@ fn set_text<T: Transactable>(
     }
 }
 
+/// Replace an identifier field outright. `set_text`'s character diff is for
+/// prose, where merging two edits keeps both; two devices diffing different
+/// urls into the same field merges the spellings into a url neither wrote.
+/// A fresh put makes concurrent writes a conflict automerge picks one whole
+/// winner from.
+fn set_identifier<T: Transactable>(
+    t: &mut T,
+    obj: &automerge::ObjId,
+    key: &str,
+    value: &str,
+) -> Result<(), automerge::AutomergeError> {
+    let current = match t.get(obj, key)? {
+        Some((automerge::Value::Object(ObjType::Text), id)) => t.text(&id).ok(),
+        Some((automerge::Value::Scalar(s), _)) => s.to_str().map(str::to_string),
+        _ => None,
+    };
+    if current.as_deref() == Some(value) {
+        return Ok(());
+    }
+    put_text(t, obj, key, value)
+}
+
+/// Whether a url is worth keeping when read back: an `automerge:` url that
+/// doesn't decode is a casualty of the text merge `set_identifier` exists to
+/// prevent, and handing it on just moves the error somewhere harder to see.
+fn usable_url(url: &str) -> bool {
+    !url.starts_with("automerge:") || crate::repo::DocId::from_url(url).is_ok()
+}
+
 /// Read a string field regardless of representation (Text object or scalar).
 fn string_at(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Option<String> {
     let (v, id) = doc.get(obj, key).ok().flatten()?;
@@ -674,7 +703,7 @@ pub fn refresh_folder_entry(
             if let Some((_, docs)) = t.get(ROOT, "docs")? {
                 if let Some((_, entry)) = t.get(&docs, index)? {
                     set_text(t, &entry, "name", new_name)?;
-                    set_text(t, &entry, "type", new_kind)?;
+                    set_identifier(t, &entry, "type", new_kind)?;
                 }
             }
             Ok(())
@@ -791,11 +820,16 @@ fn config_url_list(doc: &Automerge, key: &str) -> Vec<String> {
         .filter_map(|key| {
             let index: u64 = key.parse().ok()?;
             let url = read_str(doc, &list, &key)?;
-            Some((index, url))
+            usable_url(&url).then_some((index, url))
         })
         .collect();
     entries.sort_by_key(|entry| entry.0);
-    entries.into_iter().map(|entry| entry.1).collect()
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .map(|entry| entry.1)
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
 }
 
 fn config_set_url_list(doc: &mut Automerge, key: &str, urls: &[String]) -> anyhow::Result<()> {
@@ -818,7 +852,7 @@ fn config_set_url_list(doc: &mut Automerge, key: &str, urls: &[String]) -> anyho
                 t.delete(&list, key.as_str())?;
             }
             for (index, url) in urls.iter().enumerate() {
-                set_text(t, &list, &index.to_string(), url)?;
+                set_identifier(t, &list, &index.to_string(), url)?;
             }
             Ok(())
         },
@@ -901,7 +935,7 @@ pub fn config_set_smart_notebooks(
                     Some((automerge::Value::Object(ObjType::Map), id)) => id,
                     _ => t.put_object(&smart, key.as_str(), ObjType::Map)?,
                 };
-                set_text(t, &item, "id", &folder.id)?;
+                set_identifier(t, &item, "id", &folder.id)?;
                 set_text(t, &item, "name", &folder.name)?;
                 set_text(t, &item, "query", &folder.query)?;
                 set_text(t, &item, "kind", &folder.kind)?;
@@ -1018,14 +1052,14 @@ pub fn config_set_folder_settings(
 }
 
 pub fn config_inbox(doc: &Automerge) -> Option<String> {
-    read_str(doc, &ROOT, "inbox")
+    read_str(doc, &ROOT, "inbox").filter(|url| usable_url(url))
 }
 
 pub fn config_set_inbox(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
     tx(doc.transact_with(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
-            set_text(t, &ROOT, "inbox", url)?;
+            set_identifier(t, &ROOT, "inbox", url)?;
             Ok(())
         },
     ))?;
@@ -1044,7 +1078,7 @@ pub fn config_set_quick_note(doc: &mut Automerge, url: Option<&str>) -> anyhow::
     tx(doc.transact_with(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
-            set_text(t, &ROOT, "quickNote", url.unwrap_or_default())?;
+            set_identifier(t, &ROOT, "quickNote", url.unwrap_or_default())?;
             Ok(())
         },
     ))?;
@@ -1492,7 +1526,7 @@ pub fn set_note_pad(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
                 Some((automerge::Value::Object(ObjType::Map), id)) => id,
                 _ => t.put_object(ROOT, "@lush", ObjType::Map)?,
             };
-            set_text(t, &lush, "pad", url)?;
+            set_identifier(t, &lush, "pad", url)?;
             Ok(())
         },
     ))?;
@@ -1507,7 +1541,7 @@ pub fn config_set_calendar(doc: &mut Automerge, url: &str) -> anyhow::Result<()>
     tx(doc.transact_with(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
-            set_text(t, &ROOT, "calendar", url)?;
+            set_identifier(t, &ROOT, "calendar", url)?;
             Ok(())
         },
     ))?;
@@ -1522,7 +1556,7 @@ pub fn config_set_pad(doc: &mut Automerge, url: &str) -> anyhow::Result<()> {
     tx(doc.transact_with(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
-            set_text(t, &ROOT, "pad", url)?;
+            set_identifier(t, &ROOT, "pad", url)?;
             Ok(())
         },
     ))?;
@@ -1794,7 +1828,7 @@ pub fn set_checkout_state(
         |_| CommitOptions::default().with_time(now_seconds()),
         |t| {
             match checked_out {
-                Some(url) => set_text(t, &ROOT, "checkedOut", url)?,
+                Some(url) => set_identifier(t, &ROOT, "checkedOut", url)?,
                 None => t.put(ROOT, "checkedOut", ScalarValue::Null)?,
             }
             match pins {
@@ -1871,7 +1905,7 @@ pub fn set_main_draft_url(doc: &mut Automerge, url: &str) -> anyhow::Result<()> 
                 Some((automerge::Value::Object(ObjType::Map), id)) => id,
                 _ => t.put_object(ROOT, "@patchwork", ObjType::Map)?,
             };
-            set_text(t, &pw, "mainDraftUrl", url)?;
+            set_identifier(t, &pw, "mainDraftUrl", url)?;
             Ok(())
         },
     ))?;
@@ -2116,13 +2150,13 @@ mod tests {
         assert!(!config_pins_configured(&doc));
         assert!(!config_quick_note_configured(&doc));
 
-        config_set_pins(&mut doc, &["automerge:one".into(), "automerge:two".into()]).unwrap();
-        config_set_quick_note(&mut doc, Some("automerge:quick")).unwrap();
-        assert_eq!(
-            config_pins(&doc),
-            vec!["automerge:one".to_string(), "automerge:two".to_string()]
-        );
-        assert_eq!(config_quick_note(&doc).as_deref(), Some("automerge:quick"));
+        let one = crate::repo::DocId::random().to_url();
+        let two = crate::repo::DocId::random().to_url();
+        let quick = crate::repo::DocId::random().to_url();
+        config_set_pins(&mut doc, &[one.clone(), two.clone()]).unwrap();
+        config_set_quick_note(&mut doc, Some(&quick)).unwrap();
+        assert_eq!(config_pins(&doc), vec![one, two]);
+        assert_eq!(config_quick_note(&doc).as_deref(), Some(quick.as_str()));
         assert!(config_pins_configured(&doc));
         assert!(config_quick_note_configured(&doc));
 
@@ -3286,5 +3320,57 @@ mod pad_tests {
         assert_eq!(b.data, "[1]");
         assert!(pad_remove_item(&mut doc, "a").unwrap());
         assert_eq!(pad_items(&doc).len(), 1);
+    }
+
+    /// Two devices rewriting the folder list at once — a reorder against an
+    /// append — must merge to whole urls from one side or the other. The
+    /// character diff `set_text` runs merged the two spellings of an index
+    /// into a url neither device wrote.
+    #[test]
+    fn concurrent_folder_list_writes_stay_whole_urls() {
+        use crate::repo::DocId;
+        let urls: Vec<String> = (0..3).map(|_| DocId::random().to_url()).collect();
+        let mut doc = Automerge::new();
+        init_lush_config(&mut doc).unwrap();
+        config_set_folders(&mut doc, &urls).unwrap();
+        let mut fork = doc.fork();
+
+        let extra = DocId::random().to_url();
+        let ours = vec![urls[2].clone(), urls[0].clone(), urls[1].clone()];
+        let theirs = vec![
+            urls[1].clone(),
+            urls[2].clone(),
+            urls[0].clone(),
+            extra.clone(),
+        ];
+        config_set_folders(&mut doc, &ours).unwrap();
+        config_set_folders(&mut fork, &theirs).unwrap();
+        doc.merge(&mut fork).unwrap();
+
+        // The raw entries, not `config_folders`: the read path filters what
+        // it can't parse, and the point here is that nothing unparseable got
+        // written in the first place.
+        let known: std::collections::HashSet<&String> = urls.iter().chain([&extra]).collect();
+        let (_, list) = doc.get(ROOT, "folders").unwrap().unwrap();
+        for key in doc.keys(&list) {
+            let url = read_str(&doc, &list, &key).unwrap();
+            assert!(known.contains(&url), "merge invented a url: {url}");
+        }
+        let merged = config_folders(&doc);
+        let unique: std::collections::HashSet<&String> = merged.iter().collect();
+        assert_eq!(unique.len(), merged.len(), "duplicate urls: {merged:?}");
+    }
+
+    /// A list that already took the damage reads back healed: the chimera url
+    /// is dropped and a doubled root collapses to one.
+    #[test]
+    fn a_corrupted_url_list_reads_back_usable() {
+        use crate::repo::DocId;
+        let good = DocId::random().to_url();
+        let chimera = format!("automerge:2{}", good.trim_start_matches("automerge:"));
+        let mut doc = Automerge::new();
+        init_lush_config(&mut doc).unwrap();
+        config_set_folders(&mut doc, &[good.clone(), chimera, good.clone()]).unwrap();
+        assert_eq!(config_folders(&doc), vec![good]);
     }
 }
