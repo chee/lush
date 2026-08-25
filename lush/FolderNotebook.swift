@@ -724,6 +724,8 @@ private struct NotebookArrangeList: View {
     let entries: [NotebookEntry]
 
     @Environment(NotesModel.self) private var model
+    /// The rows a delete gesture picked, held until the reader confirms.
+    @State private var deleteRequest: [FolderNode] = []
 
     private struct Sheaf: Identifiable {
         let folderUrl: String
@@ -762,11 +764,37 @@ private struct NotebookArrangeList: View {
                             to: to
                         )
                     }
+                    .onDelete { indices in
+                        deleteRequest = indices.map { sheaf.notes[$0] }
+                    }
                 } header: {
                     if !sheaf.path.isEmpty { Text(sheaf.path) }
                 }
             }
         }
+        .confirmationDialog(
+            deleteRequestTitle,
+            isPresented: Binding(
+                get: { !deleteRequest.isEmpty },
+                set: { if !$0 { deleteRequest = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                for node in deleteRequest {
+                    model.removeEntry(parentUrl: node.parentUrl, url: node.url)
+                }
+                deleteRequest = []
+            }
+            Button("Cancel", role: .cancel) { deleteRequest = [] }
+        }
+    }
+
+    private var deleteRequestTitle: String {
+        if deleteRequest.count == 1, let node = deleteRequest.first {
+            return "Delete \u{201C}\(node.displayName)\u{201D}?"
+        }
+        return "Delete \(deleteRequest.count) notes?"
     }
 }
 

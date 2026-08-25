@@ -2577,6 +2577,8 @@ struct FolderScreen: View {
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
     @State private var askRequest: NoteFinderRequest?
+    /// The rows a delete gesture picked, held until the reader confirms.
+    @State private var deleteRequest: [FolderNode] = []
     /// UndoManager is not observable, so nothing would notice the redo stack
     /// filling or emptying and the toolbar would keep whatever shape it had
     /// when something else last redrew it. Its own notifications are the nudge.
@@ -2660,6 +2662,14 @@ struct FolderScreen: View {
         }
     }
 
+    private var deleteRequestTitle: String {
+        let action = folderUrl == nil ? "Remove" : "Delete"
+        if deleteRequest.count == 1, let node = deleteRequest.first {
+            return "\(action) \u{201C}\(node.displayName)\u{201D}?"
+        }
+        return "\(action) \(deleteRequest.count) items?"
+    }
+
     var body: some View {
         List {
             if searchText.isEmpty, folderUrl == nil {
@@ -2723,6 +2733,9 @@ struct FolderScreen: View {
                                 .moveDisabled(node.kind == "folder" && folderUrl != nil)
                         }
                         .onMove(perform: moveNodes)
+                        .onDelete { indices in
+                            deleteRequest = indices.map { nodes[$0] }
+                        }
                     } header: {
                         if folderUrl == nil { Text("Notebooks") }
                     }
@@ -2864,6 +2877,30 @@ struct FolderScreen: View {
             }
         }
         .navigationTitle(title)
+        .confirmationDialog(
+            deleteRequestTitle,
+            isPresented: Binding(
+                get: { !deleteRequest.isEmpty },
+                set: { if !$0 { deleteRequest = [] } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(folderUrl == nil ? "Remove" : "Delete", role: .destructive) {
+                for node in deleteRequest {
+                    if folderUrl == nil {
+                        model.removeRootFolder(node.url)
+                    } else {
+                        model.removeEntry(parentUrl: folderUrl, url: node.url)
+                    }
+                }
+                deleteRequest = []
+            }
+            Button("Cancel", role: .cancel) { deleteRequest = [] }
+        } message: {
+            if folderUrl == nil {
+                Text("The notebook leaves the sidebar; its notes stay in the notebook.")
+            }
+        }
         .userActivity(
             LushHandoff.activityType,
             element: folderUrl.flatMap { LushHandoff.item(for: model.node(for: $0)) }
