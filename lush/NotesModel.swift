@@ -328,7 +328,17 @@ final class NotesModel {
     private(set) var accountConfigUrl: String?
     private(set) var accountModuleSettingsUrl: String? = PatchworkWeb.accountModuleUrl
     private(set) var packageListUrls: [String] = PatchworkWeb.moduleUrls
-    private(set) var inboxUrl: String?
+    /// Cached across launches: cmd+N and the widget/shortcut paths route
+    /// through the inbox, and its folder settings are looked up by this url,
+    /// so waiting for the config doc would put a doc load in front of every
+    /// new note made before login settles.
+    private(set) var inboxUrl: String? = LushShared.accountUrl == nil
+        ? nil : UserDefaults.standard.string(forKey: NotesModel.inboxUrlKey) {
+        didSet {
+            guard oldValue != inboxUrl else { return }
+            UserDefaults.standard.set(inboxUrl, forKey: Self.inboxUrlKey)
+        }
+    }
     /// Notes about calendar items are filed here rather than in whichever
     /// notebook happened to be open. Made the first time one is written and
     /// kept on the account config, so every device files them together.
@@ -4173,6 +4183,10 @@ final class NotesModel {
     /// Which end of a folder a new note lands at, for folders that haven't
     /// been told otherwise. Unset means the bottom.
     nonisolated static let newNoteAtTopKey = "newNoteAtTop"
+
+    /// The account's inbox folder, remembered so the new-note paths know
+    /// their target before the account config has loaded.
+    nonisolated static let inboxUrlKey = "inboxUrl"
 
     nonisolated static var importsTextFilesAsNotes: Bool {
         UserDefaults.standard.object(forKey: importAsNotesKey) as? Bool ?? true

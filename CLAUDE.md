@@ -19,6 +19,21 @@ The same principle applies anywhere a synchronous call might block: file I/O, JS
 
 **Rust/FFI calls** through `Core` are already async — keep them in `Task.detached` or the async FFI wrappers that already exist.
 
+## New notes are instant
+
+Making a new note as-instantly-as-can-be is a primary feature of this
+application. Nothing on the create path — cmd+N, widgets, shortcuts, quick
+actions, the dock tile — may wait on a doc open, a config read, or the
+network. Everything the path needs is cached and read synchronously on the
+main actor: folder settings are indexed by folder url in
+`NotesModel.folderSettings` (persisted through `FolderSettingsStore`), and the
+inbox url is persisted in UserDefaults (`NotesModel.inboxUrlKey`) so the
+target folder and its formatting are known before login or the config doc
+have settled. `createNoteNow` then builds the doc, its opening spans and the
+folder entry in one call. `bootLog` traces every millisecond of cmd+N; keep
+it that way — anything new the create path needs must be cached the same way,
+never fetched at creation time.
+
 ## Architecture
 
 - `NotesModel` — `@MainActor @Observable`, owns the Rust `Core`
