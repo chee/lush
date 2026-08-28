@@ -133,7 +133,16 @@ extension NotesModel {
         syncConfigFolderSettings()
     }
 
+    /// A config doc that is still loading reads as empty, and forgetting the
+    /// folders' formatting on that read gives a note made during the load the
+    /// wrong first line — and persists the wipe. Empty-against-non-empty is
+    /// resolved the way the startup load resolves it: the local copy is
+    /// pushed back up.
     func applyConfigFolderSettings(_ settings: [FolderSettings]) {
+        if settings.isEmpty, !folderSettings.isEmpty {
+            syncConfigFolderSettings()
+            return
+        }
         let keyed = Dictionary(settings.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
         guard keyed != folderSettings else { return }
         folderSettings = keyed
@@ -183,11 +192,7 @@ extension NotesModel {
                 self.smartNotebooks = state.smart
                 SmartNotebookStore.save(state.smart)
             }
-            if state.folderSettings.isEmpty, !self.folderSettings.isEmpty {
-                self.syncConfigFolderSettings()
-            } else {
-                self.applyConfigFolderSettings(state.folderSettings)
-            }
+            self.applyConfigFolderSettings(state.folderSettings)
         }
     }
 

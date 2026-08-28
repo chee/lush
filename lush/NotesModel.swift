@@ -471,7 +471,9 @@ final class NotesModel {
         localQuickNote: String?
     ) async {
         accountConfigUrl = state.configUrl
-        inboxUrl = state.inbox
+        // A config doc still loading reads as having no inbox; only logout
+        // and switching accounts forget the cached one.
+        if let inbox = state.inbox { inboxUrl = inbox }
         accountModuleSettingsUrl = state.moduleSettingsUrl
         PatchworkWeb.accountModuleUrl = state.moduleSettingsUrl
         if let core, let configUrl = state.configUrl {
@@ -1846,7 +1848,7 @@ final class NotesModel {
             Task { @MainActor [weak self] in
                 let state = await Task.detached { core.configState(configUrl: configUrl) }.value
                 guard let self, let state else { return }
-                self.inboxUrl = state.inbox
+                if let inbox = state.inbox { self.inboxUrl = inbox }
                 self.calendarFolderUrl = state.calendar
                 if state.smart != self.smartNotebooks {
                     self.smartNotebooks = state.smart
