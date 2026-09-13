@@ -755,6 +755,7 @@ pub struct Repo {
     deferred_applies: Mutex<HashSet<DocId>>,
     deferred_sends: Mutex<HashSet<DocId>>,
     next_save: AtomicU64,
+    resaves: mpsc::Sender<DocId>,
     events: broadcast::Sender<RepoEvent>,
     connected: AtomicBool,
     connect_started: AtomicBool,
@@ -1616,6 +1617,7 @@ impl Repo {
         );
         let (stored_tx, mut stored_rx) = mpsc::channel(OBSERVER_QUEUE);
         let (heads_tx, mut heads_rx) = mpsc::channel(OBSERVER_QUEUE);
+        let (resave_tx, mut resave_rx) = mpsc::channel::<DocId>(OBSERVER_QUEUE);
         let storage = ObservedStorage::new(storage, stored_tx);
 
         let sedimentrees = Arc::new(BoundedShardedMap::new());
@@ -1720,6 +1722,7 @@ impl Repo {
             deferred_sends: Mutex::new(HashSet::new()),
             outbox_locks: std::sync::Mutex::new(HashMap::new()),
             next_save: AtomicU64::new(0),
+            resaves: resave_tx,
             events,
             connected: AtomicBool::new(false),
             connect_started: AtomicBool::new(false),
@@ -1783,6 +1786,14 @@ impl Repo {
             });
         }
 
+        {
+            let repo = repo.clone();
+            tokio::spawn(async move {
+                while let Some(id) = resave_rx.recv().await {
+                    repo.schedule_save_doc(id).await;
+                }
+            });
+        }
         {
             let repo = repo.clone();
             tokio::spawn(async move {
@@ -2634,6 +2645,19 @@ impl Repo {
         self.emit_batch_events(id, count, advanced, failed);
         if received_fragments && advanced {
             self.reclaim_doc(id).await;
+        }
+        // The same bundling that runs after a local edit runs after a receive:
+        // loose commits arriving one at a time over live sync complete spans
+        // whose fragments both peers derive identically, and without this tick
+        // a receive-only doc never stores them and the backlog just grows.
+        // The debounced save ingests only what isn't stored yet, so the work
+        // per tick stays bounded by what just arrived.
+        if advanced && self.send_changes.load(Ordering::Relaxed) {
+            // Awaited, not try_send: dropping the tick after the final batch
+            // of a burst would leave the doc unbundled until something else
+            // touches it. The consumer only schedules (never runs) saves, so
+            // this can't feed back into the apply loop.
+            let _ = self.resaves.send(id).await;
         }
         Ok(advanced)
     }
@@ -5163,6 +5187,54 @@ mod tests {
             "track_doc built the doc it was supposed to leave alone"
         );
         assert!(repo.tracked.lock().await.contains(&id));
+    }
+
+    /// A receive-only doc bundles like an edited one: an incoming batch that
+    /// advances the doc schedules the same debounced save a local edit would.
+    #[tokio::test]
+    async fn an_incoming_batch_schedules_a_save_for_the_receiving_doc() {
+        let (_dir, repo) = test_repo().await;
+        let id = repo
+            .create_doc(|doc| {
+                put(doc, "value", "before");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            while repo.pending_saves.lock().await.contains_key(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut remote = repo.read_doc(id, |doc| Ok(doc.fork())).await.unwrap();
+        remote.set_actor(ActorId::from([24; 16].as_slice()));
+        put(&mut remote, "remote", "arrived");
+        let ingested = ingest(
+            &remote,
+            id.sedimentree_id(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        repo.core
+            .store_built_batch(
+                id.sedimentree_id(),
+                ingested.commits,
+                ingested.fragments,
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            while !repo.pending_saves.lock().await.contains_key(&id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the receive should have scheduled a save");
     }
 
     /// A doc that arrives for nobody stays on disk. Reading the batch back to
