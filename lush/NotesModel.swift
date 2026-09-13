@@ -258,6 +258,16 @@ final class NotesModel {
     @ObservationIgnored private var spotlightIndexTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var spotlightIndexTokens: [String: UUID] = [:]
     @ObservationIgnored private var spotlightBackfilled: Set<String> = []
+    /// What each note looked like the last time it reached Spotlight, so a cold
+    /// boot re-indexes the notes that moved rather than the whole corpus.
+    @ObservationIgnored private var spotlightHeads: [String: String] = UserDefaults.standard
+        .dictionary(forKey: NotesModel.spotlightHeadsKey) as? [String: String] ?? [:]
+    @ObservationIgnored private var spotlightHeadsDirty = 0
+    @ObservationIgnored private var backfillQueue: [BackfillJob] = []
+    @ObservationIgnored private var backfillTask: Task<Void, Never>?
+    @ObservationIgnored private var backfillGateOpen = false
+    private static let spotlightHeadsKey = "lushSpotlightIndexedHeads"
+    private static let backfillConcurrency = 4
     @ObservationIgnored private var calendarNotesReindexed = false
     private var previewUpdateTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var previewUpdateTokens: [String: UUID] = [:]
@@ -1456,6 +1466,10 @@ final class NotesModel {
             await spotlightIndex.reset()
         }
         spotlightBackfilled.removeAll()
+        spotlightHeads.removeAll()
+        spotlightHeadsDirty += 1
+        flushSpotlightHeads()
+        openBackfillGate()
         let richNotes = notes.filter { $0.kind == "rich" }
         backfillSemanticIndex(for: richNotes)
         backfillSpotlightIndex(for: richNotes)
@@ -1589,6 +1603,7 @@ final class NotesModel {
         guard !startupSettled else { return }
         startupSettled = true
         drainStartupWaiters()
+        openBackfillGate()
         Task { [weak self] in await self?.checkSmartNotebooks() }
         if deferredStartupRefresh {
             deferredStartupRefresh = false
@@ -2259,6 +2274,9 @@ final class NotesModel {
         spotlightIndexTasks[url] = nil
         spotlightIndexTokens[url] = nil
         spotlightBackfilled.remove(url)
+        spotlightHeads[url] = nil
+        spotlightHeadsDirty += 1
+        backfillQueue.removeAll { $0.url == url }
         previewUpdateTasks[url]?.cancel()
         previewUpdateTasks[url] = nil
         previewUpdateTokens[url] = nil
@@ -2543,6 +2561,7 @@ final class NotesModel {
             await start()
         }
         guard let core else { return nil }
+        defer { openBackfillGate() }
         let start = Date()
         try? await core.openNote(url: url)
         defer { try? core.closeNote(url: url) }
@@ -3111,15 +3130,73 @@ final class NotesModel {
             .filter { liveUrls[$0.url] != nil && (allowed?.contains($0.url) ?? true) }
     }
 
+    private struct BackfillJob: Sendable {
+        enum Kind: Sendable { case semantic, file, spotlight }
+        let kind: Kind
+        let url: String
+        let name: String?
+    }
+
+    /// Backfill runs as one bounded drain rather than a task per note: a cold
+    /// boot has hundreds of them, and the editor's first snapshot has to reach
+    /// the core before any of it.
+    private func enqueueBackfill(_ jobs: [BackfillJob]) {
+        guard !jobs.isEmpty else { return }
+        backfillQueue.append(contentsOf: jobs)
+        startBackfillDrain()
+    }
+
+    /// Opened by the first note served, or by the core finishing its walk when
+    /// no note is waiting on one.
+    private func openBackfillGate() {
+        guard !backfillGateOpen else { return }
+        backfillGateOpen = true
+        startBackfillDrain()
+    }
+
+    private func nextBackfillJob() -> BackfillJob? {
+        backfillQueue.isEmpty ? nil : backfillQueue.removeFirst()
+    }
+
+    private func startBackfillDrain() {
+        guard backfillGateOpen, backfillTask == nil, !backfillQueue.isEmpty else { return }
+        backfillTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(1200))
+            guard let self, !Task.isCancelled else { return }
+            await withTaskGroup(of: Void.self) { group in
+                var running = 0
+                while !Task.isCancelled, let job = self.nextBackfillJob() {
+                    if running == Self.backfillConcurrency {
+                        await group.next()
+                        running -= 1
+                    }
+                    group.addTask { await self.runBackfill(job) }
+                    running += 1
+                }
+            }
+            self.flushSpotlightHeads()
+            self.backfillTask = nil
+            self.startBackfillDrain()
+        }
+    }
+
+    private nonisolated func runBackfill(_ job: BackfillJob) async {
+        switch job.kind {
+        case .semantic: await indexSemantically(url: job.url, name: job.name, token: nil)
+        case .file: await indexFileSemantically(url: job.url, name: job.name, token: nil)
+        case .spotlight: await indexForSpotlight(url: job.url, name: job.name, token: nil)
+        }
+    }
+
     /// Notes the index has never seen — everything else is kept current by
     /// docChanged and the edit paths, so a refresh must not re-embed the world.
     private func backfillSemanticIndex(for notes: [NoteInfo]) {
         Task { [weak self, semanticSearch] in
             let known = await semanticSearch.contextIndexedUrls()
             guard let self else { return }
-            for note in notes where !known.contains(note.url) {
-                self.scheduleSemanticIndex(url: note.url, name: note.name)
-            }
+            self.enqueueBackfill(notes.filter { !known.contains($0.url) }.map {
+                BackfillJob(kind: .semantic, url: $0.url, name: $0.name)
+            })
             await self.reindexCalendarNotes(notes)
         }
     }
@@ -3169,9 +3246,9 @@ final class NotesModel {
         Task { [weak self, semanticSearch] in
             let known = await semanticSearch.indexedUrls()
             guard let self else { return }
-            for file in files where !known.contains(file.url) {
-                self.scheduleFileSemanticIndex(url: file.url, name: file.name)
-            }
+            self.enqueueBackfill(files.filter { !known.contains($0.url) }.map {
+                BackfillJob(kind: .file, url: $0.url, name: $0.name)
+            })
         }
     }
 
@@ -3189,7 +3266,7 @@ final class NotesModel {
         }
     }
 
-    private func indexFileSemantically(url: String, name: String?, token: UUID) async {
+    private func indexFileSemantically(url: String, name: String?, token: UUID?) async {
         guard let core else { return }
         let (resolvedName, text) = await Task.detached {
             let n = name ?? core.assetInfo(url: url)?.name ?? ""
@@ -3205,17 +3282,32 @@ final class NotesModel {
             }
             return (n, parts.joined(separator: "\n"))
         }.value
-        guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
+        if let token, semanticIndexTokens[url] != token { return }
+        guard !Task.isCancelled else { return }
         await semanticSearch.indexFile(url: url, name: resolvedName, text: text)
     }
 
     /// Only notes this launch hasn't queued yet — docChanged keeps changed
     /// notes current, so a refresh must not re-index the whole corpus.
     private func backfillSpotlightIndex(for notes: [NoteInfo]) {
-        for note in notes where !spotlightBackfilled.contains(note.url) {
+        enqueueBackfill(notes.compactMap { note in
+            guard !spotlightBackfilled.contains(note.url) else { return nil }
             spotlightBackfilled.insert(note.url)
-            scheduleSpotlightIndex(url: note.url, name: note.name)
-        }
+            return BackfillJob(kind: .spotlight, url: note.url, name: note.name)
+        })
+    }
+
+    private func markSpotlightIndexed(_ url: String, heads: String) {
+        guard !heads.isEmpty, spotlightHeads[url] != heads else { return }
+        spotlightHeads[url] = heads
+        spotlightHeadsDirty += 1
+        if spotlightHeadsDirty >= 50 { flushSpotlightHeads() }
+    }
+
+    private func flushSpotlightHeads() {
+        guard spotlightHeadsDirty > 0 else { return }
+        spotlightHeadsDirty = 0
+        UserDefaults.standard.set(spotlightHeads, forKey: Self.spotlightHeadsKey)
     }
 
     private func scheduleSemanticIndex(url: String, name: String? = nil) {
@@ -3232,10 +3324,11 @@ final class NotesModel {
         }
     }
 
-    private func indexSemantically(url: String, name: String?, token: UUID) async {
+    private func indexSemantically(url: String, name: String?, token: UUID?) async {
         guard let core else { return }
         guard let row = await core.noteContent(url: url), row.kind == "rich" else { return }
-        guard semanticIndexTokens[url] == token, !Task.isCancelled else { return }
+        if let token, semanticIndexTokens[url] != token { return }
+        guard !Task.isCancelled else { return }
         CalendarLinks.set(row.eventIds, for: url)
         let resolvedName = row.title.isEmpty
             ? (name ?? node(for: url)?.displayName ?? "")
@@ -3262,10 +3355,12 @@ final class NotesModel {
         }
     }
 
-    private func indexForSpotlight(url: String, name: String?, token: UUID) async {
+    private func indexForSpotlight(url: String, name: String?, token: UUID?) async {
         guard let core else { return }
         guard let row = await core.noteContent(url: url), row.kind == "rich" else { return }
-        guard spotlightIndexTokens[url] == token, !Task.isCancelled else { return }
+        if !row.heads.isEmpty, spotlightHeads[url] == row.heads { return }
+        if let token, spotlightIndexTokens[url] != token { return }
+        guard !Task.isCancelled else { return }
         let resolvedName = row.title.isEmpty
             ? (name ?? node(for: url)?.displayName ?? "")
             : row.title
@@ -3276,6 +3371,7 @@ final class NotesModel {
             eventStart: row.eventStart > 0 ? Date(timeIntervalSince1970: TimeInterval(row.eventStart)) : nil,
             eventEnd: row.eventEnd > 0 ? Date(timeIntervalSince1970: TimeInterval(row.eventEnd)) : nil
         )
+        markSpotlightIndexed(url, heads: row.heads)
     }
 
     private func schedulePreviewUpdate(url: String) {
