@@ -770,6 +770,10 @@ struct ContentView: View {
 
 
     private var sidebarList: some View {
+        sidebarKeyHandlers(sidebarSearchHandlers(sidebarChangeHandlers(sidebarListBase)))
+    }
+
+    private var sidebarListBase: some View {
         List {
             if searchQueryText.isEmpty {
                 ForEach(sectionOrder, id: \.self) { section in
@@ -830,6 +834,10 @@ struct ContentView: View {
             )
         }
         .navigationSplitViewColumnWidth(min: 180, ideal: 230)
+    }
+
+    private func sidebarChangeHandlers(_ base: some View) -> some View {
+        base
         .onChange(of: model.folderTree, initial: true) {
             seedRootExpansion()
             rebuildNotebookRows()
@@ -842,6 +850,10 @@ struct ContentView: View {
         .onChange(of: model.childOrder) { rebuildNotebookRows() }
         .onChange(of: model.folderSettings) { rebuildNotebookRows() }
         .onChange(of: model.focus.state?.shownFolderUrls) { rebuildNotebookRows() }
+    }
+
+    private func sidebarSearchHandlers(_ base: some View) -> some View {
+        base
         .onChange(of: searchText) { oldValue, newValue in
             let preserve = preserveSearchInputOnce
             preserveSearchInputOnce = false
@@ -867,55 +879,68 @@ struct ContentView: View {
         .onChange(of: model.smartNotebooks, initial: true) {
             model.refreshSmartHits()
         }
-        .onKeyPress(.return) {
-            guard renamingUrl == nil,
-                  selectedItemUrls.count == 1,
-                  let tag = selectedItemUrls.first
-            else { return .ignored }
-            let selected = Self.sidebarUrl(tag)
-            if let node = model.node(for: selected), node.kind == "folder" {
-                setExpanded(!expanded.contains(selected), for: selected)
-            } else {
-                Task { await model.selectItem(selected) }
-            }
-            return .handled
-        }
+    }
+
+    private func sidebarKeyHandlers(_ base: some View) -> some View {
+        base
+        .onKeyPress(.return, action: sidebarReturnKey)
         .onKeyPress(.upArrow) { moveSidebarSelection(by: -1) }
         .onKeyPress(.downArrow) { moveSidebarSelection(by: 1) }
-        .onKeyPress { (press: KeyPress) -> KeyPress.Result in
-            guard press.modifiers == .control else { return .ignored }
-            if press.characters == "p" { return moveSidebarSelection(by: -1) }
-            if press.characters == "n" { return moveSidebarSelection(by: 1) }
-            return .ignored
-        }
-        .onKeyPress(.space) {
-            guard renamingUrl == nil,
-                  selectedItemUrls.count == 1,
-                  let tag = selectedItemUrls.first
-            else { return .ignored }
-            if tag.hasPrefix("smart:") {
-                let id = String(tag.dropFirst(6))
-                setSmartExpanded(!smartExpanded.contains(id), id: id)
-                return .handled
-            }
-            let selected = Self.sidebarUrl(tag)
-            guard let node = model.node(for: selected), node.kind == "folder" else { return .ignored }
-            setExpanded(!expanded.contains(selected), for: selected)
-            return .handled
-        }
-        .onKeyPress(.delete) {
-            guard renamingUrl == nil, !selectedItemUrls.isEmpty else { return .ignored }
-            for tag in selectedItemUrls {
-                let url = Self.sidebarUrl(tag)
-                if let node = model.node(for: url), node.parentUrl != nil {
-                    model.removeEntry(parentUrl: node.parentUrl, url: url)
-                }
-            }
-            return .handled
-        }
+        .onKeyPress(action: sidebarControlKeys)
+        .onKeyPress(.space, action: sidebarSpaceKey)
+        .onKeyPress(.delete, action: sidebarDeleteKey)
         .focused($sidebarFocused)
         .foregroundStyle(Color.primary)
         .tint(Color.lushPink)
+        .tint(Color(red: 1.0, green: 0.412, blue: 0.647))
+    }
+
+    private func sidebarReturnKey() -> KeyPress.Result {
+        guard renamingUrl == nil,
+              selectedItemUrls.count == 1,
+              let tag = selectedItemUrls.first
+        else { return .ignored }
+        let selected = Self.sidebarUrl(tag)
+        if let node = model.node(for: selected), node.kind == "folder" {
+            setExpanded(!expanded.contains(selected), for: selected)
+        } else {
+            Task { await model.selectItem(selected) }
+        }
+        return .handled
+    }
+
+    private func sidebarControlKeys(_ press: KeyPress) -> KeyPress.Result {
+        guard press.modifiers == .control else { return .ignored }
+        if press.characters == "p" { return moveSidebarSelection(by: -1) }
+        if press.characters == "n" { return moveSidebarSelection(by: 1) }
+        return .ignored
+    }
+
+    private func sidebarSpaceKey() -> KeyPress.Result {
+        guard renamingUrl == nil,
+              selectedItemUrls.count == 1,
+              let tag = selectedItemUrls.first
+        else { return .ignored }
+        if tag.hasPrefix("smart:") {
+            let id = String(tag.dropFirst(6))
+            setSmartExpanded(!smartExpanded.contains(id), id: id)
+            return .handled
+        }
+        let selected = Self.sidebarUrl(tag)
+        guard let node = model.node(for: selected), node.kind == "folder" else { return .ignored }
+        setExpanded(!expanded.contains(selected), for: selected)
+        return .handled
+    }
+
+    private func sidebarDeleteKey() -> KeyPress.Result {
+        guard renamingUrl == nil, !selectedItemUrls.isEmpty else { return .ignored }
+        for tag in selectedItemUrls {
+            let url = Self.sidebarUrl(tag)
+            if let node = model.node(for: url), node.parentUrl != nil {
+                model.removeEntry(parentUrl: node.parentUrl, url: url)
+            }
+        }
+        return .handled
     }
 
     private func focusCurrentNoteSearch() {
