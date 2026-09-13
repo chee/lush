@@ -103,6 +103,20 @@ final class LushAgentServer {
                     "roots": model.rootFolderUrls,
                     "selected_note": model.selectedNoteUrl as Any,
                 ])
+            case ("GET", "/v1/debug/resident"):
+                let resident = await core.residentDocs()
+                return .json(status: 200, value: [
+                    "count": resident.count,
+                    "pinned_count": resident.pinnedCount,
+                    "documents": resident.docs.map {
+                        [
+                            "url": $0.url,
+                            "title": $0.title,
+                            "pinned": $0.pinned,
+                            "idle_seconds": $0.idleSeconds.map { NSNumber(value: $0) } ?? NSNull(),
+                        ] as [String: Any]
+                    },
+                ])
             case ("GET", "/v1/notes"):
                 let query = request.query["query"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let folder = request.query["folder"]?.trimmingCharacters(in: .whitespacesAndNewlines)

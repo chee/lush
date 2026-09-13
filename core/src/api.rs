@@ -291,6 +291,25 @@ pub struct RecentNote {
 /// Everything the index knows about a doc apart from its text. A saved search
 /// tests most of its rules against this rather than asking the index one
 /// question per rule.
+/// A doc materialized in memory right now, and what holds it there.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ResidentDoc {
+    pub url: String,
+    /// Title from the index; empty when the index doesn't hold the doc.
+    pub title: String,
+    /// Open pins. Nonzero means idle eviction can't touch it.
+    pub pinned: u32,
+    /// Seconds since the doc was last read or written; `None` when untouched.
+    pub idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct ResidentDocs {
+    pub docs: Vec<ResidentDoc>,
+    pub count: u32,
+    pub pinned_count: u32,
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct IndexedNote {
     pub url: String,
@@ -1051,6 +1070,47 @@ impl Core {
         self.runtime
             .block_on(async move { repo.add_iroh_peer(code).await })?;
         Ok(())
+    }
+
+    /// What is materialized in memory right now, pinned first, and what
+    /// holds each doc there. Nothing is materialized to answer: residency
+    /// comes from the repo's maps and the title from the index.
+    pub async fn resident_docs(&self) -> ResidentDocs {
+        let repo = self.repo.clone();
+        let index = self.index.clone();
+        let mut docs = self
+            .run(async move {
+                let mut rows = Vec::new();
+                for doc in repo.resident_docs().await {
+                    let url = doc.id.to_url();
+                    let lookup = url.clone();
+                    let index = index.clone();
+                    let title = tokio::task::spawn_blocking(move || index.stored_title(&lookup))
+                        .await
+                        .ok()
+                        .flatten();
+                    rows.push(ResidentDoc {
+                        url,
+                        title: title.unwrap_or_default(),
+                        pinned: doc.pinned,
+                        idle_seconds: doc.idle.map(|idle| idle.as_secs()),
+                    });
+                }
+                rows
+            })
+            .await
+            .unwrap_or_default();
+        docs.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| a.idle_seconds.cmp(&b.idle_seconds))
+                .then_with(|| a.url.cmp(&b.url))
+        });
+        ResidentDocs {
+            count: docs.len() as u32,
+            pinned_count: docs.iter().filter(|d| d.pinned > 0).count() as u32,
+            docs,
+        }
     }
 
     pub fn iroh_peers(&self) -> Vec<IrohPeer> {
@@ -3455,6 +3515,33 @@ mod tests {
 
     fn heads(core: &Core, url: &str) -> Vec<String> {
         core.runtime.block_on(core.doc_heads(url.to_string()))
+    }
+
+    #[test]
+    fn resident_docs_names_what_holds_memory() {
+        let (_dir, core) = test_core();
+        let note = core.create_note_doc("resident".into()).unwrap();
+        core.runtime.block_on(core.open_note(note.clone())).unwrap();
+
+        let resident = core.runtime.block_on(core.resident_docs());
+        let row = resident
+            .docs
+            .iter()
+            .find(|d| d.url == note)
+            .expect("the open note is resident");
+        assert_eq!(row.pinned, 1);
+        assert!(row.idle_seconds.is_some());
+        assert_eq!(resident.count, resident.docs.len() as u32);
+        assert_eq!(resident.pinned_count, 1);
+        assert_eq!(resident.docs[0].url, note, "pinned first");
+
+        core.close_note(note.clone()).unwrap();
+        let resident = core.runtime.block_on(core.resident_docs());
+        assert_eq!(resident.pinned_count, 0);
+        assert_eq!(
+            resident.docs.iter().find(|d| d.url == note).unwrap().pinned,
+            0
+        );
     }
 
     /// The sedimentree keeps one file per record. A launch that rebuilds docs

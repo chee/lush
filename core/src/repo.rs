@@ -795,6 +795,15 @@ pub struct Peers {
     seen: BTreeMap<String, Option<String>>,
 }
 
+/// A doc materialized in memory right now, with what holds it there. `idle`
+/// is `None` for a doc the maps never recorded a touch for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentDoc {
+    pub id: DocId,
+    pub pinned: u32,
+    pub idle: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrohPeerEntry {
     pub node_id: String,
@@ -3175,6 +3184,23 @@ impl Repo {
 
     fn is_pinned(&self, id: DocId) -> bool {
         self.pins.lock().unwrap().contains_key(&id)
+    }
+
+    /// Every doc materialized in memory, with its pin count and idle time.
+    /// Reads the residency maps only — no doc lock, no storage, nothing
+    /// materialized — so it is safe to ask while the app is under pressure.
+    pub async fn resident_docs(&self) -> Vec<ResidentDoc> {
+        let ids: Vec<DocId> = self.docs.lock().await.keys().copied().collect();
+        let now = Instant::now();
+        let touched = self.last_touched.lock().unwrap();
+        let pins = self.pins.lock().unwrap();
+        ids.into_iter()
+            .map(|id| ResidentDoc {
+                id,
+                pinned: pins.get(&id).copied().unwrap_or(0),
+                idle: touched.get(&id).map(|t| now.duration_since(*t)),
+            })
+            .collect()
     }
 
     /// Track a doc and populate it from local storage. The fresh doc's lock is

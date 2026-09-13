@@ -465,6 +465,20 @@ impl SearchIndex {
 
     /// The extracted row content consumers read instead of re-opening the
     /// doc: previews, Spotlight, and the embedding index all feed off this.
+    /// The title stored for a doc, if the index holds a row for it.
+    pub fn stored_title(&self, url: &str) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT title FROM search_docs WHERE url = ?1",
+            params![url],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|title| !title.is_empty())
+    }
+
     pub fn indexed_note(&self, url: &str) -> Result<Option<IndexedDoc>> {
         let conn = self.conn.lock().unwrap();
         let row = conn

@@ -229,6 +229,9 @@ struct SyncSettingsPane: View {
     @State private var compacting = false
     @State private var compactionResult: String?
     @State private var serverDraft = NotesModel.shared.syncServerUrl ?? ""
+    @State private var showingResident = false
+    @State private var resident: ResidentDocs?
+    @State private var loadingResident = false
     @State private var serverChanged = false
     var body: some View {
         Form {
@@ -369,6 +372,33 @@ struct SyncSettingsPane: View {
             } footer: {
                 Text("Reclaim Absorbed Records drops loose commits and old fragments that a bigger fragment already covers — this also happens automatically on save and open. Force Resync re-fetches all notebooks from the server. Clear Local Storage deletes all cached data and quits — the app will re-sync from scratch on next launch. Keeping your identity spares the two keys and the peer list, so your friend codes still works. You'll still be logged out tho")
             }
+            Section {
+                DisclosureGroup("Resident Documents", isExpanded: $showingResident) {
+                    if let resident {
+                        LabeledContent(
+                            "Total",
+                            value: "\(resident.count) documents · \(resident.pinnedCount) pinned"
+                        )
+                        ForEach(resident.docs, id: \.url) { doc in
+                            DocumentLabel(
+                                title: doc.title.isEmpty ? shortUrl(doc.url) : doc.title,
+                                url: residentDetail(doc),
+                                symbol: doc.pinned > 0 ? "pin.fill" : "doc"
+                            )
+                        }
+                    } else {
+                        Text(loadingResident ? "reading…" : "nothing resident")
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Refresh") { loadResident() }
+                        .disabled(loadingResident)
+                }
+                .onChange(of: showingResident) {
+                    if showingResident, resident == nil { loadResident() }
+                }
+            } footer: {
+                Text("what the core is holding in memory right now, pinned first. a pinned document is exempt from idle eviction.")
+            }
             if !model.syncLog.isEmpty {
                 Section("Sync Log") {
                     ScrollView {
@@ -408,6 +438,34 @@ struct SyncSettingsPane: View {
             peerError = error.localizedDescription
         }
         model.refreshPeers()
+    }
+
+    private func loadResident() {
+        guard let core = model.core else { return }
+        loadingResident = true
+        Task {
+            resident = await core.residentDocs()
+            loadingResident = false
+        }
+    }
+
+    private func residentDetail(_ doc: ResidentDoc) -> String {
+        var parts = [shortUrl(doc.url)]
+        if doc.pinned > 0 {
+            parts.append("pinned ×\(doc.pinned)")
+        }
+        parts.append(doc.idleSeconds.map { "idle \(idle($0))" } ?? "never touched")
+        return parts.joined(separator: " · ")
+    }
+
+    private func idle(_ seconds: UInt64) -> String {
+        if seconds < 60 { return "\(seconds)s" }
+        if seconds < 3600 { return "\(seconds / 60)m" }
+        return "\(seconds / 3600)h\((seconds % 3600) / 60)m"
+    }
+
+    private func shortUrl(_ url: String) -> String {
+        String(url.suffix(12))
     }
 
     private func shortNodeId(_ nodeId: String) -> String {
