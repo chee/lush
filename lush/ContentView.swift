@@ -259,6 +259,8 @@ struct ContentView: View {
     @FocusState private var sidebarFocused: Bool
     @FocusState private var searchFocused: Bool
     @State private var expanded: Set<String> = []
+    @State private var notebookRows: [SidebarRow] = []
+    @State private var notebookRowShapes: [SidebarRowShape] = []
     @State private var revealTarget: String?
     @State private var moveTarget: MoveTarget?
     @State private var pinnedExpanded = true
@@ -830,11 +832,16 @@ struct ContentView: View {
         .navigationSplitViewColumnWidth(min: 180, ideal: 230)
         .onChange(of: model.folderTree, initial: true) {
             seedRootExpansion()
+            rebuildNotebookRows()
             resolveSelectionRows()
         }
         .onChange(of: expanded) {
+            rebuildNotebookRows()
             resolveSelectionRows()
         }
+        .onChange(of: model.childOrder) { rebuildNotebookRows() }
+        .onChange(of: model.folderSettings) { rebuildNotebookRows() }
+        .onChange(of: model.focus.state?.shownFolderUrls) { rebuildNotebookRows() }
         .onChange(of: searchText) { oldValue, newValue in
             let preserve = preserveSearchInputOnce
             preserveSearchInputOnce = false
@@ -875,7 +882,7 @@ struct ContentView: View {
         }
         .onKeyPress(.upArrow) { moveSidebarSelection(by: -1) }
         .onKeyPress(.downArrow) { moveSidebarSelection(by: 1) }
-        .onKeyPress { press in
+        .onKeyPress { (press: KeyPress) -> KeyPress.Result in
             guard press.modifiers == .control else { return .ignored }
             if press.characters == "p" { return moveSidebarSelection(by: -1) }
             if press.characters == "n" { return moveSidebarSelection(by: 1) }
@@ -992,18 +999,7 @@ struct ContentView: View {
                 }
             case .notebooks:
                 guard !collapsedSections.contains(section.rawValue) else { continue }
-                func append(_ nodes: [FolderNode], path: String) {
-                    for row in Self.sidebarRows(nodes, path: path) {
-                        tags.append(row.id)
-                        if row.node.kind == "folder", expanded.contains(row.node.url) {
-                            append(
-                                model.orderedChildren(row.node.children ?? [], in: row.node.url),
-                                path: row.id
-                            )
-                        }
-                    }
-                }
-                append(model.visibleFolderTree, path: "")
+                tags += notebookRows.map(\.id)
             }
         }
         return tags
@@ -1109,7 +1105,9 @@ struct ContentView: View {
         case .notebooks:
             sectionHeader("Notebooks", section: .notebooks)
             if !collapsedSections.contains(SidebarSection.notebooks.rawValue) {
-                nodeRows(model.visibleFolderTree)
+                ForEach(notebookRows) { row in
+                    notebookRow(row)
+                }
             }
         }
     }
@@ -1237,70 +1235,145 @@ struct ContentView: View {
 
     private func pinnedNoteRow(_ node: FolderNode) -> some View {
         let tag = "pinned:\(node.url)"
-        return NoteRowView(node: node, showFolder: true)
+        return KeyedSidebarRow(key: noteRowKey(node, depth: 1, tag: tag)) {
+            pinnedNoteRowBody(node, tag: tag)
+        }
+            .equatable()
+            .id(tag)
+            .listRowInsets(sidebarRowInsets(depth: 1))
+            .listRowBackground(selectionBackground(url: node.url, tag: tag))
+    }
+
+    private func pinnedNoteRowBody(_ node: FolderNode, tag: String) -> some View {
+        NoteRowView(node: node, showFolder: true)
             .padding(.trailing, sidebarTrailingGutter)
             .padding(.leading, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .tag(tag)
-            .id(tag)
             .gesture(PrimaryClickGesture { selectSidebarRow(tag) })
             .onDrag({ SidebarDrag.provider(node.url, kind: .item) }, preview: {
                 DragPreviewView(name: node.displayName)
             })
             .modifier(PinReorderTarget(url: node.url, model: model))
-            .listRowInsets(sidebarRowInsets(depth: 1))
-            .listRowBackground(selectionBackground(url: node.url, tag: tag))
             .contextMenu {
                 singleNoteContextMenu(for: node, showInFolder: true)
             }
     }
 
-    private func nodeRows(_ nodes: [FolderNode], depth: Int = 0, path: String = "") -> AnyView {
-        AnyView(
-            ForEach(Self.sidebarRows(nodes, path: path)) { row in
-                let node = row.node
-                if node.kind == "folder" {
-                    folderRow(for: node, depth: depth, tag: row.id)
-                        .tag(row.id)
-                        .listRowInsets(sidebarRowInsets(depth: depth))
-                        .listRowBackground(selectionBackground(url: node.url, tag: row.id))
-                    if expanded.contains(node.url) {
-                        nodeRows(
-                            model.orderedChildren(node.children ?? [], in: node.url),
-                            depth: depth + 1,
-                            path: row.id
-                        )
-                    }
-                } else {
-                    noteRow(for: node, depth: depth, tag: row.id)
-                        .listRowInsets(sidebarRowInsets(depth: depth))
-                        .listRowBackground(selectionBackground(url: node.url, tag: row.id))
-                }
+    @ViewBuilder
+    private func notebookRow(_ row: SidebarRow) -> some View {
+        let node = row.node
+        if node.kind == "folder" {
+            KeyedSidebarRow(key: folderRowKey(node, depth: row.depth, tag: row.id)) {
+                folderRow(for: node, depth: row.depth, tag: row.id)
             }
+                .equatable()
+                .tag(row.id)
+                .listRowInsets(sidebarRowInsets(depth: row.depth))
+                .listRowBackground(selectionBackground(url: node.url, tag: row.id))
+        } else {
+            KeyedSidebarRow(key: noteRowKey(node, depth: row.depth, tag: row.id)) {
+                noteRow(for: node, depth: row.depth, tag: row.id)
+            }
+                .equatable()
+                .listRowInsets(sidebarRowInsets(depth: row.depth))
+                .listRowBackground(selectionBackground(url: node.url, tag: row.id))
+        }
+    }
+
+    /// The outline is unfolded here rather than by nesting the list inside
+    /// itself: one flat run of rows carrying their own depth, so the list walks
+    /// them in a line instead of descending a tree per row.
+    ///
+    /// The run is held in state and rebuilt from its inputs rather than walked
+    /// again per publish: a sync that lands a note in a folded folder moves the
+    /// tree without moving a single visible row. The rebuilt run replaces the
+    /// old one only where it draws differently, so the rows keep their
+    /// instances across a publish that changed nothing they show.
+    private func rebuildNotebookRows() {
+        var rows: [SidebarRow] = []
+        func walk(_ nodes: [FolderNode], depth: Int, path: String) {
+            for row in Self.sidebarRows(nodes, depth: depth, path: path) {
+                rows.append(row)
+                guard row.node.kind == "folder", expanded.contains(row.node.url) else { continue }
+                walk(
+                    model.orderedChildren(row.node.children ?? [], in: row.node.url),
+                    depth: depth + 1,
+                    path: row.id
+                )
+            }
+        }
+        walk(model.visibleFolderTree, depth: 0, path: "")
+        let shapes = rows.map(notebookRowShape)
+        guard shapes != notebookRowShapes else { return }
+        notebookRowShapes = shapes
+        notebookRows = rows
+    }
+
+    /// Everything a notebook row draws from its node. A node carries its whole
+    /// subtree, but a row only ever shows these, so two runs that agree here
+    /// draw the same and the older one can stay.
+    private func notebookRowShape(_ row: SidebarRow) -> SidebarRowShape {
+        let node = row.node
+        return SidebarRowShape(
+            id: row.id,
+            depth: row.depth,
+            url: node.url,
+            name: node.name,
+            kind: node.kind,
+            parentUrl: node.parentUrl,
+            count: node.kind == "folder" && model.folderSettings(for: node.url).showCount
+                ? model.folderNoteCount(node)
+                : nil
         )
     }
 
     /// The same item can sit in a folder more than once, so a row is named by
     /// where it is, not by what it holds. Two copies are two selections.
-    private static func sidebarRows(_ nodes: [FolderNode], path: String) -> [SidebarRow] {
+    private static func sidebarRows(_ nodes: [FolderNode], depth: Int, path: String) -> [SidebarRow] {
         nodes.enumerated().map {
-            SidebarRow(id: "\(path)\u{1}\($0.offset)\u{1}\($0.element.url)", node: $0.element)
+            SidebarRow(
+                id: "\(path)\u{1}\($0.offset)\u{1}\($0.element.url)",
+                node: $0.element,
+                depth: depth
+            )
         }
+    }
+
+    private func folderRowKey(_ node: FolderNode, depth: Int, tag: String) -> SidebarRowKey {
+        SidebarRowKey(
+            tag: tag,
+            url: node.url,
+            name: node.name,
+            kind: node.kind,
+            parentUrl: node.parentUrl,
+            depth: depth,
+            renameText: renamingUrl == node.url ? renameText : nil,
+            expanded: expanded.contains(node.url),
+            isRoot: model.rootFolderUrls.contains(node.url),
+            count: model.folderSettings(for: node.url).showCount
+                ? model.folderNoteCount(node)
+                : nil
+        )
+    }
+
+    private func noteRowKey(_ node: FolderNode, depth: Int, tag: String) -> SidebarRowKey {
+        SidebarRowKey(
+            tag: tag,
+            url: node.url,
+            name: node.name,
+            kind: node.kind,
+            parentUrl: node.parentUrl,
+            depth: depth,
+            renameText: renamingUrl == node.url ? renameText : nil,
+            selection: selectedItemUrls.contains(tag) ? selectedItemUrls : []
+        )
     }
 
     /// Where a url first shows up in the tree as it is currently unfolded.
     private func firstRowId(for url: String) -> String? {
-        func walk(_ nodes: [FolderNode], path: String) -> String? {
-            for row in Self.sidebarRows(nodes, path: path) {
-                if row.node.url == url { return row.id }
-                guard row.node.kind == "folder", expanded.contains(row.node.url) else { continue }
-                let children = model.orderedChildren(row.node.children ?? [], in: row.node.url)
-                if let hit = walk(children, path: row.id) { return hit }
-            }
-            return nil
-        }
-        return walk(model.visibleFolderTree, path: "")
+        notebookRows.first { $0.node.url == url }?.id
     }
 
     private func rowTag(for url: String) -> String {
@@ -2199,9 +2272,53 @@ struct ContentView: View {
 }
 
 #if os(macOS)
-struct SidebarRow: Identifiable {
+final class SidebarRow: Identifiable {
     let id: String
     let node: FolderNode
+    let depth: Int
+
+    init(id: String, node: FolderNode, depth: Int) {
+        self.id = id
+        self.node = node
+        self.depth = depth
+    }
+}
+
+struct SidebarRowShape: Equatable {
+    let id: String
+    let depth: Int
+    let url: String
+    let name: String
+    let kind: String
+    let parentUrl: String?
+    let count: Int?
+}
+
+struct SidebarRowKey: Equatable {
+    let tag: String
+    let url: String
+    let name: String
+    let kind: String
+    let parentUrl: String?
+    let depth: Int
+    var renameText: String? = nil
+    var expanded = false
+    var isRoot = false
+    var count: Int? = nil
+    /// A row that isn't picked reads the same however the rest of the
+    /// selection moves, so only the picked rows carry it.
+    var selection: Set<String> = []
+}
+
+/// Rebuilt only when its key changes, so selecting a note leaves the rest of
+/// the outline's rows, menus and drop targets where they are.
+struct KeyedSidebarRow<Content: View>: View, Equatable {
+    let key: SidebarRowKey
+    @ViewBuilder let content: () -> Content
+
+    var body: some View { content() }
+
+    nonisolated static func == (a: Self, b: Self) -> Bool { a.key == b.key }
 }
 
 #endif
