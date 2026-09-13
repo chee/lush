@@ -332,10 +332,10 @@ struct SyncSettingsPane: View {
             } header: {
                 Text("Peers (iroh)")
             } footer: {
-                Text("Off until you turn it on — binding the endpoint reaches for a relay, and a slow one would hold up launch. Once it's on, share this device's friend code and add a friend's; the rust subduction cores then sync directly via iroh. The code is two public keys — where to dial, and who should answer.")
+                Text("add friends to sync with peer to peer")
             }
             Section {
-                Button("Force Resync") {
+                Button("Force resync from server") {
                     model.forceSync()
                 }
                 Button(compacting ? "Reclaiming…" : "Reclaim Absorbed Records") {
@@ -357,15 +357,15 @@ struct SyncSettingsPane: View {
                     isPresented: $showingClearConfirm,
                     titleVisibility: .visible
                 ) {
-                    Button("Clear, Keep Identity") {
+                    Button("Clear, keeping iroh identity") {
                         model.clearStorage(keepingIdentity: true)
                     }
-                    Button("Clear Everything", role: .destructive) {
+                    Button("Clear everything", role: .destructive) {
                         model.clearStorage()
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("The app will quit and re-sync everything from the server on next launch. Clearing everything also erases this device's keys and peers — your friend code changes, and anyone holding the old one can't reach you.")
+                    Text("quit and re-sync everything from the server on next launch.")
                 }
             } header: {
                 Text("Diagnostics")

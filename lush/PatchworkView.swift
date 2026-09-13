@@ -278,11 +278,16 @@ enum PatchworkWeb {
         50% { background-color: color-mix(in srgb, #ffb35c 26%, var(--editor-fill)); }
       }
       body.loading { animation: lush-loading-pulse 1.8s ease-in-out infinite; }
+      .picker, .picker * { box-sizing: border-box; }
       .picker { display: flex; flex-direction: column; gap: 6px; padding: 14px;
-        font: 13px system-ui, sans-serif; }
-      .picker-paste { display: flex; gap: 6px; }
-      .picker-paste input { flex: 1; padding: 5px 8px; border-radius: 6px;
+        max-width: 100%; font: 13px system-ui, sans-serif; }
+      .picker-paste { display: flex; gap: 6px; align-items: center; }
+      /* min-width: 0 or the input's intrinsic width shoves Embed off the edge */
+      .picker-paste input { flex: 1 1 0; min-width: 0; padding: 5px 8px; border-radius: 6px;
+        font: inherit; background: transparent; color: inherit;
         border: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
+      .picker-paste button { flex: 0 0 auto; white-space: nowrap; }
+      .picker-type { overflow-wrap: anywhere; }
       .picker-heading { margin-top: 8px; color: color-mix(in srgb, var(--editor-line) 55%, transparent); font-size: 11px;
         text-transform: uppercase; letter-spacing: 0.04em; }
       .picker button { padding: 6px 10px; border-radius: 6px; cursor: pointer;

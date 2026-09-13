@@ -159,10 +159,17 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
     /// pending would sit unprocessed — open the app's own lush:// url instead,
     /// which makes SwiftUI create a window to deliver it.
     private func route(_ action: AppRouter.Action, fallback url: URL?) {
-        let hasMainWindow = NSApp.windows.contains {
-            $0.isVisible && $0.identifier?.rawValue.hasPrefix("main") == true
-        }
-        if hasMainWindow || url == nil {
+        let existing = MainWindowTabs.windows.filter { $0.isVisible || $0.isMiniaturized }
+        if let front = existing.last {
+            AppRouter.shared.pending = action
+            NSApp.setActivationPolicy(.regular)
+            NSApp.unhide(nil)
+            for window in existing where window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            front.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+        } else if url == nil {
             AppRouter.shared.pending = action
             NSApp.activate()
         } else if let url {
@@ -283,6 +290,13 @@ struct MainWindowCommands: Commands {
                 AppRouter.shared.pending = .openFromUrl
             }
             .keyboardShortcut("o", modifiers: .command)
+        }
+        CommandGroup(before: .windowList) {
+            Button("Lush Window") {
+                MainWindowTabs.reveal(using: openWindow)
+            }
+            .keyboardShortcut("0", modifiers: .command)
+            Divider()
         }
     }
 }

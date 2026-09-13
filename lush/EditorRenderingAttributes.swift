@@ -24,11 +24,34 @@ final class EditorRenderingAttributes {
         return resolved.withAlphaComponent(alpha)
     }
 
-    static var matchColor: PColor { tint(0.3) }
+    private static func srgb(_ red: CGFloat, _ green: CGFloat, _ blue: CGFloat, _ alpha: CGFloat) -> PColor {
+        #if os(macOS)
+        PColor(srgbRed: red, green: green, blue: blue, alpha: alpha)
+        #else
+        PColor(red: red, green: green, blue: blue, alpha: alpha)
+        #endif
+    }
 
-    static var currentMatchColor: PColor { tint(0.65) }
+    /// #fe8, the find highlight. Only the match she is on gets it, solid with
+    /// #333 text so it reads the same in either appearance; the rest sit
+    /// behind a neutral grey wash and keep their own colour.
+    static let currentMatchColor = srgb(1, 0.933, 0.533, 1)
 
-    static var globalMatchColor: PColor { tint(0.18) }
+    static let currentMatchTextColor = srgb(0.2, 0.2, 0.2, 1)
+
+    static let matchColor = srgb(0.5, 0.5, 0.5, 0.4)
+
+    static let globalMatchColor = srgb(0.5, 0.5, 0.5, 0.25)
+
+    /// What the layout fragment paints behind the text, back to front.
+    var highlights: [(range: NSRange, color: PColor)] {
+        var out = globalMatches.map { (range: $0, color: Self.globalMatchColor) }
+        out += findMatches.map { (range: $0, color: Self.matchColor) }
+        if let currentFindMatch {
+            out.append((range: currentFindMatch, color: Self.currentMatchColor))
+        }
+        return out
+    }
 
     var validator: (NSTextLayoutManager, NSTextLayoutFragment) -> Void {
         { [weak self] textLayoutManager, fragment in
@@ -60,20 +83,15 @@ final class EditorRenderingAttributes {
               let contentStorage = textLayoutManager.textContentManager as? NSTextContentStorage
         else { return }
 
-        func paint(_ matches: [NSRange], _ color: PColor) {
-            for match in matches {
-                let clipped = NSIntersectionRange(match, fragmentRange)
-                guard clipped.length > 0,
-                      let textRange = contentStorage.textRange(for: clipped)
-                else { continue }
-                textLayoutManager.addRenderingAttribute(.backgroundColor, value: color, for: textRange)
-            }
-        }
-
-        paint(globalMatches, Self.globalMatchColor)
-        paint(findMatches, Self.matchColor)
-        if let current = currentFindMatch {
-            paint([current], Self.currentMatchColor)
-        }
+        // Backgrounds are drawn by the layout fragment (see `highlights`);
+        // only the text colour goes through rendering attributes.
+        guard let current = currentFindMatch else { return }
+        let clipped = NSIntersectionRange(current, fragmentRange)
+        guard clipped.length > 0, let textRange = contentStorage.textRange(for: clipped) else { return }
+        textLayoutManager.addRenderingAttribute(
+            .foregroundColor,
+            value: Self.currentMatchTextColor,
+            for: textRange
+        )
     }
 }

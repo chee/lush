@@ -364,20 +364,7 @@ struct MenuBarCaptureView: View {
 
     private func openLush() {
         dismiss()
-        NSApp.setActivationPolicy(.regular)
-        openWindow(id: "main")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            NSApp.unhide(nil)
-            NSRunningApplication.current.activate(options: [.activateAllWindows])
-            NSApp.windows
-                .filter { $0.level == .normal && $0.canBecomeMain }
-                .forEach { window in
-                    if window.isMiniaturized {
-                        window.deminiaturize(nil)
-                    }
-                    window.makeKeyAndOrderFront(nil)
-                }
-        }
+        MainWindowTabs.reveal(using: openWindow)
     }
 
     private func closeMenuWindow() {

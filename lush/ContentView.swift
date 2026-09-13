@@ -80,6 +80,29 @@ enum MainWindowTabs {
         openWindow(id: "main", value: route)
     }
 
+    static var windows: [NSWindow] {
+        NSApp.windows.filter { $0.identifier?.rawValue.hasPrefix("main") == true }
+    }
+
+    /// Bring the app forward on an existing main window, making one only when
+    /// there is none. Menu bar and dock actions land in the window she already
+    /// has rather than piling up new ones.
+    static func reveal(using openWindow: OpenWindowAction) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.unhide(nil)
+        let existing = windows
+        if existing.isEmpty {
+            open(selection: nil, using: openWindow)
+        } else {
+            for window in existing where window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            let front = existing.first { $0.isKeyWindow } ?? existing.last
+            front?.makeKeyAndOrderFront(nil)
+        }
+        NSApp.activate()
+    }
+
     static func claimRoute(_ selection: String?) {
         guard let selection, routedSelection == selection else { return }
         routedSelection = nil
@@ -240,6 +263,7 @@ struct ContentView: View {
     @State private var patchworkCreateRequest: PatchworkCreateRequest?
     @State private var smartEditor: SmartNotebookEdit?
     @State private var folderSettingsTarget: FolderNode?
+    @State private var unopenableUrl: String?
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
     @State private var selectedItemUrls: Set<String> = []
@@ -270,8 +294,6 @@ struct ContentView: View {
     @State private var rightSidebarVisible = false
     @State private var rightSidebarTab: RightSidebarTab = .history
     @AppStorage("rightSidebarWidth") private var rightSidebarWidth: Double = 280
-    @State private var rightSidebarDragStart: Double?
-    @State private var rightSidebarLiveWidth: Double?
     @State private var selectedHistoryEntry: DocHistoryEntry?
     @State private var sidebarHistory: [SidebarHistoryEntry] = []
     @State private var sidebarHistoryIndex = -1
@@ -341,9 +363,7 @@ struct ContentView: View {
             let deferred = deferredSidebarTag
             deferredSidebarTag = nil
             guard selectedItemUrls.count == 1, let tag = selectedItemUrls.first else { return }
-            guard !tag.hasPrefix("smart:"), tag != Agenda.sidebarTag, tag != Agenda.meetingNotesTag,
-                  tag != NotesMap.sidebarTag
-            else { return }
+            guard !Self.isPseudoTag(tag) else { return }
             guard !initialSelection else { return }
             let delay = deferred == tag ? 80 : 0
             NotesModel.selectBegin(Self.sidebarUrl(tag), "selection observed delay=\(delay)ms")
@@ -428,6 +448,12 @@ struct ContentView: View {
             OpenFromUrlView { url in
                 Task { await openDispatched(url) }
             }
+        }
+        .alert("Couldn't Open That Link", isPresented: unopenablePresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(unopenableUrl.map { "Nothing here answers to \($0)." }
+                ?? "That link doesn't name a document on this device.")
         }
         .fileImporter(
             isPresented: Binding(
@@ -524,8 +550,18 @@ struct ContentView: View {
         .sheet(item: $patchworkCreateRequest) { request in
             patchworkCreateSheet(request)
         }
+        .alert("Couldn't Open That Link", isPresented: unopenablePresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(unopenableUrl.map { "Nothing here answers to \($0)." }
+                ?? "That link doesn't name a document on this device.")
+        }
         .statusNotice()
         #endif
+    }
+
+    private var unopenablePresented: Binding<Bool> {
+        Binding(get: { unopenableUrl != nil }, set: { if !$0 { unopenableUrl = nil } })
     }
 
     private var incomingContentBinding: Binding<IncomingContent?> {
@@ -604,8 +640,13 @@ struct ContentView: View {
         case .note(let url):
             Task { await openDispatched(url) }
         case .folder(let url):
-            Task { await model.selectFolder(url) }
-            openFolder(url)
+            Task {
+                if await model.selectFolder(url) {
+                    openFolder(url)
+                } else {
+                    unopenableUrl = url
+                }
+            }
         case .calendar(let day, let item):
             AgendaStore.shared.focusItem = item
             AgendaStore.shared.focusDay = day.map { Calendar.current.startOfDay(for: $0) }
@@ -658,12 +699,20 @@ struct ContentView: View {
         if let known = model.node(for: url)?.kind {
             kind = known
         } else {
-            kind = await model.documentKind(for: url)
+            do {
+                kind = try await model.documentKind(for: url)
+            } catch {
+                unopenableUrl = url
+                return
+            }
         }
         NotesModel.selectLog("kind resolved \(kind ?? "nil")")
         switch kind {
         case "folder":
-            await model.selectFolder(url)
+            guard await model.selectFolder(url) else {
+                unopenableUrl = url
+                return
+            }
             openFolder(url)
         case "lush:script":
             #if os(macOS)
@@ -1014,6 +1063,8 @@ struct ContentView: View {
             case .calendar:
                 tags.append(Agenda.sidebarTag)
                 tags.append(NotesMap.sidebarTag)
+            case .recents:
+                tags.append(Self.recentsTag)
             case .pinned:
                 if pinnedExpanded {
                     tags += model.pinnedNodes.map { "pinned:\($0.url)" }
@@ -1100,6 +1151,13 @@ struct ContentView: View {
                 .listRowInsets(sidebarRowInsets(depth: 0))
                 .listRowBackground(
                     selectionBackground(url: NotesMap.sidebarTag, tag: NotesMap.sidebarTag)
+                )
+        case .recents:
+            recentsRow
+                .modifier(SectionDragReorder(section: .recents, order: $sectionOrder))
+                .listRowInsets(sidebarRowInsets(depth: 0))
+                .listRowBackground(
+                    selectionBackground(url: Self.recentsTag, tag: Self.recentsTag)
                 )
         case .pinned:
             if !model.pinnedNodes.isEmpty {
@@ -1233,8 +1291,36 @@ struct ContentView: View {
             .listRowInsets(sidebarRowInsets(depth: 0))
     }
 
+    private var recentsRow: some View {
+        Label("Recents", systemImage: "clock")
+            .font(.title3.weight(.medium))
+            .foregroundStyle(.primary)
+            .lineLimit(1)
+            .padding(.top, 8)
+            .padding(.bottom, 5)
+            .padding(.trailing, sidebarTrailingGutter)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded {
+                selectSidebarRow(Self.recentsTag)
+            })
+            .contextMenu {
+                Button {
+                    MainWindowTabs.open(selection: Self.recentsTag, using: openWindow)
+                } label: {
+                    Label("Open in New Tab", systemImage: "plus.square.on.square")
+                }
+            }
+            .tag(Self.recentsTag)
+            .listRowInsets(sidebarRowInsets(depth: 0))
+    }
+
     private var calendarSelected: Bool {
         selectedItemUrls.count == 1 && selectedItemUrls.first == Agenda.sidebarTag
+    }
+
+    private var recentsSelected: Bool {
+        selectedItemUrls.count == 1 && selectedItemUrls.first == Self.recentsTag
     }
 
     private var meetingNotesSelected: Bool {
@@ -1664,6 +1750,18 @@ struct ContentView: View {
         tag.contains("\u{1}") || tag.hasPrefix("pinned:") || tag.hasPrefix("smarthit:")
     }
 
+    /// Rows that stand for a screen rather than a document: they never resolve
+    /// to a url, and nothing that expects one should try.
+    nonisolated private static func isPseudoTag(_ tag: String) -> Bool {
+        tag.hasPrefix("smart:")
+            || tag == Agenda.sidebarTag
+            || tag == Agenda.meetingNotesTag
+            || tag == NotesMap.sidebarTag
+            || tag == recentsTag
+    }
+
+    nonisolated static let recentsTag = "lush:recents"
+
     nonisolated private static func sidebarUrl(_ tag: String) -> String {
         if tag.hasPrefix("pinned:") { return String(tag.dropFirst(7)) }
         if let sep = tag.lastIndex(of: "\u{1}") { return String(tag[tag.index(after: sep)...]) }
@@ -1942,39 +2040,8 @@ struct ContentView: View {
             }
     }
 
-    private var rightSidebarDivider: some View {
-        Color.clear
-            .frame(width: 10)
-            .overlay {
-                Rectangle()
-                    .fill(Color(nsColor: .separatorColor))
-                    .frame(width: 1)
-            }
-            .contentShape(Rectangle())
-            .onHover { inside in
-                if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
-            }
-            .gesture(
-                DragGesture(minimumDistance: 0, coordinateSpace: .global)
-                    .onChanged { drag in
-                        let start = rightSidebarDragStart ?? rightSidebarWidth
-                        rightSidebarDragStart = start
-                        rightSidebarLiveWidth = min(1100, max(240, (start - drag.translation.width).rounded()))
-                    }
-                    .onEnded { _ in
-                        rightSidebarDragStart = nil
-                        if let width = rightSidebarLiveWidth { rightSidebarWidth = width }
-                        rightSidebarLiveWidth = nil
-                    }
-            )
-    }
-
     private func documentUrl(in selection: Set<String>) -> String? {
-        guard selection.count == 1, let tag = selection.first,
-              !tag.hasPrefix("smart:"),
-              tag != Agenda.sidebarTag,
-              tag != Agenda.meetingNotesTag,
-              tag != NotesMap.sidebarTag
+        guard selection.count == 1, let tag = selection.first, !Self.isPseudoTag(tag)
         else { return nil }
         let url = Self.sidebarUrl(tag)
         guard url.hasPrefix("automerge:") else { return nil }
@@ -1986,6 +2053,7 @@ struct ContentView: View {
         if tag == Agenda.sidebarTag { return "Calendar" }
         if tag == Agenda.meetingNotesTag { return "Meeting Notes" }
         if tag == NotesMap.sidebarTag { return "Map" }
+        if tag == Self.recentsTag { return "Recents" }
         if tag.hasPrefix("smart:") {
             return model.smartNotebook(id: String(tag.dropFirst(6)))?.name ?? "Smart Notebook"
         }
@@ -2012,16 +2080,24 @@ struct ContentView: View {
                     AgendaScreen { open($0) }
                 } else if mapSelected {
                     NotesMapScreen { open($0) }
+                } else if recentsSelected {
+                    RecentsPane { open($0) }
                 } else if let url = selectedDocumentUrl {
                     detailContent(for: url)
                 } else {
                     Color.clear
                 }
             }
-            .frame(minWidth: 360, maxWidth: .infinity)
-
-            if rightSidebarVisible, let url = selectedDocumentUrl {
-                rightSidebarDivider
+        }
+        .frame(maxWidth: .infinity)
+        // A real inspector, so it collapses the way the sidebar does — AppKit
+        // holds the editor's place through it, which a plain pane beside it
+        // did not.
+        .inspector(isPresented: Binding(
+            get: { rightSidebarVisible && selectedDocumentUrl != nil },
+            set: { rightSidebarVisible = $0 }
+        )) {
+            if let url = selectedDocumentUrl {
                 RightSidebarView(
                     url: url,
                     node: model.node(for: url),
@@ -2029,7 +2105,9 @@ struct ContentView: View {
                     selectedEntry: $selectedHistoryEntry
                 )
                 .environment(model)
-                .frame(width: CGFloat(rightSidebarLiveWidth ?? rightSidebarWidth))
+                // No min: a floor here becomes part of the window's own
+                // minimum width, whether or not the inspector is showing.
+                .inspectorColumnWidth(ideal: rightSidebarWidth)
             }
         }
         .navigationTitle("")
@@ -2241,8 +2319,7 @@ struct ContentView: View {
             return
         }
         let identity: String
-        if tag.hasPrefix("smart:") || tag == Agenda.sidebarTag || tag == Agenda.meetingNotesTag
-            || tag == NotesMap.sidebarTag {
+        if Self.isPseudoTag(tag) {
             identity = tag
         } else {
             identity = Self.sidebarUrl(tag)
@@ -2266,11 +2343,7 @@ struct ContentView: View {
         sidebarHistoryIndex = index
         let entry = sidebarHistory[index]
         let tag: String
-        if visibleSidebarRowTags.contains(entry.tag)
-            || entry.tag.hasPrefix("smart:")
-            || entry.tag == Agenda.sidebarTag
-            || entry.tag == Agenda.meetingNotesTag
-            || entry.tag == NotesMap.sidebarTag {
+        if visibleSidebarRowTags.contains(entry.tag) || Self.isPseudoTag(entry.tag) {
             tag = entry.tag
         } else if entry.identity.hasPrefix("automerge:") {
             tag = rowTag(for: entry.identity)
@@ -3567,6 +3640,50 @@ private extension Color {
     }
 }
 
+#if os(iOS)
+/// The inspector rides the same rails as the format panel: a glass island over
+/// the editor rather than a sheet, so the text stays put behind it and the
+/// keyboard keeps its place.
+struct InspectorIsland: View {
+    let url: String
+    let node: FolderNode?
+    @Binding var tab: RightSidebarTab
+    @Binding var entry: DocHistoryEntry?
+    let close: () -> Void
+
+    @Environment(NotesModel.self) private var model
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("Inspector").uiFont(.headline)
+                Spacer()
+                Button(action: close) {
+                    Image(systemName: "xmark.circle.fill")
+                        .uiFont(.title3)
+                        .foregroundStyle(Color.secondary, Color(.systemFill))
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close Inspector")
+            }
+            .padding(.leading, 18)
+            .padding(.trailing, 4)
+            .frame(height: 52)
+
+            Divider()
+            RightSidebarView(url: url, node: node, selectedTab: $tab, selectedEntry: $entry)
+                .environment(model)
+        }
+        .frame(maxWidth: 440)
+        .frame(height: 460)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .padding(12)
+    }
+}
+#endif
+
 struct RightSidebarView: View {
     let url: String
     let node: FolderNode?
@@ -3623,7 +3740,9 @@ struct RightSidebarView: View {
                 ContextToolsView(url: url)
             }
         }
+        #if os(macOS)
         .background(.regularMaterial)
+        #endif
         .task(id: url) {
             selectedEntry = nil
             await refreshHistory()
@@ -4341,7 +4460,6 @@ private extension Array {
     }
 }
 
-#if os(macOS)
 private struct HistoricalNoteSnapshotView: View {
     let noteUrl: String
     let entry: DocHistoryEntry
@@ -4418,7 +4536,31 @@ private struct HistorySnapshotTextView: NSViewRepresentable {
         }
     }
 }
-#endif
+#else
+private struct HistorySnapshotTextView: UIViewRepresentable {
+    let attributed: NSAttributedString
+
+    func makeCoordinator() -> ListMarkerLayoutDelegate {
+        ListMarkerLayoutDelegate()
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView(usingTextLayoutManager: true)
+        textView.textLayoutManager?.delegate = context.coordinator
+        textView.textLayoutManager?.renderingAttributesValidator = CodeHighlight.applyRenderingAttributes
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.backgroundColor = .clear
+        textView.textContainerInset = UIEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+        return textView
+    }
+
+    func updateUIView(_ textView: UITextView, context: Context) {
+        if textView.attributedText != attributed {
+            textView.attributedText = attributed
+        }
+    }
+}
 #endif
 
 /// One burst of activity: consecutive changes no more than 60 s apart,
@@ -4544,9 +4686,22 @@ struct NoteDetail: View {
     @State private var showingInspector = false
     @State private var inspectorTab: RightSidebarTab = .info
     @State private var inspectorHistoryEntry: DocHistoryEntry?
+    /// UndoManager isn't observable, so the toolbar's enablement is mirrored
+    /// here and refreshed from the manager's own notifications.
+    @State private var canUndo = false
+    @State private var canRedo = false
     #endif
 
     private var currentNode: FolderNode? { model.node(for: noteUrl) }
+
+    private func refreshUndoState() {
+        #if os(iOS)
+        let undo = editor.undoManager?.canUndo == true || model.undoManager.canUndo
+        let redo = editor.undoManager?.canRedo == true || model.undoManager.canRedo
+        if canUndo != undo { canUndo = undo }
+        if canRedo != redo { canRedo = redo }
+        #endif
+    }
 
     @ViewBuilder
     private var minimapOverlay: some View {
@@ -4723,20 +4878,22 @@ struct NoteDetail: View {
                 } else {
                     model.undoManager.undo()
                 }
+                refreshUndoState()
             } label: {
                 Label("Undo", systemImage: "arrow.uturn.backward")
             }
-            .disabled(editor.undoManager?.canUndo != true && !model.undoManager.canUndo)
+            .disabled(!canUndo)
             Button {
                 if editor.undoManager?.canRedo == true {
                     editor.redo()
                 } else {
                     model.undoManager.redo()
                 }
+                refreshUndoState()
             } label: {
                 Label("Redo", systemImage: "arrow.uturn.forward")
             }
-            .disabled(editor.undoManager?.canRedo != true && !model.undoManager.canRedo)
+            .disabled(!canRedo)
         }
         ToolbarItem(placement: .primaryAction) {
             Button {
@@ -4914,8 +5071,13 @@ struct NoteDetail: View {
                     .toolbarScrollFade()
             }
             #else
-            RichTextEditor(noteUrl: noteUrl, model: model, controller: editor, contextTracker: contextTracker)
-                .toolbarScrollFade()
+            if let entry = inspectorHistoryEntry {
+                HistoricalNoteSnapshotView(noteUrl: noteUrl, entry: entry)
+                    .environment(model)
+            } else {
+                RichTextEditor(noteUrl: noteUrl, model: model, controller: editor, contextTracker: contextTracker)
+                    .toolbarScrollFade()
+            }
             #endif
         }
         .focusedSceneValue(\.editorController, editor)
@@ -5030,23 +5192,32 @@ struct NoteDetail: View {
         )) {
             CameraPicker(onCapture: handleCapturedImage)
         }
-        .sheet(isPresented: $showingInspector) {
-            RightSidebarView(
-                url: noteUrl,
-                node: currentNode,
-                selectedTab: $inspectorTab,
-                selectedEntry: $inspectorHistoryEntry
-            )
-            .environment(model)
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
-            .presentationBackgroundInteraction(.enabled(upThrough: .medium))
-            .interactiveDismissDisabled(model.pads.drawing)
-        }
         .overlay(alignment: .bottom) { formatIsland }
+        .overlay(alignment: .bottom) {
+            if showingInspector {
+                InspectorIsland(
+                    url: noteUrl,
+                    node: currentNode,
+                    tab: $inspectorTab,
+                    entry: $inspectorHistoryEntry,
+                    close: { showingInspector = false }
+                )
+                .environment(model)
+            }
+        }
         .onChange(of: editor.formatVisible) { _, visible in
             if visible { showingInspector = false }
         }
+        .onChange(of: showingInspector) { _, visible in
+            if visible {
+                editor.formatVisible = false
+            } else {
+                // Closing the inspector leaves the scrub behind: the note goes
+                // back to live rather than staying frozen at a version.
+                inspectorHistoryEntry = nil
+            }
+        }
+        .onChange(of: noteUrl) { inspectorHistoryEntry = nil }
         #else
         noteEditorBase
         #endif
@@ -5055,6 +5226,7 @@ struct NoteDetail: View {
     private var noteEditorBase: some View {
         editorStack
         .toolbar { noteToolbar }
+        .modifier(UndoStateTracking(refresh: refreshUndoState))
         .task(id: noteUrl) { joinPresence() }
         .onChange(of: model.sharingPresence) { _, enabled in
             if enabled {
@@ -5070,6 +5242,10 @@ struct NoteDetail: View {
         )) { sheet in
             EditorSheetView(sheet: sheet, controller: editor)
         }
+        .mediaPreview(Binding(
+            get: { editor.previewFile },
+            set: { editor.previewFile = $0 }
+        ))
         .alert("Rename", isPresented: $showingRename) {
             TextField("Name", text: $renameText)
             Button("Save") {
@@ -5084,6 +5260,35 @@ struct NoteDetail: View {
         .sheet(item: $moveTarget) { target in
             MoveSheet(urls: target.urls).environment(model)
         }
+    }
+}
+
+/// An UndoManager publishes no observable state, so a view that draws its
+/// buttons has to listen for the manager's own notifications instead. Not
+/// `NSUndoManagerCheckpoint`: asking a manager what it can do posts one, so an
+/// observer that answers by asking never stops.
+private struct UndoStateTracking: ViewModifier {
+    let refresh: () -> Void
+
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content
+            .onAppear(perform: refresh)
+            .onReceive(NotificationCenter.default.publisher(for: .NSUndoManagerDidUndoChange)) { _ in
+                refresh()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .NSUndoManagerDidRedoChange)) { _ in
+                refresh()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .NSUndoManagerDidOpenUndoGroup)) { _ in
+                refresh()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .NSUndoManagerDidCloseUndoGroup)) { _ in
+                refresh()
+            }
+        #else
+        content
+        #endif
     }
 }
 
@@ -5348,6 +5553,14 @@ private struct FindBar: View {
                 .textFieldStyle(.plain)
                 .focused($focused)
                 .onSubmit { controller.findNext() }
+                .onKeyPress(keys: [.return]) { press in
+                    if press.modifiers.contains(.shift) {
+                        controller.findPrevious()
+                    } else {
+                        controller.findNext()
+                    }
+                    return .handled
+                }
                 .onChange(of: controller.findQuery) { controller.findQueryChanged() }
             if !controller.findQuery.isEmpty {
                 Text(controller.findMatchCount == 0 ? "0" : "\(controller.findIndex)/\(controller.findMatchCount)")
@@ -5461,6 +5674,7 @@ private struct DragPreviewView: View {
 
 enum SidebarSection: String, CaseIterable, Hashable {
     case calendar
+    case recents
     case pinned
     case smart
     case notebooks
@@ -5470,16 +5684,23 @@ enum SidebarSection: String, CaseIterable, Hashable {
     var title: String {
         switch self {
         case .calendar: "Calendar"
+        case .recents: "Recents"
         case .pinned: "Pinned"
         case .smart: "Smart Notebooks"
         case .notebooks: "Notebooks"
         }
     }
 
+    /// A section the saved order predates takes the place it has in `allCases`
+    /// rather than falling to the bottom of the sidebar.
     static func load() -> [SidebarSection] {
         let saved = (UserDefaults.standard.stringArray(forKey: orderKey) ?? [])
             .compactMap(SidebarSection.init(rawValue:))
-        return saved + allCases.filter { !saved.contains($0) }
+        var order = saved
+        for (index, section) in allCases.enumerated() where !saved.contains(section) {
+            order.insert(section, at: min(index, order.count))
+        }
+        return order
     }
 
     static func save(_ order: [SidebarSection]) {
@@ -6328,6 +6549,7 @@ struct PatchworkDetail: View {
                         } label: {
                             Image(systemName: "chevron.down")
                         }
+                        .menuIndicator(.hidden)
                         .disabled(tools.isEmpty)
                     }
                 }
@@ -6373,18 +6595,17 @@ struct PatchworkDetail: View {
             )
         }
         #if os(iOS)
-        .sheet(isPresented: $showingInspector) {
-            RightSidebarView(
-                url: docUrl,
-                node: model.node(for: docUrl),
-                selectedTab: $inspectorTab,
-                selectedEntry: $inspectorHistoryEntry
-            )
-            .environment(model)
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
-            .presentationBackgroundInteraction(.enabled(upThrough: .medium))
-            .interactiveDismissDisabled(model.pads.drawing)
+        .overlay(alignment: .bottom) {
+            if showingInspector {
+                InspectorIsland(
+                    url: docUrl,
+                    node: model.node(for: docUrl),
+                    tab: $inspectorTab,
+                    entry: $inspectorHistoryEntry,
+                    close: { showingInspector = false }
+                )
+                .environment(model)
+            }
         }
         #endif
     }

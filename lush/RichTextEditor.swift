@@ -122,6 +122,8 @@ final class EditorController {
     var recorderVisible = false
     var liveTranscriptionActive = false
     var sheet: EditorSheet?
+    /// A plain file attachment handed to the system viewer.
+    var previewFile: URL?
     var findVisible = false
     var findQuery = ""
     var replaceVisible = false
@@ -327,6 +329,22 @@ final class EditorController {
             fileExtension: "m4a",
             mime: "audio/mp4"
         )
+    }
+
+    /// The asset on disk, written out on demand, so the system media viewer
+    /// has a file to open.
+    func assetFile(_ url: String, name: String = "attachment") async -> URL? {
+        guard let core else { return nil }
+        if let file = core.cache.fileURLs[url] { return file }
+        guard let data = await core.model.assetBytes(url) else { return nil }
+        let info = await core.model.assetInfo(url)
+        let file = AssetCache.mediaFile(
+            for: url,
+            name: EditorCore.previewFilename(info: info, fallback: name, data: data),
+            data: data
+        )
+        core.cache.fileURLs[url] = file
+        return file
     }
 
     func assetVision(_ url: String) async -> AssetVision? {
@@ -732,6 +750,9 @@ final class EditorCore: LiveWriter {
         folding.refresh(storage: layoutStorage)
         inline.resetHosts()
         attachViewToSharedStorage()
+        // One scroll view serves every note, so without this the note opens at
+        // wherever the last one was left.
+        noteView?.pScrollToY(0)
         autoLoglineCheckedNoteUrl = nil
         load()
         NotesModel.selectLog("editor switchTo end")
@@ -1281,6 +1302,9 @@ final class EditorCore: LiveWriter {
         let location = min(view.pSelectedRange.location, layoutStorage.length)
         view.pSelectedRange = NSRange(location: location, length: 0)
         refreshFormattingState()
+        // Nothing rebuilt the storage on this path, so the inspectors — the
+        // outline especially — would still be showing the note she left.
+        controller.docVersion &+= 1
     }
 
     /// Put the caret back where it was the last time this note was open, and
@@ -1561,6 +1585,34 @@ final class EditorCore: LiveWriter {
             #endif
             cache.videoThumbs[url] = PImage.playBadged(poster)
         }
+    }
+
+    /// Quick Look picks its viewer from the extension, and an image's name is
+    /// never cached — only its decoded bitmap is — so a bare "Image" gets
+    /// handed to whatever generator claims untyped data. Work an extension out
+    /// from the asset's own metadata, then from the bytes.
+    static func previewFilename(info: AssetInfo?, fallback: String, data: Data) -> String {
+        let base = info?.name.isEmpty == false ? info!.name : fallback
+        guard (base as NSString).pathExtension.isEmpty else { return base }
+        let fromMime = info.flatMap { UTType(mimeType: $0.mimeType)?.preferredFilenameExtension }
+        let candidates = [info?.extension, fromMime, sniffedExtension(data)]
+        guard let ext = candidates.compactMap({ $0 }).first(where: { !$0.isEmpty }) else { return base }
+        return "\(base).\(ext)"
+    }
+
+    private static func sniffedExtension(_ data: Data) -> String? {
+        let bytes = [UInt8](data.prefix(12))
+        guard bytes.count == 12 else { return nil }
+        if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return "jpg" }
+        if bytes.starts(with: [0x47, 0x49, 0x46]) { return "gif" }
+        if bytes.starts(with: [0x25, 0x50, 0x44, 0x46]) { return "pdf" }
+        if bytes.starts(with: [0x52, 0x49, 0x46, 0x46]) { return "webp" }
+        if Array(bytes[4..<8]) == [0x66, 0x74, 0x79, 0x70] {
+            let brand = String(bytes: bytes[8..<12], encoding: .ascii) ?? ""
+            return brand.hasPrefix("hei") || brand.hasPrefix("mif") ? "heic" : "mp4"
+        }
+        return nil
     }
 
     /// TextKit builds an attachment's view provider while drawing, but only
@@ -3009,8 +3061,8 @@ final class EditorCore: LiveWriter {
     func updateFindMatches(resetIndex: Bool = true) {
         guard let view, let storage = view.pStorage else { return }
         let query = controller.findQuery
-        let previousMatches = rendering.findMatches
         let previousCurrent = rendering.currentFindMatch
+        let previousMatches = rendering.findMatches
         rendering.findMatches = controller.findVisible && !query.isEmpty
             ? allRanges(of: query, in: storage.string)
             : []
@@ -3103,6 +3155,7 @@ final class EditorCore: LiveWriter {
         rendering.globalMatches = query.count >= 2
             ? allRanges(of: query, in: storage.string)
             : []
+        guard previous != rendering.globalMatches else { return }
         invalidateRendering(ranges: previous + rendering.globalMatches)
     }
 
@@ -3154,6 +3207,11 @@ final class EditorCore: LiveWriter {
                   let textRange = contentManager.textRange(for: clipped)
             else { continue }
             textLayoutManager.invalidateRenderingAttributes(for: textRange)
+            // The fragments paint the highlights themselves, so stale rendering
+            // attributes are not what keeps an old match painted — an unchanged
+            // fragment is never redrawn. Invalidating its layout is what marks
+            // it dirty.
+            textLayoutManager.invalidateLayout(for: textRange)
         }
         renderInvalidated()
     }
@@ -3526,6 +3584,11 @@ final class EditorCore: LiveWriter {
 
     func setHighlight(_ name: String?) {
         applyMark("highlight", value: name.map { .string($0) })
+    }
+
+    func openNote(_ url: URL) {
+        model.pendingFocusUrl = url.absoluteString
+        AppRouter.shared.pending = .note(url.absoluteString)
     }
 
     func setLink(_ url: String?) {
@@ -4151,7 +4214,16 @@ final class EditorCore: LiveWriter {
         }
         let name = cache.names[url] ?? "attachment"
         let kind = AssetCache.kind(forName: name)
-        guard kind == "audio" || kind == "video" else { return false }
+        guard kind == "audio" || kind == "video" else {
+            // No inspector for a plain file — hand it straight to the system
+            // viewer, the same place the other attachments' expand button goes.
+            guard !cache.patchworkDocs.contains(url) else { return false }
+            Task { [weak self] in
+                guard let self else { return }
+                self.controller.previewFile = await self.controller.assetFile(url, name: name)
+            }
+            return true
+        }
         Task { [weak self] in
             guard let self else { return }
             var fileURL = self.cache.fileURLs[url]
@@ -5547,6 +5619,9 @@ struct RichTextEditor: NSViewRepresentable {
         context.coordinator.markers.foldedHeadingsProvider = { [weak core = context.coordinator.core] in
             core?.folding.foldedHeadings ?? []
         }
+        context.coordinator.markers.highlightProvider = { [weak core = context.coordinator.core] in
+            core?.rendering.highlights ?? []
+        }
         textView.textContainer?.widthTracksTextView = true
         textView.isRichText = true
         // image-only pasteboards (screenshots) otherwise fail paste
@@ -6166,6 +6241,9 @@ struct RichTextEditor: UIViewRepresentable {
         context.coordinator.markers.foldedHeadingsProvider = { [weak core = context.coordinator.core] in
             core?.folding.foldedHeadings ?? []
         }
+        context.coordinator.markers.highlightProvider = { [weak core = context.coordinator.core] in
+            core?.rendering.highlights ?? []
+        }
         textView.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         textView.typingAttributes = RichText.attributes(block: .paragraph, marks: [:])
         textView.linkTextAttributes = [
@@ -6400,14 +6478,56 @@ struct RichTextEditor: UIViewRepresentable {
 
         func textView(
             _ textView: UITextView,
-            shouldInteractWith url: URL,
-            in characterRange: NSRange,
-            interaction: UITextItemInteraction
-        ) -> Bool {
-            guard url.scheme == "automerge" else { return true }
-            core.model.pendingFocusUrl = url.absoluteString
-            AppRouter.shared.pending = .note(url.absoluteString)
-            return false
+            primaryActionFor textItem: UITextItem,
+            defaultAction: UIAction
+        ) -> UIAction? {
+            guard case .link(let url) = textItem.content, url.scheme == "automerge" else {
+                return defaultAction
+            }
+            return UIAction { [core] _ in core.openNote(url) }
+        }
+
+        func textView(
+            _ textView: UITextView,
+            menuConfigurationFor textItem: UITextItem,
+            defaultMenu: UIMenu
+        ) -> UITextItem.MenuConfiguration? {
+            guard case .link(let url) = textItem.content, url.scheme == "automerge" else {
+                return UITextItem.MenuConfiguration(menu: defaultMenu)
+            }
+            let doc = url.absoluteString
+            let open = UIMenu(options: .displayInline, children: [
+                UIAction(title: "Open", image: UIImage(systemName: "doc.text")) { [core] _ in
+                    core.openNote(url)
+                },
+                UIAction(title: "Open in Patchwork", image: UIImage(systemName: "square.grid.2x2")) { [core] _ in
+                    core.model.openInPatchwork(doc)
+                },
+            ])
+            let copy = UIMenu(options: .displayInline, children: [
+                UIAction(title: "Copy Link", image: UIImage(systemName: "link")) { _ in
+                    Clipboard.copy(doc)
+                },
+                UIAction(title: "Copy Lush Link") { _ in
+                    Clipboard.copy(lushLink(for: doc))
+                },
+                UIAction(title: "Copy Patchwork Link") { _ in
+                    Clipboard.copy(NotesModel.patchworkUrl(for: doc))
+                },
+            ])
+            let edit = UIMenu(options: .displayInline, children: [
+                UIAction(title: "Edit Link", image: UIImage(systemName: "pencil")) { [core] _ in
+                    self.select(textItem, in: textView)
+                    core.controller.editLink()
+                },
+            ])
+            return UITextItem.MenuConfiguration(menu: UIMenu(children: [open, copy, edit]))
+        }
+
+        private func select(_ textItem: UITextItem, in textView: UITextView) {
+            if !textView.isFirstResponder { textView.becomeFirstResponder() }
+            textView.selectedRange = textItem.range
+            core.refreshFormattingState()
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -6536,7 +6656,30 @@ struct FormatAccessoryBar: View {
                     }
                     .accessibilityLabel("Highlight")
                     .accessibilityValue(controller.highlightActive?.capitalized ?? "None")
-                    barButton("list.bullet", label: "Bulleted List") { controller.applyStyle("unordered-list-item") }
+                    // Tap makes a bulleted list; hold to reach the other two.
+                    Menu {
+                        Button {
+                            controller.applyStyle("unordered-list-item")
+                        } label: {
+                            Label("Bulleted List", systemImage: "list.bullet")
+                        }
+                        Button {
+                            controller.applyStyle("ordered-list-item")
+                        } label: {
+                            Label("Numbered List", systemImage: "list.number")
+                        }
+                        Button {
+                            controller.applyStyle("todo-list-item")
+                        } label: {
+                            Label("To-do List", systemImage: "checklist")
+                        }
+                    } label: {
+                        Image(systemName: "list.bullet")
+                            .foregroundStyle(listActive ? Color.accentColor : Color.primary)
+                    } primaryAction: {
+                        controller.applyStyle("unordered-list-item")
+                    }
+                    .accessibilityLabel("List")
                     barButton("decrease.indent", label: "Decrease Indent") { controller.outdentBlock() }
                     barButton("increase.indent", label: "Increase Indent") { controller.indentBlock() }
                 }
@@ -6559,6 +6702,11 @@ struct FormatAccessoryBar: View {
         .glassEffect(.regular, in: Capsule())
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
+    }
+
+    private var listActive: Bool {
+        ["unordered-list-item", "ordered-list-item", "todo-list-item"]
+            .contains(controller.currentStyleKey)
     }
 
     private func barButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {

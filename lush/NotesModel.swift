@@ -862,16 +862,21 @@ final class NotesModel {
         }
     }
 
-    func selectFolder(_ url: String?) async {
-        guard let url else { return }
+    /// False when the url isn't a folder this device can open, so a caller
+    /// about to navigate there can say so instead.
+    @discardableResult
+    func selectFolder(_ url: String?) async -> Bool {
+        guard let url else { return false }
         selectedNoteUrl = nil
-        guard let core else { return }
+        guard let core else { return false }
         do {
             _ = try await Task.detached { try core.ensureFolder(existingUrl: url) }.value
             folderUrl = url
             refreshNotes()
+            return true
         } catch {
             status = "Couldn't open folder: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -2365,12 +2370,15 @@ final class NotesModel {
         ExternalBrowser.open(url)
     }
 
-    func documentKind(for url: String) async -> String? {
+    /// Throws when the url doesn't name a document this device can open — a
+    /// mistyped deep link, or a doc no peer has. Opening an editor onto that is
+    /// worse than saying so.
+    func documentKind(for url: String) async throws -> String? {
         if core == nil {
             await start()
         }
         guard let core else { return nil }
-        return try? await core.documentKind(url: url)
+        return try await core.documentKind(url: url)
     }
 
     func rememberPatchworkDocument(_ url: String) {
@@ -2654,7 +2662,6 @@ final class NotesModel {
         return snapshot
     }
 
-    #if os(macOS)
     func renderedSnapshot(for url: String, heads: [String]) async -> NSAttributedString {
         if !heads.isEmpty {
             let key = HistorySnapshotKey(url: url, heads: heads)
@@ -2757,7 +2764,6 @@ final class NotesModel {
         }
         return marked
     }
-    #endif
 
     func revertNote(_ url: String, to heads: [String]) async {
         let snapshot = await spansSnapshot(for: url, heads: heads)
@@ -4574,14 +4580,54 @@ final class NotesModel {
 
 private final class DelegateBridge: CoreDelegate {
     nonisolated(unsafe) private weak var model: NotesModel?
+    private let lock = NSLock()
+    nonisolated(unsafe) private var pendingDocs: [String] = []
+    nonisolated(unsafe) private var pendingDocSet: Set<String> = []
+    nonisolated(unsafe) private var pendingEvents: [String] = []
+    nonisolated(unsafe) private var flushScheduled = false
 
     init(model: NotesModel) {
         self.model = model
     }
 
-    func onDocChanged(url: String) {
+    /// Sync can announce the same handful of docs hundreds of times a second.
+    /// One main-actor hop per announcement is what makes that a hang, so the
+    /// bridge buffers off the main actor and delivers a deduplicated batch.
+    private func enqueue(_ work: (inout [String], inout Set<String>, inout [String]) -> Void) {
+        lock.lock()
+        work(&pendingDocs, &pendingDocSet, &pendingEvents)
+        if pendingEvents.count > 200 {
+            pendingEvents.removeFirst(pendingEvents.count - 200)
+        }
+        let schedule = !flushScheduled
+        flushScheduled = true
+        lock.unlock()
+        guard schedule else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(50))
+            self?.flush()
+        }
+    }
+
+    private func flush() {
+        lock.lock()
+        let docs = pendingDocs
+        let events = pendingEvents
+        pendingDocs = []
+        pendingDocSet = []
+        pendingEvents = []
+        flushScheduled = false
+        lock.unlock()
+        guard !docs.isEmpty || !events.isEmpty else { return }
         Task { @MainActor [model] in
-            model?.docChanged(url: url)
+            for message in events { model?.appendSyncEvent(message) }
+            for url in docs { model?.docChanged(url: url) }
+        }
+    }
+
+    func onDocChanged(url: String) {
+        enqueue { docs, seen, _ in
+            if seen.insert(url).inserted { docs.append(url) }
         }
     }
 
@@ -4599,9 +4645,7 @@ private final class DelegateBridge: CoreDelegate {
     }
 
     func onSyncEvent(message: String) {
-        Task { @MainActor [model] in
-            model?.appendSyncEvent(message)
-        }
+        enqueue { _, _, events in events.append(message) }
     }
 
     func onEphemeralMessage(url: String, payload: Data) {

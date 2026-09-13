@@ -256,7 +256,17 @@ async function boot() {
         }
       }
       toolId ??= firstToolFor(type);
-      if (toolId && view.isConnected) view.setAttribute("tool-id", toolId);
+      if (toolId && view.isConnected) {
+        view.setAttribute("tool-id", toolId);
+        // the selection was published before the tool was known; republish so
+        // `patchwork:selected-view` names the tool that actually rendered
+        view.dispatchEvent(
+          new CustomEvent("patchwork:open-document", {
+            detail: { url: docUrl, toolId },
+            bubbles: true,
+          }),
+        );
+      }
     }
     if (!view.isConnected) return;
     const descriptors = getSupportedToolsForType(type) ?? [];
@@ -280,6 +290,10 @@ async function boot() {
   // around the tree answers the overlay's `draft:checked-out`
   // subscription with it, standing in for patchwork's draft-list
   // provider, so per-member checkpoint pins apply while scrubbing.
+  // The view also sits under patchwork's selected-doc provider, which
+  // answers `patchwork:selected-doc` / `patchwork:selected-view` with the
+  // embedded doc — the same shape the context-tool panel mounts, so a tool
+  // that asks which document it is about gets an answer in either place.
   window.setDoc = async (docUrl, toolId, draftUrl, checkoutUrl, backingUrl) => {
     if (!docUrl) {
       window.setOverlay = undefined;
@@ -292,8 +306,18 @@ async function boot() {
     const view = document.createElement("patchwork-view");
     if (toolId) view.setAttribute("tool-id", toolId);
     view.setAttribute("doc-url", docUrl);
+    // the provider seeds its selection from `#doc=` when it loads, so set
+    // the hash before mounting it; the event below covers a provider that
+    // was already listening
+    location.hash = `doc=${docUrl}`;
+    const selectedDocProvider = document.createElement("patchwork-view");
+    selectedDocProvider.setAttribute(
+      "component",
+      "patchwork-selected-doc-provider",
+    );
+    selectedDocProvider.appendChild(view);
     const remapper = docRemapper(docUrl, backingUrl ?? null);
-    remapper.element.appendChild(view);
+    remapper.element.appendChild(selectedDocProvider);
     const provider = document.createElement("repo-provider");
     if (draftUrl || checkoutUrl) {
       const overlay = document.createElement("patchwork-view");
@@ -322,6 +346,11 @@ async function boot() {
       remapper.set(next ?? null);
     };
     document.body.replaceChildren(mountRoot);
+    selectedDocProvider.dispatchEvent(
+      new CustomEvent("patchwork:open-document", {
+        detail: { url: docUrl, toolId: toolId ?? null },
+      }),
+    );
     // Pulse until the tool actually renders something (content may live in
     // a shadow root, so poll rather than observe). A superseded view stops
     // its timers without touching the class — the newer setDoc owns it.
@@ -467,6 +496,10 @@ function renderPicker(repo: Repo) {
   pasteRow.className = "picker-paste";
   const input = document.createElement("input");
   input.placeholder = "paste an automerge: url";
+  input.type = "url";
+  input.autocapitalize = "off";
+  input.spellcheck = false;
+  input.setAttribute("autocorrect", "off");
   const embedButton = document.createElement("button");
   embedButton.textContent = "Embed";
   const submitUrl = () => {

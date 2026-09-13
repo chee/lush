@@ -389,6 +389,26 @@ struct EditorSheetView: View {
     let controller: EditorController
 
     var body: some View {
+        content
+        #if os(iOS)
+            .presentationDetents(detents)
+            .presentationDragIndicator(.visible)
+        #endif
+    }
+
+    #if os(iOS)
+    /// A link is two fields and three buttons; a full sheet for it leaves the
+    /// content stranded in the middle of the screen.
+    private var detents: Set<PresentationDetent> {
+        switch sheet {
+        case .link: [.height(210)]
+        default: [.large]
+        }
+    }
+    #endif
+
+    @ViewBuilder
+    private var content: some View {
         switch sheet {
         case .audio(let assetUrl, let fileURL, let name):
             AudioPlayerSheet(
@@ -421,6 +441,7 @@ struct EditorSheetView: View {
                 name: name,
                 image: image,
                 altText: block.value.altText,
+                file: { await controller.assetFile(assetUrl, name: name) },
                 fetchML: { await controller.assetML(assetUrl) },
                 generateML: { await controller.generateAssetML(assetUrl: assetUrl, name: name, choice: $0) },
                 fetch: { await controller.assetVision(assetUrl) },
@@ -435,10 +456,36 @@ struct EditorSheetView: View {
     }
 }
 
+/// Every media inspector wears the same title bar: the name, and one button
+/// that hands the file to the system viewer.
+struct MediaSheetHeader: View {
+    let name: String
+    let file: () async -> URL?
+    @Binding var previewURL: URL?
+    var beforeExpand: () -> Void = {}
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(name)
+                .uiFont(.headline)
+                .lineLimit(1)
+            Button {
+                beforeExpand()
+                Task { previewURL = await file() }
+            } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+            }
+            .buttonStyle(.plain)
+            .help("Open in the media viewer")
+        }
+    }
+}
+
 struct AssetInfoSheet: View {
     let name: String
     let image: PImage?
     @State var altText: String
+    let file: () async -> URL?
     let fetchML: () async -> AssetMl?
     let generateML: (ModelChoice?) async -> AssetMl?
     let fetch: () async -> AssetVision?
@@ -451,12 +498,11 @@ struct AssetInfoSheet: View {
     @State private var analyzing = false
     @State private var generatingML = false
     @State private var modelChoice: ModelChoice?
+    @State private var previewURL: URL?
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(name)
-                .uiFont(.headline)
-                .lineLimit(1)
+            MediaSheetHeader(name: name, file: file, previewURL: $previewURL)
             if let image {
                 #if os(macOS)
                 Image(nsImage: image)
@@ -549,6 +595,7 @@ struct AssetInfoSheet: View {
             }
             loaded = true
         }
+        .mediaPreview($previewURL)
         .onDisappear { saveAltText(altText) }
     }
 
@@ -610,12 +657,16 @@ struct AudioPlayerSheet: View {
     @State private var generatingML = false
     @State private var modelChoice: ModelChoice?
     @State private var editableTranscript = ""
+    @State private var previewURL: URL?
 
     var body: some View {
         VStack(spacing: 16) {
-            Text(name)
-                .uiFont(.headline)
-                .lineLimit(1)
+            MediaSheetHeader(
+                name: name,
+                file: { fileURL },
+                previewURL: $previewURL,
+                beforeExpand: { pausePlayback() }
+            )
 
             if trimming {
                 TrimWaveformView(
@@ -769,9 +820,16 @@ struct AudioPlayerSheet: View {
                 }
             }
         }
+        .mediaPreview($previewURL)
         .onDisappear {
             player?.stop()
         }
+    }
+
+    private func pausePlayback() {
+        guard playing else { return }
+        player?.pause()
+        playing = false
     }
 
     private func regenerateML() async {
@@ -840,18 +898,23 @@ struct VideoPlayerSheet: View {
     let name: String
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVPlayer?
+    @State private var previewURL: URL?
 
     var body: some View {
         VStack(spacing: 12) {
-            Text(name)
-                .uiFont(.headline)
-                .lineLimit(1)
+            MediaSheetHeader(
+                name: name,
+                file: { fileURL },
+                previewURL: $previewURL,
+                beforeExpand: { player?.pause() }
+            )
             PlatformVideoPlayer(player: player)
                 .frame(minHeight: 280)
             Button("Done") { dismiss() }
                 .keyboardShortcut(.defaultAction)
         }
         .padding(16)
+        .mediaPreview($previewURL)
         #if os(macOS)
         .frame(minWidth: 560, minHeight: 420)
         #endif
@@ -1122,6 +1185,8 @@ struct LinkSheet: View {
         .padding(16)
         #if os(macOS)
         .frame(width: 380)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         #endif
         .onAppear { focused = true }
     }

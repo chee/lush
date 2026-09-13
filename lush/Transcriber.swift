@@ -1,6 +1,6 @@
 import Foundation
 import Speech
-import AVFoundation
+@preconcurrency import AVFoundation
 
 /// On-device speech-to-text for audio attachments, stored on the asset doc
 /// so recordings show up in search.
@@ -160,6 +160,7 @@ final class LiveTranscriber {
         with converter: AVAudioConverter?
     ) -> AVAudioPCMBuffer? {
         guard let converter else { return copy(buffer) }
+        nonisolated(unsafe) let source = buffer
         let capacity = AVAudioFrameCount(
             ceil(Double(buffer.frameLength) * format.sampleRate / buffer.format.sampleRate)
         ) + 1
@@ -175,7 +176,7 @@ final class LiveTranscriber {
             }
             supplied = true
             state.pointee = .haveData
-            return buffer
+            return source
         }
         return status == .error ? nil : output
     }

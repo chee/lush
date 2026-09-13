@@ -393,6 +393,10 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
     var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
     var foldedHeadingsProvider: (() -> Set<HeadingFoldKey>)?
     var selectionProvider: (() -> (range: NSRange, color: PColor)?)?
+    /// Find matches, painted here rather than as rendering attributes: a
+    /// `.backgroundColor` rendering attribute doesn't survive this fragment's
+    /// own drawing, so the highlight never appeared.
+    var highlightProvider: (() -> [(range: NSRange, color: PColor)])?
 
     private var headingFoldKey: HeadingFoldKey? {
         guard let paragraph = textElement as? NSTextParagraph,
@@ -690,17 +694,28 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
     /// The card fill lands on top of the selection the text view painted into
     /// the background, so the fragment repaints the covered part itself.
     private func drawSelection() {
-        guard let selection = selectionProvider?(),
-              selection.range.length > 0,
-              let (_, elementStart) = storageContext()
-        else { return }
-        selection.color.setFill()
+        guard let selection = selectionProvider?(), selection.range.length > 0 else { return }
+        fill(selection.range, with: selection.color)
+    }
+
+    private func drawHighlights() {
+        guard let highlights = highlightProvider?(), !highlights.isEmpty else { return }
+        for highlight in highlights where highlight.range.length > 0 {
+            fill(highlight.range, with: highlight.color)
+        }
+    }
+
+    /// Paint a document range across whichever of this fragment's lines it
+    /// touches.
+    private func fill(_ range: NSRange, with color: PColor) {
+        guard let (_, elementStart) = storageContext() else { return }
+        color.setFill()
         for line in textLineFragments {
             let lineRange = NSRange(
                 location: elementStart + line.characterRange.location,
                 length: line.characterRange.length
             )
-            let hit = NSIntersectionRange(lineRange, selection.range)
+            let hit = NSIntersectionRange(lineRange, range)
             guard hit.length > 0 else { continue }
             let start = line.locationForCharacter(at: hit.location - elementStart).x
             let end = line.locationForCharacter(at: NSMaxRange(hit) - elementStart).x
@@ -766,6 +781,7 @@ final class ListMarkerLayoutFragment: NSTextLayoutFragment {
                 containerWidth: width
             )
         }
+        drawHighlights()
         super.draw(at: point, in: context)
         // super.draw is what builds the attachment's view provider, and an
         // imageless attachment draws TextKit's generic document icon in that
@@ -988,6 +1004,7 @@ final class ListMarkerLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
     var typingAttributesProvider: (() -> [NSAttributedString.Key: Any]?)?
     var foldedHeadingsProvider: (() -> Set<HeadingFoldKey>)?
     var selectionProvider: (() -> (range: NSRange, color: PColor)?)?
+    var highlightProvider: (() -> [(range: NSRange, color: PColor)])?
 
     func textLayoutManager(
         _ textLayoutManager: NSTextLayoutManager,
@@ -1001,6 +1018,7 @@ final class ListMarkerLayoutDelegate: NSObject, NSTextLayoutManagerDelegate {
         fragment.typingAttributesProvider = typingAttributesProvider
         fragment.foldedHeadingsProvider = foldedHeadingsProvider
         fragment.selectionProvider = selectionProvider
+        fragment.highlightProvider = highlightProvider
         return fragment
     }
 }
