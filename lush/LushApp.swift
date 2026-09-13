@@ -652,6 +652,21 @@ struct LushApp: App {
         }
         .windowToolbarStyle(.unified(showsTitle: false))
 
+        WindowGroup(id: "patchwork-editor", for: String.self) { $docUrl in
+            if let url = docUrl {
+                PatchworkDetail(docUrl: url)
+                    .environment(model)
+                    .environment(contextTracker)
+                    .interfaceFont()
+                    .task {
+                        async let server: Void = LocalSyncServer.startIfNeeded()
+                        await model.start()
+                        await server
+                    }
+            }
+        }
+        .windowToolbarStyle(.unified(showsTitle: false))
+
         Settings {
             SettingsView()
                 .environment(model)

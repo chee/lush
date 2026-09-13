@@ -36,7 +36,7 @@ final class NotesModel {
     private static let applyIncomingKey = "focusApplyIncoming"
     private static let sendChangesKey = "focusSendChanges"
     private static let presenceKey = "focusPresence"
-    private static let irohKey = "peerSyncEnabled"
+    static let irohKey = "peerSyncEnabled"
     private static let serverUrlKey = "syncServerUrl"
 
     private(set) var core: Core?
@@ -511,6 +511,7 @@ final class NotesModel {
                     applyQuickNote(localQuickNote)
                     syncConfigQuickNote()
                 }
+                applyConfigFocusSets(config)
             }
         }
         loadSmartNotebooks()
@@ -543,6 +544,47 @@ final class NotesModel {
         guard let core, let configUrl = accountConfigUrl else { return }
         let urls = rootFolderUrls
         Task.detached { try? core.setConfigFolders(configUrl: configUrl, urls: urls) }
+    }
+
+    /// Focus Sets live in the synced config so they follow the account across
+    /// devices. The copy in UserDefaults stays as the local cache, because the
+    /// system reads a Focus filter's contents without Core running.
+    private func syncConfigFocusSets(_ presets: [FocusPreset]) {
+        guard let core, let configUrl = accountConfigUrl else { return }
+        let sets = presets.map(Self.focusSet)
+        Task.detached { try? core.setConfigFocusSets(configUrl: configUrl, sets: sets) }
+    }
+
+    private func applyConfigFocusSets(_ state: ConfigState) {
+        if state.focusSetsConfigured {
+            focus.adoptPresets(state.focusSets.map(Self.focusPreset))
+        } else if !focus.presets.isEmpty {
+            syncConfigFocusSets(focus.presets)
+        }
+    }
+
+    private static func focusSet(_ preset: FocusPreset) -> FocusSet {
+        FocusSet(
+            id: preset.id,
+            name: preset.name,
+            folders: preset.filter.shownFolderUrls,
+            calendars: preset.filter.shownCalendarIds,
+            inbox: preset.filter.inboxUrl ?? "",
+            quickNote: preset.filter.quickNoteUrl ?? ""
+        )
+    }
+
+    private static func focusPreset(_ set: FocusSet) -> FocusPreset {
+        FocusPreset(
+            id: set.id,
+            name: set.name,
+            filter: FocusFilterState(
+                shownFolderUrls: set.folders,
+                inboxUrl: set.inbox.isEmpty ? nil : set.inbox,
+                quickNoteUrl: set.quickNote.isEmpty ? nil : set.quickNote,
+                shownCalendarIds: set.calendars
+            )
+        )
     }
 
     /// The extra package lists live in the synced config when logged in; the
@@ -771,6 +813,9 @@ final class NotesModel {
         Self.bootLog("startOnce begin")
         AppActivity.watch()
         focus.watchSystemFocus()
+        focus.publishPresets = { [weak self] presets in
+            self?.syncConfigFocusSets(presets)
+        }
         Task { await focus.reconcileWithSystemFocus() }
         do {
             var saved = LushShared.rootFolderUrls
@@ -1931,6 +1976,7 @@ final class NotesModel {
                 if state.quickNoteConfigured, state.quickNote != self.quickNoteUrl {
                     self.applyQuickNote(state.quickNote)
                 }
+                self.applyConfigFocusSets(state)
                 if !state.folders.isEmpty, state.folders != self.rootFolderUrls {
                     self.rootFolderUrls = state.folders
                     self.persistRoots()
@@ -2414,13 +2460,23 @@ final class NotesModel {
         let folders = children.filter { $0.kind == "folder" }
         let notes = children.filter { $0.kind != "folder" }
         guard let order = childOrder[folderUrl], !order.isEmpty else { return folders + notes }
-        var byUrl = Dictionary(uniqueKeysWithValues: notes.map { ($0.url, $0) })
-        let ordered: [FolderNode] = order.compactMap { byUrl.removeValue(forKey: $0) }
+        var byUrl: [String: FolderNode] = [:]
+        var remaining: [String: Int] = [:]
+        for note in notes {
+            byUrl[note.url] = note
+            remaining[note.url, default: 0] += 1
+        }
+        func take(_ url: String) -> FolderNode? {
+            guard let count = remaining[url], count > 0 else { return nil }
+            remaining[url] = count - 1
+            return byUrl[url]
+        }
+        let ordered: [FolderNode] = order.compactMap(take)
         // Notes the stored order has never seen — made since it was written,
         // or arrived from another device — go wherever new notes go. Pinning
         // them to the end regardless made a folder that had once been dragged
         // into shape ignore the setting.
-        let unplaced = notes.filter { byUrl[$0.url] != nil }
+        let unplaced = notes.compactMap { take($0.url) }
         guard !unplaced.isEmpty else { return folders + ordered }
         return folders + (newNoteAtTop(in: folderUrl) ? unplaced + ordered : ordered + unplaced)
     }

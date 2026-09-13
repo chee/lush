@@ -23,7 +23,8 @@ enum LocalSyncServer {
         // One sedimentree for the app and the server it hosts: a doc synced
         // through the server is the same copy the core reads.
         ServerController.dataDir = LushShared.coreDataDirectory()
-        let task = Task { await controller.start() }
+        let enableIroh = UserDefaults.standard.bool(forKey: NotesModel.irohKey)
+        let task = Task { await controller.start(enableIroh: enableIroh) }
         startTask = task
         await task.value
         // failed starts leave port nil; clear so a later caller can retry

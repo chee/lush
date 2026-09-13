@@ -32,15 +32,22 @@ public final class ServerController {
     /// well-known port and falling back to an ephemeral one. Writes
     /// server.json into the data dir so anything outside the app (CLIs,
     /// scripts) can find the running server, and advertises via Bonjour.
-    public func start() async {
+    /// `enableIroh` off keeps the endpoint unbound: no relay pings, no
+    /// pkarr publishes, nothing waking the radio while she isn't syncing
+    /// peer to peer.
+    public func start(enableIroh: Bool = false) async {
         let dir = Self.dataDir
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let bound = try await Task.detached {
                 do {
-                    return try serverStart(dataDir: dir.path, port: Self.preferredPort)
+                    return try serverStart(
+                        dataDir: dir.path,
+                        port: Self.preferredPort,
+                        enableIroh: enableIroh
+                    )
                 } catch {
-                    return try serverStart(dataDir: dir.path, port: 0)
+                    return try serverStart(dataDir: dir.path, port: 0, enableIroh: enableIroh)
                 }
             }.value
             port = bound

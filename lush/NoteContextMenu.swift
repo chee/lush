@@ -81,6 +81,11 @@ struct NoteContextMenu: View {
                 Label("Open in New Window", systemImage: "macwindow.badge.plus")
             }
             #endif
+        } else if node.kind == "file" {
+            #if os(macOS)
+            PatchworkEditorButton(url: node.url)
+            #endif
+            openInPatchwork
         } else if isPatchworkDoc {
             openInPatchwork
         }
@@ -114,6 +119,23 @@ struct NoteContextMenu: View {
         }
     }
 }
+
+#if os(macOS)
+/// Folders have no editor of their own and files open in Quick Look, so the
+/// embedded patchwork editor gets a window of its own.
+struct PatchworkEditorButton: View {
+    let url: String
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button {
+            openWindow(id: "patchwork-editor", value: url)
+        } label: {
+            Label("Open with Patchwork Editor", systemImage: "square.grid.2x2")
+        }
+    }
+}
+#endif
 
 struct OpenInPatchworkLabel: View {
     #if os(macOS)

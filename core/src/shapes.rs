@@ -812,7 +812,11 @@ pub fn config_set_pins(doc: &mut Automerge, urls: &[String]) -> anyhow::Result<(
 }
 
 fn config_url_list(doc: &Automerge, key: &str) -> Vec<String> {
-    let Ok(Some((_, list))) = doc.get(ROOT, key) else {
+    url_list(doc, &ROOT, key)
+}
+
+fn url_list(doc: &Automerge, obj: &automerge::ObjId, key: &str) -> Vec<String> {
+    let Ok(Some((_, list))) = doc.get(obj, key) else {
         return Vec::new();
     };
     let mut entries: Vec<(u64, String)> = doc
@@ -830,6 +834,33 @@ fn config_url_list(doc: &Automerge, key: &str) -> Vec<String> {
         .map(|entry| entry.1)
         .filter(|url| seen.insert(url.clone()))
         .collect()
+}
+
+fn put_url_list<T: Transactable>(
+    t: &mut T,
+    obj: &automerge::ObjId,
+    key: &str,
+    urls: &[String],
+) -> Result<(), automerge::AutomergeError> {
+    let list = match t.get(obj, key)? {
+        Some((automerge::Value::Object(ObjType::Map), id)) => id,
+        _ => t.put_object(obj, key, ObjType::Map)?,
+    };
+    let stale: Vec<String> = t
+        .keys(&list)
+        .filter(|key| {
+            key.parse::<usize>()
+                .map(|index| index >= urls.len())
+                .unwrap_or(true)
+        })
+        .collect();
+    for key in stale {
+        t.delete(&list, key.as_str())?;
+    }
+    for (index, url) in urls.iter().enumerate() {
+        set_text(t, &list, &index.to_string(), url)?;
+    }
+    Ok(())
 }
 
 fn config_set_url_list(doc: &mut Automerge, key: &str, urls: &[String]) -> anyhow::Result<()> {
@@ -1071,6 +1102,88 @@ pub fn config_set_smart_notebooks(
                 t.put(&item, "showCount", folder.show_count)?;
                 t.put(&item, "notifyOnChange", folder.notify_on_change)?;
                 set_text(t, &item, "rules", &folder.rules)?;
+            }
+            Ok(())
+        },
+    ))?;
+    Ok(())
+}
+
+/// A named set of Lush settings the user links to a system Focus. Empty
+/// `folders`/`calendars` mean "show everything"; empty `inbox`/`quick_note`
+/// mean "keep the normal one".
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct FocusSet {
+    pub id: String,
+    pub name: String,
+    pub folders: Vec<String>,
+    pub calendars: Vec<String>,
+    pub inbox: String,
+    pub quick_note: String,
+}
+
+/// `.focusSets` is an object keyed by numeric index, like `.smart`.
+pub fn config_focus_sets(doc: &Automerge) -> Vec<FocusSet> {
+    let Ok(Some((_, sets))) = doc.get(ROOT, "focusSets") else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(u64, FocusSet)> = doc
+        .keys(&sets)
+        .filter_map(|key| {
+            let index: u64 = key.parse().ok()?;
+            let (_, item) = doc.get(&sets, &key).ok()??;
+            Some((
+                index,
+                FocusSet {
+                    id: string_at(doc, &item, "id")?,
+                    name: string_at(doc, &item, "name").unwrap_or_default(),
+                    folders: url_list(doc, &item, "folders"),
+                    calendars: url_list(doc, &item, "calendars"),
+                    inbox: string_at(doc, &item, "inbox").unwrap_or_default(),
+                    quick_note: string_at(doc, &item, "quickNote").unwrap_or_default(),
+                },
+            ))
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.0);
+    entries.into_iter().map(|entry| entry.1).collect()
+}
+
+pub fn config_focus_sets_configured(doc: &Automerge) -> bool {
+    doc.get(ROOT, "focusSets").ok().flatten().is_some()
+}
+
+pub fn config_set_focus_sets(doc: &mut Automerge, sets: &[FocusSet]) -> anyhow::Result<()> {
+    tx(doc.transact_with(
+        |_| CommitOptions::default().with_time(now_seconds()),
+        |t| {
+            let root = match t.get(ROOT, "focusSets")? {
+                Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                _ => t.put_object(ROOT, "focusSets", ObjType::Map)?,
+            };
+            let stale: Vec<String> = t
+                .keys(&root)
+                .filter(|key| {
+                    key.parse::<usize>()
+                        .map(|index| index >= sets.len())
+                        .unwrap_or(true)
+                })
+                .collect();
+            for key in stale {
+                t.delete(&root, key.as_str())?;
+            }
+            for (index, set) in sets.iter().enumerate() {
+                let key = index.to_string();
+                let item = match t.get(&root, key.as_str())? {
+                    Some((automerge::Value::Object(ObjType::Map), id)) => id,
+                    _ => t.put_object(&root, key.as_str(), ObjType::Map)?,
+                };
+                set_text(t, &item, "id", &set.id)?;
+                set_text(t, &item, "name", &set.name)?;
+                set_text(t, &item, "inbox", &set.inbox)?;
+                set_text(t, &item, "quickNote", &set.quick_note)?;
+                put_url_list(t, &item, "folders", &set.folders)?;
+                put_url_list(t, &item, "calendars", &set.calendars)?;
             }
             Ok(())
         },

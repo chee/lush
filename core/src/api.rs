@@ -190,6 +190,8 @@ pub struct ConfigState {
     pub quick_note: Option<String>,
     pub quick_note_configured: bool,
     pub pad: Option<String>,
+    pub focus_sets: Vec<shapes::FocusSet>,
+    pub focus_sets_configured: bool,
 }
 
 /// Narrows a search without touching the query text. Every field is optional;
@@ -470,6 +472,10 @@ const PREFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const PREFETCH_CONCURRENCY: usize = 8;
 const PREFETCH_MAX_DOCS: usize = 500;
 const ADOPTED_FOLDER_TITLE: &str = "📦 Lush items from before you logged in";
+/// How long suspension waits for in-flight storage writes. Long enough for a
+/// backlog to drain, short enough to leave room in the background assertion
+/// for the caller to report its task complete.
+const STORAGE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Core {
     fn start_index_updates(self: &Arc<Self>) {
@@ -1693,6 +1699,8 @@ impl Core {
                     quick_note: shapes::config_quick_note(doc),
                     quick_note_configured: shapes::config_quick_note_configured(doc),
                     pad: shapes::config_pad(doc),
+                    focus_sets: shapes::config_focus_sets(doc),
+                    focus_sets_configured: shapes::config_focus_sets_configured(doc),
                 })
             })
             .await
@@ -1779,6 +1787,23 @@ impl Core {
                     shapes::config_set_smart_notebooks(doc, &folders)
                 })
                 .await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok(())
+        })
+    }
+
+    pub fn set_config_focus_sets(
+        &self,
+        config_url: String,
+        sets: Vec<shapes::FocusSet>,
+    ) -> Result<(), CoreError> {
+        guarded(|| {
+            let repo = self.repo.clone();
+            self.runtime.block_on(async move {
+                let id = DocId::from_url(&config_url)?;
+                repo.change_doc(id, move |doc| shapes::config_set_focus_sets(doc, &sets))
+                    .await?;
                 Ok::<_, anyhow::Error>(())
             })?;
             Ok(())
@@ -3198,10 +3223,22 @@ impl Core {
     /// can kill it later without sending `willTerminate`, so anything still
     /// waiting on the save debounce at that point is lost text. Async so the
     /// caller can await it on the main actor instead of blocking on it.
+    /// Flush debounced saves, then wait for storage to go quiet. iOS kills an
+    /// app still renaming and fsyncing in the shared container when suspension
+    /// lands (0xdead10cc), so the wait is what makes it safe to report a
+    /// background task complete. Bounded well under the assertion's budget.
     pub async fn flush_pending_saves(&self) {
         let repo = self.repo.clone();
         let _ = self
-            .run(async move { repo.flush_pending_saves().await })
+            .run(async move {
+                repo.flush_pending_saves().await;
+                if tokio::time::timeout(STORAGE_QUIESCE_TIMEOUT, repo.quiesce_storage())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("storage still writing after flush");
+                }
+            })
             .await;
     }
 

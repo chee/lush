@@ -416,6 +416,30 @@ fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -659,14 +683,15 @@ public func serverPort() -> UInt16?  {
 }
 /**
  * Starts the sync server on 127.0.0.1. `port` 0 binds an ephemeral port.
- * Also binds an iroh endpoint and redials saved iroh peers.
- * Returns the actually-bound websocket port.
+ * With `enable_iroh` it also binds an iroh endpoint and redials saved iroh
+ * peers; without it nothing reaches for a relay. Returns the bound port.
  */
-public func serverStart(dataDir: String, port: UInt16)throws  -> UInt16  {
+public func serverStart(dataDir: String, port: UInt16, enableIroh: Bool)throws  -> UInt16  {
     return try  FfiConverterUInt16.lift(try rustCallWithError(FfiConverterTypeServerError_lift) {
     uniffi_patchwork_server_fn_func_server_start(
         FfiConverterString.lower(dataDir),
-        FfiConverterUInt16.lower(port),$0
+        FfiConverterUInt16.lower(port),
+        FfiConverterBool.lower(enableIroh),$0
     )
 })
 }
@@ -706,7 +731,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_patchwork_server_checksum_func_server_port() != 19022) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_patchwork_server_checksum_func_server_start() != 23204) {
+    if (uniffi_patchwork_server_checksum_func_server_start() != 37295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_patchwork_server_checksum_func_server_stop() != 11444) {

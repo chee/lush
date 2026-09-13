@@ -620,8 +620,9 @@ struct PageSettingsPane: View {
 
 struct SystemSettingsPane: View {
     var body: some View {
-        SettingsSubtabs(["Permissions", "Import", "Calendar"]) { section in
+        SettingsSubtabs(["Permissions", "Focus", "Import", "Calendar"]) { section in
             switch section {
+            case "Focus": FocusSettingsPane()
             case "Import": ImportSettingsPane()
             case "Calendar": CalendarSettingsPane()
             default: PermissionsSettingsPane()
@@ -1196,80 +1197,5 @@ struct PackagesSettingsPane: View {
                 model.setPackageLists(moduleUrls + [url])
             }
         }
-    }
-}
-
-struct FocusSettingsSections: View {
-    @Environment(NotesModel.self) private var model
-
-    private var focus: FocusModes { model.focus }
-
-    var body: some View {
-        Group {
-            Section {
-                if let state = focus.state {
-                    if state.shownFolderUrls.isEmpty {
-                        LabeledContent("Folders", value: "All")
-                    } else {
-                        LabeledContent("Folders") {
-                            VStack(alignment: .trailing, spacing: 2) {
-                                ForEach(state.shownFolderUrls, id: \.self) { url in
-                                    Text(model.node(for: url)?.displayName ?? "Folder")
-                                }
-                            }
-                        }
-                    }
-                    LabeledContent("Inbox", value: name(state.inboxUrl) ?? "Default")
-                    LabeledContent("Quick Note", value: name(state.quickNoteUrl) ?? "Default")
-                } else {
-                    Text("No Focus is filtering Lush.")
-                        .foregroundStyle(.secondary)
-                }
-                Button("Open Focus Settings") { openFocusSettings() }
-            } header: {
-                Text("Current Focus")
-            } footer: {
-                Text("Set this up under \(Self.focusSettingsPath) › Focus Filters › Lush: pick the folders to show and, if you want, a different inbox and Quick Note. It applies while that Focus is on and stops when it ends. Anything left unset keeps the normal setting, and hidden folders stay searchable.")
-            }
-            Section {
-                switch focus.focusStatusAuthorization {
-                case .authorized:
-                    Label("Lush follows Focus changes as they happen.", systemImage: "checkmark.circle")
-                case .denied, .restricted:
-                    Text("Focus access is off, so a Focus that starts or ends while Lush is in the background is picked up next time Lush comes to the front.")
-                        .foregroundStyle(.secondary)
-                default:
-                    Button("Allow Focus Access") {
-                        Task { await focus.requestFocusStatusAuthorization() }
-                    }
-                }
-            } header: {
-                Text("Focus Access")
-            }
-        }
-    }
-
-    private static var focusSettingsPath: String {
-        #if os(macOS)
-        "System Settings › Focus › a Focus"
-        #else
-        "Settings › Focus › a Focus"
-        #endif
-    }
-
-    private func openFocusSettings() {
-        #if os(macOS)
-        guard let url = URL(string: "x-apple.systempreferences:com.apple.Focus-Settings.extension")
-        else { return }
-        NSWorkspace.shared.open(url)
-        #else
-        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-        UIApplication.shared.open(url)
-        #endif
-    }
-
-    private func name(_ url: String?) -> String? {
-        guard let url else { return nil }
-        return model.node(for: url)?.displayName ?? "Untitled"
     }
 }

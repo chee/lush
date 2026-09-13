@@ -40,6 +40,10 @@ impl ObservedStorage {
     pub(crate) fn new(inner: FsStorage, stored: mpsc::Sender<StoredBatch>) -> Self {
         Self { inner, stored }
     }
+
+    pub(crate) async fn quiesce_writes(&self) {
+        self.inner.quiesce_writes().await;
+    }
 }
 
 impl Storage<Sendable> for ObservedStorage {

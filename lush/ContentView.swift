@@ -13,6 +13,7 @@ enum NavRoute: Hashable {
     case folderNotebook(String)
     case note(String)
     case patchwork(String)
+    case file(String)
     case script(String)
     case recents
     case smart(String)
@@ -723,12 +724,12 @@ struct ContentView: View {
         case "rich", "lush":
             model.pendingFocusUrl = url
             open(url)
-        case .some(_):
+        case .some(let kind):
             model.rememberPatchworkDocument(url)
             #if os(macOS)
             open(url)
             #else
-            openMobile(.patchwork(url))
+            openMobile(kind == "file" ? .file(url) : .patchwork(url))
             #endif
         case nil:
             model.pendingFocusUrl = url
@@ -779,6 +780,8 @@ struct ContentView: View {
                     .onAppear { model.selectedNoteUrl = url }
             case .patchwork(let url):
                 PatchworkDetail(docUrl: url)
+            case .file(let url):
+                FileDetail(docUrl: url)
             case .script(let url):
                 ScriptEditorView(url: url)
                     .environment(model)
@@ -1939,6 +1942,7 @@ struct ContentView: View {
         } label: {
             Label("Search in \(node.displayName)…", systemImage: "magnifyingglass")
         }
+        PatchworkEditorButton(url: node.url)
         Divider()
         Button {
             folderSettingsTarget = node
@@ -2262,19 +2266,18 @@ struct ContentView: View {
                 historyVersion: selectedHistoryEntry,
                 rightSidebarVisible: $rightSidebarVisible
             )
-        } else if node == nil, isPatchwork {
-            // Known patchwork doc: open directly, no need to wait for the tree.
-            PatchworkDetail(
-                docUrl: url,
-                historyVersion: selectedHistoryEntry,
-                rightSidebarVisible: $rightSidebarVisible
-            )
-                .id(url)
-        } else if node == nil {
+        } else if node == nil, !isPatchwork {
             ResolvingDocumentView(url: url)
         } else if node?.kind == "lush:script" {
             ScriptEditorView(url: url)
                 .environment(model)
+                .id(url)
+        } else if node?.kind == "file" {
+            FileDetail(
+                docUrl: url,
+                historyVersion: selectedHistoryEntry,
+                rightSidebarVisible: $rightSidebarVisible
+            )
                 .id(url)
         } else {
             PatchworkDetail(
@@ -2820,9 +2823,10 @@ struct FolderScreen: View {
 
     private var nodes: [FolderNode] {
         if let folderUrl {
-            return model.node(for: folderUrl)?.children?.filter {
+            let children = model.node(for: folderUrl)?.children?.filter {
                 !($0.kind == "folder" && model.focus.hides($0.url))
             } ?? []
+            return model.orderedChildren(children, in: folderUrl)
         }
         return model.visibleFolderTree
     }
@@ -2837,31 +2841,34 @@ struct FolderScreen: View {
     private struct DisplayedNode: Identifiable {
         let node: FolderNode
         let depth: Int
-        var id: String { node.url }
+        let id: String
     }
 
     private var displayedNodes: [DisplayedNode] {
-        flattened(nodes, depth: 0)
+        flattened(nodes, depth: 0, path: "")
     }
 
-    private func flattened(_ nodes: [FolderNode], depth: Int) -> [DisplayedNode] {
-        nodes.flatMap { node in
-            var result = [DisplayedNode(node: node, depth: depth)]
+    private func flattened(_ nodes: [FolderNode], depth: Int, path: String) -> [DisplayedNode] {
+        nodes.enumerated().flatMap { offset, node in
+            let id = "\(path)\u{1}\(offset)\u{1}\(node.url)"
+            var result = [DisplayedNode(node: node, depth: depth, id: id)]
             if node.kind == "folder", expandedFolders.contains(node.url) {
-                result += flattened(node.children ?? [], depth: depth + 1)
+                result += flattened(node.children ?? [], depth: depth + 1, path: id)
             }
             return result
         }
     }
 
     private func route(for node: FolderNode) -> NavRoute {
-        node.kind == "folder"
+        return node.kind == "folder"
             ? .folder(node.url)
             : node.kind == "lush:script"
                 ? .script(node.url)
                 : node.isNote
                     ? .note(node.url)
-                    : .patchwork(node.url)
+                    : node.kind == "file"
+                        ? .file(node.url)
+                        : .patchwork(node.url)
     }
 
     /// Reordering flattens the tree to the level being shown; nesting is what
@@ -3384,6 +3391,11 @@ struct FolderScreen: View {
                 renameTarget = node
             } label: {
                 Label("Rename", systemImage: "pencil")
+            }
+            Button {
+                push(.patchwork(node.url))
+            } label: {
+                Label("Open with Patchwork Editor", systemImage: "square.grid.2x2")
             }
             if node.parentUrl != nil {
                 Button {
@@ -4897,9 +4909,10 @@ struct NoteDetail: View {
         }
         ToolbarItem(placement: .primaryAction) {
             Button {
-                showingInspector = true
+                showingInspector.toggle()
             } label: {
                 Label("Info", systemImage: "info.circle")
+                    .foregroundStyle(showingInspector ? Color.accentColor : Color.primary)
             }
         }
         #endif
@@ -6569,7 +6582,7 @@ struct PatchworkDetail: View {
                 PresenceFacesView(presence: model.presence)
             }
             ToolbarSpacer(.fixed)
-            ToolbarItem(id: "inspector") {
+            ToolbarItem {
                 Button {
                     rightSidebarVisible?.wrappedValue.toggle()
                 } label: {
@@ -6580,9 +6593,10 @@ struct PatchworkDetail: View {
             #else
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showingInspector = true
+                    showingInspector.toggle()
                 } label: {
                     Label("Info", systemImage: "info.circle")
+                        .foregroundStyle(showingInspector ? Color.accentColor : Color.primary)
                 }
             }
             #endif

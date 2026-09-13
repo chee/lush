@@ -65,6 +65,7 @@ use std::{
 use subduction_core::storage::traits::Storage;
 use subduction_crypto::{signed::Signed, verified_meta::VerifiedMeta};
 use thiserror::Error;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// Process-wide counter for distinguishing concurrent writers that target
 /// the same content-addressed path.
@@ -772,7 +773,18 @@ pub struct FsStorage {
     /// thousands of trees, so `new` must not pay it — nothing that opens the
     /// storage needs every id, and the callers that do can wait.
     ids_cache: Arc<Mutex<Option<Set<SedimentreeId>>>>,
+    /// Caps how many durable writes are on the blocking pool at once. A save
+    /// storm otherwise spawns one thread per item — hundreds of them sitting in
+    /// `write`/`fsync`/`rename` at the same time, which the disk does not serve
+    /// any faster and which iOS kills the app for if suspension lands
+    /// mid-flight (0xdead10cc). It is also what makes [`Self::quiesce_writes`]
+    /// possible: with no bound there is nothing to wait on.
+    write_gate: Arc<Semaphore>,
 }
+
+/// Concurrent durable writes allowed on the blocking pool. Storage is one
+/// device; past a handful of writers the queue is the disk's, not ours.
+const WRITE_CONCURRENCY: u32 = 8;
 
 impl FsStorage {
     /// Create a new filesystem storage backend at the given root directory.
@@ -798,7 +810,36 @@ impl FsStorage {
         Ok(Self {
             root,
             ids_cache: Arc::new(Mutex::new(None)),
+            write_gate: Arc::new(Semaphore::new(WRITE_CONCURRENCY as usize)),
         })
+    }
+
+    /// Hold one of the write slots. Drop the permit as soon as the blocking hop
+    /// returns; never hold one across a call that takes another, or writers
+    /// waiting on their second slot deadlock against each other.
+    async fn write_permit(&self) -> SemaphorePermit<'_> {
+        self.write_gate
+            .acquire()
+            .await
+            .expect("write gate is never closed")
+    }
+
+    /// Wait until no durable write is in flight.
+    ///
+    /// Holding every slot means every writer has finished and none can start;
+    /// releasing them lets the queue drain again. Call this before letting iOS
+    /// suspend the app, so nothing is mid-write in the shared container when it
+    /// does. Cancelling the wait — a caller that gave up on its deadline —
+    /// returns the slots it had taken.
+    ///
+    /// Deletes go through `tokio::fs` and are not gated: they hold no slot and
+    /// are not waited for here.
+    pub async fn quiesce_writes(&self) {
+        let _all = self
+            .write_gate
+            .acquire_many(WRITE_CONCURRENCY)
+            .await
+            .expect("write gate is never closed");
     }
 
     /// Returns the root directory of the storage.
@@ -1084,6 +1125,7 @@ impl Storage<Sendable> for FsStorage {
             if self.with_ids(|ids| ids.insert(sedimentree_id)).await? {
                 let commits_dir = self.commits_dir(sedimentree_id);
                 let fragments_dir = self.fragments_dir(sedimentree_id);
+                let _permit = self.write_permit().await;
                 tokio::task::spawn_blocking(move || -> Result<(), FsStorageError> {
                     create_dir_all_durable(&commits_dir)?;
                     create_dir_all_durable(&fragments_dir)?;
@@ -1149,7 +1191,10 @@ impl Storage<Sendable> for FsStorage {
             // `tokio::fs` call chain would), tightening the latency tail under
             // concurrent load.
             let item = self.build_commit_write(sedimentree_id, &verified)?;
-            tokio::task::spawn_blocking(move || write_compound_sync(&item)).await??;
+            {
+                let _permit = self.write_permit().await;
+                tokio::task::spawn_blocking(move || write_compound_sync(&item)).await??;
+            }
 
             // Contract: persisting an item registers its sedimentree id
             // (cache-gated no-op after the first save for this tree).
@@ -1313,7 +1358,10 @@ impl Storage<Sendable> for FsStorage {
             // Single blocking-pool hop for the whole CAS + write + rename
             // sequence; see `save_loose_commit` for the rationale.
             let item = self.build_fragment_write(sedimentree_id, &verified)?;
-            tokio::task::spawn_blocking(move || write_compound_sync(&item)).await??;
+            {
+                let _permit = self.write_permit().await;
+                tokio::task::spawn_blocking(move || write_compound_sync(&item)).await??;
+            }
 
             // Contract: persisting an item registers its sedimentree id —
             // after the durable write, so a failed write doesn't leave a
@@ -1500,51 +1548,54 @@ impl Storage<Sendable> for FsStorage {
                 items.push(self.build_fragment_write(sedimentree_id, verified)?);
             }
 
-            tokio::task::spawn_blocking(move || -> Result<(), FsStorageError> {
-                // Phased batch write so the fsync cost amortizes (via the
-                // journal's group commit) instead of being paid per item:
-                //
-                //   1. stage every item (CAS check + write temps, no fsync)
-                //   2. fsync all temps in parallel — group commit coalesces
-                //      concurrent fsyncs into shared journal transactions
-                //   3. rename all temps into place (blob before meta per item)
-                //   4. fsync each touched directory exactly once, in parallel
-                // An early error return drops the staged writes, whose
-                // `Drop` impl removes the not-yet-renamed temp files.
-                let mut staged: Vec<_> = items
-                    .iter()
-                    .map(stage_compound_write_sync)
-                    .filter_map(Result::transpose)
-                    .collect::<Result<_, _>>()?;
+            {
+                let _permit = self.write_permit().await;
+                tokio::task::spawn_blocking(move || -> Result<(), FsStorageError> {
+                    // Phased batch write so the fsync cost amortizes (via the
+                    // journal's group commit) instead of being paid per item:
+                    //
+                    //   1. stage every item (CAS check + write temps, no fsync)
+                    //   2. fsync all temps in parallel — group commit coalesces
+                    //      concurrent fsyncs into shared journal transactions
+                    //   3. rename all temps into place (blob before meta per item)
+                    //   4. fsync each touched directory exactly once, in parallel
+                    // An early error return drops the staged writes, whose
+                    // `Drop` impl removes the not-yet-renamed temp files.
+                    let mut staged: Vec<_> = items
+                        .iter()
+                        .map(stage_compound_write_sync)
+                        .filter_map(Result::transpose)
+                        .collect::<Result<_, _>>()?;
 
-                let temp_paths: Vec<&Path> = staged
-                    .iter()
-                    .flat_map(|s| [s.blob_temp.as_path(), s.meta_temp.as_path()])
-                    .collect();
-                fsync_paths_parallel_sync(&temp_paths)?;
+                    let temp_paths: Vec<&Path> = staged
+                        .iter()
+                        .flat_map(|s| [s.blob_temp.as_path(), s.meta_temp.as_path()])
+                        .collect();
+                    fsync_paths_parallel_sync(&temp_paths)?;
 
-                let mut dirs = std::collections::BTreeSet::new();
-                for s in &mut staged {
-                    s.rename_into_place()?;
-                    dirs.insert(s.item.id_dir.as_path());
-                    if let Some(parent) = s.item.id_dir.parent() {
-                        dirs.insert(parent);
+                    let mut dirs = std::collections::BTreeSet::new();
+                    for s in &mut staged {
+                        s.rename_into_place()?;
+                        dirs.insert(s.item.id_dir.as_path());
+                        if let Some(parent) = s.item.id_dir.parent() {
+                            dirs.insert(parent);
+                        }
                     }
-                }
 
-                // Parallel on Unix; directory fsync is a no-op concept on
-                // Windows (see `fsync_dir_sync`).
-                #[cfg(unix)]
-                {
-                    let dir_paths: Vec<&Path> = dirs.into_iter().collect();
-                    fsync_paths_parallel_sync(&dir_paths)?;
-                }
-                #[cfg(not(unix))]
-                drop(dirs);
+                    // Parallel on Unix; directory fsync is a no-op concept on
+                    // Windows (see `fsync_dir_sync`).
+                    #[cfg(unix)]
+                    {
+                        let dir_paths: Vec<&Path> = dirs.into_iter().collect();
+                        fsync_paths_parallel_sync(&dir_paths)?;
+                    }
+                    #[cfg(not(unix))]
+                    drop(dirs);
 
-                Ok(())
-            })
-            .await??;
+                    Ok(())
+                })
+                .await??;
+            }
 
             // Contract: persisting items registers their sedimentree id —
             // after the durable batch write, so a failed batch doesn't
@@ -1769,6 +1820,7 @@ impl Storage<Local> for FsStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn staging_nonces_are_process_tagged_and_never_repeat() {
@@ -1796,5 +1848,43 @@ mod tests {
 
         assert_eq!(remove_temp_files(dir.path(), None), 2);
         assert!(!one.exists() && !two.exists());
+    }
+
+    fn storage() -> (tempfile::TempDir, FsStorage) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = FsStorage::new(dir.path().to_path_buf()).expect("storage");
+        (dir, storage)
+    }
+
+    #[tokio::test]
+    async fn only_write_concurrency_writes_run_at_once() {
+        let (_dir, storage) = storage();
+        let mut held = Vec::new();
+        for _ in 0..WRITE_CONCURRENCY {
+            held.push(storage.write_gate.try_acquire().expect("slot free"));
+        }
+        assert!(storage.write_gate.try_acquire().is_err());
+
+        held.pop();
+        assert!(storage.write_gate.try_acquire().is_ok());
+    }
+
+    /// Suspension waits: as long as a writer holds a slot, `quiesce_writes`
+    /// has not returned.
+    #[tokio::test]
+    async fn quiesce_writes_waits_for_the_writer_to_finish() {
+        let (_dir, storage) = storage();
+        let permit = storage.write_permit().await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), storage.quiesce_writes())
+                .await
+                .is_err()
+        );
+
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(5), storage.quiesce_writes())
+            .await
+            .expect("quiesced once the slot was free");
     }
 }

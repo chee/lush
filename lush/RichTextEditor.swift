@@ -1591,7 +1591,7 @@ final class EditorCore: LiveWriter {
     /// never cached — only its decoded bitmap is — so a bare "Image" gets
     /// handed to whatever generator claims untyped data. Work an extension out
     /// from the asset's own metadata, then from the bytes.
-    static func previewFilename(info: AssetInfo?, fallback: String, data: Data) -> String {
+    nonisolated static func previewFilename(info: AssetInfo?, fallback: String, data: Data) -> String {
         let base = info?.name.isEmpty == false ? info!.name : fallback
         guard (base as NSString).pathExtension.isEmpty else { return base }
         let fromMime = info.flatMap { UTType(mimeType: $0.mimeType)?.preferredFilenameExtension }
@@ -1600,7 +1600,7 @@ final class EditorCore: LiveWriter {
         return "\(base).\(ext)"
     }
 
-    private static func sniffedExtension(_ data: Data) -> String? {
+    nonisolated private static func sniffedExtension(_ data: Data) -> String? {
         let bytes = [UInt8](data.prefix(12))
         guard bytes.count == 12 else { return nil }
         if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
@@ -6563,7 +6563,7 @@ struct FormatAccessoryBar: View {
     let controller: EditorController
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 8) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 22) {
                     // the bar rides the keyboard, so the sheet is presented by
@@ -6683,23 +6683,25 @@ struct FormatAccessoryBar: View {
                     barButton("decrease.indent", label: "Decrease Indent") { controller.outdentBlock() }
                     barButton("increase.indent", label: "Increase Indent") { controller.indentBlock() }
                 }
-                .padding(.horizontal, 16)
+                .padding(.horizontal, 18)
                 .frame(maxHeight: .infinity)
             }
-            Divider()
-                .frame(height: 28)
+            .frame(maxHeight: .infinity)
+            .clipShape(Capsule())
+            .glassEffect(.regular, in: Capsule())
+
             Button {
                 controller.dismissKeyboard()
             } label: {
                 Image(systemName: "keyboard.chevron.compact.down")
+                    .frame(width: 44)
+                    .frame(maxHeight: .infinity)
             }
-            .padding(.horizontal, 16)
+            .glassEffect(.regular, in: Capsule())
             .accessibilityLabel("Dismiss Keyboard")
         }
         .font(.system(size: 20))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(Capsule())
-        .glassEffect(.regular, in: Capsule())
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
     }

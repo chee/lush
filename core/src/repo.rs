@@ -337,16 +337,18 @@ async fn accept_iroh_peer(endpoint: Arc<iroh::Endpoint>, repo: Arc<Repo>) {
         .await
         {
             Ok(result) => {
-                tokio::spawn(result.listener_task);
-                tokio::spawn(result.sender_task);
+                let listener_task = result.listener_task;
+                let sender = tokio::spawn(result.sender_task);
                 let mut node_id = None;
                 let mapped = result.authenticated.map(|c| {
                     node_id = Some(c.quic_connection().remote_id().to_string());
                     MessageTransport::new(WsTransport::Iroh(c))
                 });
                 let peer = mapped.peer_id();
+                let registered = mapped.clone();
                 if let Err(e) = repo.core.add_connection(mapped).await {
                     tracing::warn!(error = %e, "iroh: add_connection failed");
+                    sender.abort();
                     continue;
                 }
                 repo.ephemeral.subscribe_peer(peer).await;
@@ -354,6 +356,12 @@ async fn accept_iroh_peer(endpoint: Arc<iroh::Endpoint>, repo: Arc<Repo>) {
                     repo.note_iroh_peer_seen(node_id, peer);
                 }
                 tokio::spawn(repo.clone().resync_all());
+                let repo = repo.clone();
+                tokio::spawn(async move {
+                    let _ = listener_task.await;
+                    let _ = repo.core.disconnect(&registered).await;
+                    sender.abort();
+                });
             }
             Err(subduction_iroh::error::AcceptError::NoIncoming) => break,
             Err(e) => tracing::warn!(error = %e, "iroh: accept failed"),
@@ -2086,7 +2094,7 @@ impl Repo {
     /// or a connected iroh peer. Doc fetches gate on this rather than on the
     /// server flag, so a peer can stand in when the server is down.
     pub async fn has_sync_peer(&self) -> bool {
-        self.is_connected() || !self.core.connected_peer_ids().await.is_empty()
+        !self.core.connected_peer_ids().await.is_empty()
     }
 
     pub async fn wait_for_sync_peer(&self, timeout: Duration) -> bool {
@@ -2157,6 +2165,7 @@ impl Repo {
                         dialed = Some(c.clone());
                         MessageTransport::new(WsTransport::Dialed(Box::new(c)))
                     });
+                    let registered = transport.clone();
                     if let Err(e) = self.core.add_connection(transport).await {
                         tracing::error!(error = %e, "failed to register connection");
                         listener.abort();
@@ -2171,6 +2180,7 @@ impl Repo {
                         let repo = self.clone();
                         tokio::spawn(async move { repo.resync_all().await });
                         let _ = listener.await;
+                        let _ = self.core.disconnect(&registered).await;
                     }
                     sender.abort();
                     keepalive.abort();
@@ -2419,7 +2429,8 @@ impl Repo {
                             "{}: no sync peers",
                             short(id)
                         )));
-                        true
+                        repo.syncs.lock().await.remove(&id);
+                        return;
                     }
                     Ok(SyncOutcome::Succeeded { .. }) => {
                         if let Some(heads) = pre_round_heads {
@@ -3423,6 +3434,14 @@ impl Repo {
         evicted
     }
 
+    /// Wait until no storage write is in flight. iOS kills an app that is
+    /// suspended mid-write in a shared container (0xdead10cc), so the app has
+    /// to be able to ask whether the disk is quiet before it reports a
+    /// background task complete.
+    pub async fn quiesce_storage(&self) {
+        self.storage.quiesce_writes().await;
+    }
+
     /// Evict unpinned docs oldest first, taking each one `sweep_takes` allows.
     /// `Duration::ZERO` is the memory-pressure sweep: everything evictable goes.
     ///
@@ -3594,8 +3613,6 @@ pub(crate) mod fuzz;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering as AtomicOrdering;
-
     use automerge::{transaction::Transactable, ActorId, ROOT};
     use tempfile::TempDir;
     use tokio::time::timeout;
@@ -5820,9 +5837,9 @@ mod tests {
         .unwrap();
         let expected = repo.read_doc(id, |doc| Ok(doc.get_heads())).await.unwrap();
 
-        repo.connected.store(true, AtomicOrdering::Relaxed);
+        tokio::time::pause();
         assert!(repo.flush(id).await.is_err());
-        repo.connected.store(false, AtomicOrdering::Relaxed);
+        tokio::time::resume();
 
         repo.drop_doc(id).await;
         repo.ensure_doc(id).await.unwrap();

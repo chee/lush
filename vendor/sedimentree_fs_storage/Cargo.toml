@@ -20,7 +20,7 @@ sedimentree_core = { git = "https://github.com/inkandswitch/subduction", rev = "
 subduction_core = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
 subduction_crypto = { git = "https://github.com/inkandswitch/subduction", rev = "9c0fbfd06bd499d4a8b53548788119d33af0d1ec", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", default-features = false }
-tokio = { version = "1.46", features = ["fs", "io-util", "rt"] }
+tokio = { version = "1.46", features = ["fs", "io-util", "rt", "sync"] }
 tracing = { version = "0.1.41", default-features = true }
 
 [dev-dependencies]

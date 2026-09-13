@@ -8,7 +8,7 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "@automerge/automerge": "3.4.0",
+    "@automerge/automerge": "3.3.2",
     "@automerge/automerge-repo": "2.6.0-subduction.47",
     "@automerge/automerge-repo-storage-indexeddb": "2.6.0-subduction.47",
     "@automerge/automerge-subduction": "0.16.1",

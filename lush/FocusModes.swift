@@ -17,18 +17,74 @@ struct FocusFilterState: Codable, Equatable {
     }
 }
 
+/// A named set of Lush settings, edited in the app and linked to a system Focus
+/// from Settings › Focus › Focus Filters › Lush. The system owns which Focus is
+/// on; Lush owns what the filter contains.
+struct FocusPreset: Codable, Equatable, Identifiable {
+    var id: String = UUID().uuidString
+    var name: String = "Untitled"
+    var filter = FocusFilterState()
+}
+
 @MainActor @Observable
 final class FocusModes {
     private static let stateKey = "lushFocusFilterState"
+    nonisolated static let presetsKey = "lushFocusPresets"
 
     /// nil when no Focus with a Lush filter is on.
     private(set) var state: FocusFilterState?
+    private(set) var presets: [FocusPreset] = []
+    /// Set by the model so edits reach the synced config doc.
+    @ObservationIgnored var publishPresets: (([FocusPreset]) -> Void)?
     @ObservationIgnored private var lastIsFocused: Bool?
     @ObservationIgnored private var watcher: Task<Void, Never>?
 
     init() {
         state = UserDefaults.standard.data(forKey: Self.stateKey)
             .flatMap { try? JSONDecoder().decode(FocusFilterState.self, from: $0) }
+        presets = Self.loadPresets()
+    }
+
+    // Presets ---------------------------------------------------------------
+
+    /// Read from disk rather than memory: the Focus filter's entity query and
+    /// the filter's own `state` run outside the app's main actor.
+    nonisolated static func loadPresets() -> [FocusPreset] {
+        UserDefaults.standard.data(forKey: presetsKey)
+            .flatMap { try? JSONDecoder().decode([FocusPreset].self, from: $0) } ?? []
+    }
+
+    nonisolated static func preset(id: String) -> FocusPreset? {
+        loadPresets().first { $0.id == id }
+    }
+
+    func save(_ preset: FocusPreset) {
+        if let index = presets.firstIndex(where: { $0.id == preset.id }) {
+            presets[index] = preset
+        } else {
+            presets.append(preset)
+        }
+        persistPresets()
+        publishPresets?(presets)
+    }
+
+    func deletePresets(_ ids: Set<String>) {
+        presets.removeAll { ids.contains($0.id) }
+        persistPresets()
+        publishPresets?(presets)
+    }
+
+    /// Takes what the synced config carries, without echoing it back.
+    func adoptPresets(_ presets: [FocusPreset]) {
+        guard presets != self.presets else { return }
+        self.presets = presets
+        persistPresets()
+    }
+
+    private func persistPresets() {
+        if let data = try? JSONEncoder().encode(presets) {
+            UserDefaults.standard.set(data, forKey: Self.presetsKey)
+        }
     }
 
     var isActive: Bool { state != nil }
@@ -199,49 +255,75 @@ struct LushCalendarQuery: EntityStringQuery {
     }
 }
 
-/// Configured per system Focus in Settings › Focus › Focus Filters › Lush.
-/// There are no Lush-side focus modes: the Focus is the mode, and this is what
-/// it carries.
-struct LushFocusFilter: SetFocusFilterIntent {
-    static let title: LocalizedStringResource = "Lush Focus Filter"
-    static let description = IntentDescription("Choose the folders, inbox, and Quick Note Lush uses during this Focus.")
+struct LushFocusPresetEntity: AppEntity {
+    static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Lush Focus Set")
+    static let defaultQuery = LushFocusPresetQuery()
 
-    @Parameter(title: "Folders")
-    var folders: [LushFolderEntity]?
+    let id: String
 
-    @Parameter(title: "Inbox")
-    var inbox: LushFolderEntity?
+    @Property(title: "Name")
+    var name: String
 
-    @Parameter(title: "Quick Note")
-    var quickNote: LushNoteEntity?
+    init(id: String, name: String) {
+        self.id = id
+        self.name = name
+    }
 
-    @Parameter(title: "Calendars")
-    var calendars: [LushCalendarEntity]?
+    init(_ preset: FocusPreset) {
+        self.init(id: preset.id, name: preset.name)
+    }
 
     var displayRepresentation: DisplayRepresentation {
-        var parts: [String] = []
-        if let folders, !folders.isEmpty { parts.append("\(folders.count) folders") }
-        if let inbox { parts.append("inbox: \(inbox.name)") }
-        if let quickNote { parts.append("quick note: \(quickNote.name)") }
-        if let calendars, !calendars.isEmpty { parts.append("\(calendars.count) calendars") }
-        return DisplayRepresentation(
+        DisplayRepresentation(title: "\(name)")
+    }
+}
+
+struct LushFocusPresetQuery: EntityStringQuery {
+    func entities(for identifiers: [String]) async throws -> [LushFocusPresetEntity] {
+        let all = FocusModes.loadPresets()
+        return identifiers.compactMap { id in
+            all.first { $0.id == id }.map(LushFocusPresetEntity.init)
+        }
+    }
+
+    func entities(matching string: String) async throws -> [LushFocusPresetEntity] {
+        let all = FocusModes.loadPresets().map(LushFocusPresetEntity.init)
+        let query = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return all }
+        return all.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    func suggestedEntities() async throws -> [LushFocusPresetEntity] {
+        FocusModes.loadPresets().map(LushFocusPresetEntity.init)
+    }
+}
+
+/// Linked per system Focus in Settings › Focus › Focus Filters › Lush. The
+/// filter itself carries nothing but a name: what that name means is built in
+/// the app, under Settings › System › Focus, so the notebooks and calendars are
+/// picked in Lush's own UI rather than through the system's entity pickers.
+struct LushFocusFilter: SetFocusFilterIntent {
+    static let title: LocalizedStringResource = "Lush Focus Filter"
+    static let description = IntentDescription("Pick a Focus Set built in Lush under Settings › System › Focus.")
+
+    @Parameter(title: "Lush Focus Set")
+    var preset: LushFocusPresetEntity?
+
+    var displayRepresentation: DisplayRepresentation {
+        DisplayRepresentation(
             title: "Lush",
-            subtitle: parts.isEmpty ? "Everything" : "\(parts.joined(separator: ", "))"
+            subtitle: preset.map { "\($0.name)" } ?? "Everything"
         )
     }
 
     var state: FocusFilterState {
-        FocusFilterState(
-            shownFolderUrls: (folders ?? []).compactMap { $0.isInbox ? nil : $0.url },
-            inboxUrl: inbox.flatMap { $0.isInbox ? nil : $0.url },
-            quickNoteUrl: quickNote?.id,
-            shownCalendarIds: (calendars ?? []).map(\.id)
-        )
+        preset.flatMap { FocusModes.preset(id: $0.id) }?.filter ?? FocusFilterState()
     }
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        NotesModel.shared.focus.apply(state)
+        let state = state
+        NotesModel.shared.focus.apply(state.isEmpty ? nil : state)
         return .result()
     }
 }

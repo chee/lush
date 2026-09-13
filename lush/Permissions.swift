@@ -254,7 +254,6 @@ struct PermissionsSettingsPane: View {
             } footer: {
                 Text("Lush asks for each of these only when you turn it on. Anything you have already refused has to be changed in System Settings.")
             }
-            FocusSettingsSections()
         }
         .formStyle(.grouped)
         .navigationTitle("Permissions")
