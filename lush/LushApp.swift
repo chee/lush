@@ -34,6 +34,7 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
         guard Self.systemInitiatedQuit else {
             NSApp.setActivationPolicy(.accessory)
             NSApp.hide(nil)
+            NotesModel.shared.presence.suspend()
             NotesModel.shared.core?.backgroundTrim()
             return .terminateCancel
         }
@@ -99,6 +100,7 @@ final class LushAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        NotesModel.shared.presence.resume()
         Task { await NotesModel.shared.focus.reconcileWithSystemFocus() }
     }
 

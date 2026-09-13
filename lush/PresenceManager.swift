@@ -30,6 +30,7 @@ final class PresenceManager {
     @ObservationIgnored weak var model: NotesModel?
 
     private(set) var docUrl: String?
+    @ObservationIgnored private var suspendedUrl: String?
     private(set) var peers: [String: Peer] = [:]
     private(set) var enabled = true
 
@@ -123,6 +124,7 @@ final class PresenceManager {
     }
 
     func leave() {
+        suspendedUrl = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
         snapshotDebounce?.cancel()
@@ -132,6 +134,21 @@ final class PresenceManager {
         docUrl = nil
         peers = [:]
         notifyPeersChanged()
+    }
+
+    /// Hiding the app keeps the process alive; the heartbeat would go on
+    /// speaking for a window nobody can see. Leave, and rejoin on activate.
+    func suspend() {
+        let url = docUrl
+        leave()
+        suspendedUrl = url
+    }
+
+    func resume() {
+        let url = suspendedUrl
+        suspendedUrl = nil
+        guard docUrl == nil, let url else { return }
+        join(url)
     }
 
     func setEnabled(_ enabled: Bool, url: String?) {
