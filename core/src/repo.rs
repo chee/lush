@@ -353,6 +353,7 @@ async fn accept_iroh_peer(endpoint: Arc<iroh::Endpoint>, repo: Arc<Repo>) {
                 if let Some(node_id) = node_id {
                     repo.note_iroh_peer_seen(node_id, peer);
                 }
+                tokio::spawn(repo.clone().resync_all());
             }
             Err(subduction_iroh::error::AcceptError::NoIncoming) => break,
             Err(e) => tracing::warn!(error = %e, "iroh: accept failed"),
@@ -1590,6 +1591,7 @@ impl Repo {
             .await
             .map_err(|e| anyhow!("add_connection failed: {e}"))?;
         self.ephemeral.subscribe_peer(peer).await;
+        tokio::spawn(self.clone().resync_all());
         tracing::info!(node_id = %node_id, peer = %peer, "iroh: dialed peer");
         Ok(peer)
     }
@@ -2060,6 +2062,24 @@ impl Repo {
         true
     }
 
+    /// True when any transport can serve a sync round — the websocket server
+    /// or a connected iroh peer. Doc fetches gate on this rather than on the
+    /// server flag, so a peer can stand in when the server is down.
+    pub async fn has_sync_peer(&self) -> bool {
+        self.is_connected() || !self.core.connected_peer_ids().await.is_empty()
+    }
+
+    pub async fn wait_for_sync_peer(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.has_sync_peer().await {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
     pub(crate) fn start_connect_loop_if_needed(self: &Arc<Self>) {
         if self.connect_started.swap(true, Ordering::Relaxed) {
             return;
@@ -2327,7 +2347,7 @@ impl Repo {
         force: bool,
         announced: Option<BTreeSet<CommitId>>,
     ) -> bool {
-        if !self.is_connected() {
+        if !self.has_sync_peer().await {
             return false;
         }
         // A sync round enumerates the doc's commit and fragment directories
@@ -2397,7 +2417,7 @@ impl Repo {
                 };
                 if failed {
                     failures += 1;
-                    if failures < HEAL_MAX_ATTEMPTS && repo.is_connected() {
+                    if failures < HEAL_MAX_ATTEMPTS && repo.has_sync_peer().await {
                         tokio::time::sleep(HEAL_DELAY).await;
                         continue;
                     }
@@ -2749,13 +2769,15 @@ impl Repo {
         }
         let repo = self.clone();
         tokio::spawn(async move {
-            if !repo.wait_connected(Duration::from_secs(15)).await {
+            if !repo.wait_for_sync_peer(Duration::from_secs(15)).await {
                 return;
             }
             for attempt in 0..HEAL_MAX_ATTEMPTS {
                 if attempt > 0 {
                     tokio::time::sleep(HEAL_DELAY).await;
-                    if !repo.is_connected() && !repo.wait_connected(Duration::from_secs(15)).await {
+                    if !repo.has_sync_peer().await
+                        && !repo.wait_for_sync_peer(Duration::from_secs(15)).await
+                    {
                         return;
                     }
                 }
@@ -2800,7 +2822,7 @@ impl Repo {
         }
         let repo = self.clone();
         tokio::spawn(async move {
-            if !repo.wait_connected(Duration::from_secs(15)).await {
+            if !repo.wait_for_sync_peer(Duration::from_secs(15)).await {
                 return;
             }
             if repo.doc_has_heads(id).await {
@@ -2810,7 +2832,9 @@ impl Repo {
             for attempt in 0..HEAL_MAX_ATTEMPTS {
                 if attempt > 0 {
                     tokio::time::sleep(HEAL_DELAY).await;
-                    if !repo.is_connected() && !repo.wait_connected(Duration::from_secs(15)).await {
+                    if !repo.has_sync_peer().await
+                        && !repo.wait_for_sync_peer(Duration::from_secs(15)).await
+                    {
                         return;
                     }
                 }
@@ -2880,7 +2904,7 @@ impl Repo {
         self.start_connect_loop_if_needed();
         let repo = self.clone();
         tokio::spawn(async move {
-            if repo.wait_connected(Duration::from_secs(15)).await {
+            if repo.wait_for_sync_peer(Duration::from_secs(15)).await {
                 repo.request_sync(id).await;
             }
         });
@@ -2909,7 +2933,7 @@ impl Repo {
                 .subscribe(nonempty::NonEmpty::new(Topic::from(id.sedimentree_id())))
                 .await;
             repo.start_connect_loop_if_needed();
-            if repo.wait_connected(Duration::from_secs(15)).await {
+            if repo.wait_for_sync_peer(Duration::from_secs(15)).await {
                 repo.request_sync(id).await;
             }
         });
@@ -3441,8 +3465,8 @@ impl Repo {
     /// One-shot: sync a doc and wait for the server to hold our heads.
     pub async fn flush(&self, id: DocId) -> Result<()> {
         self.save_doc(id).await?;
-        if !self.wait_connected(Duration::from_secs(15)).await {
-            return Err(anyhow!("not connected to sync server"));
+        if !self.wait_for_sync_peer(Duration::from_secs(15)).await {
+            return Err(anyhow!("no sync peer reachable"));
         }
         match self.sync_once(id, SYNC_TIMEOUT).await? {
             SyncOutcome::Succeeded { .. } => Ok(()),
@@ -3500,7 +3524,7 @@ impl Repo {
         if !self.send_changes.load(Ordering::Relaxed) {
             dirty.retain(|id| !self.outbox_path(*id).exists());
         }
-        if dirty.is_empty() || !self.is_connected() {
+        if dirty.is_empty() || !self.has_sync_peer().await {
             return;
         }
         futures::future::join_all(dirty.into_iter().map(|id| {
@@ -4095,6 +4119,43 @@ mod tests {
         let error = a.add_iroh_peer(wrong).await.unwrap_err().to_string();
         assert!(error.contains("refused the handshake"), "{error}");
         assert!(a.iroh_peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn has_sync_peer_is_false_with_no_connections() {
+        let (_dir, repo) = test_repo().await;
+        assert!(!repo.has_sync_peer().await);
+    }
+
+    /// Needs the network: dialing by node id goes through iroh discovery.
+    /// The websocket url is unparseable, so the doc can only arrive via iroh.
+    #[tokio::test]
+    #[ignore]
+    async fn a_doc_fetch_succeeds_over_an_iroh_only_connection() {
+        let (_dir_a, a) = iroh_test_repo().await;
+        let (_dir_b, b) = iroh_test_repo().await;
+        wait_until_dialable(&a).await;
+        wait_until_dialable(&b).await;
+
+        let id = a
+            .create_doc(|doc| {
+                put(doc, "hello", "from the other device");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        b.add_iroh_peer(a.iroh_friend_code().unwrap())
+            .await
+            .unwrap();
+        assert!(!b.is_connected());
+        assert!(b.has_sync_peer().await);
+
+        b.ensure_doc(id).await.unwrap();
+        assert!(
+            b.wait_for_doc(id, Duration::from_secs(20)).await,
+            "doc should arrive over the iroh connection"
+        );
     }
 
     #[test]
