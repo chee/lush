@@ -628,6 +628,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func backgroundTrim() 
     
     /**
+     * The sidebar as of the last walk. One SELECT: no doc is opened, nothing
+     * is loaded off the sedimentree, and an empty result just means this
+     * library predates the cache — the walk fills it in.
+     */
+    func cachedFolderTree() async  -> [TreeRow]
+    
+    /**
      * Full-history fork of a doc installed as a new repo doc. `cloned_at`
      * is the source's heads at fork time.
      */
@@ -769,6 +776,10 @@ public protocol CoreProtocol: AnyObject, Sendable {
      * can kill it later without sending `willTerminate`, so anything still
      * waiting on the save debounce at that point is lost text. Async so the
      * caller can await it on the main actor instead of blocking on it.
+     * Flush debounced saves, then wait for storage to go quiet. iOS kills an
+     * app still renaming and fsyncing in the shared container when suspension
+     * lands (0xdead10cc), so the wait is what makes it safe to report a
+     * background task complete. Bounded well under the assertion's budget.
      */
     func flushPendingSaves() async 
     
@@ -985,6 +996,13 @@ public protocol CoreProtocol: AnyObject, Sendable {
     
     func renameNote(url: String, title: String) throws 
     
+    /**
+     * What is materialized in memory right now, pinned first, and what
+     * holds each doc there. Nothing is materialized to answer: residency
+     * comes from the repo's maps and the title from the index.
+     */
+    func residentDocs() async  -> ResidentDocs
+    
     func resyncDoc(url: String) async throws 
     
     /**
@@ -1027,6 +1045,8 @@ public protocol CoreProtocol: AnyObject, Sendable {
      */
     func setConfigCalendar(configUrl: String, url: String) throws 
     
+    func setConfigFocusSets(configUrl: String, sets: [FocusSet]) throws 
+    
     func setConfigFolderSettings(configUrl: String, settings: [FolderSettings]) throws 
     
     func setConfigFolders(configUrl: String, urls: [String]) throws 
@@ -1042,6 +1062,14 @@ public protocol CoreProtocol: AnyObject, Sendable {
     func setConfigSmartNotebooks(configUrl: String, folders: [SmartNotebook]) throws 
     
     func setDelegate(delegate: CoreDelegate) 
+    
+    /**
+     * Write the sidebar down so the next launch can draw it before a single
+     * folder doc has been read. Called after a walk that actually read the
+     * folder docs — never from the cached tree itself, which would just
+     * rewrite what it was given.
+     */
+    func setFolderTree(rows: [TreeRow]) 
     
     func setIrohEnabled(enabled: Bool) async throws 
     
@@ -1300,6 +1328,29 @@ open func backgroundTrim()  {try! rustCall() {
     uniffi_lush_core_fn_method_core_background_trim(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+    /**
+     * The sidebar as of the last walk. One SELECT: no doc is opened, nothing
+     * is loaded off the sedimentree, and an empty result just means this
+     * library predates the cache — the walk fills it in.
+     */
+open func cachedFolderTree()async  -> [TreeRow]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_cached_folder_tree(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeTreeRow.lift,
+            errorHandler: nil
+            
+        )
 }
     
     /**
@@ -1696,6 +1747,10 @@ open func ensurePocketPad(configUrl: String)throws  -> String  {
      * can kill it later without sending `willTerminate`, so anything still
      * waiting on the save debounce at that point is lost text. Async so the
      * caller can await it on the main actor instead of blocking on it.
+     * Flush debounced saves, then wait for storage to go quiet. iOS kills an
+     * app still renaming and fsyncing in the shared container when suspension
+     * lands (0xdead10cc), so the wait is what makes it safe to report a
+     * background task complete. Bounded well under the assertion's budget.
      */
 open func flushPendingSaves()async   {
     return
@@ -2366,6 +2421,29 @@ open func renameNote(url: String, title: String)throws   {try rustCallWithError(
 }
 }
     
+    /**
+     * What is materialized in memory right now, pinned first, and what
+     * holds each doc there. Nothing is materialized to answer: residency
+     * comes from the repo's maps and the title from the index.
+     */
+open func residentDocs()async  -> ResidentDocs  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_lush_core_fn_method_core_resident_docs(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_lush_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_lush_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_lush_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeResidentDocs_lift,
+            errorHandler: nil
+            
+        )
+}
+    
 open func resyncDoc(url: String)async throws   {
     return
         try  await uniffiRustCallAsync(
@@ -2473,6 +2551,14 @@ open func setConfigCalendar(configUrl: String, url: String)throws   {try rustCal
 }
 }
     
+open func setConfigFocusSets(configUrl: String, sets: [FocusSet])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
+    uniffi_lush_core_fn_method_core_set_config_focus_sets(self.uniffiClonePointer(),
+        FfiConverterString.lower(configUrl),
+        FfiConverterSequenceTypeFocusSet.lower(sets),$0
+    )
+}
+}
+    
 open func setConfigFolderSettings(configUrl: String, settings: [FolderSettings])throws   {try rustCallWithError(FfiConverterTypeCoreError_lift) {
     uniffi_lush_core_fn_method_core_set_config_folder_settings(self.uniffiClonePointer(),
         FfiConverterString.lower(configUrl),
@@ -2532,6 +2618,19 @@ open func setConfigSmartNotebooks(configUrl: String, folders: [SmartNotebook])th
 open func setDelegate(delegate: CoreDelegate)  {try! rustCall() {
     uniffi_lush_core_fn_method_core_set_delegate(self.uniffiClonePointer(),
         FfiConverterCallbackInterfaceCoreDelegate_lower(delegate),$0
+    )
+}
+}
+    
+    /**
+     * Write the sidebar down so the next launch can draw it before a single
+     * folder doc has been read. Called after a walk that actually read the
+     * folder docs — never from the cached tree itself, which would just
+     * rewrite what it was given.
+     */
+open func setFolderTree(rows: [TreeRow])  {try! rustCall() {
+    uniffi_lush_core_fn_method_core_set_folder_tree(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeTreeRow.lower(rows),$0
     )
 }
 }
@@ -3434,10 +3533,12 @@ public struct ConfigState {
     public var quickNote: String?
     public var quickNoteConfigured: Bool
     public var pad: String?
+    public var focusSets: [FocusSet]
+    public var focusSetsConfigured: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], folderSettings: [FolderSettings], packages: [String], pins: [String], pinsConfigured: Bool, quickNote: String?, quickNoteConfigured: Bool, pad: String?) {
+    public init(folders: [String], inbox: String?, calendar: String?, smart: [SmartNotebook], folderSettings: [FolderSettings], packages: [String], pins: [String], pinsConfigured: Bool, quickNote: String?, quickNoteConfigured: Bool, pad: String?, focusSets: [FocusSet], focusSetsConfigured: Bool) {
         self.folders = folders
         self.inbox = inbox
         self.calendar = calendar
@@ -3449,6 +3550,8 @@ public struct ConfigState {
         self.quickNote = quickNote
         self.quickNoteConfigured = quickNoteConfigured
         self.pad = pad
+        self.focusSets = focusSets
+        self.focusSetsConfigured = focusSetsConfigured
     }
 }
 
@@ -3492,6 +3595,12 @@ extension ConfigState: Equatable, Hashable {
         if lhs.pad != rhs.pad {
             return false
         }
+        if lhs.focusSets != rhs.focusSets {
+            return false
+        }
+        if lhs.focusSetsConfigured != rhs.focusSetsConfigured {
+            return false
+        }
         return true
     }
 
@@ -3507,6 +3616,8 @@ extension ConfigState: Equatable, Hashable {
         hasher.combine(quickNote)
         hasher.combine(quickNoteConfigured)
         hasher.combine(pad)
+        hasher.combine(focusSets)
+        hasher.combine(focusSetsConfigured)
     }
 }
 
@@ -3529,7 +3640,9 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
                 pinsConfigured: FfiConverterBool.read(from: &buf), 
                 quickNote: FfiConverterOptionString.read(from: &buf), 
                 quickNoteConfigured: FfiConverterBool.read(from: &buf), 
-                pad: FfiConverterOptionString.read(from: &buf)
+                pad: FfiConverterOptionString.read(from: &buf), 
+                focusSets: FfiConverterSequenceTypeFocusSet.read(from: &buf), 
+                focusSetsConfigured: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -3545,6 +3658,8 @@ public struct FfiConverterTypeConfigState: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.quickNote, into: &buf)
         FfiConverterBool.write(value.quickNoteConfigured, into: &buf)
         FfiConverterOptionString.write(value.pad, into: &buf)
+        FfiConverterSequenceTypeFocusSet.write(value.focusSets, into: &buf)
+        FfiConverterBool.write(value.focusSetsConfigured, into: &buf)
     }
 }
 
@@ -3937,6 +4052,113 @@ public func FfiConverterTypeEmbeddingChunk_lower(_ value: EmbeddingChunk) -> Rus
 
 
 /**
+ * A named set of Lush settings the user links to a system Focus. Empty
+ * `folders`/`calendars` mean "show everything"; empty `inbox`/`quick_note`
+ * mean "keep the normal one".
+ */
+public struct FocusSet {
+    public var id: String
+    public var name: String
+    public var folders: [String]
+    public var calendars: [String]
+    public var inbox: String
+    public var quickNote: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, name: String, folders: [String], calendars: [String], inbox: String, quickNote: String) {
+        self.id = id
+        self.name = name
+        self.folders = folders
+        self.calendars = calendars
+        self.inbox = inbox
+        self.quickNote = quickNote
+    }
+}
+
+#if compiler(>=6)
+extension FocusSet: Sendable {}
+#endif
+
+
+extension FocusSet: Equatable, Hashable {
+    public static func ==(lhs: FocusSet, rhs: FocusSet) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.folders != rhs.folders {
+            return false
+        }
+        if lhs.calendars != rhs.calendars {
+            return false
+        }
+        if lhs.inbox != rhs.inbox {
+            return false
+        }
+        if lhs.quickNote != rhs.quickNote {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(name)
+        hasher.combine(folders)
+        hasher.combine(calendars)
+        hasher.combine(inbox)
+        hasher.combine(quickNote)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFocusSet: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusSet {
+        return
+            try FocusSet(
+                id: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                folders: FfiConverterSequenceString.read(from: &buf), 
+                calendars: FfiConverterSequenceString.read(from: &buf), 
+                inbox: FfiConverterString.read(from: &buf), 
+                quickNote: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FocusSet, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterSequenceString.write(value.folders, into: &buf)
+        FfiConverterSequenceString.write(value.calendars, into: &buf)
+        FfiConverterString.write(value.inbox, into: &buf)
+        FfiConverterString.write(value.quickNote, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusSet_lift(_ buf: RustBuffer) throws -> FocusSet {
+    return try FfiConverterTypeFocusSet.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusSet_lower(_ value: FocusSet) -> RustBuffer {
+    return FfiConverterTypeFocusSet.lower(value)
+}
+
+
+/**
  * Per-folder sidebar settings. Only folders that changed a default have an
  * entry; `.folderSettings` is keyed by folder url.
  */
@@ -4076,11 +4298,6 @@ public func FfiConverterTypeFolderSettings_lower(_ value: FolderSettings) -> Rus
 }
 
 
-/**
- * Everything the index knows about a doc apart from its text. A saved search
- * tests most of its rules against this rather than asking the index one
- * question per rule.
- */
 public struct IndexedNote {
     public var url: String
     public var title: String
@@ -5171,6 +5388,194 @@ public func FfiConverterTypeRecentNote_lower(_ value: RecentNote) -> RustBuffer 
 
 
 /**
+ * Everything the index knows about a doc apart from its text. A saved search
+ * tests most of its rules against this rather than asking the index one
+ * question per rule.
+ * A doc materialized in memory right now, and what holds it there.
+ */
+public struct ResidentDoc {
+    public var url: String
+    /**
+     * Title from the index; empty when the index doesn't hold the doc.
+     */
+    public var title: String
+    /**
+     * Open pins. Nonzero means idle eviction can't touch it.
+     */
+    public var pinned: UInt32
+    /**
+     * Seconds since the doc was last read or written; `None` when untouched.
+     */
+    public var idleSeconds: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(url: String, 
+        /**
+         * Title from the index; empty when the index doesn't hold the doc.
+         */title: String, 
+        /**
+         * Open pins. Nonzero means idle eviction can't touch it.
+         */pinned: UInt32, 
+        /**
+         * Seconds since the doc was last read or written; `None` when untouched.
+         */idleSeconds: UInt64?) {
+        self.url = url
+        self.title = title
+        self.pinned = pinned
+        self.idleSeconds = idleSeconds
+    }
+}
+
+#if compiler(>=6)
+extension ResidentDoc: Sendable {}
+#endif
+
+
+extension ResidentDoc: Equatable, Hashable {
+    public static func ==(lhs: ResidentDoc, rhs: ResidentDoc) -> Bool {
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.title != rhs.title {
+            return false
+        }
+        if lhs.pinned != rhs.pinned {
+            return false
+        }
+        if lhs.idleSeconds != rhs.idleSeconds {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(url)
+        hasher.combine(title)
+        hasher.combine(pinned)
+        hasher.combine(idleSeconds)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeResidentDoc: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResidentDoc {
+        return
+            try ResidentDoc(
+                url: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                pinned: FfiConverterUInt32.read(from: &buf), 
+                idleSeconds: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ResidentDoc, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterUInt32.write(value.pinned, into: &buf)
+        FfiConverterOptionUInt64.write(value.idleSeconds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResidentDoc_lift(_ buf: RustBuffer) throws -> ResidentDoc {
+    return try FfiConverterTypeResidentDoc.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResidentDoc_lower(_ value: ResidentDoc) -> RustBuffer {
+    return FfiConverterTypeResidentDoc.lower(value)
+}
+
+
+public struct ResidentDocs {
+    public var docs: [ResidentDoc]
+    public var count: UInt32
+    public var pinnedCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(docs: [ResidentDoc], count: UInt32, pinnedCount: UInt32) {
+        self.docs = docs
+        self.count = count
+        self.pinnedCount = pinnedCount
+    }
+}
+
+#if compiler(>=6)
+extension ResidentDocs: Sendable {}
+#endif
+
+
+extension ResidentDocs: Equatable, Hashable {
+    public static func ==(lhs: ResidentDocs, rhs: ResidentDocs) -> Bool {
+        if lhs.docs != rhs.docs {
+            return false
+        }
+        if lhs.count != rhs.count {
+            return false
+        }
+        if lhs.pinnedCount != rhs.pinnedCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(docs)
+        hasher.combine(count)
+        hasher.combine(pinnedCount)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeResidentDocs: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResidentDocs {
+        return
+            try ResidentDocs(
+                docs: FfiConverterSequenceTypeResidentDoc.read(from: &buf), 
+                count: FfiConverterUInt32.read(from: &buf), 
+                pinnedCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ResidentDocs, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeResidentDoc.write(value.docs, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+        FfiConverterUInt32.write(value.pinnedCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResidentDocs_lift(_ buf: RustBuffer) throws -> ResidentDocs {
+    return try FfiConverterTypeResidentDocs.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResidentDocs_lower(_ value: ResidentDocs) -> RustBuffer {
+    return FfiConverterTypeResidentDocs.lower(value)
+}
+
+
+/**
  * Narrows a search without touching the query text. Every field is optional;
  * an all-empty filter matches everything. `scope` is a folder url and covers
  * the whole subtree under it. `when_from`/`when_to` are inclusive `YYYY-MM-DD`
@@ -5539,6 +5944,96 @@ public func FfiConverterTypeSmartNotebook_lift(_ buf: RustBuffer) throws -> Smar
 #endif
 public func FfiConverterTypeSmartNotebook_lower(_ value: SmartNotebook) -> RustBuffer {
     return FfiConverterTypeSmartNotebook.lower(value)
+}
+
+
+/**
+ * One sidebar row, flattened: `parent` is empty for a root, and rows arrive
+ * and come back in the order the folder doc holds them.
+ */
+public struct TreeRow {
+    public var parent: String
+    public var url: String
+    public var name: String
+    public var kind: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(parent: String, url: String, name: String, kind: String) {
+        self.parent = parent
+        self.url = url
+        self.name = name
+        self.kind = kind
+    }
+}
+
+#if compiler(>=6)
+extension TreeRow: Sendable {}
+#endif
+
+
+extension TreeRow: Equatable, Hashable {
+    public static func ==(lhs: TreeRow, rhs: TreeRow) -> Bool {
+        if lhs.parent != rhs.parent {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(parent)
+        hasher.combine(url)
+        hasher.combine(name)
+        hasher.combine(kind)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTreeRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TreeRow {
+        return
+            try TreeRow(
+                parent: FfiConverterString.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TreeRow, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.parent, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTreeRow_lift(_ buf: RustBuffer) throws -> TreeRow {
+    return try FfiConverterTypeTreeRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTreeRow_lower(_ value: TreeRow) -> RustBuffer {
+    return FfiConverterTypeTreeRow.lower(value)
 }
 
 
@@ -5942,6 +6437,30 @@ fileprivate struct FfiConverterOptionUInt16: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt16.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -6436,6 +6955,31 @@ fileprivate struct FfiConverterSequenceTypeEmbeddingChunk: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFocusSet: FfiConverterRustBuffer {
+    typealias SwiftType = [FocusSet]
+
+    public static func write(_ value: [FocusSet], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFocusSet.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FocusSet] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FocusSet]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFocusSet.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFolderSettings: FfiConverterRustBuffer {
     typealias SwiftType = [FolderSettings]
 
@@ -6636,6 +7180,31 @@ fileprivate struct FfiConverterSequenceTypeRecentNote: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeResidentDoc: FfiConverterRustBuffer {
+    typealias SwiftType = [ResidentDoc]
+
+    public static func write(_ value: [ResidentDoc], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeResidentDoc.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ResidentDoc] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ResidentDoc]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeResidentDoc.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSearchHit: FfiConverterRustBuffer {
     typealias SwiftType = [SearchHit]
 
@@ -6703,6 +7272,31 @@ fileprivate struct FfiConverterSequenceTypeSmartNotebook: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeSmartNotebook.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTreeRow: FfiConverterRustBuffer {
+    typealias SwiftType = [TreeRow]
+
+    public static func write(_ value: [TreeRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTreeRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TreeRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TreeRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTreeRow.read(from: &buf))
         }
         return seq
     }
@@ -6822,6 +7416,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_background_trim() != 31378) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_cached_folder_tree() != 55204) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_clone_doc() != 45060) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6921,7 +7518,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_ensure_pocket_pad() != 52874) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_lush_core_checksum_method_core_flush_pending_saves() != 45884) {
+    if (uniffi_lush_core_checksum_method_core_flush_pending_saves() != 64750) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_folder_entries_of() != 11978) {
@@ -7080,6 +7677,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_lush_core_checksum_method_core_rename_note() != 13351) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_lush_core_checksum_method_core_resident_docs() != 36829) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_lush_core_checksum_method_core_resync_doc() != 12944) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7099,6 +7699,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_config_calendar() != 47772) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_config_focus_sets() != 31683) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_config_folder_settings() != 14031) {
@@ -7123,6 +7726,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_delegate() != 58682) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_lush_core_checksum_method_core_set_folder_tree() != 44220) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_lush_core_checksum_method_core_set_iroh_enabled() != 20138) {
