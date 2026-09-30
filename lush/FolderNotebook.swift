@@ -859,6 +859,7 @@ final class NotebookTextView: NSTextView {
         else { return }
 
         let inset = textContainerInset
+        guard bounds.width > inset.width * 2 else { return }
         PColor.separatorColor.setStroke()
 
         for location in document.separatorLocations() {
@@ -982,6 +983,7 @@ final class NotebookTextView: UITextView {
               let context = UIGraphicsGetCurrentContext()
         else { return }
 
+        guard bounds.width > textContainerInset.left + textContainerInset.right else { return }
         context.setStrokeColor(PColor.separator.cgColor)
         context.setLineWidth(1)
         context.setLineDash(phase: 0, lengths: [1.5, 4])
